@@ -72,7 +72,7 @@ var reportCmd = &cobra.Command{
 
 		fmt.Printf("\033[1;36m[Staypoint]\033[0m Rendering \033[1;33m%s\033[0m report via Chrome CDP...\n", reportType)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
 		if err := reporting.RenderReport(ctx, reportType, cfg, outFlag, rangeOpts); err != nil {
