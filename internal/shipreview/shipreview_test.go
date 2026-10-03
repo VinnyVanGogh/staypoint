@@ -89,6 +89,7 @@ func openTestDB(t testing.TB) *sql.DB {
 			gh_config_dir TEXT NOT NULL DEFAULT '',
 			live_credentials INTEGER NOT NULL DEFAULT 0,
 			target_branch TEXT NOT NULL DEFAULT '',
+			push_policy TEXT NOT NULL DEFAULT 'never',
 			updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		);
 		CREATE TABLE IF NOT EXISTS task_comments (

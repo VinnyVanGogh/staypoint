@@ -95,6 +95,12 @@ func (h *ShipReviewHandler) GetCard(w http.ResponseWriter, r *http.Request) {
 				merged["live_gate_reason"] = reason
 				merged["dev_configured"] = cfg.DevCommand != "" || shipreview.HasSupabaseConfig(task.RepoPath)
 			}
+			// STA-562: push policy and whether the branch is on origin, so the
+			// Board UI can show "not pushed" and offer the Push action.
+			merged["push_policy"] = string(shipreview.GetProjectPushPolicy(h.db, task.RepoPath))
+			rctx, rcancel := gitRequestContext(r)
+			merged["remote"] = shipreview.GetBranchRemoteInfo(rctx, task.RepoPath, card.Branch)
+			rcancel()
 			if gitErr != nil {
 				// The card itself is DB-only; return it and say why the
 				// migration check is missing rather than hanging or erroring.
@@ -683,6 +689,57 @@ func refExists(ctx gocontext.Context, dir, ref string) (bool, error) {
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// PushBranch handles POST /api/tasks/{id}/ship-review/push-branch (Board action)
+// Pushes the reviewed head of the task branch to origin so the Board (or an
+// external CI/CD) can open a PR or trigger a preview without merging. Only
+// callable from the Board; agents are denied git push by the per-project
+// push_policy gate (STA-562). It never pushes main or the merge target.
+func (h *ShipReviewHandler) PushBranch(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	card, task, ok := h.requireCard(w, taskID)
+	if !ok {
+		return
+	}
+	if card.Status != shipreview.StatusPending && card.Status != shipreview.StatusSentBack {
+		writeError(w, http.StatusConflict, "card is not in a pushable state")
+		return
+	}
+	cfg, err := shipreview.GetProjectDevConfig(h.db, task.RepoPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	auth, err := shipreview.ResolveGHAuth(cfg, task.RepoPath)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx := auth.WithAuth(r.Context())
+	if err := shipreview.PushBranch(ctx, task.RepoPath, card.Branch, card.TargetBranch, card.HeadSHA); err != nil {
+		switch {
+		case errors.Is(err, shipreview.ErrHeadMoved):
+			writeError(w, http.StatusConflict, "branch HEAD moved since card was created; re-submit the card")
+		case errors.Is(err, shipreview.ErrProtectedBranch):
+			writeError(w, http.StatusForbidden, err.Error())
+		default:
+			writeError(w, gitErrorStatus(err), "push failed: "+err.Error())
+		}
+		return
+	}
+	remoteInfo := shipreview.GetBranchRemoteInfo(ctx, task.RepoPath, card.Branch)
+	h.hub.Publish("ship_review_branch_pushed", map[string]any{
+		"task_id":    taskID,
+		"branch":     card.Branch,
+		"head_sha":   card.HeadSHA,
+		"remote_sha": remoteInfo.RemoteSHA,
+	})
+	writeJSON(w, map[string]any{
+		"branch":     card.Branch,
+		"head_sha":   card.HeadSHA,
+		"remote_sha": remoteInfo.RemoteSHA,
+	})
 }
 
 // Approve handles POST /api/tasks/{id}/ship-review/approve (Board action)

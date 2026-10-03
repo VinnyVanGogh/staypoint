@@ -1536,6 +1536,23 @@ var Migrations = []Migration{
 			return tx.Commit()
 		},
 	},
+	{
+		// PR #143 first used 19, which main has since taken.
+		Version: 45,
+		Name:    "project_push_policy",
+		Up: func(conn *sql.DB) error {
+			// STA-562: per-project push policy. Default 'never': agents must
+			// not push task branches without Board approval.
+			_, err := conn.Exec(
+				`ALTER TABLE project_dev_configs ADD COLUMN push_policy TEXT NOT NULL DEFAULT 'never'
+				 CHECK (push_policy IN ('never','branch_only','pr'));`,
+			)
+			if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+				return err
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {

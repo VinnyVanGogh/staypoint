@@ -10,7 +10,9 @@ import (
 func testClassifier(t *testing.T) *Classifier {
 	t.Helper()
 	b, _ := newTree(t)
-	return &Classifier{Worktree: b, Home: "/Users/tester"}
+	// Use "branch_only" so legacy tests that assert Yellow for non-main push
+	// remain valid; push_policy enforcement is tested in TestPushPolicy below.
+	return &Classifier{Worktree: b, Home: "/Users/tester", PushPolicy: "branch_only"}
 }
 
 func TestClassifyTiers(t *testing.T) {
@@ -209,5 +211,96 @@ func TestGateBlocksTraversalWithoutConfirm(t *testing.T) {
 	g, _ := NewGate(t.TempDir(), nil)
 	if _, err := g.Authorize(context.Background(), "cat ../../../etc/hosts"); !errors.Is(err, ErrConfirmationRequired) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// TestPushPolicy verifies that per-project push_policy is enforced by the Classifier.
+func TestPushPolicy(t *testing.T) {
+	b, _ := newTree(t)
+
+	cases := []struct {
+		policy string
+		cmd    string
+		want   Tier
+		desc   string
+	}{
+		// policy "never" (default) — all git push is Red regardless of refspec
+		{"never", "git push origin feature-branch", Red, "never: task branch push is Red"},
+		{"never", "git push -u origin staypoint/task-abc", Red, "never: -u push is Red"},
+		{"never", "git push", Red, "never: bare push is Red"},
+		// empty policy defaults to "never"
+		{"", "git push origin feature-branch", Red, "empty defaults to never: task branch push is Red"},
+		{"", "git push", Red, "empty defaults to never: bare push is Red"},
+		// policy "branch_only" — non-main push is Yellow; main push stays Red
+		{"branch_only", "git push origin feature-branch", Yellow, "branch_only: task branch push is Yellow"},
+		{"branch_only", "git push -u origin staypoint/task-xyz", Yellow, "branch_only: -u push is Yellow"},
+		{"branch_only", "git push origin main", Red, "branch_only: main push is still Red"},
+		{"branch_only", "git push --force", Red, "branch_only: force push is still Red"},
+		// policy "pr" — same as branch_only for push tier
+		{"pr", "git push origin feature-branch", Yellow, "pr: task branch push is Yellow"},
+		{"pr", "git push origin main", Red, "pr: main push is still Red"},
+	}
+
+	for _, tc := range cases {
+		c := &Classifier{Worktree: b, Home: "/Users/tester", PushPolicy: tc.policy}
+		got := c.Classify(tc.cmd)
+		if got.Tier != tc.want {
+			t.Errorf("[%s] %q: got %s (%v), want %s", tc.desc, tc.cmd, got.Tier, got.Reasons, tc.want)
+		}
+		if got.Tier == Red && len(got.Reasons) == 0 {
+			t.Errorf("[%s] %q: red without reason", tc.desc, tc.cmd)
+		}
+	}
+}
+
+// TestPushPolicyFor: the policy is resolved for the repo the push runs in,
+// not the hook's cwd, and anything that hides that repo fails closed.
+func TestPushPolicyFor(t *testing.T) {
+	allowed := t.TempDir() // project with push_policy branch_only
+	denied := t.TempDir()  // project with push_policy never
+	policies := map[string]string{allowed: "branch_only", denied: "never"}
+	var asked []string
+	resolver := func(dir string) string {
+		asked = append(asked, dir)
+		return policies[dir]
+	}
+
+	cases := []struct {
+		cwd  string
+		cmd  string
+		want Tier
+		desc string
+	}{
+		// Adversarial: another repo, or a repo the classifier cannot model.
+		{allowed, "git -C " + denied + " push origin feature", Red, "-C into a never repo"},
+		{allowed, "git --git-dir=" + denied + "/.git push origin feature", Red, "--git-dir hides the repo"},
+		{allowed, "git --work-tree " + denied + " push origin feature", Red, "--work-tree hides the repo"},
+		{allowed, "git -c remote.origin.url=" + denied + " push origin feature", Red, "-c can redirect the push"},
+		{allowed, "cd " + denied + " && git push origin feature", Red, "cd into a never repo"},
+		{denied, "cd " + allowed + " && git push origin feature", Red, "cd may sit in a subshell: original repo is never"},
+		{allowed, "git push origin main", Red, "main stays Red under branch_only"},
+		{allowed, "git push origin HEAD:refs/heads/main", Red, "refspec to main stays Red"},
+		{allowed, "git push --force origin feature", Red, "force stays Red under branch_only"},
+		{denied, "git push origin feature", Red, "never repo"},
+		{t.TempDir(), "git push origin feature", Red, "unconfigured repo"},
+		// Allowed: the configured repo pushing a task branch.
+		{allowed, "git push origin feature", Yellow, "branch_only repo, task branch"},
+		{denied, "git -C " + allowed + " push origin feature", Yellow, "-C into a branch_only repo"},
+	}
+	for _, tc := range cases {
+		c := &Classifier{CWD: tc.cwd, PushPolicy: "branch_only", PushPolicyFor: resolver}
+		got := c.Classify(tc.cmd)
+		if got.Tier != tc.want {
+			t.Errorf("[%s] %q: got %s (%v), want %s", tc.desc, tc.cmd, got.Tier, got.Reasons, tc.want)
+		}
+	}
+
+	// An unknown value from the resolver is "never".
+	c := &Classifier{CWD: allowed, PushPolicyFor: func(string) string { return "yes please" }}
+	if got := c.Classify("git push origin feature"); got.Tier != Red {
+		t.Errorf("unknown policy value: got %s, want Red", got.Tier)
+	}
+	if len(asked) == 0 {
+		t.Error("resolver never consulted")
 	}
 }

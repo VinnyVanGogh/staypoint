@@ -16,8 +16,10 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/bridge"
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
+	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
 	"github.com/VinnyVanGogh/staypoint/internal/trackgate"
 	"github.com/VinnyVanGogh/staypoint/internal/wire"
@@ -567,7 +569,8 @@ func handleHookPreTool() {
 	// Board and pinned into the command that runs.
 	snap := security.NewSnapshotter()
 	c := &security.Classifier{CWD: cwd, CWDTrusted: cwdTrusted, Snap: snap,
-		ScratchDirs: hookScratchDirs(os.Getenv("STAYPOINT_TASK_ID"))}
+		ScratchDirs:   hookScratchDirs(os.Getenv("STAYPOINT_TASK_ID")),
+		PushPolicyFor: hookPushPolicy}
 	verdict := c.Classify(bashInput.Command)
 	// A daemon-run agent (STAYPOINT_TASK_ID is in the hook's own env, which
 	// the command cannot change) asks the Board for anything that breaks an
@@ -832,6 +835,32 @@ type gateRequestBody struct {
 type hookScript struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+}
+
+// hookPushPolicy resolves the push_policy (STA-562) of the repo a push runs
+// in. A task worktree resolves to its main checkout through the git common
+// dir, which is where project_dev_configs rows are keyed. The database is
+// opened read-only, so a hook built from another version never migrates the
+// daemon's schema. It fails closed: a relative dir, no repo, no database, a
+// missing column or no row all return "never".
+func hookPushPolicy(dir string) string {
+	never := string(shipreview.PushPolicyNever)
+	if dir == "" || !filepath.IsAbs(dir) || cfg == nil || cfg.DBPath == "" {
+		return never
+	}
+	root := ""
+	if common := gitexec.CommonDir(dir); filepath.Base(common) == ".git" {
+		root = filepath.Dir(common)
+	}
+	if root == "" {
+		return never
+	}
+	conn, err := db.OpenReadOnly(cfg.DBPath)
+	if err != nil {
+		return never
+	}
+	defer conn.Close()
+	return string(shipreview.GetProjectPushPolicy(conn, root))
 }
 
 // hookScratchDirs are the system temp dirs plus the task's scratch dir.
