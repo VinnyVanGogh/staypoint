@@ -8623,31 +8623,16 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   // Interaction cards (pending ask_user_questions / request_confirmation / suggest_tasks)
   renderInteractionCards(main, task.id || '', interactions || []);
 
-  // Activity / comments
-  if (comments && comments.length) {
-    const actSection = el('div', 'task-page-section');
-    actSection.appendChild(el('div', 'task-page-section-title', `Activity (${comments.length})`));
-    for (const c of comments) {
-      const authorType = (c.authorType || c.author_type || '').toLowerCase();
-      const isAgent = authorType === 'agent' || authorType === 'system';
-      const authorLabel = isAgent
-        ? (c.authorName || c.author_name || 'Agent')
-        : (c.author || 'User');
-      const ts = c.createdAt || c.created_at || c.timestamp || '';
-      const row = el('div', `chat-msg ${isAgent ? 'chat-msg-agent' : 'chat-msg-user'}`);
-      row.appendChild(el('div', 'chat-msg-meta', `${authorLabel}${ts ? ' · ' + fmtDateTime(ts) : ''}`));
-      const bubble = el('div', 'chat-msg-bubble');
-      bubble.appendChild(mdEl(c.body || c.message || ''));
-      row.appendChild(bubble);
-      actSection.appendChild(row);
-    }
-    main.appendChild(actSection);
-  }
-
-  // Agent interaction (chat) — composer only; Activity above already shows comments.
+  // Agent interaction (chat) — messages + composer in one section.
   const chatSection = el('div', 'task-page-section');
   chatSection.id = 'page-chat-section';
   chatSection.appendChild(el('div', 'task-page-section-title', 'Send to Agent'));
+
+  const messagesDiv = el('div', 'chat-messages');
+  messagesDiv.id = 'page-chat-messages';
+  messagesDiv.style.maxHeight = '320px';
+  renderChatMessages(messagesDiv, comments || []);
+  chatSection.appendChild(messagesDiv);
 
   const compose = el('div', 'chat-compose');
   const textarea = document.createElement('textarea');

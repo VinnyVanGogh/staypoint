@@ -340,12 +340,15 @@ test.describe('ship review card', () => {
     await gotoTaskPage(page, task);
     await expect(page.locator('.ship-review-card')).toBeVisible({ timeout: 10_000 });
 
-    // The "Send to Agent" section must exist but must NOT have a messages list.
+    // The "Send to Agent" section must exist with the messages list inside it.
     const chatSection = page.locator('#page-chat-section');
     await expect(chatSection).toBeVisible();
 
-    // page-chat-messages div must not exist — comments are shown in Activity only.
-    await expect(page.locator('#page-chat-messages')).toHaveCount(0);
+    // page-chat-messages must live inside page-chat-section (single source of truth).
+    await expect(chatSection.locator('#page-chat-messages')).toHaveCount(1);
+
+    // The comment must appear exactly once — no duplicate Activity section.
+    await expect(page.getByText('Board comment for duplicate test')).toHaveCount(1);
 
     // The textarea composer must be present.
     await expect(chatSection.locator('textarea')).toBeVisible();
