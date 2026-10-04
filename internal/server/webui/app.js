@@ -417,6 +417,14 @@ function handleEvent(evt) {
     }
     return;
   }
+  if (type === 'ship_review_dev_progress' && evt.data) {
+    const d = evt.data;
+    const tid = d.task_id;
+    if (tid && state.openDetailTaskId === tid) {
+      updateDevProgressUI(tid, d.step, d.message, d.ok);
+    }
+    return;
+  }
   if (type.startsWith('ship_review_') && evt.data) {
     const d = evt.data;
     const tid = d.task_id;
@@ -7352,6 +7360,27 @@ function renderFinalShipReviewCard(taskId, headSHA, status, mainSHA, rejectComme
 }
 
 // renderShipReviewCardFromData renders the ship review card synchronously from
+// updateDevProgressUI appends a progress line to the dev env log UI element
+// for a task that is in async setup. Called from the SSE ship_review_dev_progress handler.
+function updateDevProgressUI(taskId, step, message, ok) {
+  const row = document.getElementById(`ship-review-devenv-${taskId}`);
+  if (!row) return;
+  const stateEl = row.querySelector('.ship-review-devenv-state');
+  if (stateEl) {
+    stateEl.textContent = step === 'ready' ? '✓ Dev env ready'
+      : step === 'error' ? '❌ Dev env error'
+      : `⏳ ${message}`;
+  }
+  let logEl = row.querySelector('.ship-review-devenv-log');
+  if (!logEl) {
+    logEl = el('pre', 'ship-review-devenv-log', '');
+    row.appendChild(logEl);
+  }
+  const icon = ok ? '✓' : '✗';
+  logEl.textContent += `${icon} ${message}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
 // a pre-fetched card object. Pass null/undefined to render nothing.
 // Called both from renderTaskPage (pre-fetched data) and from the async
 // renderShipReviewCard (SSE-triggered refresh).
@@ -7417,6 +7446,22 @@ function renderShipReviewCardFromData(container, taskId, card) {
         migBanner.textContent = `⚠ ${pending.length} DB migration${pending.length > 1 ? 's' : ''} not yet marked applied. Apply in the SQL editor, then Mark applied, before approving.`;
       }
     }).catch(() => {});
+  }
+
+  // Dev env state (async setup progress).
+  if (card.dev_state === 'starting' || card.dev_state === 'error' || (card.dev_log && card.dev_log.length > 0)) {
+    const devEnvRow = el('div', 'ship-review-devenv-row');
+    devEnvRow.id = `ship-review-devenv-${taskId}`;
+    const stateLabel = card.dev_state === 'starting' ? '⏳ Starting dev env…'
+      : card.dev_state === 'error' ? '❌ Dev env error'
+      : card.dev_state === 'ready' ? '✓ Dev env ready'
+      : '…';
+    devEnvRow.appendChild(el('div', 'ship-review-devenv-state', stateLabel));
+    if (card.dev_log && card.dev_log.length > 0) {
+      const logEl = el('pre', 'ship-review-devenv-log', card.dev_log.join('\n'));
+      devEnvRow.appendChild(logEl);
+    }
+    section.appendChild(devEnvRow);
   }
 
   // Dev URL — only render http/https loopback URLs to prevent XSS via javascript: etc.

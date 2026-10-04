@@ -53,6 +53,8 @@ func openTestDB(t *testing.T) *sql.DB {
 			test_steps_json TEXT NOT NULL DEFAULT '[]',
 			dev_url TEXT NOT NULL DEFAULT '',
 			dev_pid INTEGER NOT NULL DEFAULT 0,
+			dev_state TEXT NOT NULL DEFAULT '',
+			dev_log_json TEXT NOT NULL DEFAULT '[]',
 			status TEXT NOT NULL DEFAULT 'pending',
 			approved_sha TEXT,
 			main_sha TEXT,
@@ -70,6 +72,8 @@ func openTestDB(t *testing.T) *sql.DB {
 			setup_steps_json TEXT NOT NULL DEFAULT '[]',
 			migration_globs_json TEXT NOT NULL DEFAULT '[]',
 			sql_editor_url TEXT NOT NULL DEFAULT '',
+			supabase_enabled INTEGER NOT NULL DEFAULT 0,
+			supabase_keep_up INTEGER NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		);
 		CREATE TABLE IF NOT EXISTS task_comments (
