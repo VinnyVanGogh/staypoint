@@ -16,6 +16,7 @@ type Server struct {
 	httpServer *http.Server
 	hub        *EventHub
 	secMid     *SecurityMiddleware
+	webAuthnH  *WebAuthnHandler
 	addr       string
 	port       int
 	mu         sync.Mutex
@@ -48,6 +49,10 @@ func New(opts Options) (*Server, error) {
 	}
 	if opts.DB != nil {
 		secMid.SetDB(opts.DB)
+		// Wire the default WebAuthn verifier (challenge-store validation).
+		// Tests may override this via SetWebAuthnVerifier.
+		s.webAuthnH = NewWebAuthnHandler(opts.DB, hub)
+		secMid.setWebAuthnVerifier(s.webAuthnH.VerifyAssertion)
 	}
 
 	mux := http.NewServeMux()
@@ -205,7 +210,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		}
 
 		// WebAuthn / passkey endpoints (Board session required; assertion enforced on delete)
-		webAuthnH := NewWebAuthnHandler(s.opts.DB, s.hub)
+		webAuthnH := s.webAuthnH
+		if webAuthnH == nil {
+			webAuthnH = NewWebAuthnHandler(s.opts.DB, s.hub)
+		}
 		mux.Handle("GET /api/board/webauthn/status", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.Status)))
 		mux.Handle("POST /api/board/webauthn/register/begin", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.RegisterBegin)))
 		mux.Handle("POST /api/board/webauthn/register/finish", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.RegisterFinish)))

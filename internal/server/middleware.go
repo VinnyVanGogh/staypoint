@@ -158,11 +158,15 @@ func (sm *SecurityMiddleware) WrapBoardAction(next http.Handler) http.Handler {
 			sm.verifierMu.RLock()
 			verifier := sm.webAuthnVerifier
 			sm.verifierMu.RUnlock()
-			if verifier != nil {
-				if err := verifier(r, assertion); err != nil {
-					writeBoardError(w, "board_passkey_assertion_invalid", "forbidden: WebAuthn assertion verification failed")
-					return
-				}
+			// Fail-closed: if no verifier is wired, reject all assertions.
+			// Tests inject a stub via SetWebAuthnVerifier; production wires the real verifier.
+			if verifier == nil {
+				writeBoardError(w, "board_passkey_verifier_unavailable", "forbidden: WebAuthn verifier not configured")
+				return
+			}
+			if err := verifier(r, assertion); err != nil {
+				writeBoardError(w, "board_passkey_assertion_invalid", "forbidden: WebAuthn assertion verification failed")
+				return
 			}
 		}
 
