@@ -386,6 +386,12 @@ func TestStaypointd_BoardToken_PersistedAndUsable(t *testing.T) {
 	}
 }
 
+// webAuthnVerifierSetterE2E is a local copy of the test seam interface; defined
+// here because this package (main) cannot import server_test.
+type webAuthnVerifierSetterE2E interface {
+	SetWebAuthnVerifier(func(r *http.Request, assertion string) error)
+}
+
 // testCookieJar is a minimal http.CookieJar for tests.
 type testCookieJar struct{ cookies []*http.Cookie }
 
