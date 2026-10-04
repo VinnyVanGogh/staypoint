@@ -449,7 +449,8 @@ func (h *ShipReviewHandler) ListProjectDevConfigs(w http.ResponseWriter, r *http
 	writeJSON(w, map[string]any{"configs": cfgs})
 }
 
-// UpsertProjectDevConfig handles PUT /api/project-dev-configs
+// UpsertProjectDevConfig handles PUT /api/project-dev-configs.
+// Board-action gate is enforced by WrapBoardAction in server.go (STA-520).
 func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *http.Request) {
 	var cfg shipreview.ProjectDevConfig
 	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
@@ -472,10 +473,28 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 			return
 		}
 	}
+
+	// Read old config before the write so we can record old → new in the audit log.
+	old, _ := shipreview.GetProjectDevConfig(h.db, cfg.RepoPath)
+
 	if err := shipreview.UpsertProjectDevConfig(h.db, &cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	// Audit every Board-approved dev-config change via governance.LogBoardEvent.
+	// Fail the whole request if the audit write fails (STA-520).
+	if err := governance.LogBoardEvent(h.db, "board", "dev_config_change", map[string]any{
+		"repo_path":       cfg.RepoPath,
+		"old_dev_command": old.DevCommand,
+		"new_dev_command": cfg.DevCommand,
+		"old_setup_steps": old.SetupSteps,
+		"new_setup_steps": cfg.SetupSteps,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "audit log write failed: "+err.Error())
+		return
+	}
+
 	writeJSON(w, &cfg)
 }
 

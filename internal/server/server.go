@@ -209,7 +209,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		// Board-only: disabling ship review is a Board action.
 		mux.Handle("POST /api/settings/ship-review", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.SetSettings)))
 		mux.HandleFunc("GET /api/project-dev-configs", shipH.ListProjectDevConfigs)
-		mux.HandleFunc("PUT /api/project-dev-configs", shipH.UpsertProjectDevConfig)
+		// Board-only: setting dev_command/setup_steps is a Board action (STA-520).
+		mux.Handle("PUT /api/project-dev-configs", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.UpsertProjectDevConfig)))
 		if s.opts.TestMode {
 			mux.HandleFunc("PUT /api/tasks/{id}/ship-review/seed", shipH.SeedCard)
 		}

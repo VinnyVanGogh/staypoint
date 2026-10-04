@@ -1406,6 +1406,8 @@ func TestServer_BoardToken_Required(t *testing.T) {
 		{"POST", "/api/security/gate-requests/nonexistent-id/decide", `{"decision":"approved"}`},
 		{"POST", "/api/settings/security-gate", `{"main_merge_approval":true}`},
 		{"POST", "/api/settings/ship-review", `{"ship_review":true}`},
+		// STA-520: dev-config write is Board-only (can inject dev_command/setup_steps).
+		{"PUT", "/api/project-dev-configs", `{"repo_path":"/tmp/testrepo","dev_command":"npm run dev"}`},
 	}
 
 	for _, ep := range boardEndpoints {
@@ -1560,5 +1562,81 @@ func TestServer_FreshNonce_RequiresBoardToken(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("valid: want 200, got %d", resp.StatusCode)
+	}
+}
+
+// TestUpsertDevConfig_BoardGate_AuditLog verifies STA-520:
+//   - Agent token alone → 403 (no board cookie)
+//   - Board session + passkey assertion succeeds and writes a board_audit_log row with old→new diff
+func TestUpsertDevConfig_BoardGate_AuditLog(t *testing.T) {
+	database := setupTestDB(t)
+	seedBoardWebAuthnCredential(t, database)
+	srv, token := startTestServer(t, database)
+	// Stub WebAuthn verifier so tests don't need real Touch ID hardware.
+	if s, ok := any(srv).(webAuthnVerifierSetter); ok {
+		s.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
+	}
+	boardToken := srv.BoardToken()
+	base := srv.URL()
+
+	body := `{"repo_path":"/tmp/sta520repo","dev_command":"npm run dev","setup_steps":["npm ci"]}`
+
+	// Agent-only → must be rejected with 403 (missing board cookie).
+	req, _ := http.NewRequest("PUT", base+"/api/project-dev-configs", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("agent-only request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("agent-only PUT /api/project-dev-configs: want 403, got %d", resp.StatusCode)
+	}
+
+	// Board session + passkey assertion → must succeed (200) and write an audit row.
+	req, _ = http.NewRequest("PUT", base+"/api/project-dev-configs", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "staypoint_board", Value: boardToken})
+	req.Header.Set("X-WebAuthn-Assertion", "stub-assertion")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("board session request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("board session PUT: want 200, got %d body=%s", resp.StatusCode, b)
+	}
+
+	// Verify board_audit_log has exactly one dev_config_change row.
+	var count int
+	if err := database.QueryRow(
+		`SELECT COUNT(*) FROM board_audit_log WHERE event_type = 'dev_config_change'`,
+	).Scan(&count); err != nil {
+		t.Fatalf("audit log query failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("audit log: want 1 dev_config_change row, got %d", count)
+	}
+
+	// Verify the audit payload contains old and new dev_command.
+	var payload string
+	if err := database.QueryRow(
+		`SELECT payload FROM board_audit_log WHERE event_type = 'dev_config_change' LIMIT 1`,
+	).Scan(&payload); err != nil {
+		t.Fatalf("audit payload query: %v", err)
+	}
+	var p map[string]any
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		t.Fatalf("audit payload not valid JSON: %v", err)
+	}
+	if p["new_dev_command"] != "npm run dev" {
+		t.Errorf("audit payload new_dev_command: want 'npm run dev', got %v", p["new_dev_command"])
+	}
+	// First upsert has no prior config, so old_dev_command should be empty.
+	if p["old_dev_command"] != "" {
+		t.Errorf("audit payload old_dev_command: want '', got %v", p["old_dev_command"])
 	}
 }
