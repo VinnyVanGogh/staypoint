@@ -574,11 +574,11 @@ function handleEvent(evt) {
     const tid = d.task_id;
     if (tid && state.openDetailTaskId === tid) {
       // Reload the task page so the ship review card updates.
-      const main = document.querySelector('.task-page-main');
-      if (main) {
+      const side = document.querySelector('#task-page-content .task-page-side');
+      if (side) {
         const existing = document.getElementById(`ship-review-${tid}`);
         if (existing) existing.remove();
-        renderShipReviewCard(main, tid);
+        renderShipReviewCard(side, tid);
       }
     }
     return;
@@ -7333,6 +7333,12 @@ function stopElapsedTicker() {
 
 function buildTimelineStats(task, steps, elapsedMs, isStuck) {
   const wrap = el('div', 'timeline-stats-inner');
+  // A space between cells keeps the strip's text readable ("−6 Commands",
+  // not "−6Commands"); the grid ignores whitespace-only text.
+  const add = (tile) => {
+    if (wrap.lastChild) wrap.appendChild(document.createTextNode(' '));
+    wrap.appendChild(tile);
+  };
   const stat = (label, value, cls) => {
     const s = el('span', `timeline-stat${cls ? ' ' + cls : ''}`);
     s.appendChild(el('span', 'timeline-stat-label', label));
@@ -7347,28 +7353,39 @@ function buildTimelineStats(task, steps, elapsedMs, isStuck) {
   const lastStep     = steps.length ? steps[steps.length - 1] : null;
   const currentStep  = (lastStep && lastStep.title) ? lastStep.title : 'idle';
 
-  wrap.appendChild(stat('Elapsed', fmtDuration(elapsedMs)));
-  wrap.appendChild(stat('Step', currentStep));
-  wrap.appendChild(stat('Files read', filesRead));
-  wrap.appendChild(stat('Files edited', filesEdited));
+  add(stat('Elapsed', fmtDuration(elapsedMs)));
+  const stepTile = stat('Step', currentStep, 'timeline-stat-step');
+  stepTile.title = currentStep;
+  add(stepTile);
+  add(stat('Files read', filesRead));
+  add(stat('Files edited', filesEdited));
+
+  // Lines +/- over the whole run, from the diff the page already loaded.
+  const fileStats = (task._diffData && task._diffData.file_stats) || [];
+  const added = fileStats.reduce((n, f) => n + (f.added || 0), 0);
+  const removed = fileStats.reduce((n, f) => n + (f.removed || 0), 0);
+  const linesTile = el('span', 'timeline-stat');
+  linesTile.appendChild(el('span', 'timeline-stat-label', 'Lines'));
+  const linesVal = el('span', 'timeline-stat-val');
+  linesVal.appendChild(el('span', 'lines-added', `+${added}`));
+  linesVal.appendChild(document.createTextNode(' '));
+  linesVal.appendChild(el('span', 'lines-removed', `−${removed}`));
+  linesTile.appendChild(linesVal);
+  add(linesTile);
 
   const cmdTile = el('span', 'timeline-stat');
-  cmdTile.appendChild(el('span', 'timeline-stat-label', 'Cmds'));
+  cmdTile.appendChild(el('span', 'timeline-stat-label', 'Commands'));
   const cmdVal = el('span', 'timeline-stat-val');
   cmdVal.appendChild(el('span', 'cmds-ok', `✓${commandsOk}`));
   cmdVal.appendChild(document.createTextNode(' '));
   cmdVal.appendChild(el('span', 'cmds-fail', `✗${commandsFail}`));
   cmdTile.appendChild(cmdVal);
-  wrap.appendChild(cmdTile);
+  add(cmdTile);
 
-  const spentUsd = task.spent_usd || 0;
-  const spentTok = task.spent_tokens || 0;
-  if (spentUsd > 0 || spentTok > 0) {
-    wrap.appendChild(stat('Cost', fmtCurrency(spentUsd)));
-    wrap.appendChild(stat('Tokens', fmtCompactNum(spentTok)));
-  }
+  add(stat('Tokens', fmtCompactNum(task.spent_tokens || 0)));
+  add(stat('Cost', fmtCurrency(task.spent_usd || 0)));
   if (isStuck) {
-    wrap.appendChild(stat('⚠️ Stuck', '>5 min no step', 'timeline-stat-warn'));
+    add(stat('⚠️ Stuck', '>5 min no step', 'timeline-stat-warn'));
   }
   return wrap;
 }
@@ -7679,8 +7696,17 @@ function updateDevProgressUI(taskId, step, message, ok) {
 // a pre-fetched card object. Pass null/undefined to render nothing.
 // Called both from renderTaskPage (pre-fetched data) and from the async
 // renderShipReviewCard (SSE-triggered refresh).
+// The task page header holds the ship review buttons and their inline forms
+// (STA-638). Empty both slots whenever the card re-renders or leaves pending.
+function clearShipReviewHeaderActions(taskId) {
+  document.getElementById(`task-page-review-actions-${taskId}`)?.replaceChildren();
+  document.getElementById(`task-page-action-tray-${taskId}`)
+    ?.querySelectorAll('.ship-review-actions-wrap').forEach((n) => n.remove());
+}
+
 function renderShipReviewCardFromData(container, taskId, card) {
   if (!card || !taskId) return;
+  clearShipReviewHeaderActions(taskId);
 
   // Render collapsed final state for terminal statuses.
   if (card.status === 'approved' || card.status === 'rejected') {
@@ -7971,6 +7997,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
         );
         if (r === null) { rjSubmit.disabled = false; return; }
         if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        clearShipReviewHeaderActions(taskId);
         section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'rejected', '', comment));
       } catch (e) {
         rjSubmit.disabled = false;
@@ -8022,6 +8049,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
         if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
         const result = await r.json();
         const mainSHA = result.main_sha || (result.card && result.card.main_sha) || '';
+        clearShipReviewHeaderActions(taskId);
         section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', mainSHA, '', {
           branch: card.branch,
           branch_deleted: !!result.branch_deleted,
@@ -8068,13 +8096,22 @@ function renderShipReviewCardFromData(container, taskId, card) {
   });
   actions.appendChild(rejectBtn);
 
-  actionsWrap.appendChild(actions);
-  section.appendChild(actionsWrap);
+  // On the task page the buttons sit in the sticky header and their forms
+  // drop down under it; anywhere else they stay at the bottom of the card.
+  const headerSlot = document.getElementById(`task-page-review-actions-${taskId}`);
+  const headerTray = document.getElementById(`task-page-action-tray-${taskId}`);
+  if (headerSlot && headerTray) {
+    headerSlot.appendChild(actions);
+    headerTray.appendChild(actionsWrap);
+  } else {
+    actionsWrap.appendChild(actions);
+    section.appendChild(actionsWrap);
+  }
   container.appendChild(section);
 
   // For SSE-driven re-renders the buttons may already be in the DOM.
   // Hide them so they don't sit alongside the card's own action buttons.
-  const page = container.closest('.task-page-main') || container;
+  const page = container.closest('#task-page-content') || container;
   for (const btn of page.querySelectorAll('.run-now-btn, .mark-done-btn, .mark-done-error, .ship-review-see-card-link')) {
     btn.style.display = 'none';
   }
@@ -8083,6 +8120,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
 // showWorkingState replaces the card with a "Sent back · agent working (run N)…" spinner.
 // The SSE handler will re-render when the new card arrives.
 function showWorkingState(section, taskId, prevRunNumber) {
+  clearShipReviewHeaderActions(taskId);
   const nextRun = (prevRunNumber || 1) + 1;
   const working = el('div', 'ship-review-card ship-review-card--working task-page-section');
   working.id = `ship-review-${taskId}`;
@@ -8554,11 +8592,30 @@ function renderInteractionCards(container, taskId, interactions) {
   container.appendChild(section);
 }
 
+// Header line under the back button: "STA-12 · assigned to X (claude · sonnet)".
+// The model comes from the latest route step, since the task row has none.
+function taskPageHeaderMeta(task, ident) {
+  const parts = [];
+  if (ident) parts.push(ident);
+  const assignee = task.assignee_name || task.checkout_agent_id || '';
+  const route = [...(task.runSteps || [])].reverse().find(s => s && s.kind === 'route' && s.title);
+  const model = route ? route.title.replace(/^Routed to\s+/i, '') : '';
+  if (assignee) parts.push(`assigned to ${assignee}${model ? ` (${model})` : ''}`);
+  else if (model) parts.push(model);
+  return parts.join(' · ');
+}
+
 function renderTaskPage(container, task, comments, interactions, diffData, checkpoints, runErrors, shipCard) {
   container.innerHTML = '';
 
-  // Back bar
-  const backBar = el('div', 'task-page-back-bar');
+  const ident = task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : '');
+
+  // ── Header (STA-638): identifier · assignee/model · title · status · actions ──
+  // Primary actions live here so they are on screen without scrolling:
+  // Run Now / Mark done, run control while running, and the ship review
+  // buttons (mounted by renderShipReviewCardFromData into the review slot).
+  const header = el('div', 'task-page-header');
+  const headerRow = el('div', 'task-page-header-row');
   const backBtn = el('button', 'task-page-back-btn', '← Back');
   backBtn.addEventListener('click', () => {
     stopChatPoll();
@@ -8566,34 +8623,56 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     state.openDetailTaskId = null;
     history.back();
   });
-  backBar.appendChild(backBtn);
+  headerRow.appendChild(backBtn);
 
-  const ident = task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : '');
-  if (ident) {
-    const breadcrumb = el('span', 'task-page-breadcrumb', ident);
-    backBar.appendChild(breadcrumb);
-  }
-  container.appendChild(backBar);
-
-  // Two-column layout
-  const layout = el('div', 'task-page-layout');
-
-  // ── Main column ──
-  const main = el('div', 'task-page-main');
-
-  // Title
-  const titleEl = el('h1', 'task-page-title', task.title || task.name || '(untitled)');
-  main.appendChild(titleEl);
-
-  // Status/priority pills row
+  const headerMain = el('div', 'task-page-header-main');
+  const metaLine = taskPageHeaderMeta(task, ident);
+  if (metaLine) headerMain.appendChild(el('div', 'task-page-breadcrumb', metaLine));
+  const titleRow = el('div', 'task-page-title-row');
+  titleRow.appendChild(el('h1', 'task-page-title', task.title || task.name || '(untitled)'));
   const pillsRow = el('div', 'task-page-pills');
   if (task.status) pillsRow.appendChild(statusPill(task.status));
   if (task.priority) pillsRow.appendChild(statusPill(task.priority));
-  if (ident) {
-    const identBadge = el('span', 'card-id', ident);
-    pillsRow.appendChild(identBadge);
+  titleRow.appendChild(pillsRow);
+  headerMain.appendChild(titleRow);
+  headerRow.appendChild(headerMain);
+
+  const headerActions = el('div', 'task-page-actions');
+  const reviewSlot = el('div', 'task-page-review-actions');
+  reviewSlot.id = `task-page-review-actions-${task.id}`;
+  headerActions.appendChild(reviewSlot);
+  headerRow.appendChild(headerActions);
+  header.appendChild(headerRow);
+
+  // Inline forms opened by header buttons (merge confirm, send-back, reject,
+  // mark-done errors) drop down here, under the buttons that opened them.
+  const actionTray = el('div', 'task-page-action-tray');
+  actionTray.id = `task-page-action-tray-${task.id}`;
+  header.appendChild(actionTray);
+  container.appendChild(header);
+
+  // ── Stats strip ──
+  // Uses currentRunSteps so refused runs don't pollute the display.
+  const runSteps = task.runSteps || [];
+  const statsBar = el('div', 'timeline-stats-bar task-page-stats');
+  statsBar.id = `timeline-stats-${task.id}`;
+  statsBar.setAttribute('data-task-id', task.id || '');
+  {
+    const curSteps = currentRunSteps(runSteps);
+    const elapsedMs = runElapsedMs(curSteps, Date.now());
+    const stuck = isStuck(runSteps, Date.now(), task.status);
+    statsBar.appendChild(buildTimelineStats(task, curSteps, elapsedMs, stuck));
   }
-  main.appendChild(pillsRow);
+  container.appendChild(statsBar);
+
+  // Two-column body: timeline left, panel right, each scrolling internally.
+  const layout = el('div', 'task-page-layout');
+
+  // ── Left column: timeline ──
+  const main = el('div', 'task-page-main task-page-timeline');
+
+  // ── Right column: review, migrations, diff, brief, details ──
+  const side = el('div', 'task-page-side');
 
   // Description (editable)
   const descSection = el('div', 'task-page-section');
@@ -8678,35 +8757,20 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     }
   });
 
-  main.appendChild(descSection);
-
-  // Notes (if any)
+  // Notes (if any) — shown with the brief in the right column.
   const notesVal = task.notes || '';
+  let notesSection = null;
   if (notesVal) {
-    const notesSection = el('div', 'task-page-section');
+    notesSection = el('div', 'task-page-section');
     notesSection.appendChild(el('div', 'task-page-section-title', 'Notes'));
     notesSection.appendChild(mdEl(notesVal));
-    main.appendChild(notesSection);
   }
 
   // ── Timeline ──────────────────────────────────────────────
-  const runSteps = task.runSteps || [];
   const timelineSection = el('div', 'task-page-section');
   timelineSection.id = `timeline-section-${task.id}`;
   timelineSection.setAttribute('data-task-id', task.id || '');
   timelineSection.appendChild(el('div', 'task-page-section-title', `Timeline${runSteps.length ? ` (${runSteps.length})` : ''}`));
-
-  // Stats bar — use currentRunSteps so refused runs don't pollute the display.
-  const statsBar = el('div', 'timeline-stats-bar');
-  statsBar.id = `timeline-stats-${task.id}`;
-  statsBar.setAttribute('data-task-id', task.id || '');
-  {
-    const curSteps = currentRunSteps(runSteps);
-    const elapsedMs = runElapsedMs(curSteps, Date.now());
-    const stuck = isStuck(runSteps, Date.now(), task.status);
-    statsBar.appendChild(buildTimelineStats(task, curSteps, elapsedMs, stuck));
-  }
-  timelineSection.appendChild(statsBar);
 
   // Start live elapsed ticker if the run is still active.
   {
@@ -8717,10 +8781,10 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     }
   }
 
-  // Run-control bar (pause / stop / send message)
+  // Run-control bar (pause / stop / send message) — in the header while running.
   const rcBar = buildRunControlBar(task);
   rcBar.id = `run-control-bar-${task.id}`;
-  timelineSection.appendChild(rcBar);
+  headerActions.appendChild(rcBar);
 
   // Step rows — grouped by run so each send-back creates a new "Run N" header.
   const stepList = el('div', 'timeline-steps');
@@ -8776,38 +8840,39 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     renderPendingGatesForTask(main, task.run_id || task.runId);
   }
 
-  // Ship Review card (when agent has created one for Board approval).
-  // Rendered synchronously from the pre-fetched shipCard so it appears
-  // immediately alongside the title with no extra round-trip.
-  renderShipReviewCardFromData(main, task.id || '', shipCard || null);
-
-  // Migrations panel — lazy-loads migration files from the task's diff
-  if (task.id && !isFleetTaskId(task.id || '')) {
-    renderMigrationsPanel(main, task.id);
-  }
-
   // Interaction cards (pending ask_user_questions / request_confirmation / suggest_tasks)
   renderInteractionCards(main, task.id || '', interactions || []);
 
-  // Agent interaction (chat) — messages + composer in one section.
-  const chatSection = el('div', 'task-page-section');
+  layout.appendChild(main);
+
+  // Ship Review card (when agent has created one for Board approval).
+  // Rendered synchronously from the pre-fetched shipCard so it appears
+  // immediately with no extra round-trip; its action buttons go to the header.
+  renderShipReviewCardFromData(side, task.id || '', shipCard || null);
+
+  // Migrations panel — lazy-loads migration files from the task's diff
+  if (task.id && !isFleetTaskId(task.id || '')) {
+    renderMigrationsPanel(side, task.id);
+  }
+
+  // Agent interaction (chat): recent messages above a composer pinned to the
+  // bottom of the page.
+  const chatSection = el('div', 'task-page-dock');
   chatSection.id = 'page-chat-section';
-  chatSection.appendChild(el('div', 'task-page-section-title', 'Send to Agent'));
 
   const messagesDiv = el('div', 'chat-messages');
   messagesDiv.id = 'page-chat-messages';
-  messagesDiv.style.maxHeight = '320px';
   renderChatMessages(messagesDiv, comments || []);
   chatSection.appendChild(messagesDiv);
 
-  const compose = el('div', 'chat-compose');
+  const compose = el('div', 'chat-compose task-page-composer');
   const textarea = document.createElement('textarea');
   textarea.className = 'chat-textarea';
-  textarea.placeholder = 'Message the agent… (⌘↵ to send)';
-  textarea.rows = 3;
+  textarea.placeholder = 'Message the agent. Delivered at the next step boundary (⌘↵ to send)';
+  textarea.rows = 1;
   textarea.addEventListener('input', () => {
     textarea.style.height = 'auto';
-    textarea.style.height = Math.max(56, Math.min(300, textarea.scrollHeight)) + 'px';
+    textarea.style.height = Math.max(38, Math.min(160, textarea.scrollHeight)) + 'px';
   });
   const sendBtn = el('button', 'chat-send-btn', 'Send');
   sendBtn.type = 'button';
@@ -8835,19 +8900,21 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   compose.appendChild(textarea);
   compose.appendChild(sendBtn);
   chatSection.appendChild(compose);
-  main.appendChild(chatSection);
 
-  layout.appendChild(main);
-
-  // ── Diff sidebar ──
+  // ── Diff ──
   const diffPane = el('div', 'task-page-diff');
   if (!isFleetTaskId(task.id || '')) {
     renderDiffPane(diffPane, task, checkpoints || [], diffData || { diff: '', files: [], checkpoint_id: '' });
   }
-  layout.appendChild(diffPane);
+  side.appendChild(diffPane);
 
-  // ── Metadata sidebar ──
+  // ── Brief ──
+  side.appendChild(descSection);
+  if (notesSection) side.appendChild(notesSection);
+
+  // ── Details ──
   const meta = el('div', 'task-page-meta');
+  meta.appendChild(el('div', 'task-page-section-title', 'Details'));
 
   const addMetaField = (label, value) => {
     if (!value && value !== 0) return;
@@ -8927,7 +8994,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
         console.error('run-now failed:', err);
       }
     });
-    meta.appendChild(runBtn);
+    headerActions.prepend(runBtn);
   } else if (task.id && runableStatuses.has(task.status) && shipCard && ['pending', 'sent_back'].includes(shipCard.status)) {
     const reviewLink = el('a', 'ship-review-see-card-link', '↓ See review card');
     reviewLink.href = '#';
@@ -8974,12 +9041,14 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
         console.error('mark-done failed:', err);
       }
     });
-    meta.appendChild(doneBtn);
-    meta.appendChild(doneError);
+    headerActions.prepend(doneBtn);
+    actionTray.appendChild(doneError);
   }
 
-  layout.appendChild(meta);
+  side.appendChild(meta);
+  layout.appendChild(side);
   container.appendChild(layout);
+  container.appendChild(chatSection);
 }
 
 document.addEventListener('click', (e) => {
