@@ -229,6 +229,183 @@ INSERT INTO %s.corporate_values (key, label, sort_order) VALUES
 	}
 }
 
+// ------------- Tests using the exact 20261003120000_corporate_values.sql ----
+
+// exactCorporateValuesMigration is the verbatim content of the migration added
+// in rhizome commit 3da7576 (STA-604). The parser must produce pg_policies
+// checks for the two quoted-identifier policy names and a rows check for the
+// four seed titles inserted via SELECT … FROM (VALUES …).
+const exactCorporateValuesMigration = `-- About page: "Our corporate values" block
+-- Additive only. Lives in its own table rather than in company_values so the
+-- live "Our commitments" block cannot pick these rows up, whichever of the
+-- migration and the frontend deploy lands first.
+
+CREATE TABLE IF NOT EXISTS public.corporate_values (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title TEXT NOT NULL,
+    description TEXT,
+    icon TEXT NOT NULL DEFAULT 'leaf',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE public.corporate_values ENABLE ROW LEVEL SECURITY;
+
+-- Same access rules company_values ends up with after 20260127100000
+DROP POLICY IF EXISTS "Public can view active corporate values" ON public.corporate_values;
+CREATE POLICY "Public can view active corporate values"
+    ON public.corporate_values
+    FOR SELECT
+    USING (is_active = true);
+
+DROP POLICY IF EXISTS "Admins can manage corporate values" ON public.corporate_values;
+CREATE POLICY "Admins can manage corporate values"
+    ON public.corporate_values
+    FOR ALL
+    USING (
+        EXISTS (
+            SELECT 1 FROM public.profiles
+            WHERE id = auth.uid()
+            AND role IN ('admin', 'editor')
+        )
+    );
+
+DROP TRIGGER IF EXISTS update_corporate_values_updated_at ON public.corporate_values;
+CREATE TRIGGER update_corporate_values_updated_at
+    BEFORE UPDATE ON public.corporate_values
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- Seed only into an empty table so a re-run never duplicates rows
+INSERT INTO public.corporate_values (title, icon, sort_order)
+SELECT v.title, v.icon, v.sort_order
+FROM (VALUES
+    ('Integrity', 'shield', 1),
+    ('Creativity', 'lightbulb', 2),
+    ('Teamwork', 'users', 3),
+    ('Responsible citizenship', 'civic', 4)
+) AS v(title, icon, sort_order)
+WHERE NOT EXISTS (SELECT 1 FROM public.corporate_values);
+
+-- Section heading. DO NOTHING so an edited value is never overwritten.
+INSERT INTO public.site_settings (key, value, category, description) VALUES
+    ('about_corporate_values_title', '"Our corporate values"', 'about', 'About page corporate values section title'),
+    ('about_corporate_values_subtitle', '"Collective Achievement"', 'about', 'About page corporate values section subtitle (motto)')
+ON CONFLICT (key) DO NOTHING;
+`
+
+// TestParseChecks_ExactCorporateValuesMigration verifies that the parser
+// produces pg_policies checks for both quoted-identifier policies and a
+// KindRows check covering the 4 INSERT…SELECT…FROM (VALUES…) seed titles.
+func TestParseChecks_ExactCorporateValuesMigration(t *testing.T) {
+	checks := migration.ParseChecks(exactCorporateValuesMigration)
+
+	var policyDescs []string
+	var rowsDescs []string
+	for _, c := range checks {
+		switch c.Kind {
+		case migration.KindPolicy:
+			policyDescs = append(policyDescs, c.Description)
+			if c.SQL == "" {
+				t.Errorf("policy check %q has empty SQL", c.Description)
+			}
+		case migration.KindRows:
+			rowsDescs = append(rowsDescs, c.Description)
+		}
+	}
+
+	// Both quoted-identifier policies must produce pg_policies checks.
+	wantPolicies := []string{
+		"Public can view active corporate values",
+		"Admins can manage corporate values",
+	}
+	for _, want := range wantPolicies {
+		found := false
+		for _, c := range checks {
+			if c.Kind == migration.KindPolicy && strings.Contains(c.SQL, want) {
+				found = true
+				if !strings.Contains(c.SQL, "pg_policies") {
+					t.Errorf("policy check for %q does not query pg_policies: %s", want, c.SQL)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("no KindPolicy check found for policy %q; got policy checks: %v", want, policyDescs)
+		}
+	}
+
+	// The INSERT…SELECT…FROM (VALUES…) seed must produce a KindRows check
+	// covering all 4 titles, not be silently omitted.
+	wantTitles := []string{"Integrity", "Creativity", "Teamwork", "Responsible citizenship"}
+	foundRows := false
+	for _, c := range checks {
+		if c.Kind != migration.KindRows {
+			continue
+		}
+		if !strings.Contains(c.SQL, "corporate_values") {
+			continue
+		}
+		allPresent := true
+		for _, title := range wantTitles {
+			if !strings.Contains(c.SQL, title) {
+				allPresent = false
+				break
+			}
+		}
+		if allPresent {
+			foundRows = true
+			break
+		}
+	}
+	if !foundRows {
+		t.Errorf("no KindRows check covering all 4 seed titles; got rows checks: %v", rowsDescs)
+	}
+}
+
+// TestParseChecks_QuotedPolicyName verifies the policy name case is preserved
+// (pg_policies stores quoted-identifier names with original case).
+func TestParseChecks_QuotedPolicyName(t *testing.T) {
+	sql := `CREATE POLICY "Mixed Case Policy" ON public.things FOR SELECT USING (true);`
+	checks := migration.ParseChecks(sql)
+	found := false
+	for _, c := range checks {
+		if c.Kind == migration.KindPolicy && strings.Contains(c.SQL, "Mixed Case Policy") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected policy check preserving case 'Mixed Case Policy', got %v", checks)
+	}
+}
+
+// TestParseChecks_InsertSelectValues verifies that INSERT…SELECT…FROM (VALUES…)
+// seed rows are checked, not silently omitted.
+func TestParseChecks_InsertSelectValues(t *testing.T) {
+	sql := `INSERT INTO public.settings (key, value)
+SELECT v.key, v.value
+FROM (VALUES
+    ('alpha', 'a'),
+    ('beta', 'b'),
+    ('gamma', 'c')
+) AS v(key, value)
+WHERE NOT EXISTS (SELECT 1 FROM public.settings);`
+	checks := migration.ParseChecks(sql)
+	found := false
+	for _, c := range checks {
+		if c.Kind == migration.KindRows && strings.Contains(c.SQL, "settings") {
+			found = true
+			if !strings.Contains(c.SQL, "'alpha'") || !strings.Contains(c.SQL, "'beta'") || !strings.Contains(c.SQL, "'gamma'") {
+				t.Errorf("rows check missing expected keys: %s", c.SQL)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("INSERT…SELECT…FROM (VALUES…) produced no KindRows check; got %v", checks)
+	}
+}
+
 func TestRunChecks_ReadOnly(t *testing.T) {
 	dsn := testPGDSN(t)
 	ctx := context.Background()
