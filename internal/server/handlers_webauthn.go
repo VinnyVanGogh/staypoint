@@ -1,11 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"crypto/rand"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"os/exec"
@@ -13,24 +14,110 @@ import (
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/google/uuid"
 )
 
+// boardWebAuthnUser implements webauthn.User for the single Board principal.
+type boardWebAuthnUser struct {
+	credentials []webauthn.Credential
+}
+
+func (u *boardWebAuthnUser) WebAuthnID() []byte                         { return []byte("staypoint-board") }
+func (u *boardWebAuthnUser) WebAuthnName() string                       { return "StayPoint Board" }
+func (u *boardWebAuthnUser) WebAuthnDisplayName() string                { return "StayPoint Board" }
+func (u *boardWebAuthnUser) WebAuthnCredentials() []webauthn.Credential { return u.credentials }
+
 // WebAuthnHandler manages Board passkey registration and credential lifecycle.
 type WebAuthnHandler struct {
-	db  *sql.DB
-	hub *EventHub
+	db       *sql.DB
+	hub      *EventHub
+	wa       *webauthn.WebAuthn
+	waInitMu sync.Mutex
 
 	pairingMu   sync.Mutex
 	pairingCode string
 	pairingExp  time.Time
 
-	challengeMu sync.Mutex
-	challenges  map[string]time.Time // challenge → expiry
+	sessionMu sync.Mutex
+	sessions  map[string]*webauthn.SessionData
 }
 
 func NewWebAuthnHandler(db *sql.DB, hub *EventHub) *WebAuthnHandler {
-	return &WebAuthnHandler{db: db, hub: hub, challenges: make(map[string]time.Time)}
+	return &WebAuthnHandler{
+		db:       db,
+		hub:      hub,
+		sessions: make(map[string]*webauthn.SessionData),
+	}
+}
+
+// initWebAuthn lazily creates the webauthn.WebAuthn instance from the request's Host header.
+func (h *WebAuthnHandler) initWebAuthn(r *http.Request) (*webauthn.WebAuthn, error) {
+	h.waInitMu.Lock()
+	defer h.waInitMu.Unlock()
+	if h.wa != nil {
+		return h.wa, nil
+	}
+	host := r.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	rpid := host
+	for i := len(host) - 1; i >= 0; i-- {
+		if host[i] == ':' {
+			rpid = host[:i]
+			break
+		}
+	}
+	wa, err := webauthn.New(&webauthn.Config{
+		RPDisplayName: "StayPoint Board",
+		RPID:          rpid,
+		RPOrigins:     []string{"http://" + host},
+	})
+	if err != nil {
+		return nil, err
+	}
+	h.wa = wa
+	return wa, nil
+}
+
+// loadUser returns a boardWebAuthnUser populated with all stored credentials.
+func (h *WebAuthnHandler) loadUser() *boardWebAuthnUser {
+	rows, err := h.db.Query(
+		`SELECT credential_id, public_key, sign_count FROM board_webauthn_credentials`,
+	)
+	if err != nil {
+		return &boardWebAuthnUser{}
+	}
+	defer rows.Close()
+	var user boardWebAuthnUser
+	for rows.Next() {
+		var credID, pubKey []byte
+		var signCount uint32
+		if err := rows.Scan(&credID, &pubKey, &signCount); err != nil {
+			continue
+		}
+		user.credentials = append(user.credentials, webauthn.Credential{
+			ID:        credID,
+			PublicKey: pubKey,
+			Authenticator: webauthn.Authenticator{
+				SignCount: signCount,
+			},
+		})
+	}
+	return &user
+}
+
+// evictSessions removes expired sessions (caller may hold sessionMu or not; this is
+// called only while sessionMu is held).
+func (h *WebAuthnHandler) evictSessions() {
+	now := time.Now()
+	for k, v := range h.sessions {
+		if !v.Expires.IsZero() && v.Expires.Before(now) {
+			delete(h.sessions, k)
+		}
+	}
 }
 
 // Status handles GET /api/board/webauthn/status
@@ -42,96 +129,192 @@ func (h *WebAuthnHandler) Status(w http.ResponseWriter, r *http.Request) {
 
 // RegisterBegin handles POST /api/board/webauthn/register/begin
 func (h *WebAuthnHandler) RegisterBegin(w http.ResponseWriter, r *http.Request) {
-	var count int
-	_ = h.db.QueryRow(`SELECT COUNT(*) FROM board_webauthn_credentials`).Scan(&count)
-	if count > 0 {
-		assertion := r.Header.Get("X-WebAuthn-Assertion")
-		if assertion == "" {
-			writeBoardError(w, "board_passkey_assertion_required", "an existing passkey assertion is required to register a second passkey")
-			return
-		}
+	wa, err := h.initWebAuthn(r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "webauthn init: "+err.Error())
+		return
 	}
 
+	var count int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM board_webauthn_credentials`).Scan(&count)
+	if count > 0 && r.Header.Get("X-WebAuthn-Assertion") == "" {
+		writeBoardError(w, "board_passkey_assertion_required", "an existing passkey assertion is required to register a second passkey")
+		return
+	}
+
+	// Issue pairing code via macOS notification.
 	n, _ := rand.Int(rand.Reader, big.NewInt(1_000_000))
 	code := fmt.Sprintf("%06d", n.Int64())
-
 	h.pairingMu.Lock()
 	h.pairingCode = code
 	h.pairingExp = time.Now().Add(2 * time.Minute)
 	h.pairingMu.Unlock()
-
-	// Fire-and-forget macOS notification with the pairing code.
 	go exec.Command("osascript", "-e",
 		fmt.Sprintf(`display notification "StayPoint Board registration code: %s" with title "StayPoint Board"`, code),
 	).Run() //nolint:errcheck
 
-	challenge := h.mintChallenge()
-	writeJSON(w, map[string]any{
-		"challenge": challenge,
-		"rp":        map[string]string{"name": "StayPoint Board"},
-		"authenticatorSelection": map[string]string{
-			"authenticatorAttachment": "platform",
-			"userVerification":        "required",
-			"residentKey":             "preferred",
-		},
-		"attestation": "indirect",
-	})
+	user := h.loadUser()
+	options, sessionData, err := wa.BeginRegistration(user,
+		webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
+			AuthenticatorAttachment: protocol.Platform,
+			UserVerification:        protocol.VerificationRequired,
+			ResidentKey:             protocol.ResidentKeyRequirementPreferred,
+		}),
+		webauthn.WithConveyancePreference(protocol.PreferIndirectAttestation),
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "begin registration: "+err.Error())
+		return
+	}
+
+	sessionToken := uuid.New().String()
+	h.sessionMu.Lock()
+	h.evictSessions()
+	h.sessions[sessionToken] = sessionData
+	h.sessionMu.Unlock()
+
+	w.Header().Set("X-WebAuthn-Session", sessionToken)
+	writeJSON(w, options)
 }
 
 // RegisterFinish handles POST /api/board/webauthn/register/finish
 func (h *WebAuthnHandler) RegisterFinish(w http.ResponseWriter, r *http.Request) {
-	var req struct {
+	wa, err := h.initWebAuthn(r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "webauthn init: "+err.Error())
+		return
+	}
+
+	sessionToken := r.Header.Get("X-WebAuthn-Session")
+	h.sessionMu.Lock()
+	sessionData := h.sessions[sessionToken]
+	if sessionData != nil {
+		delete(h.sessions, sessionToken)
+	}
+	h.sessionMu.Unlock()
+	if sessionData == nil {
+		writeBoardError(w, "board_passkey_session_invalid", "missing or expired registration session")
+		return
+	}
+
+	// Decode outer envelope: { "code": "123456", "credential": {...} }
+	body, _ := io.ReadAll(r.Body)
+	var env struct {
 		Code       string          `json:"code"`
 		Credential json.RawMessage `json:"credential"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &env); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
 
 	h.pairingMu.Lock()
-	validCode := h.pairingCode != "" && req.Code == h.pairingCode && time.Now().Before(h.pairingExp)
+	validCode := h.pairingCode != "" && env.Code == h.pairingCode && time.Now().Before(h.pairingExp)
 	if validCode {
-		h.pairingCode = "" // consume
+		h.pairingCode = ""
 	}
 	h.pairingMu.Unlock()
-
 	if !validCode {
 		writeBoardError(w, "board_passkey_pairing_required", "missing, wrong, or expired pairing code")
 		return
 	}
 
-	// Extract credential_id from the credential JSON for storage.
-	var cred struct {
-		ID        string `json:"id"`
-		PublicKey string `json:"publicKey"`
-		Type      string `json:"type"`
-	}
-	_ = json.Unmarshal(req.Credential, &cred)
-	if cred.ID == "" {
-		writeError(w, http.StatusBadRequest, "credential.id required")
+	// Forward the credential JSON to FinishRegistration via a synthetic request body.
+	syntheticReq := r.Clone(r.Context())
+	syntheticReq.Body = io.NopCloser(bytes.NewReader(env.Credential))
+
+	user := h.loadUser()
+	cred, err := wa.FinishRegistration(user, *sessionData, syntheticReq)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "finish registration: "+err.Error())
 		return
 	}
 
+	credIDHex := fmt.Sprintf("%x", cred.ID)
 	if _, err := h.db.Exec(
-		`INSERT INTO board_webauthn_credentials (id, credential_id, public_key) VALUES (?, ?, ?)`,
-		uuid.New().String(), cred.ID, []byte(cred.PublicKey),
+		`INSERT INTO board_webauthn_credentials (id, credential_id, public_key, sign_count, aaguid) VALUES (?, ?, ?, ?, ?)`,
+		uuid.New().String(), cred.ID, cred.PublicKey, cred.Authenticator.SignCount,
+		fmt.Sprintf("%x", cred.Authenticator.AAGUID),
 	); err != nil {
 		writeError(w, http.StatusInternalServerError, "store credential: "+err.Error())
 		return
 	}
 
 	_ = governance.LogEvent(h.db, "board", "board", governance.AuditPasskeyEvent, nil, nil,
-		map[string]string{"action": "register", "credential_id": cred.ID})
-
-	h.hub.Publish("board_passkey_registered", map[string]string{"credential_id": cred.ID})
+		map[string]string{"action": "register", "credential_id": credIDHex})
+	h.hub.Publish("board_passkey_registered", map[string]string{"credential_id": credIDHex})
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
 // Challenge handles POST /api/board/webauthn/challenge — mints a one-time assertion challenge.
 func (h *WebAuthnHandler) Challenge(w http.ResponseWriter, r *http.Request) {
-	challenge := h.mintChallenge()
-	writeJSON(w, map[string]string{"challenge": challenge})
+	wa, err := h.initWebAuthn(r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "webauthn init: "+err.Error())
+		return
+	}
+
+	user := h.loadUser()
+	if len(user.credentials) == 0 {
+		writeError(w, http.StatusPreconditionFailed, "no credentials registered")
+		return
+	}
+
+	options, sessionData, err := wa.BeginLogin(user)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "begin login: "+err.Error())
+		return
+	}
+
+	sessionToken := uuid.New().String()
+	h.sessionMu.Lock()
+	h.evictSessions()
+	h.sessions[sessionToken] = sessionData
+	h.sessionMu.Unlock()
+
+	w.Header().Set("X-WebAuthn-Session", sessionToken)
+	writeJSON(w, options)
+}
+
+// VerifyAssertion is the default production verifier wired into WrapBoardAction.
+// It calls go-webauthn FinishLogin for full cryptographic assertion verification.
+func (h *WebAuthnHandler) VerifyAssertion(r *http.Request, assertion string) error {
+	wa, err := h.initWebAuthn(r)
+	if err != nil {
+		return fmt.Errorf("webauthn init: %w", err)
+	}
+
+	sessionToken := r.Header.Get("X-WebAuthn-Session")
+	h.sessionMu.Lock()
+	sessionData := h.sessions[sessionToken]
+	if sessionData != nil {
+		delete(h.sessions, sessionToken)
+	}
+	h.sessionMu.Unlock()
+	if sessionData == nil {
+		return fmt.Errorf("missing or expired WebAuthn session (X-WebAuthn-Session header required)")
+	}
+
+	user := h.loadUser()
+	if len(user.credentials) == 0 {
+		return fmt.Errorf("no credentials registered")
+	}
+
+	// FinishLogin reads from r.Body; forward the assertion JSON there.
+	syntheticReq := r.Clone(r.Context())
+	syntheticReq.Body = io.NopCloser(bytes.NewReader([]byte(assertion)))
+
+	cred, err := wa.FinishLogin(user, *sessionData, syntheticReq)
+	if err != nil {
+		return fmt.Errorf("assertion verification failed: %w", err)
+	}
+
+	// Update signCount to defend against cloned authenticators.
+	_, _ = h.db.Exec(
+		`UPDATE board_webauthn_credentials SET sign_count = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE credential_id = ?`,
+		cred.Authenticator.SignCount, cred.ID,
+	)
+	return nil
 }
 
 // ListCredentials handles GET /api/board/webauthn/credentials
@@ -146,8 +329,8 @@ func (h *WebAuthnHandler) ListCredentials(w http.ResponseWriter, r *http.Request
 	defer rows.Close()
 	type credRow struct {
 		ID           string `json:"id"`
-		CredentialID string `json:"credential_id"`
-		SignCount     int64  `json:"sign_count"`
+		CredentialID []byte `json:"credential_id"`
+		SignCount    uint32 `json:"sign_count"`
 		AAGUID       string `json:"aaguid"`
 		CreatedAt    string `json:"created_at"`
 	}
@@ -166,7 +349,7 @@ func (h *WebAuthnHandler) ListCredentials(w http.ResponseWriter, r *http.Request
 // DeleteCredential handles DELETE /api/board/webauthn/credentials/{id} (Board action)
 func (h *WebAuthnHandler) DeleteCredential(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	var credentialID string
+	var credentialID []byte
 	if err := h.db.QueryRow(
 		`SELECT credential_id FROM board_webauthn_credentials WHERE id = ?`, id,
 	).Scan(&credentialID); err != nil {
@@ -178,69 +361,10 @@ func (h *WebAuthnHandler) DeleteCredential(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	credIDHex := fmt.Sprintf("%x", credentialID)
 	_ = governance.LogEvent(h.db, "board", "board", governance.AuditPasskeyEvent, nil, nil,
-		map[string]string{"action": "delete", "credential_id": credentialID,
+		map[string]string{"action": "delete", "credential_id": credIDHex,
 			"ip": r.RemoteAddr, "user_agent": r.UserAgent()})
-
-	h.hub.Publish("board_passkey_deleted", map[string]string{"credential_id": credentialID})
+	h.hub.Publish("board_passkey_deleted", map[string]string{"credential_id": credIDHex})
 	writeJSON(w, map[string]string{"status": "ok"})
-}
-
-// VerifyAssertion is the default production verifier wired into WrapBoardAction.
-// It validates the assertion header as a JSON object containing a clientDataJSON field
-// whose challenge matches one of our minted, unexpired challenges. This prevents replay
-// and ensures the Board user's browser produced the response. Full signature verification
-// with go-webauthn/webauthn can be layered on later without changing this interface.
-func (h *WebAuthnHandler) VerifyAssertion(_ *http.Request, assertion string) error {
-	// Assertion is JSON: { "response": { "clientDataJSON": "<base64url>" }, ... }
-	var outer struct {
-		Response struct {
-			ClientDataJSON string `json:"clientDataJSON"`
-		} `json:"response"`
-	}
-	if err := json.Unmarshal([]byte(assertion), &outer); err != nil {
-		return fmt.Errorf("assertion: invalid JSON: %w", err)
-	}
-	cdj, err := base64.RawURLEncoding.DecodeString(outer.Response.ClientDataJSON)
-	if err != nil {
-		return fmt.Errorf("assertion: clientDataJSON: %w", err)
-	}
-	var clientData struct {
-		Challenge string `json:"challenge"`
-	}
-	if err := json.Unmarshal(cdj, &clientData); err != nil {
-		return fmt.Errorf("assertion: clientDataJSON parse: %w", err)
-	}
-	h.challengeMu.Lock()
-	defer h.challengeMu.Unlock()
-	exp, ok := h.challenges[clientData.Challenge]
-	if !ok {
-		return fmt.Errorf("assertion: unknown challenge")
-	}
-	if time.Now().After(exp) {
-		delete(h.challenges, clientData.Challenge)
-		return fmt.Errorf("assertion: challenge expired")
-	}
-	delete(h.challenges, clientData.Challenge) // single-use
-	return nil
-}
-
-// mintChallenge creates a random 32-byte hex challenge, stores it with a 90-second TTL.
-func (h *WebAuthnHandler) mintChallenge() string {
-	b := make([]byte, 32)
-	_, _ = rand.Read(b)
-	ch := fmt.Sprintf("%x", b)
-
-	exp := time.Now().Add(90 * time.Second)
-	h.challengeMu.Lock()
-	h.challenges[ch] = exp
-	// evict expired challenges
-	now := time.Now()
-	for k, v := range h.challenges {
-		if now.After(v) {
-			delete(h.challenges, k)
-		}
-	}
-	h.challengeMu.Unlock()
-	return ch
 }
