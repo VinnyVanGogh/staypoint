@@ -8,11 +8,14 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 // HasSupabaseConfig returns true when repoPath contains supabase/config.toml.
@@ -26,6 +29,24 @@ func HasSupabaseConfig(repoPath string) bool {
 func HasEdgeRuntime(repoPath string) bool {
 	entries, err := os.ReadDir(filepath.Join(repoPath, "supabase", "functions"))
 	return err == nil && len(entries) > 0
+}
+
+// supabaseProjectID reads the project_id from supabase/config.toml.
+// Returns "" when the file cannot be parsed.
+func supabaseProjectID(repoPath string) string {
+	type supabaseCfg struct {
+		ProjectID string `toml:"project_id"`
+	}
+	cfgPath := filepath.Join(repoPath, "supabase", "config.toml")
+	data, err := os.ReadFile(cfgPath) //nolint:gosec
+	if err != nil {
+		return ""
+	}
+	var cfg supabaseCfg
+	if err := toml.Unmarshal(data, &cfg); err != nil {
+		return ""
+	}
+	return cfg.ProjectID
 }
 
 // ProposeSupabaseDevConfig returns a pre-filled ProjectDevConfig for a
@@ -46,6 +67,16 @@ func ProposeSupabaseDevConfig(repoPath string) *ProjectDevConfig {
 // supabasePorts are the default local Supabase port range (API, DB, Studio, …).
 var supabasePorts = []string{"54321", "54322", "54323", "54324"}
 
+// supabaseServices is the canonical list of Supabase CLI service names used in
+// container names (supabase_<service>_<project>). Multi-word names are joined
+// with underscores by the CLI.
+var supabaseServices = map[string]bool{
+	"db": true, "kong": true, "auth": true, "rest": true, "realtime": true,
+	"storage": true, "imgproxy": true, "pg_meta": true, "studio": true,
+	"inbucket": true, "mailpit": true, "edge_runtime": true,
+	"analytics": true, "vector": true, "pooler": true,
+}
+
 // SupabaseProgress describes a single progress update emitted during setup.
 type SupabaseProgress struct {
 	Step    string `json:"step"`
@@ -59,7 +90,8 @@ type SupabaseProgress struct {
 // Steps executed:
 //  1. Docker: wait up to 3 min if not running.
 //  2. Port conflicts: stop any other project's containers holding 54321–54324.
-//  3. Copy .env.local from mainRepoPath; refuse unless it points at 127.0.0.1/localhost.
+//  3. Copy .env.local from mainRepoPath; refuse if missing or if any Supabase
+//     URL key points outside 127.0.0.1/localhost.
 //  4. supabase start (with -x edge-runtime when no functions dir).
 //  5. DB state: fresh → db reset --local + stop/start; existing → migration up.
 func StartSupabaseDevEnv(mainRepoPath, wtPath string, report func(SupabaseProgress)) error {
@@ -77,13 +109,13 @@ func StartSupabaseDevEnv(mainRepoPath, wtPath string, report func(SupabaseProgre
 
 	// 2. Port conflicts.
 	prog("ports", "Checking port conflicts (54321–54324)…", true)
-	if err := resolvePortConflicts(wtPath, prog); err != nil {
+	if err := resolvePortConflicts(mainRepoPath, prog); err != nil {
 		return fmt.Errorf("port conflicts: %w", err)
 	}
 
-	// 3. .env.local safety check.
-	prog("env", "Copying .env.local…", true)
-	if err := copyAndValidateEnv(mainRepoPath, wtPath, prog); err != nil {
+	// 3. .env.local safety check (must exist and validate for Supabase projects).
+	prog("env", "Validating .env.local…", true)
+	if err := CopyAndValidateEnv(mainRepoPath, wtPath, prog); err != nil {
 		return fmt.Errorf("env: %w", err)
 	}
 
@@ -142,32 +174,38 @@ func dockerRunning() bool {
 }
 
 // resolvePortConflicts stops any *other* project's Supabase containers that
-// hold the default Supabase ports. Data volumes are kept so the next review
-// can resume quickly.
-func resolvePortConflicts(wtPath string, prog func(step, msg string, ok bool)) error {
-	// Derive the current project name from the worktree path to avoid
-	// stopping ourselves if we are already running.
-	currentProject := filepath.Base(wtPath)
+// hold the default Supabase ports. mainRepoPath is used to read this project's
+// project_id from supabase/config.toml so we never stop our own stack.
+func resolvePortConflicts(mainRepoPath string, prog func(step, msg string, ok bool)) error {
+	// Read the current project's id from config.toml so we can skip its containers.
+	currentProjectID := supabaseProjectID(mainRepoPath)
 
 	for _, port := range supabasePorts {
 		holder, err := containerHoldingPort(port)
 		if err != nil || holder == "" {
 			continue
 		}
-		// Skip if it belongs to the current project.
-		if strings.Contains(holder, currentProject) {
+
+		// First try Docker label — authoritative, works for any naming scheme.
+		holderProject := containerProjectFromLabel(holder)
+		if holderProject == "" {
+			// Fall back to name-based extraction.
+			holderProject = ExtractSupabaseProject(holder)
+		}
+		if holderProject == "" {
+			prog("ports", fmt.Sprintf("port %s held by %s (not a Supabase container — skipping)", port, holder), true)
 			continue
 		}
-		// The supabase container naming convention is supabase_<service>_<project>.
-		// Extract the other project name and stop all its containers.
-		otherProject := extractSupabaseProject(holder)
-		if otherProject == "" {
-			prog("ports", fmt.Sprintf("port %s held by %s (skipping)", port, holder), true)
+
+		// Skip if it's our own project.
+		if currentProjectID != "" && holderProject == currentProjectID {
+			prog("ports", fmt.Sprintf("port %s held by own project %s — ok", port, holderProject), true)
 			continue
 		}
-		prog("ports", fmt.Sprintf("port %s held by %s — stopping %s containers (volumes kept)", port, holder, otherProject), true)
-		if err := stopProjectContainers(otherProject); err != nil {
-			prog("ports", fmt.Sprintf("warning: could not stop %s: %v", otherProject, err), false)
+
+		prog("ports", fmt.Sprintf("port %s held by %s (project %s) — stopping (volumes kept)", port, holder, holderProject), true)
+		if err := stopProjectContainers(holderProject); err != nil {
+			prog("ports", fmt.Sprintf("warning: could not stop %s: %v", holderProject, err), false)
 		}
 	}
 	return nil
@@ -186,24 +224,77 @@ func containerHoldingPort(port string) (string, error) {
 	return "", nil
 }
 
-// extractSupabaseProject extracts the project name from a Supabase container
-// name like "supabase_db_my_project" → "my_project".
-func extractSupabaseProject(containerName string) string {
-	// supabase_<service>_<project>
-	parts := strings.SplitN(containerName, "_", 3)
-	if len(parts) == 3 && parts[0] == "supabase" {
-		return parts[2]
+// containerProjectFromLabel reads the com.supabase.cli.project label from a
+// running container. Returns "" on any error or when the label is absent.
+func containerProjectFromLabel(containerName string) string {
+	out, err := exec.Command( //nolint:gosec
+		"docker", "inspect",
+		"--format", `{{index .Config.Labels "com.supabase.cli.project"}}`,
+		containerName,
+	).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// ExtractSupabaseProject extracts the project name from a Supabase container
+// name of the form supabase_<service>_<project>, where <service> may itself
+// contain underscores (e.g. pg_meta, edge_runtime).
+//
+// Strategy: strip the leading "supabase_" prefix, then greedily match the
+// longest known service name at the start of the remainder. What follows is
+// the project id.
+func ExtractSupabaseProject(containerName string) string {
+	const prefix = "supabase_"
+	if !strings.HasPrefix(containerName, prefix) {
+		return ""
+	}
+	rest := containerName[len(prefix):] // "<service>_<project>"
+
+	// Try matching known service names from longest to shortest to avoid
+	// partial matches (e.g. "pg_meta" before "pg").
+	for svc := range supabaseServices {
+		svcPrefix := svc + "_"
+		if strings.HasPrefix(rest, svcPrefix) {
+			project := rest[len(svcPrefix):]
+			if project != "" {
+				return project
+			}
+		}
 	}
 	return ""
 }
 
-// stopProjectContainers stops all Docker containers whose name ends with "_<project>".
+// stopProjectContainers stops all running containers labelled with a given
+// Supabase project id. Falls back to name-suffix matching if labels are absent.
 func stopProjectContainers(project string) error {
-	out, err := exec.Command("docker", "ps", "--format", "{{.Names}}").Output() //nolint:gosec
+	// Prefer label-based filter (exact, works regardless of naming).
+	labelOut, err := exec.Command( //nolint:gosec
+		"docker", "ps",
+		"--filter", "label=com.supabase.cli.project="+project,
+		"--format", "{{.Names}}",
+	).Output()
+	if err == nil {
+		var toStop []string
+		scanner := bufio.NewScanner(bytes.NewReader(labelOut))
+		for scanner.Scan() {
+			if name := strings.TrimSpace(scanner.Text()); name != "" {
+				toStop = append(toStop, name)
+			}
+		}
+		if len(toStop) > 0 {
+			args := append([]string{"stop"}, toStop...)
+			return exec.Command("docker", args...).Run() //nolint:gosec
+		}
+	}
+
+	// Fallback: name suffix matching.
+	nameOut, err := exec.Command("docker", "ps", "--format", "{{.Names}}").Output() //nolint:gosec
 	if err != nil {
 		return err
 	}
-	scanner := bufio.NewScanner(bytes.NewReader(out))
+	scanner := bufio.NewScanner(bytes.NewReader(nameOut))
 	var toStop []string
 	suffix := "_" + project
 	for scanner.Scan() {
@@ -219,33 +310,98 @@ func stopProjectContainers(project string) error {
 	return exec.Command("docker", args...).Run() //nolint:gosec
 }
 
-// copyAndValidateEnv copies mainRepoPath/.env.local into wtPath and verifies it
-// points at 127.0.0.1 or localhost, refusing to run if it references prod.
-func copyAndValidateEnv(mainRepoPath, wtPath string, prog func(step, msg string, ok bool)) error {
+// supabaseURLKeys are the env var names that must point at a local Supabase.
+// Any file that sets one of these to a non-local host is refused.
+var supabaseURLKeys = []string{
+	"VITE_SUPABASE_URL",
+	"NEXT_PUBLIC_SUPABASE_URL",
+	"SUPABASE_URL",
+}
+
+// CopyAndValidateEnv copies mainRepoPath/.env.local into wtPath and verifies
+// every Supabase URL key in the file resolves to 127.0.0.1 or localhost.
+//
+// For Supabase projects, .env.local is mandatory: if it is absent the function
+// returns an error so the review never silently falls back to .env or
+// .env.production (which may point at production Supabase).
+// CopyAndValidateEnv is exported for testing.
+func CopyAndValidateEnv(mainRepoPath, wtPath string, prog func(step, msg string, ok bool)) error {
 	src := filepath.Join(mainRepoPath, ".env.local")
-	if _, err := os.Stat(src); os.IsNotExist(err) {
-		prog("env", "No .env.local found — skipping copy (project may not need it)", true)
-		return nil
-	}
 	data, err := os.ReadFile(src) //nolint:gosec
+	if os.IsNotExist(err) {
+		prog("env", "No .env.local found — refusing to start (Supabase projects require a local env file; without it Vite loads .env.production which may point at prod)", false)
+		return fmt.Errorf(".env.local is required for Supabase projects but was not found at %s", src)
+	}
 	if err != nil {
 		return fmt.Errorf("read .env.local: %w", err)
 	}
-	if !envIsLocal(string(data)) {
-		prog("env", ".env.local does not point at 127.0.0.1 or localhost — refusing to start (safety: cannot use prod DB)", false)
-		return fmt.Errorf(".env.local must point at 127.0.0.1 or localhost for local DB; refusing to start")
+
+	if err := ValidateSupabaseEnvURLs(string(data)); err != nil {
+		prog("env", ".env.local failed safety check: "+err.Error(), false)
+		return err
 	}
+
 	dst := filepath.Join(wtPath, ".env.local")
 	if err := os.WriteFile(dst, data, 0o600); err != nil {
 		return fmt.Errorf("write .env.local: %w", err)
 	}
-	prog("env", "Copied .env.local (confirmed local DB)", true)
+	prog("env", "Copied .env.local (all Supabase URLs confirmed local)", true)
 	return nil
 }
 
-// envIsLocal returns true when the env file content references a loopback address.
-func envIsLocal(content string) bool {
-	return strings.Contains(content, "127.0.0.1") || strings.Contains(content, "localhost")
+// ValidateSupabaseEnvURLs parses each line of an env file and returns an error
+// if any Supabase URL key is present with a host that is not 127.0.0.1 or
+// localhost. A key that is absent or empty is not an error.
+func ValidateSupabaseEnvURLs(content string) error {
+	vals := parseEnvKeys(content, supabaseURLKeys)
+	for _, key := range supabaseURLKeys {
+		raw, found := vals[key]
+		if !found || raw == "" {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("%s=%q is not a valid URL: %w", key, raw, err)
+		}
+		host := u.Hostname()
+		if host != "127.0.0.1" && host != "localhost" && !strings.HasPrefix(host, "127.") {
+			return fmt.Errorf("%s=%q points at %q, not 127.0.0.1 or localhost — refusing to start (would hit non-local DB)", key, raw, host)
+		}
+	}
+	return nil
+}
+
+// parseEnvKeys scans a dotenv-style file for the given keys and returns their
+// raw (unquoted) values. Only lines of the form KEY=VALUE are considered;
+// comments and blank lines are skipped.
+func parseEnvKeys(content string, keys []string) map[string]string {
+	want := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		want[k] = true
+	}
+	result := make(map[string]string)
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.IndexByte(line, '=')
+		if idx < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:idx])
+		if !want[key] {
+			continue
+		}
+		val := strings.TrimSpace(line[idx+1:])
+		// Strip optional surrounding quotes.
+		if len(val) >= 2 && ((val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'')) {
+			val = val[1 : len(val)-1]
+		}
+		result[key] = val
+	}
+	return result
 }
 
 // supabaseStart runs supabase start, omitting edge-runtime when no functions dir exists.
