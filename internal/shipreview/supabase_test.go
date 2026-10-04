@@ -78,6 +78,106 @@ func TestProposeSupabaseDevConfig(t *testing.T) {
 	}
 }
 
+// --- Effective Vite env merge tests ---
+
+func TestValidateEffectiveSupabaseURLs(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     map[string]string
+		wantErr bool
+	}{
+		{
+			name:    "local URL — ok",
+			env:     map[string]string{"VITE_SUPABASE_URL": "http://127.0.0.1:54321"},
+			wantErr: false,
+		},
+		{
+			name:    "localhost URL — ok",
+			env:     map[string]string{"SUPABASE_URL": "http://localhost:54321"},
+			wantErr: false,
+		},
+		{
+			name:    "prod URL — refuse",
+			env:     map[string]string{"VITE_SUPABASE_URL": "https://prod.supabase.co"},
+			wantErr: true,
+		},
+		{
+			name:    "no supabase URL keys at all — refuse (cannot verify)",
+			env:     map[string]string{"FOO": "bar"},
+			wantErr: true,
+		},
+		{
+			name:    "empty map — refuse",
+			env:     map[string]string{},
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := shipreview.ValidateEffectiveSupabaseURLs(tc.env)
+			if tc.wantErr && err == nil {
+				t.Error("want error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("want nil, got %v", err)
+			}
+		})
+	}
+}
+
+// TestCopyAndValidateEnv_ProdURLInDotEnv_LocalMissing is the exact case the
+// Board identified: .env has a prod VITE_SUPABASE_URL, .env.local lacks it
+// (only has the anon key). Vite merges the files so the effective URL is prod.
+func TestCopyAndValidateEnv_ProdURLInDotEnv_LocalMissing(t *testing.T) {
+	mainRepo := t.TempDir()
+	wt := t.TempDir()
+
+	// .env — prod URL (lower precedence but still loaded by Vite)
+	if err := os.WriteFile(filepath.Join(mainRepo, ".env"),
+		[]byte("VITE_SUPABASE_URL=https://prod.supabase.co\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+	// .env.local — only anon key, no URL override
+	if err := os.WriteFile(filepath.Join(mainRepo, ".env.local"),
+		[]byte("VITE_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiJ9.local\n"),
+		0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var msgs []string
+	report := func(step, msg string, ok bool) { msgs = append(msgs, msg) }
+
+	err := shipreview.CopyAndValidateEnv(mainRepo, wt, report)
+	if err == nil {
+		t.Fatal("want error: effective Vite env has prod URL from .env but .env.local lacks override — should refuse")
+	}
+}
+
+// TestCopyAndValidateEnv_ProdURLInDotEnv_OverriddenInLocal confirms that when
+// .env has prod and .env.local overrides with local, we accept.
+func TestCopyAndValidateEnv_ProdURLInDotEnv_OverriddenInLocal(t *testing.T) {
+	mainRepo := t.TempDir()
+	wt := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(mainRepo, ".env"),
+		[]byte("VITE_SUPABASE_URL=https://prod.supabase.co\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mainRepo, ".env.local"),
+		[]byte("VITE_SUPABASE_URL=http://127.0.0.1:54321\nVITE_SUPABASE_ANON_KEY=local\n"),
+		0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	report := func(_, _ string, _ bool) {}
+	err := shipreview.CopyAndValidateEnv(mainRepo, wt, report)
+	if err != nil {
+		t.Errorf("want nil when .env.local overrides prod URL with local: %v", err)
+	}
+}
+
 // --- Bug 1: no .env.local must refuse ---
 
 func TestCopyAndValidateEnv_NoEnvFile_Refuses(t *testing.T) {

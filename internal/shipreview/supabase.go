@@ -318,26 +318,85 @@ var supabaseURLKeys = []string{
 	"SUPABASE_URL",
 }
 
+// viteEnvPrecedence lists env files Vite loads in dev mode, from lowest to
+// highest priority. Higher-index files override earlier ones (same as Vite).
+// .env.production is intentionally excluded — it is never loaded in dev.
+var viteEnvPrecedence = []string{
+	".env",
+	".env.development",
+	".env.local",
+	".env.development.local",
+}
+
+// loadEffectiveViteEnv builds the merged env map for Vite's dev mode by reading
+// all env files from repoPath in precedence order. Missing files are skipped.
+func loadEffectiveViteEnv(repoPath string) map[string]string {
+	effective := make(map[string]string)
+	for _, fname := range viteEnvPrecedence {
+		data, err := os.ReadFile(filepath.Join(repoPath, fname)) //nolint:gosec
+		if err != nil {
+			continue
+		}
+		for k, v := range parseEnvKeysAll(string(data)) {
+			effective[k] = v
+		}
+	}
+	return effective
+}
+
+// ValidateEffectiveSupabaseURLs checks the merged Vite env map. It returns an
+// error if:
+//   - any Supabase URL key resolves to a non-local host (127.0.0.1 / localhost), OR
+//   - no Supabase URL key is present at all (cannot confirm local target).
+func ValidateEffectiveSupabaseURLs(effective map[string]string) error {
+	found := 0
+	for _, key := range supabaseURLKeys {
+		raw, ok := effective[key]
+		if !ok || raw == "" {
+			continue
+		}
+		found++
+		u, err := url.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("%s=%q is not a valid URL: %w", key, raw, err)
+		}
+		host := u.Hostname()
+		if host != "127.0.0.1" && host != "localhost" && !strings.HasPrefix(host, "127.") {
+			return fmt.Errorf("%s=%q (from merged Vite env) points at %q, not 127.0.0.1/localhost — refusing to start; check .env or .env.development", key, raw, host)
+		}
+	}
+	if found == 0 {
+		return fmt.Errorf("no Supabase URL key (%s) found in any Vite env file — cannot confirm local DB target; add VITE_SUPABASE_URL=http://127.0.0.1:54321 to .env.local",
+			strings.Join(supabaseURLKeys, ", "))
+	}
+	return nil
+}
+
 // CopyAndValidateEnv copies mainRepoPath/.env.local into wtPath and verifies
-// every Supabase URL key in the file resolves to 127.0.0.1 or localhost.
+// the effective Vite dev env across all env files resolves all Supabase URL
+// keys to 127.0.0.1 or localhost.
 //
-// For Supabase projects, .env.local is mandatory: if it is absent the function
-// returns an error so the review never silently falls back to .env or
-// .env.production (which may point at production Supabase).
+// .env.local is mandatory: if it is absent the function refuses so the review
+// never silently falls back to .env / .env.production (which point at prod).
+// After existence check, the merged effective env is validated so a key absent
+// from .env.local but set to prod in .env is still caught.
 // CopyAndValidateEnv is exported for testing.
 func CopyAndValidateEnv(mainRepoPath, wtPath string, prog func(step, msg string, ok bool)) error {
 	src := filepath.Join(mainRepoPath, ".env.local")
 	data, err := os.ReadFile(src) //nolint:gosec
 	if os.IsNotExist(err) {
-		prog("env", "No .env.local found — refusing to start (Supabase projects require a local env file; without it Vite loads .env.production which may point at prod)", false)
+		prog("env", "No .env.local found — refusing to start (Supabase projects require a local env file; without it Vite loads .env which may point at prod)", false)
 		return fmt.Errorf(".env.local is required for Supabase projects but was not found at %s", src)
 	}
 	if err != nil {
 		return fmt.Errorf("read .env.local: %w", err)
 	}
 
-	if err := ValidateSupabaseEnvURLs(string(data)); err != nil {
-		prog("env", ".env.local failed safety check: "+err.Error(), false)
+	// Validate effective merged Vite env (catches keys set in .env but absent
+	// from .env.local that would fall back to the prod value at runtime).
+	effective := loadEffectiveViteEnv(mainRepoPath)
+	if err := ValidateEffectiveSupabaseURLs(effective); err != nil {
+		prog("env", "Effective Vite env failed safety check: "+err.Error(), false)
 		return err
 	}
 
@@ -345,13 +404,14 @@ func CopyAndValidateEnv(mainRepoPath, wtPath string, prog func(step, msg string,
 	if err := os.WriteFile(dst, data, 0o600); err != nil {
 		return fmt.Errorf("write .env.local: %w", err)
 	}
-	prog("env", "Copied .env.local (all Supabase URLs confirmed local)", true)
+	prog("env", "Copied .env.local (effective Vite env confirms all Supabase URLs local)", true)
 	return nil
 }
 
-// ValidateSupabaseEnvURLs parses each line of an env file and returns an error
-// if any Supabase URL key is present with a host that is not 127.0.0.1 or
-// localhost. A key that is absent or empty is not an error.
+// ValidateSupabaseEnvURLs parses a single env file's content and returns an
+// error if any Supabase URL key has a non-local host. Absent keys are not an
+// error here — use ValidateEffectiveSupabaseURLs for the merged-file check.
+// Kept for unit tests that exercise single-file semantics.
 func ValidateSupabaseEnvURLs(content string) error {
 	vals := parseEnvKeys(content, supabaseURLKeys)
 	for _, key := range supabaseURLKeys {
@@ -369,6 +429,29 @@ func ValidateSupabaseEnvURLs(content string) error {
 		}
 	}
 	return nil
+}
+
+// parseEnvKeysAll parses all KEY=VALUE pairs from a dotenv-style file.
+func parseEnvKeysAll(content string) map[string]string {
+	result := make(map[string]string)
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.IndexByte(line, '=')
+		if idx < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:idx])
+		val := strings.TrimSpace(line[idx+1:])
+		if len(val) >= 2 && ((val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'')) {
+			val = val[1 : len(val)-1]
+		}
+		result[key] = val
+	}
+	return result
 }
 
 // parseEnvKeys scans a dotenv-style file for the given keys and returns their
