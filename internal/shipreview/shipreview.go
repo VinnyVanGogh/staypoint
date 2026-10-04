@@ -72,6 +72,9 @@ type Card struct {
 	// path pattern (supabase/migrations/, db/migrations/, prisma/migrations/, *.sql
 	// inside a migrations/ dir). Computed at read time; not stored.
 	HasDBMigration bool      `json:"has_db_migration"`
+	// RunNumber is the 1-based count of ship-review cards for this task (i.e. run N).
+	// Computed at read time; not stored.
+	RunNumber      int       `json:"run_number"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -377,17 +380,36 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 	c.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
 	c.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
 
-	// Populate AgentSummary from the most recent agent-summary comment (posted by
-	// the harness postflight; see internal/orchestrator/run_summary.go).
+	// Populate AgentSummary from the most recent agent-summary comment that was
+	// posted AFTER the previous card for this task (if any). This prevents a
+	// re-created card (run 2+) from inheriting the summary posted during run 1
+	// before run 2 has had a chance to post its own summary.
+	// For run 1 (no previous card) this is equivalent to the most-recent query.
 	var summary sql.NullString
-	_ = db.QueryRow(
-		`SELECT message FROM task_comments WHERE task_id = ? AND author = 'agent-summary' ORDER BY created_at DESC LIMIT 1`,
-		taskID,
+	_ = db.QueryRow(`
+		SELECT message FROM task_comments
+		WHERE task_id = ? AND author = 'agent-summary'
+		  AND created_at > COALESCE(
+		    (SELECT created_at FROM ship_review_cards
+		       WHERE task_id = ? ORDER BY created_at DESC LIMIT 1 OFFSET 1),
+		    '0000-00-00T00:00:00Z'
+		  )
+		ORDER BY created_at DESC LIMIT 1`,
+		taskID, taskID,
 	).Scan(&summary)
 	c.AgentSummary = summary.String
 
 	// Compute HasDBMigration from FilesChanged.
 	c.HasDBMigration = isMigrationInFiles(c.FilesChanged)
+
+	// Compute RunNumber: how many cards (including this one) exist for the task.
+	var runNum int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM ship_review_cards WHERE task_id = ?`, taskID,
+	).Scan(&runNum); err != nil || runNum < 1 {
+		runNum = 1
+	}
+	c.RunNumber = runNum
 
 	return &c, nil
 }

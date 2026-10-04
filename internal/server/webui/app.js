@@ -7708,92 +7708,225 @@ function renderShipReviewCardFromData(container, taskId, card) {
     section.appendChild(checksSection);
   }
 
-  // Approve / Send back / Reject buttons
+  // ── Inline action area ────────────────────────────────────────────────────
+  // No browser alert/confirm/prompt — all UI is inline.
+
+  const actionsWrap = el('div', 'ship-review-actions-wrap');
+
+  // ── Error banner (shown on API failure) ──
+  const errBanner = el('div', 'ship-review-err-banner');
+  errBanner.style.display = 'none';
+  actionsWrap.appendChild(errBanner);
+  const showErr = (msg) => { errBanner.textContent = msg; errBanner.style.display = ''; };
+  const clearErr = () => { errBanner.style.display = 'none'; };
+
+  // ── head_moved inline banner (hidden until 409 head_moved) ──
+  const headMovedBanner = el('div', 'ship-review-head-moved-banner');
+  headMovedBanner.style.display = 'none';
+  {
+    headMovedBanner.appendChild(el('span', 'ship-review-head-moved-text', 'Branch HEAD moved since card was rendered. '));
+    const repin = el('button', 'ship-review-repin-btn', 'Ask agent to re-pin');
+    repin.addEventListener('click', async () => {
+      repin.disabled = true;
+      try {
+        const r = await withBoardWebAuthn((sessionToken, assertion) =>
+          fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/send-back`, {
+            method: 'POST',
+            headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+            body: JSON.stringify({ comment: 'HEAD moved — please re-pin to the current branch HEAD.' }),
+          })
+        );
+        if (r === null) { repin.disabled = false; return; }
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        showWorkingState(section, taskId, card.run_number || 1);
+      } catch (e) {
+        repin.disabled = false;
+        showErr('Re-pin send-back failed: ' + (e.message || e));
+      }
+    });
+    headMovedBanner.appendChild(repin);
+  }
+  actionsWrap.appendChild(headMovedBanner);
+
+  // ── Send-back inline form (hidden until "↩ Send Back" clicked) ──
+  const sendBackForm = el('div', 'ship-review-inline-form');
+  sendBackForm.style.display = 'none';
+  {
+    sendBackForm.appendChild(el('label', 'ship-review-form-label', 'Feedback for the agent (required):'));
+    const sbTextarea = document.createElement('textarea');
+    sbTextarea.className = 'ship-review-form-textarea';
+    sbTextarea.rows = 3;
+    sbTextarea.placeholder = 'What should the agent fix or improve?';
+    sendBackForm.appendChild(sbTextarea);
+    const sbRow = el('div', 'ship-review-form-row');
+    const sbSubmit = el('button', 'ship-review-sendback-submit-btn', '↩ Send Back');
+    const sbCancel = el('button', 'ship-review-form-cancel-btn', 'Cancel');
+    sbRow.appendChild(sbSubmit);
+    sbRow.appendChild(sbCancel);
+    sendBackForm.appendChild(sbRow);
+    sbCancel.addEventListener('click', () => { sendBackForm.style.display = 'none'; clearErr(); });
+    sbSubmit.addEventListener('click', async () => {
+      const comment = sbTextarea.value.trim();
+      if (!comment) { showErr('Feedback is required.'); return; }
+      clearErr();
+      sbSubmit.disabled = true;
+      try {
+        const r = await withBoardWebAuthn((sessionToken, assertion) =>
+          fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/send-back`, {
+            method: 'POST',
+            headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+            body: JSON.stringify({ comment }),
+          })
+        );
+        if (r === null) { sbSubmit.disabled = false; return; }
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        showWorkingState(section, taskId, card.run_number || 1);
+      } catch (e) {
+        sbSubmit.disabled = false;
+        showErr('Send back failed: ' + (e.message || e));
+      }
+    });
+  }
+  actionsWrap.appendChild(sendBackForm);
+
+  // ── Reject inline form (hidden until "✕ Reject" clicked) ──
+  const rejectForm = el('div', 'ship-review-inline-form');
+  rejectForm.style.display = 'none';
+  {
+    rejectForm.appendChild(el('label', 'ship-review-form-label', 'Reason for rejection (optional):'));
+    const rjTextarea = document.createElement('textarea');
+    rjTextarea.className = 'ship-review-form-textarea';
+    rjTextarea.rows = 3;
+    rjTextarea.placeholder = 'Why is this being rejected?';
+    rejectForm.appendChild(rjTextarea);
+    const delRow = el('div', 'ship-review-form-checkbox-row');
+    const delChk = document.createElement('input');
+    delChk.type = 'checkbox';
+    delChk.id = `ship-review-del-branch-${taskId}`;
+    delChk.className = 'ship-review-del-branch-chk';
+    const delLabel = document.createElement('label');
+    delLabel.htmlFor = delChk.id;
+    delLabel.textContent = 'Delete remote branch';
+    delRow.appendChild(delChk);
+    delRow.appendChild(delLabel);
+    rejectForm.appendChild(delRow);
+    const rjRow = el('div', 'ship-review-form-row');
+    const rjSubmit = el('button', 'ship-review-reject-submit-btn', '✕ Reject');
+    const rjCancel = el('button', 'ship-review-form-cancel-btn', 'Cancel');
+    rjRow.appendChild(rjSubmit);
+    rjRow.appendChild(rjCancel);
+    rejectForm.appendChild(rjRow);
+    rjCancel.addEventListener('click', () => { rejectForm.style.display = 'none'; clearErr(); });
+    rjSubmit.addEventListener('click', async () => {
+      const comment = rjTextarea.value.trim();
+      const delBranch = delChk.checked;
+      clearErr();
+      rjSubmit.disabled = true;
+      try {
+        const r = await withBoardWebAuthn((sessionToken, assertion) =>
+          fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/reject`, {
+            method: 'POST',
+            headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+            body: JSON.stringify({ comment, delete_branch: delBranch }),
+          })
+        );
+        if (r === null) { rjSubmit.disabled = false; return; }
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'rejected', '', comment));
+      } catch (e) {
+        rjSubmit.disabled = false;
+        showErr('Reject failed: ' + (e.message || e));
+      }
+    });
+  }
+  actionsWrap.appendChild(rejectForm);
+
+  // ── Approve inline confirm form ──
+  const approveConfirmForm = el('div', 'ship-review-inline-form ship-review-approve-confirm');
+  approveConfirmForm.style.display = 'none';
+  {
+    const shortSHA = card.head_sha ? card.head_sha.slice(0, 12) : '—';
+    const repoName = card.repo_name || '';
+    approveConfirmForm.appendChild(el('div', 'ship-review-form-label',
+      repoName ? `Merge ${shortSHA} → main (${repoName})` : `Merge ${shortSHA} → main`));
+    const acRow = el('div', 'ship-review-form-row');
+    const acMerge = el('button', 'ship-review-form-submit', 'Merge to main');
+    const acCancel = el('button', 'ship-review-form-cancel', 'Cancel');
+    acRow.appendChild(acMerge);
+    acRow.appendChild(acCancel);
+    approveConfirmForm.appendChild(acRow);
+    acCancel.addEventListener('click', () => { approveConfirmForm.style.display = 'none'; clearErr(); });
+    acMerge.addEventListener('click', async () => {
+      clearErr();
+      acMerge.disabled = true;
+      try {
+        const r = await withBoardWebAuthn((sessionToken, assertion) =>
+          fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/approve`, {
+            method: 'POST',
+            headers: { ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+          })
+        );
+        if (r === null) { acMerge.disabled = false; return; }
+        if (r.status === 409) {
+          const body = await r.json().catch(() => ({}));
+          if (body.error === 'head_moved') {
+            const newSHA = body.new_head_sha || '?';
+            headMovedBanner.querySelector('.ship-review-head-moved-text').textContent =
+              `Branch HEAD moved to ${newSHA.slice(0, 12)} since card was rendered. `;
+            headMovedBanner.style.display = '';
+            approveConfirmForm.style.display = 'none';
+            acMerge.disabled = false;
+            return;
+          }
+          throw new Error(`${r.status} ${r.statusText}`);
+        }
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        const result = await r.json();
+        const mainSHA = result.main_sha || (result.card && result.card.main_sha) || '';
+        section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', mainSHA, ''));
+      } catch (e) {
+        showErr('Approve failed: ' + (e.message || e));
+        acMerge.disabled = false;
+      }
+    });
+  }
+  actionsWrap.appendChild(approveConfirmForm);
+
+  // ── Primary action buttons ──
   const actions = el('div', 'ship-review-actions');
 
   const approveBtn = el('button', 'ship-review-approve-btn', '✓ Approve & Merge');
-  approveBtn.addEventListener('click', async () => {
-    if (!confirm('Approve and merge this branch? Only the pinned SHA will be merged.')) return;
-    approveBtn.disabled = true;
-    try {
-      // Use raw fetch so we can inspect the 409 body before throwing.
-      const r = await withBoardWebAuthn((sessionToken, assertion) =>
-        fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/approve`, {
-          method: 'POST',
-          headers: { ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-        })
-      );
-      if (r === null) { approveBtn.disabled = false; return; } // enrollment required
-      if (r.status === 409) {
-        const body = await r.json().catch(() => ({}));
-        if (body.error === 'head_moved') {
-          alert(`Branch HEAD moved since the card was rendered.\nNew HEAD: ${body.new_head_sha || '?'}\nThe agent must re-submit the review card; re-pin the new HEAD to proceed.`);
-          const parent = container.closest('.task-page-main') || container;
-          const existing = document.getElementById(`ship-review-${taskId}`);
-          if (existing) existing.remove();
-          renderShipReviewCard(parent, taskId);
-          return;
-        }
-        throw new Error(`${r.status} ${r.statusText}`);
-      }
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-      const result = await r.json();
-      const mainSHA = result.main_sha || (result.card && result.card.main_sha) || '';
-      section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', mainSHA, ''));
-    } catch (e) {
-      alert('Approve failed: ' + (e.message || e));
-      approveBtn.disabled = false;
-    }
+  approveBtn.addEventListener('click', () => {
+    sendBackForm.style.display = 'none';
+    rejectForm.style.display = 'none';
+    approveConfirmForm.style.display = approveConfirmForm.style.display === 'none' ? '' : 'none';
+    headMovedBanner.style.display = 'none';
+    clearErr();
   });
   actions.appendChild(approveBtn);
 
   const sendBackBtn = el('button', 'ship-review-sendback-btn', '↩ Send Back');
-  sendBackBtn.addEventListener('click', async () => {
-    const comment = prompt('Feedback for the agent (required):');
-    if (!comment || !comment.trim()) return;
-    sendBackBtn.disabled = true;
-    try {
-      const r = await withBoardWebAuthn((sessionToken, assertion) =>
-        fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/send-back`, {
-          method: 'POST',
-          headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-          body: JSON.stringify({ comment: comment.trim() }),
-        })
-      );
-      if (r === null) { sendBackBtn.disabled = false; return; }
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-      section.remove();
-    } catch (e) {
-      alert('Send back failed: ' + (e.message || e));
-      sendBackBtn.disabled = false;
-    }
+  sendBackBtn.addEventListener('click', () => {
+    rejectForm.style.display = 'none';
+    approveConfirmForm.style.display = 'none';
+    headMovedBanner.style.display = 'none';
+    clearErr();
+    sendBackForm.style.display = sendBackForm.style.display === 'none' ? '' : 'none';
   });
   actions.appendChild(sendBackBtn);
 
   const rejectBtn = el('button', 'ship-review-reject-btn', '✕ Reject');
-  rejectBtn.addEventListener('click', async () => {
-    const comment = prompt('Reason for rejection (optional):');
-    const delBranch = confirm('Also delete the remote branch?');
-    rejectBtn.disabled = true;
-    try {
-      const r = await withBoardWebAuthn((sessionToken, assertion) =>
-        fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/reject`, {
-          method: 'POST',
-          headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-          body: JSON.stringify({ comment: comment || '', delete_branch: delBranch }),
-        })
-      );
-      if (r === null) { rejectBtn.disabled = false; return; }
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-      section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'rejected', '', comment || ''));
-    } catch (e) {
-      alert('Reject failed: ' + (e.message || e));
-      rejectBtn.disabled = false;
-    }
+  rejectBtn.addEventListener('click', () => {
+    sendBackForm.style.display = 'none';
+    approveConfirmForm.style.display = 'none';
+    headMovedBanner.style.display = 'none';
+    clearErr();
+    rejectForm.style.display = rejectForm.style.display === 'none' ? '' : 'none';
   });
   actions.appendChild(rejectBtn);
 
-  section.appendChild(actions);
+  actionsWrap.appendChild(actions);
+  section.appendChild(actionsWrap);
   container.appendChild(section);
 
   // For SSE-driven re-renders the buttons may already be in the DOM.
@@ -7802,6 +7935,25 @@ function renderShipReviewCardFromData(container, taskId, card) {
   for (const btn of page.querySelectorAll('.run-now-btn, .mark-done-btn, .mark-done-error, .ship-review-see-card-link')) {
     btn.style.display = 'none';
   }
+}
+
+// showWorkingState replaces the card with a "Sent back · agent working (run N)…" spinner.
+// The SSE handler will re-render when the new card arrives.
+function showWorkingState(section, taskId, prevRunNumber) {
+  const nextRun = (prevRunNumber || 1) + 1;
+  const working = el('div', 'ship-review-card ship-review-card--working task-page-section');
+  working.id = `ship-review-${taskId}`;
+  const hdr = el('div', 'ship-review-header');
+  hdr.appendChild(el('span', 'ship-review-badge', 'Ship Review'));
+  hdr.appendChild(el('span', 'ship-review-status-badge status-working', 'Sent Back'));
+  working.appendChild(hdr);
+  const status = el('div', 'ship-review-working-status');
+  const spinner = el('span', 'ship-review-spinner', '');
+  spinner.setAttribute('aria-label', 'working');
+  status.appendChild(spinner);
+  status.appendChild(document.createTextNode(` Sent back · agent working (run ${nextRun})…`));
+  working.appendChild(status);
+  section.replaceWith(working);
 }
 
 async function renderShipReviewCard(container, taskId) {
@@ -8427,14 +8579,31 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   rcBar.id = `run-control-bar-${task.id}`;
   timelineSection.appendChild(rcBar);
 
-  // Step rows
+  // Step rows — grouped by run so each send-back creates a new "Run N" header.
   const stepList = el('div', 'timeline-steps');
   stepList.id = `timeline-steps-${task.id}`;
   if (runSteps.length === 0) {
     stepList.appendChild(el('p', 'panel-field-muted timeline-empty', 'No steps yet. Steps will appear here during a run.'));
   } else {
-    for (const s of runSteps) {
-      stepList.appendChild(buildRunStepRow(s));
+    const runGroups = groupStepsByRun(runSteps);
+    const realGroups = runGroups.filter(isRealRunGroup);
+    // Only add run headers when there is more than one real run.
+    if (realGroups.length <= 1) {
+      for (const s of runSteps) stepList.appendChild(buildRunStepRow(s));
+    } else {
+      let runNum = 0;
+      for (const group of runGroups) {
+        if (!isRealRunGroup(group)) continue;
+        runNum++;
+        const firstStep = group[0];
+        const stateStep = [...group].reverse().find(s => s.kind === 'state');
+        const startTime = firstStep ? fmtDateTime(firstStep.created_at) : '';
+        const endTime = stateStep ? fmtDateTime(stateStep.created_at) : '';
+        const hdr = el('div', 'timeline-run-header');
+        hdr.textContent = `Run ${runNum}` + (startTime ? `  ·  started ${startTime}` : '') + (endTime ? `  ·  ended ${endTime}` : '');
+        stepList.appendChild(hdr);
+        for (const s of group) stepList.appendChild(buildRunStepRow(s));
+      }
     }
   }
   timelineSection.appendChild(stepList);
@@ -8477,28 +8646,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   // Interaction cards (pending ask_user_questions / request_confirmation / suggest_tasks)
   renderInteractionCards(main, task.id || '', interactions || []);
 
-  // Activity / comments
-  if (comments && comments.length) {
-    const actSection = el('div', 'task-page-section');
-    actSection.appendChild(el('div', 'task-page-section-title', `Activity (${comments.length})`));
-    for (const c of comments) {
-      const authorType = (c.authorType || c.author_type || '').toLowerCase();
-      const isAgent = authorType === 'agent' || authorType === 'system';
-      const authorLabel = isAgent
-        ? (c.authorName || c.author_name || 'Agent')
-        : (c.author || 'User');
-      const ts = c.createdAt || c.created_at || c.timestamp || '';
-      const row = el('div', `chat-msg ${isAgent ? 'chat-msg-agent' : 'chat-msg-user'}`);
-      row.appendChild(el('div', 'chat-msg-meta', `${authorLabel}${ts ? ' · ' + fmtDateTime(ts) : ''}`));
-      const bubble = el('div', 'chat-msg-bubble');
-      bubble.appendChild(mdEl(c.body || c.message || ''));
-      row.appendChild(bubble);
-      actSection.appendChild(row);
-    }
-    main.appendChild(actSection);
-  }
-
-  // Agent interaction (chat)
+  // Agent interaction (chat) — messages + composer in one section.
   const chatSection = el('div', 'task-page-section');
   chatSection.id = 'page-chat-section';
   chatSection.appendChild(el('div', 'task-page-section-title', 'Send to Agent'));
@@ -8506,9 +8654,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   const messagesDiv = el('div', 'chat-messages');
   messagesDiv.id = 'page-chat-messages';
   messagesDiv.style.maxHeight = '320px';
-  if (!comments || !comments.length) {
-    messagesDiv.appendChild(el('p', 'panel-field-muted', 'No messages yet.'));
-  }
+  renderChatMessages(messagesDiv, comments || []);
   chatSection.appendChild(messagesDiv);
 
   const compose = el('div', 'chat-compose');

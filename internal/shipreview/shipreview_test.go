@@ -649,6 +649,75 @@ func TestAgentSummaryEmptyWhenNoComment(t *testing.T) {
 	_ = card
 }
 
+// TestAgentSummaryNotStaleAfterSendBack verifies that a re-created card (run 2)
+// does not inherit the run-1 summary when run 2 has not yet posted its own summary.
+func TestAgentSummaryNotStaleAfterSendBack(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = db.Exec(`INSERT INTO tasks (id, name) VALUES ('t-stalesummary', 'Stale summary test')`)
+
+	// Run 1: post summary then create card 1.
+	_, _ = db.Exec(
+		`INSERT INTO task_comments (task_id, author, message, created_at)
+		 VALUES ('t-stalesummary', 'agent-summary', 'Run 1 summary.', '2025-01-01T00:00:01Z')`,
+	)
+	_, _ = db.Exec(
+		`INSERT INTO ship_review_cards (id, task_id, branch, head_sha, test_steps_json, status, created_at, updated_at)
+		 VALUES ('card1', 't-stalesummary', 'feat/a', 'sha1', '["1. Check"]', 'sent_back', '2025-01-01T00:00:02Z', '2025-01-01T00:00:03Z')`,
+	)
+
+	// Run 2: create card 2 BEFORE posting run-2 summary (simulates the race window).
+	_, _ = db.Exec(
+		`INSERT INTO ship_review_cards (id, task_id, branch, head_sha, test_steps_json, status, created_at, updated_at)
+		 VALUES ('card2', 't-stalesummary', 'feat/a', 'sha2', '["1. Check"]', 'pending', '2025-01-01T00:01:00Z', '2025-01-01T00:01:00Z')`,
+	)
+
+	got, err := shipreview.GetCard(db, "t-stalesummary")
+	if err != nil {
+		t.Fatalf("GetCard: %v", err)
+	}
+	// Card 2's summary should be empty — run-2 summary not yet posted.
+	if got.AgentSummary != "" {
+		t.Errorf("AgentSummary = %q on run-2 card before run-2 summary posted; want empty (not stale run-1 summary)", got.AgentSummary)
+	}
+
+	// Now run 2 posts its summary.
+	_, _ = db.Exec(
+		`INSERT INTO task_comments (task_id, author, message, created_at)
+		 VALUES ('t-stalesummary', 'agent-summary', 'Run 2 summary.', '2025-01-01T00:01:30Z')`,
+	)
+
+	got2, err := shipreview.GetCard(db, "t-stalesummary")
+	if err != nil {
+		t.Fatalf("GetCard after run-2 summary: %v", err)
+	}
+	if got2.AgentSummary != "Run 2 summary." {
+		t.Errorf("AgentSummary = %q; want run-2 summary after it was posted", got2.AgentSummary)
+	}
+}
+
+func TestRunNumberIncrementsWithCards(t *testing.T) {
+	db := openTestDB(t)
+	_, _ = db.Exec(`INSERT INTO tasks (id, name) VALUES ('t-runnum', 'RunNumber test')`)
+
+	_, _ = db.Exec(
+		`INSERT INTO ship_review_cards (id, task_id, branch, head_sha, test_steps_json, status, created_at, updated_at)
+		 VALUES ('rn-card1', 't-runnum', 'feat/x', 'sha1', '["1. Check"]', 'sent_back', '2025-01-01T00:00:01Z', '2025-01-01T00:00:02Z')`,
+	)
+	got1, _ := shipreview.GetCard(db, "t-runnum")
+	if got1.RunNumber != 1 {
+		t.Errorf("RunNumber = %d; want 1 for first card", got1.RunNumber)
+	}
+
+	_, _ = db.Exec(
+		`INSERT INTO ship_review_cards (id, task_id, branch, head_sha, test_steps_json, status, created_at, updated_at)
+		 VALUES ('rn-card2', 't-runnum', 'feat/x', 'sha2', '["1. Check"]', 'pending', '2025-01-01T00:01:00Z', '2025-01-01T00:01:00Z')`,
+	)
+	got2, _ := shipreview.GetCard(db, "t-runnum")
+	if got2.RunNumber != 2 {
+		t.Errorf("RunNumber = %d; want 2 for second card", got2.RunNumber)
+	}
+}
+
 func TestHasDBMigrationDetected(t *testing.T) {
 	db := openTestDB(t)
 	_, _ = db.Exec(`INSERT INTO tasks (id, name) VALUES ('t-migr', 'Migration test')`)

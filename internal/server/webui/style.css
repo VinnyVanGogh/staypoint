@@ -3911,6 +3911,139 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .ship-review-reject-btn:hover { background: rgba(248,81,73,.2); }
 .ship-review-reject-btn:disabled { opacity: .5; cursor: default; }
 
+/* ── Inline action forms (send-back / reject) ─────────────────────────────── */
+.ship-review-actions-wrap { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+.ship-review-err-banner {
+  padding: 7px 12px;
+  border-radius: 6px;
+  background: rgba(248,81,73,.12);
+  border: 1px solid rgba(248,81,73,.4);
+  color: var(--red, #f85149);
+  font-size: 12px;
+}
+.ship-review-head-moved-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: rgba(248,196,54,.1);
+  border: 1px solid rgba(248,196,54,.35);
+  color: #f8c436;
+  font-size: 12px;
+}
+.ship-review-head-moved-text { flex: 1; }
+.ship-review-repin-btn {
+  padding: 4px 10px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  background: rgba(248,196,54,.15);
+  border: 1px solid rgba(248,196,54,.45);
+  color: #f8c436;
+  white-space: nowrap;
+}
+.ship-review-repin-btn:hover { background: rgba(248,196,54,.25); }
+.ship-review-repin-btn:disabled { opacity: .5; cursor: default; }
+.ship-review-inline-form {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--bg-secondary, #161b22);
+  border: 1px solid var(--border, #30363d);
+}
+.ship-review-form-label { font-size: 12px; font-weight: 600; color: var(--text-muted, #8b949e); }
+.ship-review-form-textarea {
+  resize: vertical;
+  min-height: 60px;
+  border-radius: 5px;
+  border: 1px solid var(--border, #30363d);
+  background: var(--bg, #0d1117);
+  color: var(--text, #cdd6f4);
+  font-size: 13px;
+  padding: 6px 8px;
+  font-family: inherit;
+}
+.ship-review-form-row { display: flex; gap: 8px; }
+.ship-review-form-cancel-btn {
+  padding: 6px 12px;
+  border-radius: 5px;
+  font-size: 12px;
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid var(--border, #30363d);
+  color: var(--text-muted, #8b949e);
+}
+.ship-review-form-cancel-btn:hover { background: var(--bg-secondary, #161b22); }
+.ship-review-sendback-submit-btn {
+  padding: 6px 12px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  background: rgba(248,196,54,.12);
+  border: 1px solid rgba(248,196,54,.4);
+  color: #f8c436;
+}
+.ship-review-sendback-submit-btn:hover { background: rgba(248,196,54,.22); }
+.ship-review-sendback-submit-btn:disabled { opacity: .5; cursor: default; }
+.ship-review-reject-submit-btn {
+  padding: 6px 12px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  background: rgba(248,81,73,.12);
+  border: 1px solid rgba(248,81,73,.4);
+  color: var(--red, #f85149);
+}
+.ship-review-reject-submit-btn:hover { background: rgba(248,81,73,.22); }
+.ship-review-reject-submit-btn:disabled { opacity: .5; cursor: default; }
+.ship-review-form-checkbox-row { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text, #cdd6f4); }
+.ship-review-del-branch-chk { accent-color: var(--red, #f85149); }
+
+/* ── Working state after send-back ───────────────────────────────────────── */
+.ship-review-card--working { opacity: .85; }
+.ship-review-status-badge.status-working {
+  background: rgba(100,100,100,.2);
+  color: var(--text-muted, #8b949e);
+}
+.ship-review-working-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--text-muted, #8b949e);
+}
+@keyframes ship-review-spin { to { transform: rotate(360deg); } }
+.ship-review-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255,255,255,.15);
+  border-top-color: var(--accent, #4f8ef7);
+  border-radius: 50%;
+  animation: ship-review-spin .8s linear infinite;
+  flex-shrink: 0;
+}
+
+/* ── Timeline run-group headers ──────────────────────────────────────────── */
+.timeline-run-header {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text-muted, #8b949e);
+  padding: 10px 0 4px;
+  border-top: 1px solid var(--border, #30363d);
+  margin-top: 4px;
+}
+.timeline-run-header:first-child { border-top: none; margin-top: 0; padding-top: 2px; }
+
 /* ── Migrations panel ─────────────────────────────────────────────────────── */
 .migrations-section { margin-top: 16px; }
 .migration-file-card {

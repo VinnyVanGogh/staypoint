@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"path/filepath"
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/context"
@@ -59,6 +60,7 @@ func (h *ShipReviewHandler) GetCard(w http.ResponseWriter, r *http.Request) {
 		var merged map[string]any
 		if jsonErr := json.Unmarshal(cardBytes, &merged); jsonErr == nil {
 			merged["unverified_migrations"] = unverified
+			merged["repo_name"] = filepath.Base(task.RepoPath)
 			writeJSON(w, merged)
 			return
 		}
