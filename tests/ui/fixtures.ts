@@ -1,5 +1,7 @@
 import { test as base, expect, type APIRequestContext, type Page } from '@playwright/test';
 import { execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
 // Everything here talks to the throwaway daemon started by scripts/ui-e2e.sh.
 // Fixtures are created over HTTP; the browser is only used for what a person
@@ -199,6 +201,21 @@ export function simulatePartialRun(taskId: string): number {
 }
 
 /**
+ * Saves a full-viewport screenshot as <artifacts>/<name> (the dir
+ * scripts/ui-e2e.sh exports as STAYPOINT_UI_ARTIFACTS) and attaches it to the
+ * test report. Used for side-by-side checks against design mocks, so it is
+ * kept on success, unlike Playwright's only-on-failure screenshots.
+ */
+export async function saveArtifactScreenshot(page: Page, name: string): Promise<string> {
+  const dir = path.resolve(process.env.STAYPOINT_UI_ARTIFACTS || 'artifacts');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, name);
+  await page.screenshot({ path: file });
+  await base.info().attach(name, { path: file, contentType: 'image/png' });
+  return file;
+}
+
+/**
  * Product bugs the suite already knows about. A spec that hits one is marked
  * as expected-to-fail, so the suite stays green while the bug is open and
  * turns red the moment the bug is fixed (an "unexpected pass"), which is the
@@ -206,6 +223,13 @@ export function simulatePartialRun(taskId: string): number {
  */
 export const KNOWN_BUGS = {
   'STA-378': 'StepRecorder inserts run_steps.status and expects an integer id, but the run_steps table has no status column and a TEXT id: every step insert fails',
+  // STA-638 task page re-layout, one entry per step subtask. Each step's PR
+  // removes its own entry and knownBug() call (specs/15-task-page-layout).
+  'STA-638-2': 'task page is one long scrolling column: no one-screen shell, sticky header with primary actions, stats strip or pinned composer yet (STA-640)',
+  'STA-638-3': 'task page has no tabbed right panel (Review / Diff / Migrations / Brief) yet (STA-641)',
+  'STA-638-4': 'task page timeline is a flat list in the page flow, not grouped run -> subtask -> step and not scrolling inside its column (STA-642)',
+  'STA-638-5': 'full brief, dev-server log, agent summary and migration SQL render inline at full height instead of opening in a modal (STA-643)',
+  'STA-638-6': 'task page has no narrow-screen layout: no stacking, no segmented tabs (STA-644)',
 } as const;
 
 export type KnownBug = keyof typeof KNOWN_BUGS;
