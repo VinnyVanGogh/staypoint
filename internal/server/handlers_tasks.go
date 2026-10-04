@@ -16,6 +16,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/migration"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
+	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 	"github.com/google/uuid"
 )
 
@@ -723,6 +724,10 @@ func (h *TasksHandler) GetTaskCheckpoints(w http.ResponseWriter, r *http.Request
 // repo path is returned with hasWorktree=false so the caller can fall back to a
 // branch-based diff instead.
 func taskCheckpointWorkDir(task *context.Task) (workDir string, hasWorktree bool) {
+	// A path-like task ID would point at .worktrees itself or outside it.
+	if workspace.ValidateTaskID(task.ID) != nil {
+		return task.RepoPath, false
+	}
 	wt := filepath.Join(task.RepoPath, ".worktrees", task.ID)
 	if _, err := os.Stat(wt); err == nil {
 		return wt, true
