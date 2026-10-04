@@ -91,6 +91,7 @@ type boardReq struct {
 	method, path, body string
 	cookie             bool
 	assertion          string
+	session            string // X-WebAuthn-Session to send on the request
 }
 
 // doBoard sends an authenticated request, optionally with the board cookie and an
@@ -112,6 +113,9 @@ func doBoard(t *testing.T, srv *server.Server, token string, br boardReq) (int, 
 	if br.assertion != "" {
 		req.Header.Set("X-WebAuthn-Assertion", br.assertion)
 	}
+	if br.session != "" {
+		req.Header.Set("X-WebAuthn-Session", br.session)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("%s %s: %v", br.method, br.path, err)
@@ -123,6 +127,29 @@ func doBoard(t *testing.T, srv *server.Server, token string, br boardReq) (int, 
 	}
 	_ = json.Unmarshal(raw, &out)
 	return resp.StatusCode, out.Error, string(raw)
+}
+
+// beginRegistrationSession calls POST /api/board/webauthn/register/begin and
+// returns the X-WebAuthn-Session token from the response headers. It does not
+// consume or inspect the challenge body. Callers must hold a board cookie.
+func beginRegistrationSession(t *testing.T, srv *server.Server, token string) string {
+	t.Helper()
+	req, _ := http.NewRequest("POST", srv.URL()+"/api/board/webauthn/register/begin",
+		strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "staypoint_board", Value: srv.BoardToken()})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("register/begin: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	sessionToken := resp.Header.Get("X-WebAuthn-Session")
+	if sessionToken == "" {
+		t.Fatal("register/begin: X-WebAuthn-Session header missing")
+	}
+	return sessionToken
 }
 
 // (a) Fail-closed: with no passkey registered, the board cookie alone must not
@@ -146,20 +173,26 @@ func TestBoardAction_NoPasskeyRegistered_Returns403(t *testing.T) {
 func TestPasskeyRegister_NoPairingCode_Returns403(t *testing.T) {
 	database := setupTestDB(t)
 	srv, token := startTestServer(t, database)
-	sentCode := silencePairingNotifier(srv)
+	silencePairingNotifier(srv)
 
-	// Begin issues the challenge and (in production) posts the notification.
-	doBoard(t, srv, token, boardReq{method: "POST", path: "/api/board/webauthn/register/begin", body: `{}`, cookie: true})
-
-	wrong := wrongPairingCode(*sentCode)
 	credential := `{"id":"Y3JlZC0x","rawId":"Y3JlZC0x","type":"public-key","response":{"clientDataJSON":"e30","attestationObject":"o2NmbXRkbm9uZQ"}}`
 	cases := []struct{ name, body string }{
 		{"no code field", `{"credential":` + credential + `}`},
 		{"empty code", `{"code":"","credential":` + credential + `}`},
-		{"wrong code", `{"code":"` + wrong + `","credential":` + credential + `}`},
+		{"wrong code", `{"code":"000000","credential":` + credential + `}`},
 	}
 	for _, tc := range cases {
-		status, code, raw := doBoard(t, srv, token, boardReq{method: "POST", path: "/api/board/webauthn/register/finish", body: tc.body, cookie: true})
+		// Each register/finish attempt needs a fresh session from register/begin
+		// (sessions are single-use). The pairing code check is reached only after
+		// the session is validated, so a valid session token is required.
+		sessionToken := beginRegistrationSession(t, srv, token)
+		status, code, raw := doBoard(t, srv, token, boardReq{
+			method:  "POST",
+			path:    "/api/board/webauthn/register/finish",
+			body:    tc.body,
+			cookie:  true,
+			session: sessionToken,
+		})
 		if status != http.StatusForbidden || code != "board_passkey_pairing_required" {
 			t.Errorf("register/finish %s: want 403 board_passkey_pairing_required, got %d %s", tc.name, status, strings.TrimSpace(raw))
 		}

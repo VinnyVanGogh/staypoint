@@ -1336,7 +1336,13 @@ func TestServer_REST_RunControlState(t *testing.T) {
 // accept requests that include the staypoint_board session cookie.
 func TestServer_BoardToken_Required(t *testing.T) {
 	database := setupTestDB(t)
+	// Seed a passkey so fail-closed allows through with a valid assertion.
+	seedBoardWebAuthnCredential(t, database)
 	srv, token := startTestServer(t, database)
+	// Stub the WebAuthn verifier so tests don't need real Touch ID hardware.
+	if s, ok := any(srv).(webAuthnVerifierSetter); ok {
+		s.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
+	}
 	boardToken := srv.BoardToken()
 	if boardToken == "" {
 		t.Fatal("BoardToken() returned empty string — board token was not generated")
@@ -1370,6 +1376,7 @@ func TestServer_BoardToken_Required(t *testing.T) {
 		req, _ := http.NewRequest(method, url, b)
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.AddCookie(&http.Cookie{Name: "staypoint_board", Value: boardToken})
+		req.Header.Set("X-WebAuthn-Assertion", "stub-assertion")
 		if body != "" {
 			req.Header.Set("Content-Type", "application/json")
 		}
