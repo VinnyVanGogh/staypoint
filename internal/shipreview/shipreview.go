@@ -641,15 +641,11 @@ func BuildAndStartCard(ctx context.Context, db *sql.DB, taskID, repoPath string,
 		return nil, err
 	}
 
-	// Auto-start dev server from project config; persist the URL when successful.
-	// Auto-detect Supabase project and propose config if none stored yet.
+	// Auto-start dev server only from an explicitly human-saved project config.
+	// Auto-detection of Supabase projects is handled in the board-facing StartDev
+	// HTTP endpoint (after the board user explicitly clicks Start), not here —
+	// BuildAndStartCard is agent-reachable and must not silently run dev commands.
 	cfg, _ := GetProjectDevConfig(db, repoPath)
-	if cfg != nil && cfg.DevCommand == "" && HasSupabaseConfig(repoPath) {
-		proposed := ProposeSupabaseDevConfig(repoPath)
-		if err := UpsertProjectDevConfig(db, proposed); err == nil {
-			cfg = proposed
-		}
-	}
 	if cfg != nil && cfg.DevCommand != "" {
 		if startedURL, startErr := StartDevServer(db, card, cfg, repoPath); startErr == nil && startedURL != "" && card.DevURL == "" {
 			card.DevURL = startedURL
