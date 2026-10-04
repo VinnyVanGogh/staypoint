@@ -36,6 +36,14 @@ type CheckRun struct {
 	OutputTail string `json:"output_tail,omitempty"`
 }
 
+// DevState values for a Card.
+const (
+	DevStateIdle     = ""           // no dev server running or starting
+	DevStateStarting = "starting"   // async setup in progress
+	DevStateReady    = "ready"      // dev server up
+	DevStateError    = "error"      // setup failed
+)
+
 // Card represents a Ship Review card for a task.
 type Card struct {
 	ID              string     `json:"id"`
@@ -45,6 +53,10 @@ type Card struct {
 	TestSteps       []string   `json:"test_steps"`
 	DevURL          string     `json:"dev_url"`
 	DevPID          int        `json:"dev_pid"`
+	// DevState tracks async setup progress: "", "starting", "ready", "error".
+	DevState        string     `json:"dev_state,omitempty"`
+	// DevLog holds the last N progress lines from async setup.
+	DevLog          []string   `json:"dev_log,omitempty"`
 	Status          string     `json:"status"`
 	ApprovedSHA     string     `json:"approved_sha,omitempty"`
 	MainSHA         string     `json:"main_sha,omitempty"`
@@ -206,6 +218,14 @@ func (m *procManager) has(taskID string) bool {
 	return ok
 }
 
+// paths returns the repoPath and worktree path for a running dev server.
+// Both are empty strings if no server is running for taskID.
+func (m *procManager) paths(taskID string) (repoPath, wtPath string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.repoPaths[taskID], m.worktrees[taskID]
+}
+
 // removeDevWorktree removes a temporary dev-server worktree.
 // Uses `git worktree remove --force` when a repoPath is available, else os.RemoveAll.
 func removeDevWorktree(repoPath, wtPath string) {
@@ -315,13 +335,14 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 		SELECT id, task_id, branch, head_sha, test_steps_json, dev_url, dev_pid,
 		       status, approved_sha, main_sha, send_back_comment, reject_comment,
 		       COALESCE(files_changed_json, '[]'), COALESCE(check_runs_json, '[]'),
+		       COALESCE(dev_state,''), COALESCE(dev_log_json,'[]'),
 		       created_at, updated_at
 		FROM ship_review_cards
 		WHERE task_id = ?
 		ORDER BY created_at DESC LIMIT 1`, taskID)
 
 	var c Card
-	var stepsJSON, filesJSON, checksJSON string
+	var stepsJSON, filesJSON, checksJSON, devLogJSON string
 	var approvedSHA, mainSHA, sendBack, reject sql.NullString
 	var createdAt, updatedAt string
 
@@ -329,6 +350,7 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 		&c.ID, &c.TaskID, &c.Branch, &c.HeadSHA, &stepsJSON, &c.DevURL, &c.DevPID,
 		&c.Status, &approvedSHA, &mainSHA, &sendBack, &reject,
 		&filesJSON, &checksJSON,
+		&c.DevState, &devLogJSON,
 		&createdAt, &updatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -344,6 +366,9 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 	}
 	if err := json.Unmarshal([]byte(checksJSON), &c.CheckRuns); err != nil {
 		c.CheckRuns = []CheckRun{}
+	}
+	if err := json.Unmarshal([]byte(devLogJSON), &c.DevLog); err != nil {
+		c.DevLog = []string{}
 	}
 	c.ApprovedSHA = approvedSHA.String
 	c.MainSHA = mainSHA.String
@@ -401,70 +426,196 @@ func SetDevURL(db *sql.DB, cardID, devURL string) error {
 	return err
 }
 
-// StartDevServer launches the dev server for a card and stores the PID.
-// repoPath is the main repository root; a temporary detached worktree is created
-// at card.HeadSHA so the dev server always runs on the exact pinned commit, not
-// whatever the repo root or any stale task worktree happens to be checked out at.
-// Returns the URL to show the Board.
-func StartDevServer(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath string) (string, error) {
+// SetDevState persists the async dev-env state and appends a log line to the card.
+// state is one of DevStateStarting, DevStateReady, DevStateError, DevStateIdle.
+// logLine is appended to the last 50 stored lines (empty string skips append).
+func SetDevState(db *sql.DB, cardID, state, logLine string) error {
+	// Read existing log.
+	var existing string
+	_ = db.QueryRow(`SELECT COALESCE(dev_log_json,'[]') FROM ship_review_cards WHERE id = ?`, cardID).Scan(&existing)
+	var lines []string
+	if err := json.Unmarshal([]byte(existing), &lines); err != nil {
+		lines = []string{}
+	}
+	if logLine != "" {
+		lines = append(lines, logLine)
+		if len(lines) > 50 {
+			lines = lines[len(lines)-50:]
+		}
+	}
+	logJSON, _ := json.Marshal(lines)
+	_, err := db.Exec(
+		`UPDATE ship_review_cards
+		 SET dev_state = ?, dev_log_json = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		 WHERE id = ?`,
+		state, string(logJSON), cardID,
+	)
+	return err
+}
+
+// DevProgress is emitted during async dev-server setup.
+type DevProgress struct {
+	TaskID  string `json:"task_id"`
+	Step    string `json:"step"`
+	Message string `json:"message"`
+	OK      bool   `json:"ok"`
+}
+
+// StartDevServerAsync launches dev-server setup in a background goroutine and
+// returns immediately. Progress is streamed via the optional progress callback
+// (typically h.hub.Publish). Card dev_state is set to "starting" on entry and
+// updated to "ready" or "error" on completion.
+//
+// Returns the expected URL immediately so the caller can show it before the
+// server is fully up.
+func StartDevServerAsync(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath string, progress func(DevProgress)) (string, error) {
 	if cfg.DevCommand == "" {
 		return "", fmt.Errorf("no dev_command configured for this project")
 	}
-
-	// Kill any stale server (and clean up its worktree) for this task first.
-	devServerManager.kill(card.TaskID)
-
-	// Create a temporary detached worktree at the pinned commit SHA so the dev
-	// server always serves the exact reviewed code, not the repo root (main).
-	wtPath := filepath.Join(repoPath, ".worktrees", "devserver-"+card.TaskID)
-	_ = os.RemoveAll(wtPath) // clean any stale leftover
-	bgCtx := context.Background()
-	if _, err := gitOutput(bgCtx, repoPath, "worktree", "add", "--detach", wtPath, card.HeadSHA); err != nil {
-		return "", fmt.Errorf("create dev worktree at %s: %w", card.HeadSHA, err)
-	}
-
-	// Run setup steps inside the new worktree.
-	for _, step := range cfg.SetupSteps {
-		if err := runShellStep(step, wtPath); err != nil {
-			removeDevWorktree(repoPath, wtPath)
-			return "", fmt.Errorf("setup step %q failed: %w", step, err)
-		}
-	}
-
-	// Start the dev server in background.
-	parts := strings.Fields(cfg.DevCommand)
-	cmd := exec.Command(parts[0], parts[1:]...) //nolint:gosec
-	cmd.Dir = wtPath
-	cmd.Env = append(os.Environ(), "FORCE_COLOR=1")
-
-	if err := cmd.Start(); err != nil {
-		removeDevWorktree(repoPath, wtPath)
-		return "", fmt.Errorf("start dev server: %w", err)
-	}
-
-	devServerManager.store(card.TaskID, cmd.Process, repoPath, wtPath)
-	_ = SetDevPID(db, card.ID, cmd.Process.Pid)
-
-	// Reap zombie when process exits; also cleans up the temp worktree.
-	go func() {
-		_ = cmd.Wait()
-		devServerManager.kill(card.TaskID)
-	}()
 
 	url := cfg.DevURL
 	if url == "" {
 		url = "http://localhost:3000"
 	}
+
+	_ = SetDevState(db, card.ID, DevStateStarting, "Dev server setup starting…")
+
+	emit := func(step, msg string, ok bool) {
+		_ = SetDevState(db, card.ID, DevStateStarting, msg)
+		if progress != nil {
+			progress(DevProgress{TaskID: card.TaskID, Step: step, Message: msg, OK: ok})
+		}
+	}
+
+	go func() {
+		if err := startDevServerSync(db, card, cfg, repoPath, emit); err != nil {
+			_ = SetDevState(db, card.ID, DevStateError, "Error: "+err.Error())
+			if progress != nil {
+				progress(DevProgress{TaskID: card.TaskID, Step: "error", Message: err.Error(), OK: false})
+			}
+			return
+		}
+		_ = SetDevState(db, card.ID, DevStateReady, "Dev server ready at "+url)
+		if progress != nil {
+			progress(DevProgress{TaskID: card.TaskID, Step: "ready", Message: url, OK: true})
+		}
+	}()
+
 	return url, nil
 }
 
+// StartDevServer is the synchronous form used by tests and the old code path.
+// New callers should prefer StartDevServerAsync.
+func StartDevServer(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath string) (string, error) {
+	if cfg.DevCommand == "" {
+		return "", fmt.Errorf("no dev_command configured for this project")
+	}
+	noop := func(_, _ string, _ bool) {}
+	if err := startDevServerSync(db, card, cfg, repoPath, noop); err != nil {
+		return "", err
+	}
+	url := cfg.DevURL
+	if url == "" {
+		url = "http://localhost:3000"
+	}
+	_ = SetDevState(db, card.ID, DevStateReady, "Dev server ready at "+url)
+	return url, nil
+}
+
+// startDevServerSync performs the full setup sequence: worktree, Supabase env,
+// setup steps, then launches the dev process. Emits progress via emit.
+func startDevServerSync(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath string, emit func(step, msg string, ok bool)) error {
+	// Kill any stale server (and clean up its worktree) for this task first.
+	devServerManager.kill(card.TaskID)
+
+	// Create a temporary detached worktree at the pinned commit SHA.
+	wtPath := filepath.Join(repoPath, ".worktrees", "devserver-"+card.TaskID)
+	_ = os.RemoveAll(wtPath)
+	bgCtx := context.Background()
+	emit("worktree", "Creating dev worktree at "+card.HeadSHA[:min(len(card.HeadSHA), 12)]+"…", true)
+	if _, err := gitOutput(bgCtx, repoPath, "worktree", "add", "--detach", wtPath, card.HeadSHA); err != nil {
+		return fmt.Errorf("create dev worktree at %s: %w", card.HeadSHA, err)
+	}
+
+	// Built-in Supabase dev env (before custom setup steps).
+	if cfg.SupabaseEnabled {
+		emit("supabase", "Setting up local Supabase dev env…", true)
+		if err := StartSupabaseDevEnv(repoPath, wtPath, func(p SupabaseProgress) {
+			emit(p.Step, p.Message, p.OK)
+		}); err != nil {
+			removeDevWorktree(repoPath, wtPath)
+			return fmt.Errorf("supabase dev env: %w", err)
+		}
+	}
+
+	// Custom setup steps (now run via /bin/sh -c so pipes/quotes/&& work).
+	for _, step := range cfg.SetupSteps {
+		emit("setup", "Running: "+step, true)
+		if err := runShellStep(step, wtPath); err != nil {
+			removeDevWorktree(repoPath, wtPath)
+			return fmt.Errorf("setup step %q failed: %w", step, err)
+		}
+	}
+
+	// Launch the dev server process.
+	emit("server", "Starting dev server…", true)
+	cmd := exec.Command("/bin/sh", "-c", cfg.DevCommand) //nolint:gosec
+	cmd.Dir = wtPath
+	cmd.Env = append(os.Environ(),
+		"FORCE_COLOR=1",
+		"PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:"+os.Getenv("PATH"),
+	)
+
+	if err := cmd.Start(); err != nil {
+		removeDevWorktree(repoPath, wtPath)
+		return fmt.Errorf("start dev server: %w", err)
+	}
+
+	devServerManager.store(card.TaskID, cmd.Process, repoPath, wtPath)
+	_ = SetDevPID(db, card.ID, cmd.Process.Pid)
+
+	go func() {
+		_ = cmd.Wait()
+		devServerManager.kill(card.TaskID)
+	}()
+
+	return nil
+}
+
+// min returns the smaller of a and b (Go 1.20 didn't have built-in min for int).
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // StopDevServer kills the dev server for a task and clears the PID.
+// If the project config has SupabaseEnabled and !SupabaseKeepUp, also stops
+// the local Supabase stack (data volumes are kept for fast next startup).
 func StopDevServer(db *sql.DB, card *Card) {
+	// Determine the worktree path to pass to supabase stop.
+	repoPath, wtPath := devServerManager.paths(card.TaskID)
+
 	devServerManager.kill(card.TaskID)
 	_, _ = db.Exec(
-		`UPDATE ship_review_cards SET dev_pid = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`,
+		`UPDATE ship_review_cards
+		 SET dev_pid = 0, dev_state = '', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		 WHERE id = ?`,
 		card.ID,
 	)
+
+	if wtPath == "" || repoPath == "" {
+		return
+	}
+	cfg, err := GetProjectDevConfig(db, repoPath)
+	if err != nil || cfg == nil || !cfg.SupabaseEnabled || cfg.SupabaseKeepUp {
+		return
+	}
+	// Fire-and-forget: supabase stop is slow; don't block the HTTP response.
+	go func() {
+		_ = StopSupabaseDevEnv(wtPath)
+	}()
 }
 
 // BuildAndStartCard is the single entry point for creating a Ship Review card.
@@ -491,7 +642,14 @@ func BuildAndStartCard(ctx context.Context, db *sql.DB, taskID, repoPath string,
 	}
 
 	// Auto-start dev server from project config; persist the URL when successful.
+	// Auto-detect Supabase project and propose config if none stored yet.
 	cfg, _ := GetProjectDevConfig(db, repoPath)
+	if cfg != nil && cfg.DevCommand == "" && HasSupabaseConfig(repoPath) {
+		proposed := ProposeSupabaseDevConfig(repoPath)
+		if err := UpsertProjectDevConfig(db, proposed); err == nil {
+			cfg = proposed
+		}
+	}
 	if cfg != nil && cfg.DevCommand != "" {
 		if startedURL, startErr := StartDevServer(db, card, cfg, repoPath); startErr == nil && startedURL != "" && card.DevURL == "" {
 			card.DevURL = startedURL
@@ -629,16 +787,17 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-// runShellStep runs a single shell step (no shell expansion) in workDir.
+// runShellStep runs a single setup step via /bin/sh -c so that quotes,
+// pipes, and && work as expected. workDir is set as the working directory.
 func runShellStep(step, workDir string) error {
-	parts := strings.Fields(step)
-	if len(parts) == 0 {
+	if strings.TrimSpace(step) == "" {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, parts[0], parts[1:]...) //nolint:gosec
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", step) //nolint:gosec
 	cmd.Dir = workDir
+	cmd.Env = append(os.Environ(), "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:"+os.Getenv("PATH"))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -655,17 +814,24 @@ type ProjectDevConfig struct {
 	MigrationGlobs  []string `json:"migration_globs"`
 	// SQLEditorURL is the project's SQL editor deep-link (e.g. Supabase dashboard).
 	SQLEditorURL    string   `json:"sql_editor_url"`
+	// SupabaseEnabled enables the built-in Supabase dev env (Docker + local DB).
+	// Auto-set when supabase/config.toml is detected and no config exists yet.
+	SupabaseEnabled bool     `json:"supabase_enabled"`
+	// SupabaseKeepUp prevents auto-stop of the local DB after review. Default false.
+	SupabaseKeepUp  bool     `json:"supabase_keep_up"`
 }
 
 // GetProjectDevConfig loads the dev config for a repo path, or returns defaults.
 func GetProjectDevConfig(db *sql.DB, repoPath string) (*ProjectDevConfig, error) {
 	var stepsJSON, devCommand, devURL, migGlobsJSON, sqlEditorURL string
+	var supabaseEnabled, supabaseKeepUp int
 	err := db.QueryRow(
 		`SELECT dev_command, dev_url, setup_steps_json,
-		        COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,'')
+		        COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
+		        COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0)
 		 FROM project_dev_configs WHERE repo_path = ?`,
 		repoPath,
-	).Scan(&devCommand, &devURL, &stepsJSON, &migGlobsJSON, &sqlEditorURL)
+	).Scan(&devCommand, &devURL, &stepsJSON, &migGlobsJSON, &sqlEditorURL, &supabaseEnabled, &supabaseKeepUp)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return &ProjectDevConfig{RepoPath: repoPath}, nil
@@ -673,10 +839,12 @@ func GetProjectDevConfig(db *sql.DB, repoPath string) (*ProjectDevConfig, error)
 		return nil, err
 	}
 	cfg := &ProjectDevConfig{
-		RepoPath:     repoPath,
-		DevCommand:   devCommand,
-		DevURL:       devURL,
-		SQLEditorURL: sqlEditorURL,
+		RepoPath:        repoPath,
+		DevCommand:      devCommand,
+		DevURL:          devURL,
+		SQLEditorURL:    sqlEditorURL,
+		SupabaseEnabled: supabaseEnabled != 0,
+		SupabaseKeepUp:  supabaseKeepUp != 0,
 	}
 	if err := json.Unmarshal([]byte(stepsJSON), &cfg.SetupSteps); err != nil {
 		cfg.SetupSteps = []string{}
@@ -697,19 +865,31 @@ func UpsertProjectDevConfig(db *sql.DB, cfg *ProjectDevConfig) error {
 	if err != nil {
 		return err
 	}
+	supabaseEnabled := 0
+	if cfg.SupabaseEnabled {
+		supabaseEnabled = 1
+	}
+	supabaseKeepUp := 0
+	if cfg.SupabaseKeepUp {
+		supabaseKeepUp = 1
+	}
 	_, err = db.Exec(`
 		INSERT INTO project_dev_configs
-			(repo_path, dev_command, dev_url, setup_steps_json, migration_globs_json, sql_editor_url, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			(repo_path, dev_command, dev_url, setup_steps_json, migration_globs_json,
+			 sql_editor_url, supabase_enabled, supabase_keep_up, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 		ON CONFLICT(repo_path) DO UPDATE SET
 			dev_command          = excluded.dev_command,
 			dev_url              = excluded.dev_url,
 			setup_steps_json     = excluded.setup_steps_json,
 			migration_globs_json = excluded.migration_globs_json,
 			sql_editor_url       = excluded.sql_editor_url,
+			supabase_enabled     = excluded.supabase_enabled,
+			supabase_keep_up     = excluded.supabase_keep_up,
 			updated_at           = excluded.updated_at`,
 		cfg.RepoPath, cfg.DevCommand, cfg.DevURL,
 		string(stepsJSON), string(migGlobsJSON), cfg.SQLEditorURL,
+		supabaseEnabled, supabaseKeepUp,
 	)
 	return err
 }
@@ -718,7 +898,8 @@ func UpsertProjectDevConfig(db *sql.DB, cfg *ProjectDevConfig) error {
 func ListProjectDevConfigs(db *sql.DB) ([]*ProjectDevConfig, error) {
 	rows, err := db.Query(`
 		SELECT repo_path, dev_command, dev_url, setup_steps_json,
-		       COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,'')
+		       COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
+		       COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0)
 		FROM project_dev_configs ORDER BY repo_path`)
 	if err != nil {
 		return nil, err
@@ -728,9 +909,12 @@ func ListProjectDevConfigs(db *sql.DB) ([]*ProjectDevConfig, error) {
 	for rows.Next() {
 		var c ProjectDevConfig
 		var stepsJSON, migGlobsJSON string
-		if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL); err != nil {
+		var supEnabled, supKeepUp int
+		if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL, &supEnabled, &supKeepUp); err != nil {
 			continue
 		}
+		c.SupabaseEnabled = supEnabled != 0
+		c.SupabaseKeepUp = supKeepUp != 0
 		if err := json.Unmarshal([]byte(stepsJSON), &c.SetupSteps); err != nil {
 			c.SetupSteps = []string{}
 		}

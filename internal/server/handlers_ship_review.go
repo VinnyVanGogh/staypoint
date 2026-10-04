@@ -130,24 +130,61 @@ func (h *ShipReviewHandler) UpsertCard(w http.ResponseWriter, r *http.Request) {
 }
 
 // StartDev handles POST /api/tasks/{id}/ship-review/start-dev
+// Returns 202 immediately; setup runs async and streams progress via SSE.
 func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
 	card, task, ok := h.requireCard(w, taskID)
 	if !ok {
 		return
 	}
+
 	cfg, err := shipreview.GetProjectDevConfig(h.db, task.RepoPath)
-	if err != nil || cfg.DevCommand == "" {
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
+		return
+	}
+
+	// Auto-detect Supabase project if no config exists yet.
+	if cfg.DevCommand == "" && shipreview.HasSupabaseConfig(task.RepoPath) {
+		proposed := shipreview.ProposeSupabaseDevConfig(task.RepoPath)
+		if uErr := shipreview.UpsertProjectDevConfig(h.db, proposed); uErr == nil {
+			cfg = proposed
+			h.hub.Publish("ship_review_dev_config_proposed", map[string]any{
+				"task_id":          taskID,
+				"supabase_enabled": true,
+				"dev_url":          proposed.DevURL,
+			})
+		}
+	}
+
+	if cfg.DevCommand == "" {
 		writeError(w, http.StatusConflict, "no dev_command configured for this project")
 		return
 	}
-	url, err := shipreview.StartDevServer(h.db, card, cfg, task.RepoPath)
+
+	// Stream progress to board via SSE.
+	progress := func(p shipreview.DevProgress) {
+		h.hub.Publish("ship_review_dev_progress", map[string]any{
+			"task_id": p.TaskID,
+			"step":    p.Step,
+			"message": p.Message,
+			"ok":      p.OK,
+		})
+	}
+
+	url, err := shipreview.StartDevServerAsync(h.db, card, cfg, task.RepoPath, progress)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "start dev server: "+err.Error())
 		return
 	}
+
+	if card.DevURL == "" {
+		_ = shipreview.SetDevURL(h.db, card.ID, url)
+	}
+
 	h.hub.Publish("ship_review_dev_started", map[string]any{"task_id": taskID, "dev_url": url})
-	writeJSON(w, map[string]any{"dev_url": url})
+	w.WriteHeader(http.StatusAccepted)
+	writeJSON(w, map[string]any{"dev_url": url, "status": "starting"})
 }
 
 // StopDev handles POST /api/tasks/{id}/ship-review/stop-dev

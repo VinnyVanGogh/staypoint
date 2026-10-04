@@ -133,6 +133,8 @@ CREATE TABLE IF NOT EXISTS ship_review_cards (
     test_steps_json     TEXT NOT NULL DEFAULT '[]',
     dev_url             TEXT NOT NULL DEFAULT '',
     dev_pid             INTEGER NOT NULL DEFAULT 0,
+    dev_state           TEXT NOT NULL DEFAULT '',
+    dev_log_json        TEXT NOT NULL DEFAULT '[]',
     status              TEXT NOT NULL DEFAULT 'pending',
     approved_sha        TEXT,
     main_sha            TEXT,

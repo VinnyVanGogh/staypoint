@@ -929,6 +929,39 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version: 21,
+		Name:    "supabase_devenv",
+		Up: func(conn *sql.DB) error {
+			// ship_review_cards: async dev-env state and progress log.
+			cardCols := []struct{ name, def string }{
+				{"dev_state", "TEXT NOT NULL DEFAULT ''"},
+				{"dev_log_json", "TEXT NOT NULL DEFAULT '[]'"},
+			}
+			for _, c := range cardCols {
+				_, err := conn.Exec(fmt.Sprintf(
+					"ALTER TABLE ship_review_cards ADD COLUMN %s %s;", c.name, c.def,
+				))
+				if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			// project_dev_configs: built-in Supabase dev env flags.
+			cfgCols := []struct{ name, def string }{
+				{"supabase_enabled", "INTEGER NOT NULL DEFAULT 0"},
+				{"supabase_keep_up", "INTEGER NOT NULL DEFAULT 0"},
+			}
+			for _, c := range cfgCols {
+				_, err := conn.Exec(fmt.Sprintf(
+					"ALTER TABLE project_dev_configs ADD COLUMN %s %s;", c.name, c.def,
+				))
+				if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {
