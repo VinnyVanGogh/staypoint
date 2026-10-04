@@ -142,8 +142,7 @@ func (h *SecurityGateHandler) DecideGateRequest(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Write to security_gate_audit_log so the decision (and who made it) is durable.
-	// governance_audit_log has a FK to tasks(id) so it cannot hold gate UUIDs.
+	// Write to security_gate_audit_log (gate-scoped) and governance_audit_log (Board action).
 	pendingStatus := string(security.GateRequestPending)
 	decidedStatus := string(gr.Status)
 	if err := governance.LogGateEvent(h.db, gr.ID, "board", "security_gate_decided",
@@ -153,7 +152,9 @@ func (h *SecurityGateHandler) DecideGateRequest(w http.ResponseWriter, r *http.R
 		http.Error(w, `{"error":"audit log write failed"}`, http.StatusInternalServerError)
 		return
 	}
-
+	_ = governance.LogEvent(h.db, id, "board", governance.AuditBoardAction, nil, nil,
+		map[string]string{"action": "decide_gate_request", "decision": req.Decision,
+			"ip": r.RemoteAddr, "user_agent": r.UserAgent()})
 	h.hub.Publish("security_gate_decided", map[string]any{
 		"id":       gr.ID,
 		"decision": gr.Status,
@@ -202,15 +203,13 @@ func (h *SecurityGateHandler) UpdateSecurityGateSettings(w http.ResponseWriter, 
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
-	// Audit log
 	action := "enabled"
 	if !req.MainMergeApproval {
 		action = "disabled"
 	}
-	_, _ = h.db.Exec(
-		`INSERT INTO activity_log (task_id, event_type, details) VALUES ('system', 'settings_change', ?)`,
-		fmt.Sprintf("gates.main_merge_approval %s", action),
-	)
+	_ = governance.LogEvent(h.db, "global", "board", governance.AuditBoardAction, nil, nil,
+		map[string]string{"action": "update_security_gate_settings", "value": action,
+			"ip": r.RemoteAddr, "user_agent": r.UserAgent()})
 	h.hub.Publish("security_gate_settings", map[string]any{"main_merge_approval": req.MainMergeApproval})
 	writeJSON(w, map[string]any{"main_merge_approval": req.MainMergeApproval})
 }

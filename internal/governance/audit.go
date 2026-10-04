@@ -9,16 +9,19 @@ import (
 
 // AuditEvent types for the governance_audit_log.
 const (
-	AuditReviewerAssigned   = "reviewer_assigned"
-	AuditReviewerRemoved    = "reviewer_removed"
-	AuditApproverAssigned   = "approver_assigned"
-	AuditApproverRemoved    = "approver_removed"
-	AuditWatchdogAssigned   = "watchdog_assigned"
-	AuditReviewSubmitted    = "review_submitted"
-	AuditApprovalVote       = "approval_vote"
-	AuditWatchdogEval       = "watchdog_eval"
-	AuditStateTransition    = "state_transition"
-	AuditGovernanceUpdated  = "governance_updated"
+	AuditReviewerAssigned  = "reviewer_assigned"
+	AuditReviewerRemoved   = "reviewer_removed"
+	AuditApproverAssigned  = "approver_assigned"
+	AuditApproverRemoved   = "approver_removed"
+	AuditWatchdogAssigned  = "watchdog_assigned"
+	AuditReviewSubmitted   = "review_submitted"
+	AuditApprovalVote      = "approval_vote"
+	AuditWatchdogEval      = "watchdog_eval"
+	AuditStateTransition   = "state_transition"
+	AuditGovernanceUpdated = "governance_updated"
+
+	AuditBoardAction  = "board_action"
+	AuditPasskeyEvent = "passkey_event"
 )
 
 // AuditEntry is a single row from governance_audit_log.

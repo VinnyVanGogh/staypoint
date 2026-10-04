@@ -962,6 +962,22 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version: 22,
+		Name:    "board_webauthn_credentials",
+		Up: func(conn *sql.DB) error {
+			_, err := conn.Exec(`CREATE TABLE IF NOT EXISTS board_webauthn_credentials (
+				id             TEXT PRIMARY KEY,
+				credential_id  BLOB NOT NULL,
+				public_key     BLOB NOT NULL,
+				sign_count     INTEGER NOT NULL DEFAULT 0,
+				aaguid         TEXT NOT NULL DEFAULT '',
+				created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+				updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			);`)
+			return err
+		},
+	},
 }
 
 func copyFile(src, dst string) error {

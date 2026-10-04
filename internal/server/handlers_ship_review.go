@@ -9,6 +9,7 @@ import (
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/context"
+	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/migration"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 	"github.com/google/uuid"
@@ -316,6 +317,9 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 	_ = context.AddWorkProduct(h.db, taskID, "commit", mainSHA)
 	_ = context.MarkTaskDone(h.db, taskID)
 
+	_ = governance.LogEvent(h.db, taskID, "board", governance.AuditBoardAction, nil, nil,
+		map[string]string{"action": "approve", "ip": r.RemoteAddr, "user_agent": r.UserAgent()})
+
 	h.hub.Publish("ship_review_approved", map[string]any{
 		"task_id":      taskID,
 		"approved_sha": card.HeadSHA,
@@ -349,6 +353,8 @@ func (h *ShipReviewHandler) SendBack(w http.ResponseWriter, r *http.Request) {
 
 	shipreview.StopDevServer(h.db, card)
 	_ = context.AddTaskComment(h.db, taskID, "board", req.Comment)
+	_ = governance.LogEvent(h.db, taskID, "board", governance.AuditBoardAction, nil, nil,
+		map[string]string{"action": "send_back", "ip": r.RemoteAddr, "user_agent": r.UserAgent()})
 
 	h.hub.Publish("ship_review_sent_back", map[string]any{
 		"task_id": taskID,
@@ -384,6 +390,9 @@ func (h *ShipReviewHandler) Reject(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	_ = governance.LogEvent(h.db, taskID, "board", governance.AuditBoardAction, nil, nil,
+		map[string]string{"action": "reject", "ip": r.RemoteAddr, "user_agent": r.UserAgent()})
+
 	h.hub.Publish("ship_review_rejected", map[string]any{
 		"task_id":        taskID,
 		"comment":        req.Comment,
@@ -416,6 +425,8 @@ func (h *ShipReviewHandler) SetSettings(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	_ = governance.LogEvent(h.db, "global", "board", governance.AuditBoardAction, nil, nil,
+		map[string]string{"action": "set_ship_review_settings", "ip": r.RemoteAddr, "user_agent": r.UserAgent()})
 	h.hub.Publish("ship_review_settings", map[string]any{"ship_review": req.ShipReview})
 	writeJSON(w, map[string]any{"ship_review": req.ShipReview})
 }

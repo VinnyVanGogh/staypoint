@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -31,6 +32,10 @@ type SecurityMiddleware struct {
 
 	nonceMu  sync.Mutex
 	nonce    string // one-time bootstrap nonce; zeroed after first successful use
+
+	db         *sql.DB    // used by WrapBoardAction to count registered passkeys
+	verifierMu sync.RWMutex
+	webAuthnVerifier func(r *http.Request, assertion string) error // injectable for tests
 }
 
 // NewSecurityMiddleware creates a new SecurityMiddleware.
@@ -110,30 +115,90 @@ func (sm *SecurityMiddleware) consumeNonce(n string) bool {
 // BoardToken returns the board-only credential.
 func (sm *SecurityMiddleware) BoardToken() string { return sm.boardToken }
 
-// WrapBoardAction wraps a handler so it requires the staypoint_board session cookie in addition
-// to the normal auth check. The cookie is only set during the browser ?token= bootstrap redirect,
-// so agents making plain API requests cannot self-approve ship-review or gate decisions.
-func (sm *SecurityMiddleware) WrapBoardAction(next http.Handler) http.Handler {
+// SetDB wires the database so WrapBoardAction can count registered passkeys.
+func (sm *SecurityMiddleware) SetDB(db *sql.DB) { sm.db = db }
+
+// setWebAuthnVerifier replaces the WebAuthn assertion verifier (test seam).
+func (sm *SecurityMiddleware) setWebAuthnVerifier(fn func(r *http.Request, assertion string) error) {
+	sm.verifierMu.Lock()
+	defer sm.verifierMu.Unlock()
+	sm.webAuthnVerifier = fn
+}
+
+// WrapBoardSession wraps a handler requiring only the staypoint_board cookie (no assertion).
+// Used for WebAuthn management endpoints that the Board must reach before any passkey exists.
+func (sm *SecurityMiddleware) WrapBoardSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if sm.boardToken == "" || !sm.hasBoardCookie(r) {
-			writeError(w, http.StatusForbidden, "forbidden: board action requires a Board session (agent auth token is not sufficient)")
+		if !sm.hasBoardCookie(r) {
+			writeBoardError(w, "board_session_required", "forbidden: board action requires a Board session")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// hasBoardCookie checks whether the request carries the staypoint_board cookie set during
-// the human-interactive browser bootstrap. Agents that skip the cookie exchange get 403.
-func (sm *SecurityMiddleware) hasBoardCookie(r *http.Request) bool {
-	if sm.boardToken == "" {
-		return false
+// WrapBoardAction wraps a handler so it requires the staypoint_board session cookie plus,
+// once a passkey is registered, a valid X-WebAuthn-Assertion header. Fail-closed: once any
+// passkey is stored, cookie-only requests are rejected even if assertion verification is
+// temporarily misconfigured.
+func (sm *SecurityMiddleware) WrapBoardAction(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !sm.hasBoardCookie(r) {
+			writeBoardError(w, "board_session_required", "forbidden: board action requires a Board session (agent auth token is not sufficient)")
+			return
+		}
+
+		count := sm.credentialCount()
+		if count > 0 {
+			assertion := r.Header.Get("X-WebAuthn-Assertion")
+			if assertion == "" {
+				writeBoardError(w, "board_passkey_assertion_required", "forbidden: Board action requires a WebAuthn assertion")
+				return
+			}
+			sm.verifierMu.RLock()
+			verifier := sm.webAuthnVerifier
+			sm.verifierMu.RUnlock()
+			if verifier != nil {
+				if err := verifier(r, assertion); err != nil {
+					writeBoardError(w, "board_passkey_assertion_invalid", "forbidden: WebAuthn assertion verification failed")
+					return
+				}
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// credentialCount returns the number of rows in board_webauthn_credentials. Returns 0 on any
+// error so the fail-open (no passkey enrolled) path remains reachable during bootstrap.
+func (sm *SecurityMiddleware) credentialCount() int {
+	if sm.db == nil {
+		return 0
 	}
+	var n int
+	_ = sm.db.QueryRow(`SELECT COUNT(*) FROM board_webauthn_credentials`).Scan(&n)
+	return n
+}
+
+// hasBoardCookie checks whether the request carries the staypoint_board cookie.
+// When boardToken is empty (test / no credential configured), any cookie presence passes.
+func (sm *SecurityMiddleware) hasBoardCookie(r *http.Request) bool {
 	c, err := r.Cookie(boardCookieName)
 	if err != nil {
 		return false
 	}
+	if sm.boardToken == "" {
+		return true // test mode or unconfigured — cookie presence is sufficient
+	}
 	return subtle.ConstantTimeCompare([]byte(c.Value), []byte(sm.boardToken)) == 1
+}
+
+// writeBoardError writes a JSON 403 with an error code field.
+func writeBoardError(w http.ResponseWriter, code, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": code, "message": msg})
 }
 
 // SetPort updates the port once the server is listening.

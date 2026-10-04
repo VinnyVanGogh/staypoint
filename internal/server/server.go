@@ -46,6 +46,9 @@ func New(opts Options) (*Server, error) {
 		hub:    hub,
 		secMid: secMid,
 	}
+	if opts.DB != nil {
+		secMid.SetDB(opts.DB)
+	}
 
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
@@ -200,6 +203,15 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		if s.opts.TestMode {
 			mux.HandleFunc("PUT /api/tasks/{id}/ship-review/seed", shipH.SeedCard)
 		}
+
+		// WebAuthn / passkey endpoints (Board session required; assertion enforced on delete)
+		webAuthnH := NewWebAuthnHandler(s.opts.DB, s.hub)
+		mux.Handle("GET /api/board/webauthn/status", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.Status)))
+		mux.Handle("POST /api/board/webauthn/register/begin", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.RegisterBegin)))
+		mux.Handle("POST /api/board/webauthn/register/finish", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.RegisterFinish)))
+		mux.Handle("POST /api/board/webauthn/challenge", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.Challenge)))
+		mux.Handle("GET /api/board/webauthn/credentials", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.ListCredentials)))
+		mux.Handle("DELETE /api/board/webauthn/credentials/{id}", s.secMid.WrapBoardAction(http.HandlerFunc(webAuthnH.DeleteCredential)))
 	}
 
 	// Embedded web UI (must be registered last so /api/* patterns take precedence)
@@ -298,4 +310,11 @@ func (s *Server) BoardNonce() string {
 // Hub returns the server's EventHub for publishing events.
 func (s *Server) Hub() *EventHub {
 	return s.hub
+}
+
+// SetWebAuthnVerifier replaces the WebAuthn assertion verifier on the security middleware.
+// This is the test seam: tests inject a stub so they can exercise WrapBoardAction without
+// real Touch ID hardware.
+func (s *Server) SetWebAuthnVerifier(fn func(r *http.Request, assertion string) error) {
+	s.secMid.setWebAuthnVerifier(fn)
 }
