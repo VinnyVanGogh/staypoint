@@ -233,8 +233,9 @@ func TestBoard_ThreadViewAndComments(t *testing.T) {
 	if len(m.activeProducts) != 1 {
 		t.Errorf("expected 1 work product, got %d", len(m.activeProducts))
 	}
-	if len(m.activeActivity) != 1 {
-		t.Errorf("expected 1 activity log entry, got %d", len(m.activeActivity))
+	// 2 comment_added (auto-logged by AddTaskComment since STA-542) + 1 checkpoint
+	if len(m.activeActivity) != 3 {
+		t.Errorf("expected 3 activity log entries, got %d", len(m.activeActivity))
 	}
 
 	// View output verification
