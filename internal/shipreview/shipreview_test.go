@@ -848,6 +848,115 @@ func TestBuildAndStartCard_IgnoresGitBranch(t *testing.T) {
 	}
 }
 
+// TestStartDevServerRecoversStalWorktree is the regression test for STA-630.
+// It simulates a daemon restart: a dev-server worktree was created by a prior
+// run, then its directory was deleted (daemon killed / reinstall cleaned up the
+// process) while git still held the registration. The next call to StartDevServer
+// must succeed without requiring a manual `git worktree prune`.
+func TestStartDevServerRecoversStalWorktree(t *testing.T) {
+	const taskID = "task-sta630"
+	db := openTestDB(t)
+
+	repoDir, featureBranch, featureSHA := setupGitRepo(t)
+
+	_, err := db.Exec(`INSERT INTO tasks (id, name) VALUES (?, ?)`, taskID, "STA-630 stale worktree regression")
+	if err != nil {
+		t.Fatalf("insert task: %v", err)
+	}
+
+	// The exact path that startDevServerSync will use.
+	wtPath := filepath.Join(repoDir, ".worktrees", "devserver-"+taskID)
+
+	// Pre-register a worktree at that path (simulating a prior successful run).
+	gitEnv := append(os.Environ(),
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=t@t.com",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=t@t.com",
+	)
+	preReg := exec.Command("git", "worktree", "add", "--detach", wtPath, featureSHA)
+	preReg.Dir = repoDir
+	preReg.Env = gitEnv
+	if out, err := preReg.CombinedOutput(); err != nil {
+		t.Fatalf("pre-register worktree: %v\n%s", err, out)
+	}
+
+	// Simulate daemon restart: delete the directory, leave git registration intact.
+	if err := os.RemoveAll(wtPath); err != nil {
+		t.Fatalf("RemoveAll (simulate restart): %v", err)
+	}
+	if _, err := os.Stat(wtPath); !os.IsNotExist(err) {
+		t.Fatal("test setup error: expected wtPath to be absent after RemoveAll")
+	}
+
+	// Create the card using the feature branch and call StartDevServer.
+	// Without the fix this fails:
+	//   fatal: '<path>' is a missing but already registered worktree
+	card, err := shipreview.CreateCard(db, taskID, featureBranch, featureSHA, []string{"1. Check"}, "http://127.0.0.1:9997", repoDir, nil)
+	if err != nil {
+		t.Fatalf("CreateCard: %v", err)
+	}
+
+	cfg := &shipreview.ProjectDevConfig{
+		RepoPath:   repoDir,
+		DevCommand: "sleep 9999",
+		DevURL:     "http://127.0.0.1:9997",
+	}
+	_, err = shipreview.StartDevServer(db, card, cfg, repoDir)
+	if err != nil {
+		t.Fatalf("StartDevServer with stale worktree registration: %v (want success after auto-prune)", err)
+	}
+	defer shipreview.StopDevServer(db, card)
+
+	// Worktree must exist at the correct SHA after recovery.
+	headInWT, err := shipreview.CurrentBranchHEAD(context.Background(), wtPath, "HEAD")
+	if err != nil {
+		t.Fatalf("CurrentBranchHEAD in recovered worktree: %v", err)
+	}
+	if headInWT != featureSHA {
+		t.Errorf("worktree HEAD = %q, want featureSHA %q", headInWT, featureSHA)
+	}
+}
+
+// TestStartDevServerReusesSameWorktree verifies that calling StartDevServer
+// twice for the same task and same SHA reuses the existing worktree rather
+// than failing with "already registered".
+func TestStartDevServerReusesSameWorktree(t *testing.T) {
+	const taskID = "task-sta630-reuse"
+	db := openTestDB(t)
+
+	repoDir, featureBranch, featureSHA := setupGitRepo(t)
+
+	_, err := db.Exec(`INSERT INTO tasks (id, name) VALUES (?, ?)`, taskID, "STA-630 reuse worktree")
+	if err != nil {
+		t.Fatalf("insert task: %v", err)
+	}
+
+	card, err := shipreview.CreateCard(db, taskID, featureBranch, featureSHA, []string{"1. Check"}, "http://127.0.0.1:9996", repoDir, nil)
+	if err != nil {
+		t.Fatalf("CreateCard: %v", err)
+	}
+
+	cfg := &shipreview.ProjectDevConfig{
+		RepoPath:   repoDir,
+		DevCommand: "sleep 9999",
+		DevURL:     "http://127.0.0.1:9996",
+	}
+
+	// First start.
+	_, err = shipreview.StartDevServer(db, card, cfg, repoDir)
+	if err != nil {
+		t.Fatalf("StartDevServer (first): %v", err)
+	}
+	shipreview.StopDevServer(db, card)
+
+	// Second start with the same worktree path registered and then cleaned up
+	// by StopDevServer — should succeed.
+	_, err = shipreview.StartDevServer(db, card, cfg, repoDir)
+	if err != nil {
+		t.Fatalf("StartDevServer (second): %v", err)
+	}
+	defer shipreview.StopDevServer(db, card)
+}
+
 // TestBuildAndStartCard_AutoStartsDevServer verifies that BuildAndStartCard
 // auto-starts the project dev server when a config exists and the card has no
 // explicit dev_url, then persists the URL. This mirrors the HTTP handler path.

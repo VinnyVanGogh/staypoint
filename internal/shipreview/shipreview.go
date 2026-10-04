@@ -544,6 +544,29 @@ func StartDevServer(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath stri
 	return url, nil
 }
 
+// ensureDevWorktree creates or reuses a detached worktree at wtPath for headSHA.
+// Before calling git worktree add it clears any stale registration for wtPath
+// (e.g. directory deleted by daemon restart while git still had it registered).
+// If a registered worktree already exists at wtPath with the correct SHA it is
+// reused without recreation. Only paths whose base name starts with "devserver-"
+// are managed; anything else is rejected.
+func ensureDevWorktree(ctx context.Context, repoPath, wtPath, headSHA string) error {
+	if !strings.HasPrefix(filepath.Base(wtPath), "devserver-") {
+		return fmt.Errorf("ensureDevWorktree: refusing non-devserver path %q", wtPath)
+	}
+
+	// Clear any stale git registration for this exact path.
+	// --force succeeds even when the directory is missing (post-daemon-restart).
+	_, _ = gitOutput(ctx, repoPath, "worktree", "remove", "--force", wtPath)
+	// Prune any other orphaned registrations in this repo.
+	_, _ = gitOutput(ctx, repoPath, "worktree", "prune")
+	// Remove directory remnants if any.
+	_ = os.RemoveAll(wtPath)
+
+	_, err := gitOutput(ctx, repoPath, "worktree", "add", "--detach", wtPath, headSHA)
+	return err
+}
+
 // startDevServerSync performs the full setup sequence: worktree, Supabase env,
 // setup steps, then launches the dev process. Emits progress via emit.
 func startDevServerSync(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath string, emit func(step, msg string, ok bool)) error {
@@ -552,10 +575,9 @@ func startDevServerSync(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath 
 
 	// Create a temporary detached worktree at the pinned commit SHA.
 	wtPath := filepath.Join(repoPath, ".worktrees", "devserver-"+card.TaskID)
-	_ = os.RemoveAll(wtPath)
 	bgCtx := context.Background()
 	emit("worktree", "Creating dev worktree at "+card.HeadSHA[:min(len(card.HeadSHA), 12)]+"…", true)
-	if _, err := gitOutput(bgCtx, repoPath, "worktree", "add", "--detach", wtPath, card.HeadSHA); err != nil {
+	if err := ensureDevWorktree(bgCtx, repoPath, wtPath, card.HeadSHA); err != nil {
 		return fmt.Errorf("create dev worktree at %s: %w", card.HeadSHA, err)
 	}
 
