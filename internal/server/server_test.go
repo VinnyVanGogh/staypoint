@@ -1336,7 +1336,13 @@ func TestServer_REST_RunControlState(t *testing.T) {
 // accept requests that include the staypoint_board session cookie.
 func TestServer_BoardToken_Required(t *testing.T) {
 	database := setupTestDB(t)
+	// Seed a passkey so fail-closed allows through with a valid assertion.
+	seedBoardWebAuthnCredential(t, database)
 	srv, token := startTestServer(t, database)
+	// Stub the WebAuthn verifier so tests don't need real Touch ID hardware.
+	if s, ok := any(srv).(webAuthnVerifierSetter); ok {
+		s.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
+	}
 	boardToken := srv.BoardToken()
 	if boardToken == "" {
 		t.Fatal("BoardToken() returned empty string — board token was not generated")
@@ -1370,6 +1376,7 @@ func TestServer_BoardToken_Required(t *testing.T) {
 		req, _ := http.NewRequest(method, url, b)
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.AddCookie(&http.Cookie{Name: "staypoint_board", Value: boardToken})
+		req.Header.Set("X-WebAuthn-Assertion", "stub-assertion")
 		if body != "" {
 			req.Header.Set("Content-Type", "application/json")
 		}
@@ -1402,18 +1409,27 @@ func TestServer_BoardToken_Required(t *testing.T) {
 	}
 
 	for _, ep := range boardEndpoints {
-		// Agent auth token alone → 403
+		// Agent auth token alone → 403 board_session_required
 		resp := authOnly(ep.method, base+ep.path, ep.body)
+		raw, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusForbidden {
 			t.Errorf("%s %s with agent token only: want 403, got %d", ep.method, ep.path, resp.StatusCode)
+		} else {
+			var e struct{ Error string `json:"error"` }
+			if _ = json.Unmarshal(raw, &e); e.Error != "board_session_required" {
+				t.Errorf("%s %s with agent token only: want error=board_session_required, got %s", ep.method, ep.path, raw)
+			}
 		}
 
-		// Board token included → not 403 (may be 404/409/etc depending on state, but not a token rejection)
+		// Board cookie + assertion + seeded passkey → board auth gate passes (not 403).
+		// The separate TestBoardAction_NoPasskeyRegistered_Returns403 covers the
+		// enrollment_required case; here we verify the full happy-path gate clears.
 		resp = withBoard(ep.method, base+ep.path, ep.body)
+		raw, _ = io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
-			t.Errorf("%s %s with board token: want not 401/403, got %d", ep.method, ep.path, resp.StatusCode)
+		if resp.StatusCode == http.StatusForbidden {
+			t.Errorf("%s %s with board cookie+passkey+assertion: want not 403, got %d %s", ep.method, ep.path, resp.StatusCode, raw)
 		}
 	}
 }

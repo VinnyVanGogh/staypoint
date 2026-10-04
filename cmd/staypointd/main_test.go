@@ -217,13 +217,20 @@ func TestWireOnWake_ParseDeltaUsesClaudeAdapter(t *testing.T) {
 //  3. GET /?token=…&board_nonce=… sets the staypoint_board cookie (nonce flow, STA-583).
 //  4. Reusing the same nonce does NOT set the cookie (single-use).
 //  5. The legacy ?board_token= URL bootstrap is rejected (removed in STA-583).
-//  6. A board session can call a WrapBoardAction-protected endpoint (not 403).
+//  6. A board session + assertion can call a WrapBoardAction-protected endpoint (not 403).
 //  7. An agent-only request (no board cookie) gets 403.
 func TestStaypointd_BoardToken_PersistedAndUsable(t *testing.T) {
 	dataDir := t.TempDir()
 	boardTokenPath := filepath.Join(dataDir, "board_token")
 
 	store := openTestStore(t)
+
+	// Seed one Board passkey so WrapBoardAction passes the enrollment gate (post-STA-583).
+	if _, err := store.DB().Exec(`INSERT INTO board_webauthn_credentials (id, credential_id, public_key) VALUES (?, ?, ?)`,
+		"staypointd-test-passkey", []byte("cred-id-1"), []byte("pub-key-1"),
+	); err != nil {
+		t.Fatalf("seed board_webauthn_credentials: %v", err)
+	}
 
 	// Mirror the server.Options now used by runDaemon.
 	srv, err := server.New(server.Options{
@@ -244,6 +251,9 @@ func TestStaypointd_BoardToken_PersistedAndUsable(t *testing.T) {
 		defer cancel()
 		_ = srv.Shutdown(ctx)
 	})
+
+	// Stub out WebAuthn assertion verification so tests pass without Touch ID hardware.
+	srv.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
 
 	// 1. board_token file must have been written to DataDir.
 	data, err := os.ReadFile(boardTokenPath)
@@ -343,11 +353,14 @@ func TestStaypointd_BoardToken_PersistedAndUsable(t *testing.T) {
 		}
 	}
 
-	// 6. Board session → POST /api/settings/security-gate must return something other than 403.
-	// (It may return 400/422 due to missing body, but not 403 — the board gate is passed.)
+	// 6. Board session + WebAuthn assertion → POST /api/settings/security-gate must return
+	// something other than 403. (It may return 400/422 due to missing body, but not 403 —
+	// the board gate and enrollment gate both pass.) Post-STA-583: passkey seeded and
+	// verifier stubbed so WrapBoardAction passes.
 	req6, _ := http.NewRequest("POST", base+"/api/settings/security-gate", strings.NewReader(`{}`))
 	req6.Header.Set("Authorization", "Bearer "+authToken)
 	req6.Header.Set("Content-Type", "application/json")
+	req6.Header.Set("X-WebAuthn-Assertion", "mock-assertion-for-test")
 	for _, c := range jar.cookies {
 		req6.AddCookie(c)
 	}
@@ -355,9 +368,10 @@ func TestStaypointd_BoardToken_PersistedAndUsable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("board-session POST: %v", err)
 	}
+	body6, _ := io.ReadAll(resp6.Body)
 	resp6.Body.Close()
-	if resp6.StatusCode == http.StatusForbidden {
-		t.Errorf("board session got 403 Forbidden on /api/settings/security-gate; board cookie gate is broken")
+	if resp6.StatusCode == http.StatusForbidden || resp6.StatusCode == http.StatusUnauthorized {
+		t.Errorf("board session with assertion: want not 401/403, got %d %s", resp6.StatusCode, body6)
 	}
 
 	// 7. Agent-only (no board cookie) → must get 403.
@@ -372,6 +386,12 @@ func TestStaypointd_BoardToken_PersistedAndUsable(t *testing.T) {
 	if resp7.StatusCode != http.StatusForbidden {
 		t.Errorf("agent-only request expected 403, got %d", resp7.StatusCode)
 	}
+}
+
+// webAuthnVerifierSetterE2E is a local copy of the test seam interface; defined
+// here because this package (main) cannot import server_test.
+type webAuthnVerifierSetterE2E interface {
+	SetWebAuthnVerifier(func(r *http.Request, assertion string) error)
 }
 
 // testCookieJar is a minimal http.CookieJar for tests.

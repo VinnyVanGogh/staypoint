@@ -9,16 +9,19 @@ import (
 
 // AuditEvent types for the governance_audit_log.
 const (
-	AuditReviewerAssigned   = "reviewer_assigned"
-	AuditReviewerRemoved    = "reviewer_removed"
-	AuditApproverAssigned   = "approver_assigned"
-	AuditApproverRemoved    = "approver_removed"
-	AuditWatchdogAssigned   = "watchdog_assigned"
-	AuditReviewSubmitted    = "review_submitted"
-	AuditApprovalVote       = "approval_vote"
-	AuditWatchdogEval       = "watchdog_eval"
-	AuditStateTransition    = "state_transition"
-	AuditGovernanceUpdated  = "governance_updated"
+	AuditReviewerAssigned  = "reviewer_assigned"
+	AuditReviewerRemoved   = "reviewer_removed"
+	AuditApproverAssigned  = "approver_assigned"
+	AuditApproverRemoved   = "approver_removed"
+	AuditWatchdogAssigned  = "watchdog_assigned"
+	AuditReviewSubmitted   = "review_submitted"
+	AuditApprovalVote      = "approval_vote"
+	AuditWatchdogEval      = "watchdog_eval"
+	AuditStateTransition   = "state_transition"
+	AuditGovernanceUpdated = "governance_updated"
+
+	AuditBoardAction  = "board_action"
+	AuditPasskeyEvent = "passkey_event"
 )
 
 // AuditEntry is a single row from governance_audit_log.
@@ -69,6 +72,26 @@ func LogGateEvent(db *sql.DB, gateID, actorID, eventType string, fromStatus, toS
 		`INSERT INTO security_gate_audit_log (gate_id, actor_id, event_type, from_status, to_status, payload)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		gateID, actorID, eventType, fromStatus, toStatus, payloadJSON,
+	)
+	return err
+}
+
+// LogBoardEvent writes a Board action or passkey event to board_audit_log.
+// This table has no foreign-key constraint to tasks, so it accepts arbitrary actor IDs
+// such as "board", "global", or WebAuthn credential identifiers.
+func LogBoardEvent(db *sql.DB, actorID, eventType string, payload any) error {
+	var payloadJSON *string
+	if payload != nil {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("governance: marshal board audit payload: %w", err)
+		}
+		s := string(b)
+		payloadJSON = &s
+	}
+	_, err := db.Exec(
+		`INSERT INTO board_audit_log (actor_id, event_type, payload) VALUES (?, ?, ?)`,
+		actorID, eventType, payloadJSON,
 	)
 	return err
 }

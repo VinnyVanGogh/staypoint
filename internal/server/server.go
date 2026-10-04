@@ -16,6 +16,7 @@ type Server struct {
 	httpServer *http.Server
 	hub        *EventHub
 	secMid     *SecurityMiddleware
+	webAuthnH  *WebAuthnHandler
 	addr       string
 	port       int
 	mu         sync.Mutex
@@ -41,10 +42,22 @@ func New(opts Options) (*Server, error) {
 		opts.BoardNonce = nonce
 	}
 
+	// Gate testMode on opts.TestMode only — never call SetTestMode from production paths.
+	if opts.TestMode {
+		secMid.SetTestMode(true)
+	}
+
 	s := &Server{
 		opts:   opts,
 		hub:    hub,
 		secMid: secMid,
+	}
+	if opts.DB != nil {
+		secMid.SetDB(opts.DB)
+		// Wire the default WebAuthn verifier (challenge-store validation).
+		// Tests may override this via SetWebAuthnVerifier.
+		s.webAuthnH = NewWebAuthnHandler(opts.DB, hub)
+		secMid.setWebAuthnVerifier(s.webAuthnH.VerifyAssertion)
 	}
 
 	mux := http.NewServeMux()
@@ -200,6 +213,25 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		if s.opts.TestMode {
 			mux.HandleFunc("PUT /api/tasks/{id}/ship-review/seed", shipH.SeedCard)
 		}
+
+		// WebAuthn / passkey endpoints (Board session required; assertion enforced on delete)
+		webAuthnH := s.webAuthnH
+		if webAuthnH == nil {
+			webAuthnH = NewWebAuthnHandler(s.opts.DB, s.hub)
+		}
+		mux.Handle("GET /api/board/webauthn/status", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.Status)))
+		mux.Handle("POST /api/board/webauthn/register/begin", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.RegisterBegin)))
+		mux.Handle("POST /api/board/webauthn/register/finish", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.RegisterFinish)))
+		mux.Handle("POST /api/board/webauthn/challenge", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.Challenge)))
+		mux.Handle("GET /api/board/webauthn/credentials", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.ListCredentials)))
+		mux.Handle("DELETE /api/board/webauthn/credentials/{id}", s.secMid.WrapBoardAction(http.HandlerFunc(webAuthnH.DeleteCredential)))
+		if s.opts.TestMode {
+			// Test-only: expose the last generated pairing code so Playwright's CDP
+			// enrollment helper can finish registration without a macOS notification.
+			mux.Handle("GET /api/board/webauthn/test/last-pairing-code", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.TestLastPairingCode)))
+			// Test-only: wipe all passkeys so boardPage fixture can re-enroll on each test.
+			mux.Handle("DELETE /api/board/webauthn/test/clear-credentials", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.TestClearCredentials)))
+		}
 	}
 
 	// Embedded web UI (must be registered last so /api/* patterns take precedence)
@@ -233,6 +265,9 @@ func (s *Server) Start() error {
 	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
 		s.port = tcpAddr.Port
 		s.secMid.SetPort(s.port)
+		if s.webAuthnH != nil {
+			s.webAuthnH.SetPort(s.port)
+		}
 	}
 
 	s.running = true
@@ -298,4 +333,19 @@ func (s *Server) BoardNonce() string {
 // Hub returns the server's EventHub for publishing events.
 func (s *Server) Hub() *EventHub {
 	return s.hub
+}
+
+// SetWebAuthnVerifier replaces the WebAuthn assertion verifier on the security middleware.
+// This is the test seam: tests inject a stub so they can exercise WrapBoardAction without
+// real Touch ID hardware.
+func (s *Server) SetWebAuthnVerifier(fn func(r *http.Request, assertion string) error) {
+	s.secMid.setWebAuthnVerifier(fn)
+}
+
+// SetPairingNotifier replaces the macOS notification with a custom function for
+// the WebAuthn registration pairing code. Used in tests and the Playwright e2e suite.
+func (s *Server) SetPairingNotifier(fn func(code string) error) {
+	if s.webAuthnH != nil {
+		s.webAuthnH.SetPairingNotifier(fn)
+	}
 }
