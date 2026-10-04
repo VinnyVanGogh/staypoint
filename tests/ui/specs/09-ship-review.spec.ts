@@ -134,6 +134,9 @@ test.describe('ship review card', () => {
     });
 
     await card.getByRole('button', { name: /Approve/i }).click();
+    // Inline confirm form must appear; click Merge to main to proceed.
+    await expect(card.locator('.ship-review-approve-confirm')).toBeVisible({ timeout: 3_000 });
+    await card.getByRole('button', { name: /Merge to main/i }).click();
 
     // The inline head-moved banner must appear with the new SHA and a re-pin button.
     const banner = card.locator('.ship-review-head-moved-banner');
@@ -176,8 +179,10 @@ test.describe('ship review card', () => {
       });
     });
 
-    // Approve no longer uses a confirm() dialog — click directly.
+    // Approve shows inline confirm form — click Approve then Merge to main.
     await page.locator('.ship-review-card .ship-review-approve-btn').click();
+    await expect(page.locator('.ship-review-approve-confirm')).toBeVisible({ timeout: 3_000 });
+    await page.locator('.ship-review-approve-confirm').getByRole('button', { name: /Merge to main/i }).click();
 
     // The action buttons must disappear.
     await expect(page.locator('.ship-review-approve-btn')).toHaveCount(0, { timeout: 5_000 });
@@ -227,7 +232,7 @@ test.describe('ship review card', () => {
     await page.locator('.ship-review-card .ship-review-reject-btn').click();
 
     // The inline form must be visible.
-    const rejectForm = section.locator('.ship-review-inline-form').last();
+    const rejectForm = section.locator('.ship-review-inline-form:not(.ship-review-approve-confirm)').last();
     await expect(rejectForm).toBeVisible({ timeout: 3_000 });
 
     // Fill in reason.
@@ -271,7 +276,7 @@ test.describe('ship review card', () => {
     });
 
     await page.locator('.ship-review-card .ship-review-reject-btn').click();
-    const rejectForm = section.locator('.ship-review-inline-form').last();
+    const rejectForm = section.locator('.ship-review-inline-form:not(.ship-review-approve-confirm)').last();
     await expect(rejectForm).toBeVisible({ timeout: 3_000 });
 
     await rejectForm.locator('.ship-review-del-branch-chk').check();
@@ -397,12 +402,67 @@ test.describe('ship review card', () => {
     });
 
     await card.getByRole('button', { name: /Approve/i }).click();
+    // Inline confirm form must appear; click Merge to main to trigger withBoardWebAuthn.
+    await expect(card.locator('.ship-review-approve-confirm')).toBeVisible({ timeout: 3_000 });
+    await card.getByRole('button', { name: /Merge to main/i }).click();
 
     // Give async operations time to settle.
     await page.waitForTimeout(800);
 
     expect(enrollmentPromptSeen).toBe(true);
     expect(approveWasCalled).toBe(false);
+    cleanup();
+  });
+
+  // ── Approve inline confirm: cancel suppresses request; confirm proceeds ────
+  test('Approve inline confirm shows SHA and branch; Cancel suppresses request; Merge proceeds', async ({ boardPage: page, request }) => {
+    const { task, cleanup } = await createShipReviewTask(request, 'Approve inline confirm');
+    const res = await upsertShipReview(request, task.id);
+    expect(res.ok(), `upsert failed: ${await res.text()}`).toBeTruthy();
+
+    await gotoTaskPage(page, task);
+    const card = page.locator('.ship-review-card');
+    await expect(card).toBeVisible({ timeout: 10_000 });
+
+    // Track approve calls.
+    let approveCallCount = 0;
+    await page.route('**/ship-review/approve', async (route) => {
+      approveCallCount++;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ main_sha: 'deadbeef00000000', card: { status: 'approved' } }),
+      });
+    });
+
+    // Fail if any browser dialog fires — everything is inline.
+    page.on('dialog', async (d) => {
+      await d.dismiss();
+      throw new Error(`Unexpected browser dialog (${d.type()}): ${d.message()}`);
+    });
+
+    // Click Approve → inline confirm form must appear.
+    await card.getByRole('button', { name: /Approve/i }).click();
+    const confirmForm = card.locator('.ship-review-approve-confirm');
+    await expect(confirmForm).toBeVisible({ timeout: 3_000 });
+
+    // Form must mention the target branch.
+    await expect(confirmForm).toContainText('main');
+
+    // No request yet.
+    expect(approveCallCount).toBe(0);
+
+    // Cancel hides the form without making a request.
+    await confirmForm.getByRole('button', { name: /Cancel/i }).click();
+    await expect(confirmForm).toBeHidden({ timeout: 2_000 });
+    expect(approveCallCount).toBe(0);
+
+    // Click Approve again → Merge to main → final card appears.
+    await card.getByRole('button', { name: /Approve/i }).click();
+    await expect(confirmForm).toBeVisible({ timeout: 3_000 });
+    await confirmForm.getByRole('button', { name: /Merge to main/i }).click();
+    await expect(page.locator('.ship-review-card--final')).toBeVisible({ timeout: 5_000 });
+    expect(approveCallCount).toBe(1);
     cleanup();
   });
 

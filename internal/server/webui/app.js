@@ -7841,52 +7841,74 @@ function renderShipReviewCardFromData(container, taskId, card) {
   }
   actionsWrap.appendChild(rejectForm);
 
+  // ── Approve inline confirm form ──
+  const approveConfirmForm = el('div', 'ship-review-inline-form ship-review-approve-confirm');
+  approveConfirmForm.style.display = 'none';
+  {
+    const shortSHA = card.head_sha ? card.head_sha.slice(0, 12) : '—';
+    const repoName = card.repo_name || '';
+    approveConfirmForm.appendChild(el('div', 'ship-review-form-label',
+      repoName ? `Merge ${shortSHA} → main (${repoName})` : `Merge ${shortSHA} → main`));
+    const acRow = el('div', 'ship-review-form-row');
+    const acMerge = el('button', 'ship-review-form-submit', 'Merge to main');
+    const acCancel = el('button', 'ship-review-form-cancel', 'Cancel');
+    acRow.appendChild(acMerge);
+    acRow.appendChild(acCancel);
+    approveConfirmForm.appendChild(acRow);
+    acCancel.addEventListener('click', () => { approveConfirmForm.style.display = 'none'; clearErr(); });
+    acMerge.addEventListener('click', async () => {
+      clearErr();
+      acMerge.disabled = true;
+      try {
+        const r = await withBoardWebAuthn((sessionToken, assertion) =>
+          fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/approve`, {
+            method: 'POST',
+            headers: { ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+          })
+        );
+        if (r === null) { acMerge.disabled = false; return; }
+        if (r.status === 409) {
+          const body = await r.json().catch(() => ({}));
+          if (body.error === 'head_moved') {
+            const newSHA = body.new_head_sha || '?';
+            headMovedBanner.querySelector('.ship-review-head-moved-text').textContent =
+              `Branch HEAD moved to ${newSHA.slice(0, 12)} since card was rendered. `;
+            headMovedBanner.style.display = '';
+            approveConfirmForm.style.display = 'none';
+            acMerge.disabled = false;
+            return;
+          }
+          throw new Error(`${r.status} ${r.statusText}`);
+        }
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        const result = await r.json();
+        const mainSHA = result.main_sha || (result.card && result.card.main_sha) || '';
+        section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', mainSHA, ''));
+      } catch (e) {
+        showErr('Approve failed: ' + (e.message || e));
+        acMerge.disabled = false;
+      }
+    });
+  }
+  actionsWrap.appendChild(approveConfirmForm);
+
   // ── Primary action buttons ──
   const actions = el('div', 'ship-review-actions');
 
   const approveBtn = el('button', 'ship-review-approve-btn', '✓ Approve & Merge');
-  approveBtn.addEventListener('click', async () => {
-    // Close any open inline forms before attempting approve.
+  approveBtn.addEventListener('click', () => {
     sendBackForm.style.display = 'none';
     rejectForm.style.display = 'none';
+    approveConfirmForm.style.display = approveConfirmForm.style.display === 'none' ? '' : 'none';
+    headMovedBanner.style.display = 'none';
     clearErr();
-    approveBtn.disabled = true;
-    try {
-      // Use raw fetch so we can inspect the 409 body before throwing.
-      const r = await withBoardWebAuthn((sessionToken, assertion) =>
-        fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/approve`, {
-          method: 'POST',
-          headers: { ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-        })
-      );
-      if (r === null) { approveBtn.disabled = false; return; } // enrollment required
-      if (r.status === 409) {
-        const body = await r.json().catch(() => ({}));
-        if (body.error === 'head_moved') {
-          // Show inline banner instead of alert().
-          const newSHA = body.new_head_sha || '?';
-          headMovedBanner.querySelector('.ship-review-head-moved-text').textContent =
-            `Branch HEAD moved to ${newSHA.slice(0, 12)} since card was rendered. `;
-          headMovedBanner.style.display = '';
-          approveBtn.disabled = false;
-          return;
-        }
-        throw new Error(`${r.status} ${r.statusText}`);
-      }
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-      const result = await r.json();
-      const mainSHA = result.main_sha || (result.card && result.card.main_sha) || '';
-      section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', mainSHA, ''));
-    } catch (e) {
-      showErr('Approve failed: ' + (e.message || e));
-      approveBtn.disabled = false;
-    }
   });
   actions.appendChild(approveBtn);
 
   const sendBackBtn = el('button', 'ship-review-sendback-btn', '↩ Send Back');
   sendBackBtn.addEventListener('click', () => {
     rejectForm.style.display = 'none';
+    approveConfirmForm.style.display = 'none';
     headMovedBanner.style.display = 'none';
     clearErr();
     sendBackForm.style.display = sendBackForm.style.display === 'none' ? '' : 'none';
@@ -7896,6 +7918,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
   const rejectBtn = el('button', 'ship-review-reject-btn', '✕ Reject');
   rejectBtn.addEventListener('click', () => {
     sendBackForm.style.display = 'none';
+    approveConfirmForm.style.display = 'none';
     headMovedBanner.style.display = 'none';
     clearErr();
     rejectForm.style.display = rejectForm.style.display === 'none' ? '' : 'none';
