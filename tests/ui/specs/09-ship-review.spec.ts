@@ -256,7 +256,7 @@ test.describe('ship review card', () => {
   });
 
   // ── STA-586 Bug 6b: delete_branch checkbox sends delete_branch=true ──────
-  test('Reject with delete-branch checked sends delete_branch=true', async ({ page, api: _api, request }) => {
+  test('Reject with delete-branch checked sends delete_branch=true', async ({ boardPage: page, api: _api, request }) => {
     const { task, cleanup } = await createShipReviewTask(request, 'Ship review reject del branch');
     await upsertShipReview(request, task.id);
 
@@ -283,7 +283,7 @@ test.describe('ship review card', () => {
   });
 
   // ── STA-586 Bug 7: Send back uses inline form ────────────────────────────
-  test('Send back uses inline form and shows working-state spinner', async ({ page, api: _api, request }) => {
+  test('Send back uses inline form and shows working-state spinner', async ({ boardPage: page, api: _api, request }) => {
     const { task, cleanup } = await createShipReviewTask(request, 'Ship review send back');
     await upsertShipReview(request, task.id);
 
@@ -384,16 +384,11 @@ test.describe('ship review card', () => {
       await route.continue();
     });
 
-    // Handle dialogs in order:
-    //   1st confirm: "Approve and merge?" → accept
-    //   2nd confirm: enrollment offer → dismiss (decline enrollment)
+    // Approve no longer shows an "Approve and merge?" confirm dialog — the first
+    // dialog will be the enrollment prompt from withBoardWebAuthn when no passkey enrolled.
     let enrollmentPromptSeen = false;
-    let dialogIndex = 0;
     page.on('dialog', async (d) => {
-      dialogIndex++;
-      if (dialogIndex === 1 && d.type() === 'confirm') {
-        await d.accept(); // accept the "Approve and merge?" gate
-      } else if (d.type() === 'confirm' && /enroll|passkey/i.test(d.message())) {
+      if (d.type() === 'confirm' && /enroll|passkey/i.test(d.message())) {
         enrollmentPromptSeen = true;
         await d.dismiss(); // decline enrollment
       } else {
