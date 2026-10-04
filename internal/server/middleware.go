@@ -121,7 +121,7 @@ func (sm *SecurityMiddleware) BoardToken() string { return sm.boardToken }
 // SetDB wires the database so WrapBoardAction can count registered passkeys.
 func (sm *SecurityMiddleware) SetDB(db *sql.DB) {
 	if db != nil && sm.boardToken == "" {
-		log.Printf("[warn] SecurityMiddleware: board DB wired but boardToken is empty; any board cookie value will be accepted")
+		log.Printf("[warn] SecurityMiddleware: board DB wired but boardToken is empty; board actions will be denied (403) until boardToken is configured")
 	}
 	sm.db = db
 }
