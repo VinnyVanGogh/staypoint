@@ -284,6 +284,10 @@ export const test = base.extend<Fixtures>({
 
       const headers: Record<string, string> = { 'Authorization': `Bearer ${token}` };
 
+      // Clear any credentials left from a previous test so this test gets a clean
+      // virtual authenticator state. The endpoint is TestMode-only.
+      await fetch('/api/board/webauthn/test/clear-credentials', { method: 'DELETE', headers });
+
       // begin registration
       const br = await fetch('/api/board/webauthn/register/begin', {
         method: 'POST', headers, body: JSON.stringify({}),

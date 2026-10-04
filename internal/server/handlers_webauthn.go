@@ -81,6 +81,18 @@ func (h *WebAuthnHandler) TestLastPairingCode(w http.ResponseWriter, _ *http.Req
 	writeJSON(w, map[string]string{"code": h.LastPairingCode()})
 }
 
+// TestClearCredentials handles DELETE /api/board/webauthn/test/clear-credentials.
+// Only registered when server.Options.TestMode is true. Wipes all stored passkeys
+// so that the Playwright boardPage fixture can re-enroll on each test without
+// hitting the "assertion required to add a second passkey" gate.
+func (h *WebAuthnHandler) TestClearCredentials(w http.ResponseWriter, _ *http.Request) {
+	if _, err := h.db.Exec(`DELETE FROM board_webauthn_credentials`); err != nil {
+		writeError(w, http.StatusInternalServerError, "clear credentials: "+err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"ok": "cleared"})
+}
+
 // SetPort updates the port and resets the WebAuthn instance so initWebAuthn
 // will recreate it with the correct origin on the next call.
 func (h *WebAuthnHandler) SetPort(port int) {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
@@ -71,10 +72,18 @@ func seedBoardWebAuthnCredential(t *testing.T, database *sql.DB) {
 
 // silencePairingNotifier stubs the notification and returns a pointer to the last
 // code the daemon generated (empty if the seam does not exist yet).
+// The notifier is called in a goroutine by RegisterBegin; the mutex prevents data
+// races when multiple begin requests are in flight concurrently.
 func silencePairingNotifier(srv *server.Server) *string {
+	var mu sync.Mutex
 	var last string
 	if s, ok := any(srv).(pairingNotifierSetter); ok {
-		s.SetPairingNotifier(func(code string) error { last = code; return nil })
+		s.SetPairingNotifier(func(code string) error {
+			mu.Lock()
+			last = code
+			mu.Unlock()
+			return nil
+		})
 	}
 	return &last
 }

@@ -116,7 +116,10 @@ ARTIFACTS="${E2E_ARTIFACTS:-$UI_DIR/artifacts}"
 rm -rf "$ARTIFACTS"
 
 status=0
-STAYPOINT_UI_BASE_URL="$MAIN_URL" \
+# WebAuthn credentials.create() requires the page origin's effective domain to
+# match the rpId ("localhost"). The daemon URL uses 127.0.0.1; replace it so the
+# browser lands on localhost and the passkey enrollment in boardPage fixtures works.
+STAYPOINT_UI_BASE_URL="${MAIN_URL/127.0.0.1/localhost}" \
 STAYPOINT_UI_DB="$TMP/main/staypoint.db" \
 STAYPOINT_UI_STEPSIM="$TMP/stepsim" \
 STAYPOINT_UI_DOWN_BASE_URL="$DOWN_URL" \

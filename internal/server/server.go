@@ -229,6 +229,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 			// Test-only: expose the last generated pairing code so Playwright's CDP
 			// enrollment helper can finish registration without a macOS notification.
 			mux.Handle("GET /api/board/webauthn/test/last-pairing-code", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.TestLastPairingCode)))
+			// Test-only: wipe all passkeys so boardPage fixture can re-enroll on each test.
+			mux.Handle("DELETE /api/board/webauthn/test/clear-credentials", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.TestClearCredentials)))
 		}
 	}
 
