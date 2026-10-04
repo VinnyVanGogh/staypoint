@@ -4623,6 +4623,94 @@ function renderSettings() {
       if (data) srToggle.checked = data.ship_review !== false;
     }).catch(() => { srToggle.disabled = false; });
   });
+
+  // ── Dev Environment Config section (STA-520) ──────────────────────────────
+  // PUT /api/project-dev-configs is Board-gated; writes go through withBoardWebAuthn.
+  const devSec = el('div', 'settings-section');
+  const devHdr = el('div', 'settings-section-header');
+  devHdr.appendChild(el('div', 'settings-section-title', 'Dev Environment Config'));
+  devHdr.appendChild(el('div', 'settings-section-desc', 'Per-repo dev server command and setup steps. Saving requires Board passkey.'));
+  devSec.appendChild(devHdr);
+  container.appendChild(devSec);
+
+  const devConfigList = el('div', 'settings-dev-config-list');
+  devSec.appendChild(devConfigList);
+
+  function renderDevConfigList(configs) {
+    devConfigList.innerHTML = '';
+    if (!configs || configs.length === 0) {
+      devConfigList.appendChild(el('div', 'settings-dev-config-empty', 'No dev configs saved yet.'));
+      return;
+    }
+    for (const c of configs) {
+      const row = el('div', 'settings-dev-config-row');
+      row.appendChild(el('code', 'settings-dev-config-repo', c.repo_path));
+      row.appendChild(el('span', 'settings-dev-config-cmd', c.dev_command || '—'));
+      devConfigList.appendChild(row);
+    }
+  }
+
+  function loadDevConfigs() {
+    fetch('/api/project-dev-configs', { headers: authHeader() })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => renderDevConfigList(data && data.configs))
+      .catch(() => {});
+  }
+  loadDevConfigs();
+
+  // Edit form
+  const devForm = el('div', 'settings-dev-config-form');
+  const repoInput = el('input');
+  repoInput.type = 'text';
+  repoInput.className = 'settings-dev-config-input';
+  repoInput.placeholder = 'Repo path (e.g. /Users/you/project)';
+  const cmdInput = el('input');
+  cmdInput.type = 'text';
+  cmdInput.className = 'settings-dev-config-input';
+  cmdInput.placeholder = 'Dev command (e.g. npm run dev)';
+  const stepsInput = el('textarea');
+  stepsInput.className = 'settings-dev-config-input';
+  stepsInput.placeholder = 'Setup steps, one per line (e.g. npm ci)';
+  stepsInput.rows = 3;
+  const saveBtn = el('button', 'settings-dev-config-save', 'Save config');
+  const saveStatus = el('span', 'settings-dev-config-status', '');
+  devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Repo path'));
+  devForm.appendChild(repoInput);
+  devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Dev command'));
+  devForm.appendChild(cmdInput);
+  devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Setup steps'));
+  devForm.appendChild(stepsInput);
+  devForm.appendChild(saveBtn);
+  devForm.appendChild(saveStatus);
+  devSec.appendChild(devForm);
+
+  saveBtn.addEventListener('click', async () => {
+    const repoPath = repoInput.value.trim();
+    const devCommand = cmdInput.value.trim();
+    if (!repoPath) { saveStatus.textContent = 'Repo path required.'; return; }
+    saveBtn.disabled = true;
+    saveStatus.textContent = '';
+    const payload = {
+      repo_path: repoPath,
+      dev_command: devCommand,
+      setup_steps: stepsInput.value.split('\n').map(s => s.trim()).filter(Boolean),
+    };
+    const r = await withBoardWebAuthn((sessionToken, assertion) =>
+      fetch('/api/project-dev-configs', {
+        method: 'PUT',
+        headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+        body: JSON.stringify(payload),
+      })
+    );
+    saveBtn.disabled = false;
+    if (r === null) { saveStatus.textContent = 'Passkey required — enroll first.'; return; }
+    if (r.ok) {
+      saveStatus.textContent = '✓ Saved.';
+      loadDevConfigs();
+    } else {
+      r.json().catch(() => ({})).then(e => { saveStatus.textContent = 'Error: ' + (e.error || r.status); });
+    }
+  });
 }
 
 // ── Fleet Info Modal Drill-Down ────────────────────────────

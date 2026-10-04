@@ -1406,6 +1406,8 @@ func TestServer_BoardToken_Required(t *testing.T) {
 		{"POST", "/api/security/gate-requests/nonexistent-id/decide", `{"decision":"approved"}`},
 		{"POST", "/api/settings/security-gate", `{"main_merge_approval":true}`},
 		{"POST", "/api/settings/ship-review", `{"ship_review":true}`},
+		// STA-520: dev-config write is Board-only (can inject dev_command/setup_steps).
+		{"PUT", "/api/project-dev-configs", `{"repo_path":"/tmp/testrepo","dev_command":"npm run dev"}`},
 	}
 
 	for _, ep := range boardEndpoints {
@@ -1560,5 +1562,165 @@ func TestServer_FreshNonce_RequiresBoardToken(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("valid: want 200, got %d", resp.StatusCode)
+	}
+}
+
+// TestUpsertDevConfig_BoardGate_AuditLog verifies STA-520:
+//   - Agent token alone → 403 (no board cookie)
+//   - Board session + passkey assertion succeeds and writes a board_audit_log row with old→new diff
+func TestUpsertDevConfig_BoardGate_AuditLog(t *testing.T) {
+	database := setupTestDB(t)
+	seedBoardWebAuthnCredential(t, database)
+	srv, token := startTestServer(t, database)
+	// Stub WebAuthn verifier so tests don't need real Touch ID hardware.
+	if s, ok := any(srv).(webAuthnVerifierSetter); ok {
+		s.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
+	}
+	boardToken := srv.BoardToken()
+	base := srv.URL()
+
+	body := `{"repo_path":"/tmp/sta520repo","dev_command":"npm run dev","setup_steps":["npm ci"]}`
+
+	// Agent-only → must be rejected with 403 (missing board cookie).
+	req, _ := http.NewRequest("PUT", base+"/api/project-dev-configs", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("agent-only request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("agent-only PUT /api/project-dev-configs: want 403, got %d", resp.StatusCode)
+	}
+
+	// Board session + passkey assertion → must succeed (200) and write an audit row.
+	req, _ = http.NewRequest("PUT", base+"/api/project-dev-configs", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "staypoint_board", Value: boardToken})
+	req.Header.Set("X-WebAuthn-Assertion", "stub-assertion")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("board session request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("board session PUT: want 200, got %d body=%s", resp.StatusCode, b)
+	}
+
+	// Verify board_audit_log has exactly one dev_config_change row.
+	var count int
+	if err := database.QueryRow(
+		`SELECT COUNT(*) FROM board_audit_log WHERE event_type = 'dev_config_change'`,
+	).Scan(&count); err != nil {
+		t.Fatalf("audit log query failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("audit log: want 1 dev_config_change row, got %d", count)
+	}
+
+	// Verify the audit payload contains old and new dev_command.
+	var payload string
+	if err := database.QueryRow(
+		`SELECT payload FROM board_audit_log WHERE event_type = 'dev_config_change' LIMIT 1`,
+	).Scan(&payload); err != nil {
+		t.Fatalf("audit payload query: %v", err)
+	}
+	var p map[string]any
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		t.Fatalf("audit payload not valid JSON: %v", err)
+	}
+	if p["new_dev_command"] != "npm run dev" {
+		t.Errorf("audit payload new_dev_command: want 'npm run dev', got %v", p["new_dev_command"])
+	}
+	// First upsert has no prior config, so old_dev_command should be empty.
+	if p["old_dev_command"] != "" {
+		t.Errorf("audit payload old_dev_command: want '', got %v", p["old_dev_command"])
+	}
+}
+
+// TestUpsertDevConfig_PartialUpdate verifies that a PUT carrying only dev_command
+// does not blank dev_url, sql_editor_url, or supabase_enabled (fix for STA-520 blocker).
+func TestUpsertDevConfig_PartialUpdate(t *testing.T) {
+	database := setupTestDB(t)
+	seedBoardWebAuthnCredential(t, database)
+	srv, token := startTestServer(t, database)
+	// Stub WebAuthn verifier so tests don't need real Touch ID hardware.
+	if s, ok := any(srv).(webAuthnVerifierSetter); ok {
+		s.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
+	}
+	boardToken := srv.BoardToken()
+	base := srv.URL()
+
+	putJSON := func(body string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest("PUT", base+"/api/project-dev-configs", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: "staypoint_board", Value: boardToken})
+		req.Header.Set("X-WebAuthn-Assertion", "stub-assertion")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("PUT /api/project-dev-configs: %v", err)
+		}
+		return resp
+	}
+
+	// Seed the config with all fields set.
+	seed := `{"repo_path":"/tmp/partial-repo","dev_command":"make dev","dev_url":"http://127.0.0.1:3000","sql_editor_url":"http://localhost:54323","supabase_enabled":true,"setup_steps":["make install"]}`
+	resp := putJSON(seed)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("seed PUT: want 200, got %d body=%s", resp.StatusCode, b)
+	}
+
+	// Partial update: only dev_command is provided; all other fields are absent.
+	partial := `{"repo_path":"/tmp/partial-repo","dev_command":"npm run dev"}`
+	resp2 := putJSON(partial)
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("partial PUT: want 200, got %d body=%s", resp2.StatusCode, b)
+	}
+
+	var got map[string]any
+	if err := json.NewDecoder(resp2.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if got["dev_command"] != "npm run dev" {
+		t.Errorf("dev_command: want 'npm run dev', got %v", got["dev_command"])
+	}
+	if got["dev_url"] != "http://127.0.0.1:3000" {
+		t.Errorf("dev_url: want 'http://127.0.0.1:3000', got %v", got["dev_url"])
+	}
+	if got["sql_editor_url"] != "http://localhost:54323" {
+		t.Errorf("sql_editor_url: want 'http://localhost:54323', got %v", got["sql_editor_url"])
+	}
+	if got["supabase_enabled"] != true {
+		t.Errorf("supabase_enabled: want true, got %v", got["supabase_enabled"])
+	}
+
+	// Clear dev_url explicitly by sending an empty string (non-nil *string).
+	clear := `{"repo_path":"/tmp/partial-repo","dev_url":""}`
+	resp3 := putJSON(clear)
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp3.Body)
+		t.Fatalf("clear PUT: want 200, got %d body=%s", resp3.StatusCode, b)
+	}
+	var got3 map[string]any
+	if err := json.NewDecoder(resp3.Body).Decode(&got3); err != nil {
+		t.Fatalf("decode clear response: %v", err)
+	}
+	if got3["dev_url"] != "" {
+		t.Errorf("clear dev_url: want '', got %v", got3["dev_url"])
+	}
+	// dev_command from the previous partial update must be preserved.
+	if got3["dev_command"] != "npm run dev" {
+		t.Errorf("dev_command after clear: want 'npm run dev', got %v", got3["dev_command"])
 	}
 }

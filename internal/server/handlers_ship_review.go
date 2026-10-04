@@ -449,33 +449,104 @@ func (h *ShipReviewHandler) ListProjectDevConfigs(w http.ResponseWriter, r *http
 	writeJSON(w, map[string]any{"configs": cfgs})
 }
 
-// UpsertProjectDevConfig handles PUT /api/project-dev-configs
+// devConfigUpdateReq is the partial-update request body for PUT /api/project-dev-configs.
+// Pointer fields: nil means absent (keep existing value); non-nil applies the value,
+// including "" or [] to clear a field.
+type devConfigUpdateReq struct {
+	RepoPath        string    `json:"repo_path"`
+	DevCommand      *string   `json:"dev_command"`
+	DevURL          *string   `json:"dev_url"`
+	SetupSteps      *[]string `json:"setup_steps"`
+	MigrationGlobs  *[]string `json:"migration_globs"`
+	SQLEditorURL    *string   `json:"sql_editor_url"`
+	SupabaseEnabled *bool     `json:"supabase_enabled"`
+	SupabaseKeepUp  *bool     `json:"supabase_keep_up"`
+}
+
+// UpsertProjectDevConfig handles PUT /api/project-dev-configs.
+// Board-action gate is enforced by WrapBoardAction in server.go (STA-520).
+// The request body is a partial update: only supplied fields overwrite the existing config.
 func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *http.Request) {
-	var cfg shipreview.ProjectDevConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	var req devConfigUpdateReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
-	if cfg.RepoPath == "" {
+	if req.RepoPath == "" {
 		writeError(w, http.StatusBadRequest, "repo_path required")
 		return
 	}
-	if cfg.DevURL != "" {
-		if err := shipreview.ValidateDevURL(cfg.DevURL); err != nil {
+	if req.DevURL != nil && *req.DevURL != "" {
+		if err := shipreview.ValidateDevURL(*req.DevURL); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
-	if cfg.SQLEditorURL != "" {
-		if err := shipreview.ValidateSQLEditorURL(cfg.SQLEditorURL); err != nil {
+	if req.SQLEditorURL != nil && *req.SQLEditorURL != "" {
+		if err := shipreview.ValidateSQLEditorURL(*req.SQLEditorURL); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
-	if err := shipreview.UpsertProjectDevConfig(h.db, &cfg); err != nil {
+
+	old, err := shipreview.GetProjectDevConfig(h.db, req.RepoPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load existing config: "+err.Error())
+		return
+	}
+
+	cfg := *old
+	if req.DevCommand != nil {
+		cfg.DevCommand = *req.DevCommand
+	}
+	if req.DevURL != nil {
+		cfg.DevURL = *req.DevURL
+	}
+	if req.SQLEditorURL != nil {
+		cfg.SQLEditorURL = *req.SQLEditorURL
+	}
+	if req.SetupSteps != nil {
+		cfg.SetupSteps = *req.SetupSteps
+	}
+	if req.MigrationGlobs != nil {
+		cfg.MigrationGlobs = *req.MigrationGlobs
+	}
+	if req.SupabaseEnabled != nil {
+		cfg.SupabaseEnabled = *req.SupabaseEnabled
+	}
+	if req.SupabaseKeepUp != nil {
+		cfg.SupabaseKeepUp = *req.SupabaseKeepUp
+	}
+
+	// Audit failure must roll back the config write; both go in one transaction.
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		writeError(w, http.StatusInternalServerError, "tx begin failed: "+txErr.Error())
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if err := shipreview.UpsertProjectDevConfigTx(tx, &cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	if err := governance.LogBoardEventTx(tx, "board", "dev_config_change", map[string]any{
+		"repo_path":       cfg.RepoPath,
+		"old_dev_command": old.DevCommand,
+		"new_dev_command": cfg.DevCommand,
+		"old_setup_steps": old.SetupSteps,
+		"new_setup_steps": cfg.SetupSteps,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "audit log write failed: "+err.Error())
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, "commit failed: "+err.Error())
+		return
+	}
+
 	writeJSON(w, &cfg)
 }
 
