@@ -236,6 +236,7 @@ CREATE TABLE IF NOT EXISTS run_steps (
     kind        TEXT NOT NULL DEFAULT '',
     title       TEXT NOT NULL DEFAULT '',
     body        TEXT,
+    command     TEXT NOT NULL DEFAULT '',
     status      TEXT NOT NULL DEFAULT '',
     started_at  TEXT,
     ended_at    TEXT,
@@ -697,6 +698,7 @@ var Migrations = []Migration{
 					kind        TEXT NOT NULL DEFAULT '',
 					title       TEXT NOT NULL DEFAULT '',
 					body        TEXT,
+					command     TEXT NOT NULL DEFAULT '',
 					started_at  TEXT,
 					ended_at    TEXT,
 					created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -995,6 +997,17 @@ var Migrations = []Migration{
 				if _, err := conn.Exec(stmt); err != nil {
 					return err
 				}
+			}
+			return nil
+		},
+	},
+	{
+		Version: 24,
+		Name:    "run_steps_command",
+		Up: func(conn *sql.DB) error {
+			_, err := conn.Exec(`ALTER TABLE run_steps ADD COLUMN command TEXT NOT NULL DEFAULT '';`)
+			if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+				return err
 			}
 			return nil
 		},

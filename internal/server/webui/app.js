@@ -7336,14 +7336,16 @@ function buildRunStepRow(s) {
   row.appendChild(summary);
 
   // Build expanded body: for run steps, prepend "$ <command>" and append exit status.
+  // s.command holds the verbatim command (may differ from s.title when a description is set).
   const hasBody = !!(s.body && s.body.trim());
   const isRunStep = s.kind === 'run';
   if (isRunStep || hasBody) {
     let bodyText = s.body || '';
     if (isRunStep) {
-      const cmdHeader = s.title ? '$ ' + s.title : '';
-      const exitFooter = s.status === 'done' ? 'exit 0' : '';
-      bodyText = [cmdHeader, bodyText, exitFooter].filter(Boolean).join('\n');
+      const cmd = s.command || s.title;
+      const cmdHeader = cmd ? '$ ' + cmd : '';
+      const exitLine = s.status === 'done' ? 'exit 0' : (s.status === 'error' ? 'exit 1' : '');
+      bodyText = [cmdHeader, bodyText, exitLine].filter(Boolean).join('\n');
     }
     if (bodyText) {
       const body = el('pre', 'timeline-body hidden', bodyText);

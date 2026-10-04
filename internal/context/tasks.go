@@ -1408,6 +1408,9 @@ type RunStep struct {
 	Kind      string  `json:"kind"`
 	Title     string  `json:"title"`
 	Body      *string `json:"body,omitempty"`
+	// Command holds the verbatim shell command for run/Bash steps. Title may be a
+	// plain-language description; Command is what the expanded body shows.
+	Command   string  `json:"command,omitempty"`
 	Status    string  `json:"status"`
 	StartedAt *string `json:"started_at,omitempty"`
 	EndedAt   *string `json:"ended_at,omitempty"`
@@ -1418,7 +1421,7 @@ type RunStep struct {
 // seq restarts at 1 per run, so ordering by seq alone interleaves steps from different runs.
 // We group runs by their earliest step timestamp and order within each run by seq.
 func ListRunStepsByTask(db *sql.DB, taskID string) ([]RunStep, error) {
-	query := `SELECT id, run_id, COALESCE(task_id,''), seq, parent_seq, kind, title, body, COALESCE(status,''), started_at, ended_at, created_at
+	query := `SELECT id, run_id, COALESCE(task_id,''), seq, parent_seq, kind, title, body, COALESCE(status,''), started_at, ended_at, created_at, COALESCE(command,'')
 	          FROM run_steps WHERE task_id = ?
 	          ORDER BY MIN(COALESCE(started_at, created_at)) OVER (PARTITION BY run_id) ASC, seq ASC`
 	rows, err := db.Query(query, taskID)
@@ -1429,7 +1432,7 @@ func ListRunStepsByTask(db *sql.DB, taskID string) ([]RunStep, error) {
 	var steps []RunStep
 	for rows.Next() {
 		var s RunStep
-		if err := rows.Scan(&s.ID, &s.RunID, &s.TaskID, &s.Seq, &s.ParentSeq, &s.Kind, &s.Title, &s.Body, &s.Status, &s.StartedAt, &s.EndedAt, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.RunID, &s.TaskID, &s.Seq, &s.ParentSeq, &s.Kind, &s.Title, &s.Body, &s.Status, &s.StartedAt, &s.EndedAt, &s.CreatedAt, &s.Command); err != nil {
 			return nil, err
 		}
 		steps = append(steps, s)
