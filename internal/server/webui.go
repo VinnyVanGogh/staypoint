@@ -36,6 +36,7 @@ var validSPARoutes = map[string]bool{
 	"skills":       true,
 	"connectors":   true,
 	"audit":        true,
+	"gates":        true,
 	"tasks":        true,
 	"issues":       true,
 	"task-page":    true,

@@ -4019,3 +4019,78 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .ship-review-migration-banner--applied {
   color: var(--success, #4ade80);
 }
+
+/* ── Gates page ─────────────────────────────────────────────── */
+.sidebar-badge {
+  margin-left: auto;
+  background: var(--red, #f85149);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 1px 6px;
+  min-width: 18px;
+  text-align: center;
+  line-height: 16px;
+}
+.gates-table-wrapper { overflow-x: auto; }
+.gates-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.gates-table th {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border, #30363d);
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.gates-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border, #30363d);
+  vertical-align: top;
+}
+.gates-table tr:last-child td { border-bottom: none; }
+.gates-table tr:hover td { background: var(--surface2, #161b22); }
+.gate-cmdline { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; word-break: break-all; }
+.gate-reasons { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.gate-run-link { font-size: 11px; color: var(--accent-light, #a78bfa); text-decoration: none; }
+.gate-run-link:hover { text-decoration: underline; }
+.gate-status-pending  { color: var(--amber, #f59e0b); font-weight: 600; }
+.gate-status-approved { color: var(--green, #3fb950); font-weight: 600; }
+.gate-status-denied   { color: var(--red, #f85149); font-weight: 600; }
+.gate-btn {
+  padding: 4px 12px; border-radius: var(--radius, 6px);
+  border: 1px solid; cursor: pointer; font-size: 12px; font-weight: 600;
+  transition: background .1s, color .1s;
+}
+.gate-approve-btn {
+  background: rgba(63,185,80,.1); color: var(--green, #3fb950);
+  border-color: rgba(63,185,80,.4);
+}
+.gate-approve-btn:hover { background: rgba(63,185,80,.2); }
+.gate-deny-btn {
+  background: rgba(248,81,73,.1); color: var(--red, #f85149);
+  border-color: rgba(248,81,73,.4);
+}
+.gate-deny-btn:hover { background: rgba(248,81,73,.2); }
+.gate-action-btns { display: flex; gap: 6px; }
+.gates-empty {
+  text-align: center; padding: 40px 0; color: var(--muted);
+  font-size: 14px;
+}
+.gates-empty-icon { font-size: 32px; margin-bottom: 8px; }
+.task-pending-gates {
+  margin-top: 0;
+  padding: 10px 16px;
+  background: rgba(245,158,11,.08);
+  border: 1px solid rgba(245,158,11,.25);
+  border-radius: var(--radius, 6px);
+}
+.task-pending-gates-title { font-weight: 600; font-size: 13px; color: var(--amber, #f59e0b); margin-bottom: 8px; }
+.task-pending-gate-row { font-size: 12px; display: flex; align-items: flex-start; gap: 10px; margin-bottom: 6px; }
+.task-pending-gate-cmd { font-family: 'JetBrains Mono', ui-monospace, monospace; word-break: break-all; flex: 1; }

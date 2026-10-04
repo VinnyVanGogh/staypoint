@@ -905,6 +905,30 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version: 20,
+		Name:    "security_gate_audit_log",
+		Up: func(conn *sql.DB) error {
+			for _, stmt := range []string{
+				`CREATE TABLE IF NOT EXISTS security_gate_audit_log (
+					id          INTEGER PRIMARY KEY AUTOINCREMENT,
+					gate_id     TEXT NOT NULL,
+					actor_id    TEXT NOT NULL,
+					event_type  TEXT NOT NULL,
+					from_status TEXT,
+					to_status   TEXT,
+					payload     TEXT,
+					created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+				);`,
+				`CREATE INDEX IF NOT EXISTS idx_sga_gate ON security_gate_audit_log(gate_id, created_at DESC);`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {

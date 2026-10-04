@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 )
 
@@ -140,11 +141,38 @@ func (h *SecurityGateHandler) DecideGateRequest(w http.ResponseWriter, r *http.R
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
+
+	// Write to security_gate_audit_log so the decision (and who made it) is durable.
+	// governance_audit_log has a FK to tasks(id) so it cannot hold gate UUIDs.
+	pendingStatus := string(security.GateRequestPending)
+	decidedStatus := string(gr.Status)
+	if err := governance.LogGateEvent(h.db, gr.ID, "board", "security_gate_decided",
+		&pendingStatus, &decidedStatus,
+		map[string]any{"cmdline": gr.Cmdline, "decision": string(gr.Status), "run_id": gr.RunID},
+	); err != nil {
+		http.Error(w, `{"error":"audit log write failed"}`, http.StatusInternalServerError)
+		return
+	}
+
 	h.hub.Publish("security_gate_decided", map[string]any{
 		"id":       gr.ID,
 		"decision": gr.Status,
 	})
 	writeJSON(w, gr)
+}
+
+// ListGateAuditLog handles GET /api/security/gate-requests/{id}/audit-log
+func (h *SecurityGateHandler) ListGateAuditLog(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	entries, err := governance.ListGateAuditLog(h.db, id)
+	if err != nil {
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	if entries == nil {
+		entries = []map[string]any{}
+	}
+	writeJSON(w, map[string]any{"audit_log": entries})
 }
 
 // GetSecurityGateSettings handles GET /api/settings/security-gate
@@ -205,9 +233,19 @@ func setSettingKV(db *sql.DB, key, value string) error {
 }
 
 func listGateRequestsByStatus(db *sql.DB, status string) ([]*security.GateRequest, error) {
-	rows, err := db.Query(
-		`SELECT id, cmdline, reasons_json, run_id, status, created_at, decided_at
-		 FROM security_gate_requests WHERE status = ? ORDER BY created_at DESC LIMIT 100`, status)
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if status == "all" {
+		rows, err = db.Query(
+			`SELECT id, cmdline, reasons_json, run_id, status, created_at, decided_at
+			 FROM security_gate_requests ORDER BY created_at DESC LIMIT 100`)
+	} else {
+		rows, err = db.Query(
+			`SELECT id, cmdline, reasons_json, run_id, status, created_at, decided_at
+			 FROM security_gate_requests WHERE status = ? ORDER BY created_at DESC LIMIT 100`, status)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -238,3 +276,4 @@ func listGateRequestsByStatus(db *sql.DB, status string) ([]*security.GateReques
 	}
 	return out, rows.Err()
 }
+

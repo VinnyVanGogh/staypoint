@@ -10,6 +10,8 @@ if (TOKEN.length < 16) {
   throw new Error('STAYPOINT_API_TOKEN is not set: run the suite via scripts/ui-e2e.sh');
 }
 
+export const BOARD_TOKEN = process.env.STAYPOINT_BOARD_TOKEN || '';
+
 export type Task = {
   id: string;
   name: string;
@@ -138,6 +140,18 @@ export class StayPointAPI {
       test_steps: ['Open the preview URL and verify the feature.'],
     });
   }
+
+  async createGateRequest(cmdline: string, reasons: string[] = [], runId = ''): Promise<{ id: string; cmdline: string; status: string }> {
+    return this.json('POST', '/api/security/gate-requests', { cmdline, reasons, run_id: runId });
+  }
+
+  async listGateRequests(status = 'pending'): Promise<{ gate_requests: Array<{ id: string; cmdline: string; status: string; reasons: string[]; run_id: string; created_at: string }> }> {
+    return this.json('GET', `/api/security/gate-requests?status=${status}`);
+  }
+
+  async listGateAuditLog(gateId: string): Promise<{ audit_log: Array<{ id: string; gate_id: string; actor_id: string; event_type: string; from_status?: string; to_status?: string; created_at: string }> }> {
+    return this.json('GET', `/api/security/gate-requests/${gateId}/audit-log`);
+  }
 }
 
 /** URL of the full task page, matching taskToPath() in app.js for local tasks. */
@@ -202,7 +216,7 @@ export function knownBug(id: KnownBug) {
   base.fail(true, `${id}: ${KNOWN_BUGS[id]}`);
 }
 
-type Fixtures = { api: StayPointAPI; page: Page };
+type Fixtures = { api: StayPointAPI; page: Page; boardPage: Page };
 
 export const test = base.extend<Fixtures>({
   api: async ({ request }, use) => {
@@ -212,6 +226,26 @@ export const test = base.extend<Fixtures>({
   // swaps it for a session cookie and redirects to the clean URL.
   page: async ({ page, baseURL }, use) => {
     await page.goto(`${baseURL}/?token=${encodeURIComponent(TOKEN)}`);
+    await expect(page).toHaveURL(`${baseURL}/`);
+    await use(page);
+  },
+  // boardPage is a page with a Board session cookie set.
+  // Requires STAYPOINT_BOARD_TOKEN (exported by scripts/ui-e2e.sh).
+  // Uses POST /api/board/fresh-nonce (STA-583 removed the ?board_token= URL bootstrap).
+  boardPage: async ({ page, baseURL, request }, use) => {
+    const bt = BOARD_TOKEN;
+    if (!bt) throw new Error('STAYPOINT_BOARD_TOKEN is not set: run via scripts/ui-e2e.sh');
+    const nonceRes = await request.post(`${baseURL}/api/board/fresh-nonce`, {
+      headers: {
+        'Authorization': `Bearer ${TOKEN}`,
+        'X-Board-Token': bt,
+      },
+    });
+    if (!nonceRes.ok()) {
+      throw new Error(`POST /api/board/fresh-nonce -> ${nonceRes.status()}: ${await nonceRes.text()}`);
+    }
+    const { nonce } = await nonceRes.json();
+    await page.goto(`${baseURL}/?token=${encodeURIComponent(TOKEN)}&board_nonce=${encodeURIComponent(nonce)}`);
     await expect(page).toHaveURL(`${baseURL}/`);
     await use(page);
   },

@@ -89,6 +89,7 @@ start_daemon() { # start_daemon <name>; sets DAEMON_URL and DAEMON_PID
     exit 1
   fi
   DAEMON_URL="$(sed -n 's/^READY //p' "$dir/daemon.out")"
+  DAEMON_BOARD_TOKEN="$(sed -n 's/^BOARD_TOKEN //p' "$dir/daemon.out")"
   case "$DAEMON_URL" in
     *:41421) echo "ui-e2e: refusing $DAEMON_URL: 41421 is the real staypointd port" >&2; exit 1 ;;
   esac
@@ -96,6 +97,7 @@ start_daemon() { # start_daemon <name>; sets DAEMON_URL and DAEMON_PID
 
 start_daemon main
 MAIN_URL="$DAEMON_URL"
+MAIN_BOARD_TOKEN="$DAEMON_BOARD_TOKEN"
 start_daemon expendable
 DOWN_URL="$DAEMON_URL"
 DOWN_PID="$DAEMON_PID"
@@ -121,6 +123,7 @@ STAYPOINT_UI_DOWN_BASE_URL="$DOWN_URL" \
 STAYPOINT_UI_DOWN_PID="$DOWN_PID" \
 STAYPOINT_UI_ARTIFACTS="$ARTIFACTS" \
 STAYPOINT_API_TOKEN="$TOKEN" \
+STAYPOINT_BOARD_TOKEN="$MAIN_BOARD_TOKEN" \
   npx playwright test "$@" || status=$?
 
 if [ "$status" -ne 0 ]; then

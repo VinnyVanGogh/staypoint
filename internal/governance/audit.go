@@ -52,6 +52,68 @@ func LogEvent(db *sql.DB, taskID, actorID, eventType string, fromState, toState 
 	return err
 }
 
+// LogGateEvent writes a security gate decision to security_gate_audit_log.
+// Unlike LogEvent, gate_id is not a foreign key to tasks — gate requests have
+// their own UUID namespace in security_gate_requests.
+func LogGateEvent(db *sql.DB, gateID, actorID, eventType string, fromStatus, toStatus *string, payload any) error {
+	var payloadJSON *string
+	if payload != nil {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("governance: marshal gate audit payload: %w", err)
+		}
+		s := string(b)
+		payloadJSON = &s
+	}
+	_, err := db.Exec(
+		`INSERT INTO security_gate_audit_log (gate_id, actor_id, event_type, from_status, to_status, payload)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		gateID, actorID, eventType, fromStatus, toStatus, payloadJSON,
+	)
+	return err
+}
+
+// ListGateAuditLog returns all audit events for a given gate request ID.
+func ListGateAuditLog(db *sql.DB, gateID string) ([]map[string]any, error) {
+	rows, err := db.Query(
+		`SELECT id, gate_id, actor_id, event_type, from_status, to_status, payload, created_at
+		 FROM security_gate_audit_log WHERE gate_id = ? ORDER BY id ASC`,
+		gateID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []map[string]any
+	for rows.Next() {
+		var (
+			id, gateID2, actorID2, eventType2, createdAt string
+			fromStatus, toStatus, payload                sql.NullString
+		)
+		if err := rows.Scan(&id, &gateID2, &actorID2, &eventType2, &fromStatus, &toStatus, &payload, &createdAt); err != nil {
+			return nil, err
+		}
+		entry := map[string]any{
+			"id": id, "gate_id": gateID2, "actor_id": actorID2,
+			"event_type": eventType2, "created_at": createdAt,
+		}
+		if fromStatus.Valid {
+			entry["from_status"] = fromStatus.String
+		}
+		if toStatus.Valid {
+			entry["to_status"] = toStatus.String
+		}
+		if payload.Valid {
+			var v any
+			if json.Unmarshal([]byte(payload.String), &v) == nil {
+				entry["payload"] = v
+			}
+		}
+		out = append(out, entry)
+	}
+	return out, rows.Err()
+}
+
 // GetAuditLog returns the combined audit trail for a task (governance events +
 // activity-log entries), sorted newest first.
 func GetAuditLog(db *sql.DB, taskID string) ([]AuditEntry, error) {

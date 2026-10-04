@@ -175,6 +175,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("GET /api/security/gate-requests", gateH.ListGateRequests)
 		mux.HandleFunc("POST /api/security/gate-requests", gateH.CreateGateRequest)
 		mux.HandleFunc("GET /api/security/gate-requests/{id}", gateH.GetGateRequest)
+		mux.HandleFunc("GET /api/security/gate-requests/{id}/audit-log", gateH.ListGateAuditLog)
 		// Board-only: deciding a gate request requires the board token so agents cannot self-approve.
 		mux.Handle("POST /api/security/gate-requests/{id}/decide", s.secMid.WrapBoardAction(http.HandlerFunc(gateH.DecideGateRequest)))
 		mux.HandleFunc("GET /api/settings/security-gate", gateH.GetSecurityGateSettings)

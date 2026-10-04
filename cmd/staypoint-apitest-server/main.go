@@ -44,6 +44,13 @@ func run() error {
 		return errors.New("STAYPOINT_API_TOKEN must be set (16+ chars)")
 	}
 
+	// Generate a distinct board token so Playwright tests can exercise Board-only
+	// endpoints (gate decide, ship-review approve/send-back/reject).
+	boardToken := os.Getenv("STAYPOINT_BOARD_TOKEN")
+	if boardToken == "" {
+		boardToken = token + "-board"
+	}
+
 	// The fleet handlers proxy to whatever PAPERCLIP_API_URL names, with
 	// PAPERCLIP_API_KEY attached, and default to the live control plane.
 	// Pin them to the stub and drop the credentials so a test POST can never
@@ -99,6 +106,7 @@ func run() error {
 		BindHost:        "127.0.0.1",
 		Port:            *port,
 		AuthToken:       token,
+		BoardToken:      boardToken,
 		DB:              store.DB(),
 		TelemetryDBPath: *telemetryDB,
 		GitCommit:       "apitest",
@@ -110,8 +118,10 @@ func run() error {
 	if err := srv.Start(); err != nil {
 		return err
 	}
-	// scripts/api-e2e.sh waits for this exact line.
+	// scripts/api-e2e.sh and scripts/ui-e2e.sh wait for this exact line.
 	fmt.Printf("READY %s\n", srv.URL())
+	// Board token for Playwright tests that need Board-only endpoints.
+	fmt.Printf("BOARD_TOKEN %s\n", boardToken)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
