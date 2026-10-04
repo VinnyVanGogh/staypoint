@@ -1640,3 +1640,67 @@ func TestUpsertDevConfig_BoardGate_AuditLog(t *testing.T) {
 		t.Errorf("audit payload old_dev_command: want '', got %v", p["old_dev_command"])
 	}
 }
+
+// TestUpsertDevConfig_PartialUpdate verifies that a PUT carrying only dev_command
+// does not blank dev_url, sql_editor_url, or supabase_enabled (fix for STA-520 blocker).
+func TestUpsertDevConfig_PartialUpdate(t *testing.T) {
+	database := setupTestDB(t)
+	seedBoardWebAuthnCredential(t, database)
+	srv, token := startTestServer(t, database)
+	// Stub WebAuthn verifier so tests don't need real Touch ID hardware.
+	if s, ok := any(srv).(webAuthnVerifierSetter); ok {
+		s.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
+	}
+	boardToken := srv.BoardToken()
+	base := srv.URL()
+
+	putJSON := func(body string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest("PUT", base+"/api/project-dev-configs", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: "staypoint_board", Value: boardToken})
+		req.Header.Set("X-WebAuthn-Assertion", "stub-assertion")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("PUT /api/project-dev-configs: %v", err)
+		}
+		return resp
+	}
+
+	// Seed the config with all fields set.
+	seed := `{"repo_path":"/tmp/partial-repo","dev_command":"make dev","dev_url":"http://127.0.0.1:3000","sql_editor_url":"http://localhost:54323","supabase_enabled":true,"setup_steps":["make install"]}`
+	resp := putJSON(seed)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("seed PUT: want 200, got %d body=%s", resp.StatusCode, b)
+	}
+
+	// Partial update: only dev_command is provided; all other fields are absent.
+	partial := `{"repo_path":"/tmp/partial-repo","dev_command":"npm run dev"}`
+	resp2 := putJSON(partial)
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("partial PUT: want 200, got %d body=%s", resp2.StatusCode, b)
+	}
+
+	var got map[string]any
+	if err := json.NewDecoder(resp2.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if got["dev_command"] != "npm run dev" {
+		t.Errorf("dev_command: want 'npm run dev', got %v", got["dev_command"])
+	}
+	if got["dev_url"] != "http://127.0.0.1:3000" {
+		t.Errorf("dev_url: want 'http://127.0.0.1:3000', got %v", got["dev_url"])
+	}
+	if got["sql_editor_url"] != "http://localhost:54323" {
+		t.Errorf("sql_editor_url: want 'http://localhost:54323', got %v", got["sql_editor_url"])
+	}
+	if got["supabase_enabled"] != true {
+		t.Errorf("supabase_enabled: want true, got %v", got["supabase_enabled"])
+	}
+}

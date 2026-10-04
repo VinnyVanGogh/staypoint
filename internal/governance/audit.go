@@ -79,7 +79,21 @@ func LogGateEvent(db *sql.DB, gateID, actorID, eventType string, fromStatus, toS
 // LogBoardEvent writes a Board action or passkey event to board_audit_log.
 // This table has no foreign-key constraint to tasks, so it accepts arbitrary actor IDs
 // such as "board", "global", or WebAuthn credential identifiers.
+// boardExecer is satisfied by both *sql.DB and *sql.Tx.
+type boardExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
 func LogBoardEvent(db *sql.DB, actorID, eventType string, payload any) error {
+	return logBoardEvent(db, actorID, eventType, payload)
+}
+
+// LogBoardEventTx writes a board audit row inside an existing transaction.
+func LogBoardEventTx(tx *sql.Tx, actorID, eventType string, payload any) error {
+	return logBoardEvent(tx, actorID, eventType, payload)
+}
+
+func logBoardEvent(exec boardExecer, actorID, eventType string, payload any) error {
 	var payloadJSON *string
 	if payload != nil {
 		b, err := json.Marshal(payload)
@@ -89,7 +103,7 @@ func LogBoardEvent(db *sql.DB, actorID, eventType string, payload any) error {
 		s := string(b)
 		payloadJSON = &s
 	}
-	_, err := db.Exec(
+	_, err := exec.Exec(
 		`INSERT INTO board_audit_log (actor_id, event_type, payload) VALUES (?, ?, ?)`,
 		actorID, eventType, payloadJSON,
 	)

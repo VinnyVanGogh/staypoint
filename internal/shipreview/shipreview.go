@@ -876,8 +876,22 @@ func GetProjectDevConfig(db *sql.DB, repoPath string) (*ProjectDevConfig, error)
 	return cfg, nil
 }
 
+// devExecer is satisfied by both *sql.DB and *sql.Tx.
+type devExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
 // UpsertProjectDevConfig saves a project dev config.
 func UpsertProjectDevConfig(db *sql.DB, cfg *ProjectDevConfig) error {
+	return upsertDevConfig(db, cfg)
+}
+
+// UpsertProjectDevConfigTx saves a project dev config inside an existing transaction.
+func UpsertProjectDevConfigTx(tx *sql.Tx, cfg *ProjectDevConfig) error {
+	return upsertDevConfig(tx, cfg)
+}
+
+func upsertDevConfig(exec devExecer, cfg *ProjectDevConfig) error {
 	stepsJSON, err := json.Marshal(cfg.SetupSteps)
 	if err != nil {
 		return err
@@ -894,7 +908,7 @@ func UpsertProjectDevConfig(db *sql.DB, cfg *ProjectDevConfig) error {
 	if cfg.SupabaseKeepUp {
 		supabaseKeepUp = 1
 	}
-	_, err = db.Exec(`
+	_, err = exec.Exec(`
 		INSERT INTO project_dev_configs
 			(repo_path, dev_command, dev_url, setup_steps_json, migration_globs_json,
 			 sql_editor_url, supabase_enabled, supabase_keep_up, updated_at)
