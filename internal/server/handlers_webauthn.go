@@ -218,7 +218,12 @@ func (h *WebAuthnHandler) RegisterFinish(w http.ResponseWriter, r *http.Request)
 
 	h.pairingMu.Lock()
 	validCode := h.pairingCode != "" && env.Code == h.pairingCode && time.Now().Before(h.pairingExp)
-	// Consume on any attempt (success or failure) to prevent brute-force.
+	// Consume the pairing code on every attempt (success or failure) to prevent brute-force.
+	// Trade-off: a Board-session holder can send a request with the correct code but an
+	// intentionally invalid X-WebAuthn-Session header, burning the code and forcing a new
+	// RegisterBegin cycle. This is acceptable — the attacker must already hold the Board
+	// session cookie (a strong first factor) and cannot register a rogue credential, only
+	// cause the operator to repeat the pairing flow.
 	h.pairingCode = ""
 	h.pairingMu.Unlock()
 	if !validCode {
