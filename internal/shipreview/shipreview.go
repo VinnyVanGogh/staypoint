@@ -540,7 +540,7 @@ func startDevServerSync(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath 
 	// Built-in Supabase dev env (before custom setup steps).
 	if cfg.SupabaseEnabled {
 		emit("supabase", "Setting up local Supabase dev env…", true)
-		if err := StartSupabaseDevEnv(repoPath, wtPath, func(p SupabaseProgress) {
+		if err := StartSupabaseDevEnv(repoPath, wtPath, cfg.DevCommand, func(p SupabaseProgress) {
 			emit(p.Step, p.Message, p.OK)
 		}); err != nil {
 			removeDevWorktree(repoPath, wtPath)
@@ -561,7 +561,10 @@ func startDevServerSync(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath 
 	emit("server", "Starting dev server…", true)
 	cmd := exec.Command("/bin/sh", "-c", cfg.DevCommand) //nolint:gosec
 	cmd.Dir = wtPath
-	cmd.Env = append(os.Environ(),
+	// Strip inherited VITE_* and SUPABASE_* vars: process env beats every .env
+	// file in Vite, so an inherited VITE_SUPABASE_URL would route to production
+	// even when .env.local points at localhost.
+	cmd.Env = append(StripViteSupabaseEnv(os.Environ()),
 		"FORCE_COLOR=1",
 		"PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:"+os.Getenv("PATH"),
 	)

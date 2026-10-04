@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -95,7 +96,7 @@ type SupabaseProgress struct {
 //     URL key points outside 127.0.0.1/localhost.
 //  4. supabase start (with -x edge-runtime when no functions dir).
 //  5. DB state: fresh → db reset --local + stop/start; existing → migration up.
-func StartSupabaseDevEnv(mainRepoPath, wtPath string, report func(SupabaseProgress)) error {
+func StartSupabaseDevEnv(mainRepoPath, wtPath, devCmd string, report func(SupabaseProgress)) error {
 	prog := func(step, msg string, ok bool) {
 		if report != nil {
 			report(SupabaseProgress{Step: step, Message: msg, OK: ok})
@@ -116,7 +117,7 @@ func StartSupabaseDevEnv(mainRepoPath, wtPath string, report func(SupabaseProgre
 
 	// 3. .env.local safety check (must exist and validate for Supabase projects).
 	prog("env", "Validating .env.local…", true)
-	if err := CopyAndValidateEnv(mainRepoPath, wtPath, prog); err != nil {
+	if err := CopyAndValidateEnv(mainRepoPath, wtPath, devCmd, prog); err != nil {
 		return fmt.Errorf("env: %w", err)
 	}
 
@@ -319,21 +320,43 @@ var supabaseURLKeys = []string{
 	"SUPABASE_URL",
 }
 
-// viteEnvPrecedence lists env files Vite loads in dev mode, from lowest to
-// highest priority. Higher-index files override earlier ones (same as Vite).
-// .env.production is intentionally excluded — it is never loaded in dev.
-var viteEnvPrecedence = []string{
-	".env",
-	".env.development",
-	".env.local",
-	".env.development.local",
+// viteModeRE matches --mode=<val> or --mode <val> in a dev command string.
+var viteModeRE = regexp.MustCompile(`(?:^|\s)--mode(?:=|\s+)(\S+)`)
+
+// parseViteMode extracts the Vite mode from a dev command string.
+// Returns "development" if --mode is absent. Returns an error if --mode
+// appears but no value follows it (prevents silently using wrong mode).
+func parseViteMode(devCmd string) (string, error) {
+	if m := viteModeRE.FindStringSubmatch(devCmd); m != nil {
+		return m[1], nil
+	}
+	if strings.Contains(devCmd, "--mode") {
+		return "", fmt.Errorf("dev_command contains '--mode' but no mode value follows it; cannot determine env file names")
+	}
+	return "development", nil
 }
 
-// loadEffectiveViteEnv builds the merged env map for Vite's dev mode by reading
-// all env files from repoPath in precedence order. Missing files are skipped.
-func loadEffectiveViteEnv(repoPath string) map[string]string {
+// viteEnvFiles returns the env filenames Vite loads in priority order for the
+// given mode, from lowest to highest. Correct Vite order:
+//
+//	.env < .env.local < .env.<mode> < .env.<mode>.local
+//
+// .env.production is intentionally excluded — never loaded in dev.
+func viteEnvFiles(mode string) []string {
+	return []string{
+		".env",
+		".env.local",
+		".env." + mode,
+		".env." + mode + ".local",
+	}
+}
+
+// loadEffectiveViteEnv builds the merged env map for the given Vite mode by
+// reading all env files from repoPath in precedence order. Missing files are
+// skipped.
+func loadEffectiveViteEnv(repoPath, mode string) map[string]string {
 	effective := make(map[string]string)
-	for _, fname := range viteEnvPrecedence {
+	for _, fname := range viteEnvFiles(mode) {
 		data, err := os.ReadFile(filepath.Join(repoPath, fname)) //nolint:gosec
 		if err != nil {
 			continue
@@ -343,6 +366,36 @@ func loadEffectiveViteEnv(repoPath string) map[string]string {
 		}
 	}
 	return effective
+}
+
+// validateEnvFileForProd reads a single env file and returns an error if any
+// Supabase URL key it contains resolves to a non-local host. Missing files are
+// silently skipped (not an error).
+func validateEnvFileForProd(repoPath, fname string) error {
+	data, err := os.ReadFile(filepath.Join(repoPath, fname)) //nolint:gosec
+	if err != nil {
+		return nil
+	}
+	return ValidateSupabaseEnvURLs(string(data))
+}
+
+// StripViteSupabaseEnv removes all VITE_* and SUPABASE_* entries from an
+// environment slice. Process env beats every .env file in Vite, so any
+// inherited VITE_SUPABASE_URL would route traffic to production even when
+// .env.local sets a local URL.
+func StripViteSupabaseEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		key := e
+		if idx := strings.IndexByte(e, '='); idx >= 0 {
+			key = e[:idx]
+		}
+		if strings.HasPrefix(key, "VITE_") || strings.HasPrefix(key, "SUPABASE_") {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // isLocalHost returns true when host resolves to the loopback interface.
@@ -389,10 +442,15 @@ func ValidateEffectiveSupabaseURLs(effective map[string]string) error {
 //
 // .env.local is mandatory: if it is absent the function refuses so the review
 // never silently falls back to .env / .env.production (which point at prod).
-// After existence check, the merged effective env is validated so a key absent
-// from .env.local but set to prod in .env is still caught.
-// CopyAndValidateEnv is exported for testing.
-func CopyAndValidateEnv(mainRepoPath, wtPath string, prog func(step, msg string, ok bool)) error {
+//
+// devCmd is used to extract --mode so mode-specific env files (.env.staging
+// etc.) are included in both the per-file and merged validation passes.
+//
+// Belt-and-braces: mode-specific env files (.env.<mode>, .env.<mode>.local)
+// are validated individually first — they load after .env.local in Vite's
+// real order and can silently override a correctly-set local URL. The merged
+// effective env is also validated. CopyAndValidateEnv is exported for testing.
+func CopyAndValidateEnv(mainRepoPath, wtPath, devCmd string, prog func(step, msg string, ok bool)) error {
 	src := filepath.Join(mainRepoPath, ".env.local")
 	data, err := os.ReadFile(src) //nolint:gosec
 	if os.IsNotExist(err) {
@@ -403,20 +461,37 @@ func CopyAndValidateEnv(mainRepoPath, wtPath string, prog func(step, msg string,
 		return fmt.Errorf("read .env.local: %w", err)
 	}
 
-	// Copy .env.local into the worktree FIRST so loadEffectiveViteEnv(wtPath)
-	// sees the final set of files the app will actually use (committed .env /
-	// .env.development from the branch + our .env.local override).
+	// Determine Vite mode from dev_command so we load the right mode-specific files.
+	mode, err := parseViteMode(devCmd)
+	if err != nil {
+		prog("env", "Cannot determine Vite mode from dev_command: "+err.Error(), false)
+		return err
+	}
+
+	// Belt-and-braces: validate mode-specific env files individually.
+	// Mode-specific files (.env.<mode>, .env.<mode>.local) load AFTER .env.local
+	// in Vite's real precedence, so they silently override any local URL that
+	// .env.local set. Any non-loopback Supabase URL in either → refuse.
+	// (.env itself is safe to skip: it always loads before .env.local, so
+	// .env.local genuinely wins for it in Vite.)
+	for _, fname := range []string{".env." + mode, ".env." + mode + ".local"} {
+		if ferr := validateEnvFileForProd(wtPath, fname); ferr != nil {
+			prog("env", fname+" contains non-local Supabase URL — refusing: "+ferr.Error(), false)
+			return fmt.Errorf("env file %s: %w", fname, ferr)
+		}
+	}
+
+	// Copy .env.local into the worktree so loadEffectiveViteEnv(wtPath) sees
+	// the final set of files the app will actually use.
 	dst := filepath.Join(wtPath, ".env.local")
 	if err := os.WriteFile(dst, data, 0o600); err != nil {
 		return fmt.Errorf("write .env.local: %w", err)
 	}
 
-	// Validate the effective merged Vite env in wtPath — this is what Vite will
-	// actually load, so it catches a key absent from .env.local that falls back
-	// to a prod value in the branch's committed .env or .env.development.
-	effective := loadEffectiveViteEnv(wtPath)
+	// Also validate the effective merged Vite env in wtPath — catches any
+	// key absent from .env.local that falls back to prod in .env.
+	effective := loadEffectiveViteEnv(wtPath, mode)
 	if err := ValidateEffectiveSupabaseURLs(effective); err != nil {
-		// Remove the copied file so the worktree isn't left in a half-valid state.
 		_ = os.Remove(dst)
 		prog("env", "Effective Vite env (worktree) failed safety check: "+err.Error(), false)
 		return err

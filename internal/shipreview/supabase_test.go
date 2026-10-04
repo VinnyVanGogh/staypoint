@@ -154,7 +154,7 @@ func TestCopyAndValidateEnv_ProdURLInDotEnv_LocalMissing(t *testing.T) {
 	var msgs []string
 	report := func(_, msg string, _ bool) { msgs = append(msgs, msg) }
 
-	err := shipreview.CopyAndValidateEnv(mainRepo, wt, report)
+	err := shipreview.CopyAndValidateEnv(mainRepo, wt, "", report)
 	if err == nil {
 		t.Fatal("want error: effective Vite env has prod URL from .env but .env.local lacks override — should refuse")
 	}
@@ -179,7 +179,7 @@ func TestCopyAndValidateEnv_ProdURLInDotEnv_OverriddenInLocal(t *testing.T) {
 	}
 
 	report := func(_, _ string, _ bool) {}
-	err := shipreview.CopyAndValidateEnv(mainRepo, wt, report)
+	err := shipreview.CopyAndValidateEnv(mainRepo, wt, "", report)
 	if err != nil {
 		t.Errorf("want nil when .env.local overrides prod URL with local: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestCopyAndValidateEnv_NoEnvFile_Refuses(t *testing.T) {
 		prog = append(prog, msg)
 	}
 
-	err := shipreview.CopyAndValidateEnv(mainRepo, wt, report)
+	err := shipreview.CopyAndValidateEnv(mainRepo, wt, "", report)
 	if err == nil {
 		t.Fatal("want error when .env.local absent, got nil")
 	}
@@ -403,5 +403,110 @@ func TestRunShellStep_ShellExpansion(t *testing.T) {
 
 	if _, statErr := os.Stat(touchFile); os.IsNotExist(statErr) {
 		t.Error("shell step using pipe/redirect should have created the file, but it does not exist")
+	}
+}
+
+// --- Fix 1: .env.development with prod URL must refuse (per-file validation) ---
+
+// TestCopyAndValidateEnv_ProdURLInDotEnvDevelopment verifies the precedence-order
+// bug the Board identified: .env.development has a prod URL but .env.local has a
+// local override. In Vite's merge .env.local would win — but the per-file check
+// must refuse because .env.development itself contains a production URL.
+func TestCopyAndValidateEnv_ProdURLInDotEnvDevelopment(t *testing.T) {
+	mainRepo := t.TempDir()
+	wt := t.TempDir()
+
+	// .env.development in worktree (committed) — prod URL.
+	if err := os.WriteFile(filepath.Join(wt, ".env.development"),
+		[]byte("VITE_SUPABASE_URL=https://prod.supabase.co\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// .env.local in mainRepo — local override.
+	if err := os.WriteFile(filepath.Join(mainRepo, ".env.local"),
+		[]byte("VITE_SUPABASE_URL=http://127.0.0.1:54321\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	report := func(_, _ string, _ bool) {}
+	err := shipreview.CopyAndValidateEnv(mainRepo, wt, "", report)
+	if err == nil {
+		t.Fatal("want error: .env.development contains prod URL — per-file check must refuse")
+	}
+}
+
+// --- Fix 3: --mode staging + .env.staging prod URL must refuse ---
+
+// TestCopyAndValidateEnv_ModeStagingWithProdEnv verifies that when dev_command
+// contains --mode staging, the .env.staging file is included in validation and
+// a production URL in it causes a refusal.
+func TestCopyAndValidateEnv_ModeStagingWithProdEnv(t *testing.T) {
+	mainRepo := t.TempDir()
+	wt := t.TempDir()
+
+	// .env.staging in worktree (committed) — prod URL.
+	if err := os.WriteFile(filepath.Join(wt, ".env.staging"),
+		[]byte("VITE_SUPABASE_URL=https://prod.supabase.co\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// .env.local in mainRepo — local URL (would win in merge, but per-file catches staging).
+	if err := os.WriteFile(filepath.Join(mainRepo, ".env.local"),
+		[]byte("VITE_SUPABASE_URL=http://127.0.0.1:54321\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	report := func(_, _ string, _ bool) {}
+	err := shipreview.CopyAndValidateEnv(mainRepo, wt, "bun run dev --mode staging", report)
+	if err == nil {
+		t.Fatal("want error: .env.staging has prod URL and --mode staging is set")
+	}
+}
+
+// --- Fix 4: StripViteSupabaseEnv removes VITE_* and SUPABASE_* from inherited env ---
+
+// TestStripViteSupabaseEnv confirms that process-env VITE_* and SUPABASE_* vars
+// are stripped before being passed to the dev server, preventing an inherited
+// VITE_SUPABASE_URL from routing traffic to production.
+func TestStripViteSupabaseEnv(t *testing.T) {
+	input := []string{
+		"VITE_SUPABASE_URL=https://prod.supabase.co",
+		"SUPABASE_SERVICE_ROLE_KEY=super-secret",
+		"PATH=/usr/bin:/bin",
+		"HOME=/home/user",
+		"VITE_SOME_FLAG=true",
+		"SUPABASE_URL=https://prod.supabase.co",
+	}
+	got := shipreview.StripViteSupabaseEnv(input)
+
+	for _, e := range got {
+		key := e
+		if idx := len(e); idx > 0 {
+			for i, c := range e {
+				if c == '=' {
+					key = e[:i]
+					break
+				}
+			}
+		}
+		if len(key) >= 5 && key[:5] == "VITE_" {
+			t.Errorf("StripViteSupabaseEnv left VITE_ var: %q", e)
+		}
+		if len(key) >= 9 && key[:9] == "SUPABASE_" {
+			t.Errorf("StripViteSupabaseEnv left SUPABASE_ var: %q", e)
+		}
+	}
+
+	// Non-Vite/Supabase vars must be preserved.
+	found := false
+	for _, e := range got {
+		if e == "PATH=/usr/bin:/bin" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("StripViteSupabaseEnv must preserve non-VITE_/SUPABASE_ vars like PATH")
+	}
+	// 2 non-prefixed vars remain: PATH and HOME.
+	if len(got) != 2 {
+		t.Errorf("want 2 vars after strip, got %d: %v", len(got), got)
 	}
 }
