@@ -253,6 +253,9 @@ func (s *Server) Start() error {
 	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
 		s.port = tcpAddr.Port
 		s.secMid.SetPort(s.port)
+		if s.webAuthnH != nil {
+			s.webAuthnH.SetPort(s.port)
+		}
 	}
 
 	s.running = true

@@ -142,7 +142,7 @@ func (h *SecurityGateHandler) DecideGateRequest(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Write to security_gate_audit_log (gate-scoped) and governance_audit_log (Board action).
+	// Write to security_gate_audit_log (gate-scoped) and board_audit_log (Board action).
 	pendingStatus := string(security.GateRequestPending)
 	decidedStatus := string(gr.Status)
 	if err := governance.LogGateEvent(h.db, gr.ID, "board", "security_gate_decided",
@@ -152,9 +152,12 @@ func (h *SecurityGateHandler) DecideGateRequest(w http.ResponseWriter, r *http.R
 		http.Error(w, `{"error":"audit log write failed"}`, http.StatusInternalServerError)
 		return
 	}
-	_ = governance.LogEvent(h.db, id, "board", governance.AuditBoardAction, nil, nil,
-		map[string]string{"action": "decide_gate_request", "decision": req.Decision,
-			"ip": r.RemoteAddr, "user_agent": r.UserAgent()})
+	if err := governance.LogBoardEvent(h.db, "board", governance.AuditBoardAction,
+		map[string]string{"action": "decide_gate_request", "gate_id": id, "decision": req.Decision,
+			"ip": r.RemoteAddr, "user_agent": r.UserAgent()}); err != nil {
+		http.Error(w, `{"error":"board audit write failed"}`, http.StatusInternalServerError)
+		return
+	}
 	h.hub.Publish("security_gate_decided", map[string]any{
 		"id":       gr.ID,
 		"decision": gr.Status,
@@ -207,9 +210,12 @@ func (h *SecurityGateHandler) UpdateSecurityGateSettings(w http.ResponseWriter, 
 	if !req.MainMergeApproval {
 		action = "disabled"
 	}
-	_ = governance.LogEvent(h.db, "global", "board", governance.AuditBoardAction, nil, nil,
+	if err := governance.LogBoardEvent(h.db, "board", governance.AuditBoardAction,
 		map[string]string{"action": "update_security_gate_settings", "value": action,
-			"ip": r.RemoteAddr, "user_agent": r.UserAgent()})
+			"ip": r.RemoteAddr, "user_agent": r.UserAgent()}); err != nil {
+		http.Error(w, `{"error":"board audit write failed"}`, http.StatusInternalServerError)
+		return
+	}
 	h.hub.Publish("security_gate_settings", map[string]any{"main_merge_approval": req.MainMergeApproval})
 	writeJSON(w, map[string]any{"main_merge_approval": req.MainMergeApproval})
 }

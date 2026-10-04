@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -156,7 +157,16 @@ Run 'scripts/reinstall-daemon.sh' once after upgrading to create the file.`,
 			return fmt.Errorf("board url: unexpected response from daemon: %s", string(body))
 		}
 
-		fmt.Printf("%s/?token=%s&board_nonce=%s\n", daemonURL, authToken, result.Nonce)
+		// Emit localhost (not 127.0.0.1) so the RPID "localhost" matches the WebAuthn origin.
+		u, err := url.Parse(daemonURL)
+		if err != nil {
+			return fmt.Errorf("board url: parse daemon URL: %w", err)
+		}
+		localhostURL := "http://localhost"
+		if port := u.Port(); port != "" {
+			localhostURL = fmt.Sprintf("http://localhost:%s", port)
+		}
+		fmt.Printf("%s/?token=%s&board_nonce=%s\n", localhostURL, authToken, result.Nonce)
 		return nil
 	},
 }

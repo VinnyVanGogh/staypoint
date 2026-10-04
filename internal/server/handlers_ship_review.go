@@ -425,8 +425,11 @@ func (h *ShipReviewHandler) SetSettings(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	_ = governance.LogEvent(h.db, "global", "board", governance.AuditBoardAction, nil, nil,
-		map[string]string{"action": "set_ship_review_settings", "ip": r.RemoteAddr, "user_agent": r.UserAgent()})
+	if err := governance.LogBoardEvent(h.db, "board", governance.AuditBoardAction,
+		map[string]string{"action": "set_ship_review_settings", "ip": r.RemoteAddr, "user_agent": r.UserAgent()}); err != nil {
+		writeError(w, http.StatusInternalServerError, "audit write failed: "+err.Error())
+		return
+	}
 	h.hub.Publish("ship_review_settings", map[string]any{"ship_review": req.ShipReview})
 	writeJSON(w, map[string]any{"ship_review": req.ShipReview})
 }

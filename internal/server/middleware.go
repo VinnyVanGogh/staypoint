@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -29,6 +30,7 @@ type SecurityMiddleware struct {
 	boardToken   string // separate credential required for Board-only mutations
 	port         int    // actual bound port, if known (or 0 for any local port)
 	corsAllowAll bool   // opt-in: skip origin check and emit wildcard CORS headers
+	testMode     bool   // explicit test flag; allows cookie-only board sessions without a configured boardToken
 
 	nonceMu  sync.Mutex
 	nonce    string // one-time bootstrap nonce; zeroed after first successful use
@@ -118,6 +120,12 @@ func (sm *SecurityMiddleware) BoardToken() string { return sm.boardToken }
 // SetDB wires the database so WrapBoardAction can count registered passkeys.
 func (sm *SecurityMiddleware) SetDB(db *sql.DB) { sm.db = db }
 
+// SetTestMode enables test mode: hasBoardCookie passes on cookie presence alone,
+// without requiring a configured boardToken. Must only be called in tests.
+func (sm *SecurityMiddleware) SetTestMode(enabled bool) {
+	sm.testMode = enabled
+}
+
 // setWebAuthnVerifier replaces the WebAuthn assertion verifier (test seam).
 func (sm *SecurityMiddleware) setWebAuthnVerifier(fn func(r *http.Request, assertion string) error) {
 	sm.verifierMu.Lock()
@@ -137,10 +145,12 @@ func (sm *SecurityMiddleware) WrapBoardSession(next http.Handler) http.Handler {
 	})
 }
 
-// WrapBoardAction wraps a handler so it requires the staypoint_board session cookie plus,
-// once a passkey is registered, a valid X-WebAuthn-Assertion header. Fail-closed: once any
-// passkey is stored, cookie-only requests are rejected even if assertion verification is
-// temporarily misconfigured.
+// WrapBoardAction wraps a handler so it requires the staypoint_board session cookie plus
+// a valid X-WebAuthn-Assertion header. Fail-closed:
+//   - No passkey enrolled (count == 0) → 403 board_passkey_enrollment_required
+//   - DB error counting credentials      → 403 (treat same as not enrolled)
+//   - Passkey enrolled, no assertion     → 403 board_passkey_assertion_required
+//   - Passkey enrolled, bad assertion    → 403 board_passkey_assertion_invalid
 func (sm *SecurityMiddleware) WrapBoardAction(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !sm.hasBoardCookie(r) {
@@ -148,52 +158,61 @@ func (sm *SecurityMiddleware) WrapBoardAction(next http.Handler) http.Handler {
 			return
 		}
 
-		count := sm.credentialCount()
-		if count > 0 {
-			assertion := r.Header.Get("X-WebAuthn-Assertion")
-			if assertion == "" {
-				writeBoardError(w, "board_passkey_assertion_required", "forbidden: Board action requires a WebAuthn assertion")
-				return
-			}
-			sm.verifierMu.RLock()
-			verifier := sm.webAuthnVerifier
-			sm.verifierMu.RUnlock()
-			// Fail-closed: if no verifier is wired, reject all assertions.
-			// Tests inject a stub via SetWebAuthnVerifier; production wires the real verifier.
-			if verifier == nil {
-				writeBoardError(w, "board_passkey_verifier_unavailable", "forbidden: WebAuthn verifier not configured")
-				return
-			}
-			if err := verifier(r, assertion); err != nil {
-				writeBoardError(w, "board_passkey_assertion_invalid", "forbidden: WebAuthn assertion verification failed")
-				return
-			}
+		count, err := sm.credentialCount()
+		if err != nil || count == 0 {
+			writeBoardError(w, "board_passkey_enrollment_required", "forbidden: Board actions require an enrolled passkey; open the Board UI to register one")
+			return
+		}
+
+		assertion := r.Header.Get("X-WebAuthn-Assertion")
+		if assertion == "" {
+			writeBoardError(w, "board_passkey_assertion_required", "forbidden: Board action requires a WebAuthn assertion")
+			return
+		}
+		sm.verifierMu.RLock()
+		verifier := sm.webAuthnVerifier
+		sm.verifierMu.RUnlock()
+		// Fail-closed: if no verifier is wired, reject all assertions.
+		// Tests inject a stub via setWebAuthnVerifier; production wires the real verifier.
+		if verifier == nil {
+			writeBoardError(w, "board_passkey_verifier_unavailable", "forbidden: WebAuthn verifier not configured")
+			return
+		}
+		if err := verifier(r, assertion); err != nil {
+			writeBoardError(w, "board_passkey_assertion_invalid", "forbidden: WebAuthn assertion verification failed")
+			return
 		}
 
 		next.ServeHTTP(w, r)
 	})
 }
 
-// credentialCount returns the number of rows in board_webauthn_credentials. Returns 0 on any
-// error so the fail-open (no passkey enrolled) path remains reachable during bootstrap.
-func (sm *SecurityMiddleware) credentialCount() int {
+// credentialCount returns the number of rows in board_webauthn_credentials.
+// Returns (0, error) on DB nil or query error — callers must treat any error as fail-closed.
+func (sm *SecurityMiddleware) credentialCount() (int, error) {
 	if sm.db == nil {
-		return 0
+		return 0, fmt.Errorf("database not available")
 	}
 	var n int
-	_ = sm.db.QueryRow(`SELECT COUNT(*) FROM board_webauthn_credentials`).Scan(&n)
-	return n
+	if err := sm.db.QueryRow(`SELECT COUNT(*) FROM board_webauthn_credentials`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
-// hasBoardCookie checks whether the request carries the staypoint_board cookie.
-// When boardToken is empty (test / no credential configured), any cookie presence passes.
+// hasBoardCookie checks whether the request carries the staypoint_board cookie with the
+// correct value. In testMode (explicit flag, tests only) cookie presence alone is sufficient;
+// an empty boardToken without testMode always returns false so misconfiguration fails closed.
 func (sm *SecurityMiddleware) hasBoardCookie(r *http.Request) bool {
 	c, err := r.Cookie(boardCookieName)
 	if err != nil {
 		return false
 	}
+	if sm.testMode {
+		return true
+	}
 	if sm.boardToken == "" {
-		return true // test mode or unconfigured — cookie presence is sufficient
+		return false // misconfigured — no boardToken means no Board access
 	}
 	return subtle.ConstantTimeCompare([]byte(c.Value), []byte(sm.boardToken)) == 1
 }

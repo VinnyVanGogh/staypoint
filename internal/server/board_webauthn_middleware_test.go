@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/server"
 )
 
@@ -133,8 +134,8 @@ func TestBoardAction_NoPasskeyRegistered_Returns403(t *testing.T) {
 
 	for _, ep := range boardActionEndpoints {
 		status, code, raw := doBoard(t, srv, token, boardReq{method: ep.method, path: ep.path, body: ep.body, cookie: true})
-		if status != http.StatusForbidden || code != "board_passkey_required" {
-			t.Errorf("%s %s, cookie only, no passkey registered: want 403 board_passkey_required, got %d %s",
+		if status != http.StatusForbidden || code != "board_passkey_enrollment_required" {
+			t.Errorf("%s %s, cookie only, no passkey registered: want 403 board_passkey_enrollment_required, got %d %s",
 				ep.method, ep.path, status, strings.TrimSpace(raw))
 		}
 	}
@@ -250,4 +251,86 @@ func TestBoardActionRequiresWebAuthn(t *testing.T) {
 			t.Fatalf("assertion without board cookie: want 403, got %d %s", status, raw)
 		}
 	})
+}
+
+// seedBoardAuditLog creates the board_audit_log table if it doesn't exist (migration 22).
+func seedBoardAuditLog(t *testing.T, database *sql.DB) {
+	t.Helper()
+	if _, err := database.Exec(`CREATE TABLE IF NOT EXISTS board_audit_log (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		actor_id   TEXT NOT NULL,
+		event_type TEXT NOT NULL,
+		payload    TEXT,
+		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+	)`); err != nil {
+		t.Fatalf("create board_audit_log: %v", err)
+	}
+}
+
+// TestBoardAuditLog_WrittenOnBoardAction verifies that a successful Board action
+// writes a row to board_audit_log and that the row is readable back.
+func TestBoardAuditLog_WrittenOnBoardAction(t *testing.T) {
+	database := setupTestDB(t)
+	seedBoardAuditLog(t, database)
+	seedBoardWebAuthnCredential(t, database)
+	srv, token := startTestServer(t, database)
+
+	setter, ok := any(srv).(webAuthnVerifierSetter)
+	if !ok {
+		t.Fatal("*server.Server must implement SetWebAuthnVerifier")
+	}
+	setter.SetWebAuthnVerifier(func(*http.Request, string) error { return nil })
+
+	// Before: no audit rows.
+	var before int
+	_ = database.QueryRow(`SELECT COUNT(*) FROM board_audit_log`).Scan(&before)
+
+	doBoard(t, srv, token, boardReq{
+		method:    "POST",
+		path:      "/api/settings/ship-review",
+		body:      `{"ship_review":true}`,
+		cookie:    true,
+		assertion: "mock-assertion",
+	})
+
+	var after int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM board_audit_log`).Scan(&after); err != nil {
+		t.Fatalf("count board_audit_log: %v", err)
+	}
+	if after <= before {
+		t.Errorf("expected audit row after Board action, got %d rows (was %d)", after, before)
+	}
+}
+
+// TestBoardAuditLog_LogBoardEvent_ReadBack verifies that governance.LogBoardEvent
+// writes and the row can be read back with the correct fields.
+func TestBoardAuditLog_LogBoardEvent_ReadBack(t *testing.T) {
+	database := setupTestDB(t)
+	seedBoardAuditLog(t, database)
+
+	payload := map[string]string{"action": "test_event", "ip": "127.0.0.1"}
+	if err := governance.LogBoardEvent(database, "board", governance.AuditBoardAction, payload); err != nil {
+		t.Fatalf("LogBoardEvent: %v", err)
+	}
+
+	var id int64
+	var actorID, eventType, payloadJSON string
+	var createdAt string
+	if err := database.QueryRow(
+		`SELECT id, actor_id, event_type, payload, created_at FROM board_audit_log ORDER BY id DESC LIMIT 1`,
+	).Scan(&id, &actorID, &eventType, &payloadJSON, &createdAt); err != nil {
+		t.Fatalf("read board_audit_log row: %v", err)
+	}
+	if actorID != "board" {
+		t.Errorf("actor_id: want %q, got %q", "board", actorID)
+	}
+	if eventType != governance.AuditBoardAction {
+		t.Errorf("event_type: want %q, got %q", governance.AuditBoardAction, eventType)
+	}
+	if !strings.Contains(payloadJSON, "test_event") {
+		t.Errorf("payload JSON missing expected content, got: %s", payloadJSON)
+	}
+	if createdAt == "" {
+		t.Error("created_at is empty")
+	}
 }

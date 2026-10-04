@@ -35,6 +35,7 @@ type WebAuthnHandler struct {
 	hub      *EventHub
 	wa       *webauthn.WebAuthn
 	waInitMu sync.Mutex
+	port     int // daemon TCP port; used for fixed RPID origin
 
 	pairingMu   sync.Mutex
 	pairingCode string
@@ -52,28 +53,31 @@ func NewWebAuthnHandler(db *sql.DB, hub *EventHub) *WebAuthnHandler {
 	}
 }
 
-// initWebAuthn lazily creates the webauthn.WebAuthn instance from the request's Host header.
-func (h *WebAuthnHandler) initWebAuthn(r *http.Request) (*webauthn.WebAuthn, error) {
+// SetPort updates the port and resets the WebAuthn instance so initWebAuthn
+// will recreate it with the correct origin on the next call.
+func (h *WebAuthnHandler) SetPort(port int) {
+	h.waInitMu.Lock()
+	defer h.waInitMu.Unlock()
+	h.port = port
+	h.wa = nil // force re-init with correct origin
+}
+
+// initWebAuthn returns the webauthn.WebAuthn instance, creating it if needed.
+// RPID is always "localhost" (never an IP); origin is http://localhost:<port>.
+func (h *WebAuthnHandler) initWebAuthn() (*webauthn.WebAuthn, error) {
 	h.waInitMu.Lock()
 	defer h.waInitMu.Unlock()
 	if h.wa != nil {
 		return h.wa, nil
 	}
-	host := r.Host
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	rpid := host
-	for i := len(host) - 1; i >= 0; i-- {
-		if host[i] == ':' {
-			rpid = host[:i]
-			break
-		}
+	origin := "http://localhost"
+	if h.port > 0 {
+		origin = fmt.Sprintf("http://localhost:%d", h.port)
 	}
 	wa, err := webauthn.New(&webauthn.Config{
 		RPDisplayName: "StayPoint Board",
-		RPID:          rpid,
-		RPOrigins:     []string{"http://" + host},
+		RPID:          "localhost",
+		RPOrigins:     []string{origin},
 	})
 	if err != nil {
 		return nil, err
@@ -129,7 +133,7 @@ func (h *WebAuthnHandler) Status(w http.ResponseWriter, r *http.Request) {
 
 // RegisterBegin handles POST /api/board/webauthn/register/begin
 func (h *WebAuthnHandler) RegisterBegin(w http.ResponseWriter, r *http.Request) {
-	wa, err := h.initWebAuthn(r)
+	wa, err := h.initWebAuthn()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "webauthn init: "+err.Error())
 		return
@@ -150,7 +154,11 @@ func (h *WebAuthnHandler) RegisterBegin(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Issue pairing code via macOS notification.
-	n, _ := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	n, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "pairing code generation failed")
+		return
+	}
 	code := fmt.Sprintf("%06d", n.Int64())
 	h.pairingMu.Lock()
 	h.pairingCode = code
@@ -161,6 +169,9 @@ func (h *WebAuthnHandler) RegisterBegin(w http.ResponseWriter, r *http.Request) 
 	).Run() //nolint:errcheck
 
 	user := h.loadUser()
+	// Residual risk: attestation statements are requested but not cryptographically
+	// verified against a trusted AAGUID list. The macOS notification pairing code is
+	// the sole anti-automation barrier during first enrollment.
 	options, sessionData, err := wa.BeginRegistration(user,
 		webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
 			AuthenticatorAttachment: protocol.Platform,
@@ -186,7 +197,7 @@ func (h *WebAuthnHandler) RegisterBegin(w http.ResponseWriter, r *http.Request) 
 
 // RegisterFinish handles POST /api/board/webauthn/register/finish
 func (h *WebAuthnHandler) RegisterFinish(w http.ResponseWriter, r *http.Request) {
-	wa, err := h.initWebAuthn(r)
+	wa, err := h.initWebAuthn()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "webauthn init: "+err.Error())
 		return
@@ -246,15 +257,19 @@ func (h *WebAuthnHandler) RegisterFinish(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	_ = governance.LogEvent(h.db, "board", "board", governance.AuditPasskeyEvent, nil, nil,
-		map[string]string{"action": "register", "credential_id": credIDHex})
+	if err := governance.LogBoardEvent(h.db, "board", governance.AuditPasskeyEvent,
+		map[string]string{"action": "register", "credential_id": credIDHex,
+			"ip": r.RemoteAddr, "user_agent": r.UserAgent()}); err != nil {
+		writeError(w, http.StatusInternalServerError, "audit write failed: "+err.Error())
+		return
+	}
 	h.hub.Publish("board_passkey_registered", map[string]string{"credential_id": credIDHex})
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
 // Challenge handles POST /api/board/webauthn/challenge — mints a one-time assertion challenge.
 func (h *WebAuthnHandler) Challenge(w http.ResponseWriter, r *http.Request) {
-	wa, err := h.initWebAuthn(r)
+	wa, err := h.initWebAuthn()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "webauthn init: "+err.Error())
 		return
@@ -266,7 +281,9 @@ func (h *WebAuthnHandler) Challenge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	options, sessionData, err := wa.BeginLogin(user)
+	options, sessionData, err := wa.BeginLogin(user,
+		webauthn.WithUserVerification(protocol.VerificationRequired),
+	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "begin login: "+err.Error())
 		return
@@ -285,7 +302,7 @@ func (h *WebAuthnHandler) Challenge(w http.ResponseWriter, r *http.Request) {
 // VerifyAssertion is the default production verifier wired into WrapBoardAction.
 // It calls go-webauthn FinishLogin for full cryptographic assertion verification.
 func (h *WebAuthnHandler) VerifyAssertion(r *http.Request, assertion string) error {
-	wa, err := h.initWebAuthn(r)
+	wa, err := h.initWebAuthn()
 	if err != nil {
 		return fmt.Errorf("webauthn init: %w", err)
 	}
@@ -368,9 +385,12 @@ func (h *WebAuthnHandler) DeleteCredential(w http.ResponseWriter, r *http.Reques
 	}
 
 	credIDHex := fmt.Sprintf("%x", credentialID)
-	_ = governance.LogEvent(h.db, "board", "board", governance.AuditPasskeyEvent, nil, nil,
+	if err := governance.LogBoardEvent(h.db, "board", governance.AuditPasskeyEvent,
 		map[string]string{"action": "delete", "credential_id": credIDHex,
-			"ip": r.RemoteAddr, "user_agent": r.UserAgent()})
+			"ip": r.RemoteAddr, "user_agent": r.UserAgent()}); err != nil {
+		writeError(w, http.StatusInternalServerError, "audit write failed: "+err.Error())
+		return
+	}
 	h.hub.Publish("board_passkey_deleted", map[string]string{"credential_id": credIDHex})
 	writeJSON(w, map[string]string{"status": "ok"})
 }

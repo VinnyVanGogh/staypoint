@@ -76,6 +76,26 @@ func LogGateEvent(db *sql.DB, gateID, actorID, eventType string, fromStatus, toS
 	return err
 }
 
+// LogBoardEvent writes a Board action or passkey event to board_audit_log.
+// This table has no foreign-key constraint to tasks, so it accepts arbitrary actor IDs
+// such as "board", "global", or WebAuthn credential identifiers.
+func LogBoardEvent(db *sql.DB, actorID, eventType string, payload any) error {
+	var payloadJSON *string
+	if payload != nil {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("governance: marshal board audit payload: %w", err)
+		}
+		s := string(b)
+		payloadJSON = &s
+	}
+	_, err := db.Exec(
+		`INSERT INTO board_audit_log (actor_id, event_type, payload) VALUES (?, ?, ?)`,
+		actorID, eventType, payloadJSON,
+	)
+	return err
+}
+
 // ListGateAuditLog returns all audit events for a given gate request ID.
 func ListGateAuditLog(db *sql.DB, gateID string) ([]map[string]any, error) {
 	rows, err := db.Query(

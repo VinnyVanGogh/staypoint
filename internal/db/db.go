@@ -978,6 +978,27 @@ var Migrations = []Migration{
 			return err
 		},
 	},
+	{
+		Version: 22,
+		Name:    "board_audit_log",
+		Up: func(conn *sql.DB) error {
+			for _, stmt := range []string{
+				`CREATE TABLE IF NOT EXISTS board_audit_log (
+					id         INTEGER PRIMARY KEY AUTOINCREMENT,
+					actor_id   TEXT NOT NULL,
+					event_type TEXT NOT NULL,
+					payload    TEXT,
+					created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+				);`,
+				`CREATE INDEX IF NOT EXISTS idx_bal_event ON board_audit_log(event_type, created_at DESC);`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {
