@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -118,7 +119,12 @@ func (sm *SecurityMiddleware) consumeNonce(n string) bool {
 func (sm *SecurityMiddleware) BoardToken() string { return sm.boardToken }
 
 // SetDB wires the database so WrapBoardAction can count registered passkeys.
-func (sm *SecurityMiddleware) SetDB(db *sql.DB) { sm.db = db }
+func (sm *SecurityMiddleware) SetDB(db *sql.DB) {
+	if db != nil && sm.boardToken == "" {
+		log.Printf("[warn] SecurityMiddleware: board DB wired but boardToken is empty; board actions will be denied (403) until boardToken is configured")
+	}
+	sm.db = db
+}
 
 // SetTestMode enables test mode: hasBoardCookie passes on cookie presence alone,
 // without requiring a configured boardToken. Must only be called in tests.
