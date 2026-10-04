@@ -685,7 +685,10 @@ func startDevServerSync(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath 
 		if ctx.Err() == nil {
 			return false
 		}
+		// A killed `worktree add` can leave a directory git never
+		// registered, which `worktree remove` alone would keep.
 		removeDevWorktree(repoPath, wtPath)
+		_ = os.RemoveAll(wtPath)
 		return true
 	}
 	if canceled() {
@@ -1046,7 +1049,8 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 	var errs []error
 
 	if localTip != "" {
-		if _, err := gitOutput(ctx, repoDir, "branch", "-D", branch); err != nil {
+		// Like the remote lease: only delete the tip that was checked.
+		if _, err := gitOutput(ctx, repoDir, "update-ref", "-d", "refs/heads/"+branch, localTip); err != nil {
 			errs = append(errs, fmt.Errorf("delete local branch: %w", err))
 		}
 	}
