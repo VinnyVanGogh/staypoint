@@ -3946,6 +3946,8 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 }
 .ship-review-repin-btn:hover { background: rgba(248,196,54,.25); }
 .ship-review-repin-btn:disabled { opacity: .5; cursor: default; }
+.ship-review-branch-deleted { color: var(--green, #3fb950); font-weight: 600; }
+.ship-review-branch-warning { margin-top: 8px; overflow-wrap: anywhere; }
 .ship-review-inline-form {
   display: flex;
   flex-direction: column;

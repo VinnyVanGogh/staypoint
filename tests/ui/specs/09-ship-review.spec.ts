@@ -367,6 +367,58 @@ test.describe('ship review card', () => {
     cleanup();
   });
 
+
+  // ── STA-637: branch delete failure is a non-blocking warning with Retry ───
+  test('Approve with failed branch delete shows warning; Retry shows Branch deleted', async ({ boardPage: page, request }) => {
+    const { task, cleanup } = await createShipReviewTask(request, 'Branch delete warning');
+    const upsert = await upsertShipReview(request, task.id);
+    expect(upsert.ok(), `upsert failed: ${await upsert.text()}`).toBeTruthy();
+
+    await gotoTaskPage(page, task);
+    const card = page.locator('.ship-review-card');
+    await expect(card).toBeVisible({ timeout: 10_000 });
+
+    const deleteError = 'git push origin --delete: remote rejected';
+    await page.route('**/ship-review/approve', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          main_sha: 'cafef00dcafef00d',
+          branch_deleted: false,
+          branch_delete_error: deleteError,
+          warning: `merged; branch delete failed: ${deleteError}`,
+          card: { status: 'approved', branch_deleted: false, branch_delete_error: deleteError },
+        }),
+      });
+    });
+    let retryCalls = 0;
+    await page.route('**/ship-review/delete-branch', async (route) => {
+      retryCalls++;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ branch_deleted: true, card: { status: 'approved', branch_deleted: true } }),
+      });
+    });
+
+    await card.getByRole('button', { name: /Approve/i }).click();
+    await card.getByRole('button', { name: /Merge to main/i }).click();
+
+    // Merge stands: final approved card, plus the non-blocking warning.
+    const finalCard = page.locator('.ship-review-card--final');
+    await expect(finalCard.locator('.ship-review-status-badge')).toContainText(/Approved/i, { timeout: 5_000 });
+    const warning = finalCard.locator('.ship-review-branch-warning');
+    await expect(warning).toContainText(`merged; branch delete failed: ${deleteError}`);
+    await expect(finalCard).not.toContainText('Branch deleted');
+
+    await warning.getByRole('button', { name: /Retry/i }).click();
+    await expect(page.locator('.ship-review-card--final .ship-review-branch-deleted')).toHaveText('Branch deleted', { timeout: 5_000 });
+    await expect(page.locator('.ship-review-branch-warning')).toHaveCount(0);
+    expect(retryCalls).toBe(1);
+    cleanup();
+  });
+
   });
 
   // ── Negative: no passkey enrolled → enrollment prompt, action NOT performed ─
@@ -494,6 +546,38 @@ test.describe('ship review card', () => {
     await confirmForm.getByRole('button', { name: /Merge to main/i }).click();
     await expect(page.locator('.ship-review-card--final')).toBeVisible({ timeout: 5_000 });
     expect(approveCallCount).toBe(1);
+    cleanup();
+  });
+
+  // ── STA-637: real Approve & merge deletes the task branch ─────────────────
+  // Not route-faked: the real server merges into the bare remote and deletes
+  // staypoint/<taskId> there, and the final card reports it.
+  test('Approve & merge deletes the task branch and the final card shows Branch deleted', async ({ boardPage: page, request }) => {
+    const { task, repoDir, cleanup } = await createShipReviewTask(request, 'Approve deletes branch');
+    const upsert = await upsertShipReview(request, task.id);
+    expect(upsert.ok(), `upsert failed: ${await upsert.text()}`).toBeTruthy();
+
+    const branch = `staypoint/${task.id}`;
+    const bare = execFileSync('git', ['-C', repoDir, 'remote', 'get-url', 'origin']).toString().trim();
+    const remoteBranches = () => execFileSync('git', ['-C', bare, 'branch', '--list', branch]).toString().trim();
+    expect(remoteBranches()).not.toBe('');
+
+    await gotoTaskPage(page, task);
+    const card = page.locator('.ship-review-card');
+    await expect(card).toBeVisible({ timeout: 10_000 });
+
+    await card.getByRole('button', { name: /Approve/i }).click();
+    await card.getByRole('button', { name: /Merge to main/i }).click();
+
+    const finalCard = page.locator('.ship-review-card--final');
+    await expect(finalCard.locator('.ship-review-status-badge')).toContainText(/Approved/i, { timeout: 15_000 });
+    await expect(finalCard.locator('.ship-review-branch-deleted')).toHaveText('Branch deleted');
+    await expect(finalCard).toContainText(branch);
+    expect(remoteBranches()).toBe('');
+
+    // Survives a reload: the outcome is persisted on the card.
+    await page.reload();
+    await expect(page.locator('.ship-review-card--final .ship-review-branch-deleted')).toHaveText('Branch deleted', { timeout: 10_000 });
     cleanup();
   });
 

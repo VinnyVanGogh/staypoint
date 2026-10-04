@@ -10,6 +10,7 @@ package server_test
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -308,5 +309,196 @@ func TestShipReview_ApproveMovesTaskToDone(t *testing.T) {
 	}
 	if taskResp.Task.ExecutionStage != "done" {
 		t.Errorf("want execution_stage=done, got %q", taskResp.Task.ExecutionStage)
+	}
+}
+
+// ── STA-637: delete the task branch after Approve & merge ──────────────────
+
+// shipApproveServer starts a server whose Board passkey check always passes,
+// creates a ship task with a real bare remote, and upserts its card.
+func shipApproveServer(t *testing.T) (database *sql.DB, baseURL, token, boardToken, taskID, repoDir string, client *http.Client) {
+	t.Helper()
+	database = setupTestDB(t)
+	seedBoardWebAuthnCredential(t, database)
+	srv, token := startTestServer(t, database)
+	setter, ok := any(srv).(webAuthnVerifierSetter)
+	if !ok {
+		t.Fatal("*server.Server must implement SetWebAuthnVerifier")
+	}
+	setter.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
+	baseURL = srv.URL()
+	boardToken = srv.BoardToken()
+	client = &http.Client{}
+
+	taskID, repoDir = createShipTask(t, baseURL, token, client)
+	upsertBody, _ := json.Marshal(map[string]any{"test_steps": []string{"1. Open /"}})
+	resp, rb := shipDoReq(t, client, token, "PUT", baseURL+"/api/tasks/"+taskID+"/ship-review", upsertBody)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("UpsertCard: %d %s", resp.StatusCode, rb)
+	}
+	return database, baseURL, token, boardToken, taskID, repoDir, client
+}
+
+type approveResult struct {
+	MainSHA           string `json:"main_sha"`
+	BranchDeleted     bool   `json:"branch_deleted"`
+	BranchDeleteError string `json:"branch_delete_error"`
+	Warning           string `json:"warning"`
+	Card              struct {
+		Status            string `json:"status"`
+		BranchDeleted     bool   `json:"branch_deleted"`
+		BranchDeleteError string `json:"branch_delete_error"`
+	} `json:"card"`
+}
+
+func gitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func lastBoardAudit(t *testing.T, database *sql.DB, action string) map[string]any {
+	t.Helper()
+	rows, err := database.Query(`SELECT payload FROM board_audit_log ORDER BY id DESC`)
+	if err != nil {
+		t.Fatalf("query board_audit_log: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if json.Unmarshal([]byte(payload), &m) == nil && m["action"] == action {
+			return m
+		}
+	}
+	t.Fatalf("no board_audit_log row with action %q", action)
+	return nil
+}
+
+// TestShipReview_ApproveDeletesTaskBranch: a successful Approve & merge deletes
+// the task branch from the remote and locally, and records branch_deleted in
+// the response, on the card, and in board_audit_log.
+func TestShipReview_ApproveDeletesTaskBranch(t *testing.T) {
+	database, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	branch := "staypoint/" + taskID
+	bare := gitOut(t, repoDir, "remote", "get-url", "origin")
+
+	resp, rb := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", nil, boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Approve: %d %s", resp.StatusCode, rb)
+	}
+	var res approveResult
+	if err := json.Unmarshal(rb, &res); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !res.BranchDeleted || !res.Card.BranchDeleted || res.Warning != "" {
+		t.Fatalf("want branch_deleted=true and no warning, got %s", rb)
+	}
+
+	if out := gitOut(t, bare, "branch", "--list", branch); out != "" {
+		t.Errorf("branch %q still on remote: %q", branch, out)
+	}
+	if out := gitOut(t, repoDir, "branch", "--list", branch); out != "" {
+		t.Errorf("branch %q still local: %q", branch, out)
+	}
+	// The merge itself landed on the remote main.
+	if got := gitOut(t, bare, "rev-parse", "main"); got != res.MainSHA {
+		t.Errorf("remote main = %s, want %s", got, res.MainSHA)
+	}
+
+	audit := lastBoardAudit(t, database, "approve")
+	if audit["branch_deleted"] != true || audit["branch"] != branch {
+		t.Errorf("board_audit_log approve row = %v, want branch_deleted=true branch=%s", audit, branch)
+	}
+}
+
+// TestShipReview_ApproveBranchDeleteFailureStillMerges: when the remote refuses
+// the delete, Approve still returns 200 with the merge in place and a warning;
+// the Board's retry then deletes the branch.
+func TestShipReview_ApproveBranchDeleteFailureStillMerges(t *testing.T) {
+	database, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	branch := "staypoint/" + taskID
+	bare := gitOut(t, repoDir, "remote", "get-url", "origin")
+
+	// The remote accepts pushes but refuses branch deletions.
+	hook := filepath.Join(bare, "hooks", "pre-receive")
+	script := "#!/bin/sh\nwhile read old new ref; do\n  case $new in 0000000000000000000000000000000000000000) echo \"deletes disabled\" >&2; exit 1;; esac\ndone\n"
+	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, rb := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", nil, boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Approve must succeed when only the branch delete fails: %d %s", resp.StatusCode, rb)
+	}
+	var res approveResult
+	if err := json.Unmarshal(rb, &res); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if res.BranchDeleted || res.Card.BranchDeleted {
+		t.Fatalf("want branch_deleted=false, got %s", rb)
+	}
+	if !strings.HasPrefix(res.Warning, "merged; branch delete failed: ") || res.Card.BranchDeleteError == "" {
+		t.Errorf("want merged-with-warning response, got %s", rb)
+	}
+	if res.Card.Status != "approved" {
+		t.Errorf("card status = %q, want approved (merge must not roll back)", res.Card.Status)
+	}
+	if got := gitOut(t, bare, "rev-parse", "main"); got != res.MainSHA {
+		t.Errorf("remote main = %s, want merged %s", got, res.MainSHA)
+	}
+	if out := gitOut(t, bare, "branch", "--list", branch); out == "" {
+		t.Error("remote branch vanished although the delete was refused")
+	}
+	if audit := lastBoardAudit(t, database, "approve"); audit["branch_deleted"] != false || audit["branch_delete_error"] == "" {
+		t.Errorf("board_audit_log approve row = %v, want branch_deleted=false with error", audit)
+	}
+
+	// Retry while the remote still refuses: 409, merge untouched.
+	retryURL := baseURL + "/api/tasks/" + taskID + "/ship-review/delete-branch"
+	resp2, rb2 := shipDoReq(t, client, token, "POST", retryURL, nil, boardToken, "", "mock-assertion")
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("retry with failing remote: want 409, got %d %s", resp2.StatusCode, rb2)
+	}
+
+	// Remote fixed: retry succeeds and the branch is gone.
+	if err := os.Remove(hook); err != nil {
+		t.Fatal(err)
+	}
+	resp3, rb3 := shipDoReq(t, client, token, "POST", retryURL, nil, boardToken, "", "mock-assertion")
+	if resp3.StatusCode != http.StatusOK {
+		t.Fatalf("retry: %d %s", resp3.StatusCode, rb3)
+	}
+	var res3 approveResult
+	_ = json.Unmarshal(rb3, &res3)
+	if !res3.BranchDeleted || !res3.Card.BranchDeleted || res3.Card.BranchDeleteError != "" {
+		t.Errorf("retry: want branch_deleted=true with error cleared, got %s", rb3)
+	}
+	if out := gitOut(t, bare, "branch", "--list", branch); out != "" {
+		t.Errorf("branch %q still on remote after retry", branch)
+	}
+	if audit := lastBoardAudit(t, database, "delete_branch_retry"); audit["branch_deleted"] != true {
+		t.Errorf("board_audit_log retry row = %v, want branch_deleted=true", audit)
+	}
+}
+
+// TestShipReview_DeleteBranchRequiresApprovedCard: the retry endpoint never
+// deletes a branch whose review is still open.
+func TestShipReview_DeleteBranchRequiresApprovedCard(t *testing.T) {
+	_, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	bare := gitOut(t, repoDir, "remote", "get-url", "origin")
+
+	resp, rb := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/delete-branch", nil, boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("pending card: want 409, got %d %s", resp.StatusCode, rb)
+	}
+	if out := gitOut(t, bare, "branch", "--list", "staypoint/"+taskID); out == "" {
+		t.Error("branch deleted while review still open")
 	}
 }

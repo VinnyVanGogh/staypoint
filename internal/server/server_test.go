@@ -1403,6 +1403,7 @@ func TestServer_BoardToken_Required(t *testing.T) {
 		{"POST", "/api/tasks/" + taskID + "/ship-review/approve", ""},
 		{"POST", "/api/tasks/" + taskID + "/ship-review/send-back", `{"comment":"test"}`},
 		{"POST", "/api/tasks/" + taskID + "/ship-review/reject", `{"comment":"test"}`},
+		{"POST", "/api/tasks/" + taskID + "/ship-review/delete-branch", ""},
 		{"POST", "/api/security/gate-requests/nonexistent-id/decide", `{"decision":"approved"}`},
 		{"POST", "/api/settings/security-gate", `{"main_merge_approval":true}`},
 		{"POST", "/api/settings/ship-review", `{"ship_review":true}`},

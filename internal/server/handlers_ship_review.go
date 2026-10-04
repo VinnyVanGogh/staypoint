@@ -319,17 +319,98 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 	_ = context.AddWorkProduct(h.db, taskID, "commit", mainSHA)
 	_ = context.MarkTaskDone(h.db, taskID)
 
+	// STA-637: the task branch is kept while the review is open and deleted
+	// once merged. A failed delete never undoes the merge; the Board retries
+	// from the final card via POST .../ship-review/delete-branch.
+	deleteErr := h.cleanupMergedBranch(r, card, task, mainSHA)
+
 	_ = governance.LogEvent(h.db, taskID, "board", governance.AuditBoardAction, nil, nil,
-		map[string]string{"action": "approve", "ip": r.RemoteAddr, "user_agent": r.UserAgent()})
+		map[string]any{"action": "approve", "ip": r.RemoteAddr, "user_agent": r.UserAgent(),
+			"branch": card.Branch, "branch_deleted": deleteErr == "", "branch_delete_error": deleteErr})
+	_ = governance.LogBoardEvent(h.db, "board", governance.AuditBoardAction,
+		branchAuditPayload(r, "approve", taskID, card.Branch, mainSHA, deleteErr))
 
 	h.hub.Publish("ship_review_approved", map[string]any{
-		"task_id":      taskID,
-		"approved_sha": card.HeadSHA,
-		"main_sha":     mainSHA,
+		"task_id":        taskID,
+		"approved_sha":   card.HeadSHA,
+		"main_sha":       mainSHA,
+		"branch_deleted": deleteErr == "",
 	})
 
 	refreshed, _ := shipreview.GetCard(h.db, taskID)
-	writeJSON(w, map[string]any{"card": refreshed, "main_sha": mainSHA})
+	resp := map[string]any{"card": refreshed, "main_sha": mainSHA, "branch_deleted": deleteErr == ""}
+	if deleteErr != "" {
+		resp["branch_delete_error"] = deleteErr
+		resp["warning"] = "merged; branch delete failed: " + deleteErr
+	}
+	writeJSON(w, resp)
+}
+
+// DeleteMergedBranch handles POST /api/tasks/{id}/ship-review/delete-branch
+// (Board action): retries the post-merge branch cleanup when Approve could
+// merge but not delete the branch. A no-op once the branch is gone.
+func (h *ShipReviewHandler) DeleteMergedBranch(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	card, task, ok := h.requireCard(w, taskID)
+	if !ok {
+		return
+	}
+	if card.Status != shipreview.StatusApproved || card.MainSHA == "" {
+		writeError(w, http.StatusConflict, "card is not approved and merged")
+		return
+	}
+	if card.BranchDeleted {
+		writeJSON(w, map[string]any{"card": card, "main_sha": card.MainSHA, "branch_deleted": true})
+		return
+	}
+
+	deleteErr := h.cleanupMergedBranch(r, card, task, card.MainSHA)
+	_ = governance.LogBoardEvent(h.db, "board", governance.AuditBoardAction,
+		branchAuditPayload(r, "delete_branch_retry", taskID, card.Branch, card.MainSHA, deleteErr))
+	h.hub.Publish("ship_review_branch_cleanup", map[string]any{
+		"task_id":        taskID,
+		"branch_deleted": deleteErr == "",
+	})
+
+	refreshed, _ := shipreview.GetCard(h.db, taskID)
+	resp := map[string]any{"card": refreshed, "main_sha": card.MainSHA, "branch_deleted": deleteErr == ""}
+	if deleteErr != "" {
+		resp["error"] = "branch_delete_failed"
+		resp["branch_delete_error"] = deleteErr
+		resp["warning"] = "merged; branch delete failed: " + deleteErr
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+	writeJSON(w, resp)
+}
+
+// cleanupMergedBranch deletes the merged task branch and records the outcome
+// on the card. Returns the failure message, or "" when the branch is gone.
+func (h *ShipReviewHandler) cleanupMergedBranch(r *http.Request, card *shipreview.Card, task *context.Task, mainSHA string) string {
+	// Detach from the request so a closed browser tab can't abort the git
+	// commands halfway through.
+	ctx := gocontext.WithoutCancel(r.Context())
+	errMsg := ""
+	if err := shipreview.CleanupMergedBranch(ctx, task.RepoPath, card, mainSHA); err != nil {
+		errMsg = err.Error()
+	}
+	_ = shipreview.SetBranchCleanup(h.db, card.ID, errMsg == "", errMsg)
+	return errMsg
+}
+
+func branchAuditPayload(r *http.Request, action, taskID, branch, mainSHA, deleteErr string) map[string]any {
+	return map[string]any{
+		"action":              action,
+		"task_id":             taskID,
+		"branch":              branch,
+		"main_sha":            mainSHA,
+		"branch_deleted":      deleteErr == "",
+		"branch_delete_error": deleteErr,
+		"ip":                  r.RemoteAddr,
+		"user_agent":          r.UserAgent(),
+	}
 }
 
 // SendBack handles POST /api/tasks/{id}/ship-review/send-back (Board action)
