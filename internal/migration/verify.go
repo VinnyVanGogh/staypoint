@@ -67,7 +67,9 @@ var (
 
 	reAddColumn = regexp.MustCompile(`(?is)ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+(?:\.\w+)?)\s+ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s`)
 
-	reCreatePolicy = regexp.MustCompile(`(?is)CREATE\s+POLICY\s+(\w+)\s+ON\s+(\w+(?:\.\w+)?)`)
+	// reCreatePolicy matches both unquoted (cv_select) and double-quoted
+	// ("Public can view active corporate values") policy names.
+	reCreatePolicy = regexp.MustCompile(`(?is)CREATE\s+POLICY\s+("(?:[^"]|"")*"|\w+)\s+ON\s+(\w+(?:\.\w+)?)`)
 
 	reEnableRLS = regexp.MustCompile(`(?is)ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+(?:\.\w+)?)\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY`)
 
@@ -78,6 +80,10 @@ var (
 	reCreateIndex = regexp.MustCompile(`(?is)CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+(?:\.\w+)?)`)
 
 	reInsertValues = regexp.MustCompile(`(?is)INSERT\s+INTO\s+(\w+(?:\.\w+)?)\s*\(([^)]+)\)\s*VALUES\s*(.+?)(?:;|$)`)
+
+	// reInsertSelectValues handles: INSERT INTO t (cols) SELECT … FROM (VALUES …) AS alias(cols)
+	// Groups: 1=table, 2=VALUES block, 3=alias column list.
+	reInsertSelectValues = regexp.MustCompile(`(?is)INSERT\s+INTO\s+(\w+(?:\.\w+)?)\s*\([^)]+\)\s*SELECT\s+.+?\bFROM\s*\(\s*VALUES\s*(.+?)\)\s*AS\s+\w+\s*\(([^)]+)\)`)
 )
 
 // qualifyTable returns a schema-qualified table name.
@@ -138,16 +144,24 @@ func ParseChecks(sql string) []Check {
 	}
 
 	// CREATE POLICY
+	// pg_policies.policyname stores unquoted names lowercased and quoted names
+	// with their original case, so we preserve case for quoted identifiers.
 	for _, m := range reCreatePolicy.FindAllStringSubmatch(stripped, -1) {
-		policy := strings.ToLower(m[1])
+		var policy string
+		if strings.HasPrefix(m[1], `"`) {
+			policy = unquoteIdent(m[1])
+		} else {
+			policy = strings.ToLower(m[1])
+		}
 		tbl := qualifyTable(m[2])
 		schema, table := schemaTable(tbl)
+		escapedPolicy := strings.ReplaceAll(policy, "'", "''")
 		add(Check{
 			Kind:        KindPolicy,
 			Description: fmt.Sprintf("policy %s on %s exists", policy, tbl),
 			SQL: fmt.Sprintf(
 				"SELECT EXISTS(SELECT 1 FROM pg_policies WHERE schemaname='%s' AND tablename='%s' AND policyname='%s') AS ok",
-				schema, table, policy,
+				schema, table, escapedPolicy,
 			),
 		})
 	}
@@ -263,6 +277,52 @@ func ParseChecks(sql string) []Check {
 		}
 	}
 
+	// INSERT INTO … SELECT … FROM (VALUES …) AS alias(cols)
+	// Seed rows written with the SELECT/VALUES form (e.g. with WHERE NOT EXISTS guard).
+	for _, m := range reInsertSelectValues.FindAllStringSubmatch(stripped, -1) {
+		tbl := qualifyTable(m[1])
+		valuesBlock := m[2]
+		colsRaw := m[3]
+
+		tuples := countValueTuples(valuesBlock)
+		if tuples == 0 {
+			continue
+		}
+
+		keyCol := pickKeyColumn(colsRaw)
+		if keyCol != "" && safeIdentRe.MatchString(keyCol) {
+			keys := extractKeyValues(colsRaw, keyCol, valuesBlock)
+			if len(keys) > 0 {
+				inList := buildInList(keys)
+				schema, table := schemaTable(tbl)
+				if s, tb, ok := safeQualified(schema, table); ok {
+					add(Check{
+						Kind:        KindRows,
+						Description: fmt.Sprintf("seed rows in %s (%s IN (%s))", tbl, keyCol, truncateList(inList, 60)),
+						SQL: fmt.Sprintf(
+							"SELECT COUNT(*)>=%d AS ok FROM %s.%s WHERE %s IN (%s)",
+							len(keys), quoteIdent(s), quoteIdent(tb), quoteIdent(keyCol), inList,
+						),
+					})
+					continue
+				}
+			}
+		}
+
+		// Fallback: row-count check
+		schema, table := schemaTable(tbl)
+		if s, tb, ok := safeQualified(schema, table); ok {
+			add(Check{
+				Kind:        KindRows,
+				Description: fmt.Sprintf("at least %d rows in %s", tuples, tbl),
+				SQL: fmt.Sprintf(
+					"SELECT COUNT(*) >= %d AS ok FROM %s.%s",
+					tuples, quoteIdent(s), quoteIdent(tb),
+				),
+			})
+		}
+	}
+
 	return checks
 }
 
@@ -318,7 +378,7 @@ func pickKeyColumn(colsRaw string) string {
 	cols := splitColumns(colsRaw)
 	for _, c := range cols {
 		lower := strings.ToLower(strings.TrimSpace(c))
-		if lower == "key" || lower == "name" || lower == "slug" || lower == "code" {
+		if lower == "key" || lower == "name" || lower == "slug" || lower == "code" || lower == "title" {
 			return lower
 		}
 	}
