@@ -93,7 +93,10 @@ func EvaluateSprint(ctx context.Context, dbConn *sql.DB, sprint string, opts Eva
 	if sprint == "" {
 		sprint = "STA-168"
 	}
-	commitSHA := GetGitCommitSHA(opts.RepoRoot)
+	commitSHA := opts.RunningCommit
+	if commitSHA == "" {
+		commitSHA = GetGitCommitSHA(opts.RepoRoot)
+	}
 
 	// Ensure checklist_items has contract & commit_hash columns
 	var contractCount int
