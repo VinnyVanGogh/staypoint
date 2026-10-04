@@ -142,6 +142,8 @@ CREATE TABLE IF NOT EXISTS ship_review_cards (
     reject_comment      TEXT,
     files_changed_json  TEXT NOT NULL DEFAULT '[]',
     check_runs_json     TEXT NOT NULL DEFAULT '[]',
+    branch_deleted      INTEGER NOT NULL DEFAULT 0,
+    branch_delete_error TEXT NOT NULL DEFAULT '',
     created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );

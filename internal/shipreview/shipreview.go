@@ -75,6 +75,11 @@ type Card struct {
 	// RunNumber is the 1-based count of ship-review cards for this task (i.e. run N).
 	// Computed at read time; not stored.
 	RunNumber      int       `json:"run_number"`
+	// BranchDeleted is set once the task branch (remote + local) and its
+	// worktrees are gone after Approve & merge (STA-637).
+	BranchDeleted bool `json:"branch_deleted"`
+	// BranchDeleteError holds the last cleanup failure; the merge still stands.
+	BranchDeleteError string `json:"branch_delete_error,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -339,6 +344,7 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 		       status, approved_sha, main_sha, send_back_comment, reject_comment,
 		       COALESCE(files_changed_json, '[]'), COALESCE(check_runs_json, '[]'),
 		       COALESCE(dev_state,''), COALESCE(dev_log_json,'[]'),
+		       COALESCE(branch_deleted,0), COALESCE(branch_delete_error,''),
 		       created_at, updated_at
 		FROM ship_review_cards
 		WHERE task_id = ?
@@ -354,6 +360,7 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 		&c.Status, &approvedSHA, &mainSHA, &sendBack, &reject,
 		&filesJSON, &checksJSON,
 		&c.DevState, &devLogJSON,
+		&c.BranchDeleted, &c.BranchDeleteError,
 		&createdAt, &updatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -783,9 +790,20 @@ func Reject(db *sql.DB, card *Card, comment string) error {
 	return err
 }
 
-// DeleteBranch deletes the remote branch for a rejected review.
+// DeleteBranch deletes the remote branch for a review.
 // It refuses to delete main, master, or the remote default branch.
 func DeleteBranch(ctx context.Context, repoDir, branch string) error {
+	if err := guardDeletableBranch(ctx, repoDir, branch); err != nil {
+		return err
+	}
+	// Use refs/heads/ form so the arg can never be misinterpreted as a flag.
+	_, err := gitOutput(ctx, repoDir, "push", "origin", "--delete", "refs/heads/"+branch)
+	return err
+}
+
+// guardDeletableBranch rejects branch names that must never be deleted:
+// malformed names, main, master, and the remote default branch.
+func guardDeletableBranch(ctx context.Context, repoDir, branch string) error {
 	if err := validateBranch(branch); err != nil {
 		return err
 	}
@@ -799,8 +817,80 @@ func DeleteBranch(ctx context.Context, repoDir, branch string) error {
 			return fmt.Errorf("%w: %q is the remote default branch", ErrProtectedBranch, branch)
 		}
 	}
-	// Use refs/heads/ form so the arg can never be misinterpreted as a flag.
-	_, err := gitOutput(ctx, repoDir, "push", "origin", "--delete", "refs/heads/"+branch)
+	return nil
+}
+
+// CleanupMergedBranch removes what is left of a task once its review has been
+// approved and merged into mainSHA: the dev-server worktree, the agent
+// worktree, the local branch, and the remote branch (STA-637). Only
+// card.Branch is ever touched, never the target or default branch.
+//
+// It is idempotent so the Board can retry after a failure: refs and worktrees
+// that are already gone count as deleted. A branch whose tip is not contained
+// in mainSHA is left alone, so commits made after the review are never lost.
+func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSHA string) error {
+	branch := card.Branch
+	if err := guardDeletableBranch(ctx, repoDir, branch); err != nil {
+		return err
+	}
+	if mainSHA == "" {
+		return errors.New("cleanup: merged main SHA unknown")
+	}
+	// The task ID becomes a path segment under .worktrees; an empty or
+	// path-like value would point removal at the wrong directory.
+	if card.TaskID == "" || card.TaskID != filepath.Base(card.TaskID) || strings.HasPrefix(card.TaskID, ".") {
+		return fmt.Errorf("cleanup: invalid task id %q", card.TaskID)
+	}
+	// git refuses to delete a branch that is checked out, so never touch the
+	// branch repoDir itself is on (the merge leaves it on main).
+	if cur, err := gitOutput(ctx, repoDir, "symbolic-ref", "--short", "-q", "HEAD"); err == nil && cur == branch {
+		return fmt.Errorf("%w: %q is checked out in %s", ErrProtectedBranch, branch, repoDir)
+	}
+
+	// Worktrees first: they hold the branch checked out.
+	wtDir := filepath.Join(repoDir, ".worktrees")
+	for _, wt := range []string{filepath.Join(wtDir, "devserver-"+card.TaskID), filepath.Join(wtDir, card.TaskID)} {
+		_, _ = gitOutput(ctx, repoDir, "worktree", "remove", "--force", wt)
+		if err := os.RemoveAll(wt); err != nil {
+			return fmt.Errorf("remove worktree %s: %w", wt, err)
+		}
+	}
+	_, _ = gitOutput(ctx, repoDir, "worktree", "prune")
+
+	var errs []error
+
+	if tip, err := gitOutput(ctx, repoDir, "rev-parse", "--verify", "-q", "refs/heads/"+branch); err == nil && tip != "" {
+		if err := verifyAncestor(ctx, repoDir, tip, mainSHA); err != nil {
+			errs = append(errs, fmt.Errorf("local branch %s has commits not in main (tip %s); not deleted", branch, tip))
+		} else if _, err := gitOutput(ctx, repoDir, "branch", "-D", branch); err != nil {
+			errs = append(errs, fmt.Errorf("delete local branch: %w", err))
+		}
+	}
+
+	if _, err := gitOutput(ctx, repoDir, "remote", "get-url", "origin"); err == nil {
+		// ApproveAndMerge fetched with --prune, so the tracking ref reflects the
+		// remote tip. Refuse when it holds work main does not.
+		if tip, err := gitOutput(ctx, repoDir, "rev-parse", "--verify", "-q", "refs/remotes/origin/"+branch); err == nil && tip != "" {
+			if err := verifyAncestor(ctx, repoDir, tip, mainSHA); err != nil {
+				errs = append(errs, fmt.Errorf("remote branch %s has commits not in main (tip %s); not deleted", branch, tip))
+				return errors.Join(errs...)
+			}
+		}
+		if err := DeleteBranch(ctx, repoDir, branch); err != nil && !strings.Contains(err.Error(), "remote ref does not exist") {
+			errs = append(errs, fmt.Errorf("delete remote branch: %w", err))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// SetBranchCleanup records the outcome of CleanupMergedBranch on the card.
+func SetBranchCleanup(db *sql.DB, cardID string, deleted bool, errMsg string) error {
+	_, err := db.Exec(`
+		UPDATE ship_review_cards
+		SET branch_deleted = ?, branch_delete_error = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		WHERE id = ?`, deleted, errMsg, cardID,
+	)
 	return err
 }
 

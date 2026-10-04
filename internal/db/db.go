@@ -1012,6 +1012,22 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version: 25,
+		Name:    "ship_review_branch_cleanup",
+		Up: func(conn *sql.DB) error {
+			// STA-637: outcome of deleting the task branch after Approve & merge.
+			for _, stmt := range []string{
+				`ALTER TABLE ship_review_cards ADD COLUMN branch_deleted      INTEGER NOT NULL DEFAULT 0;`,
+				`ALTER TABLE ship_review_cards ADD COLUMN branch_delete_error TEXT    NOT NULL DEFAULT '';`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {

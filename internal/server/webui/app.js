@@ -7580,7 +7580,9 @@ async function openTaskPage(target, pushHistory = true) {
 // summary, and Approve / Send back / Reject buttons.
 
 // Renders a collapsed read-only final-state card (approved or rejected).
-function renderFinalShipReviewCard(taskId, headSHA, status, mainSHA, rejectComment) {
+// cleanup ({ branch, branch_deleted, branch_delete_error }) reports the
+// post-merge branch delete (STA-637); omit it for rejected cards.
+function renderFinalShipReviewCard(taskId, headSHA, status, mainSHA, rejectComment, cleanup) {
   const section = el('div', 'ship-review-card ship-review-card--final task-page-section');
   section.id = `ship-review-${taskId}`;
   const hdr = el('div', 'ship-review-header');
@@ -7596,6 +7598,17 @@ function renderFinalShipReviewCard(taskId, headSHA, status, mainSHA, rejectComme
     shaRow.appendChild(el('code', 'ship-review-sha ship-review-sha--main', mainSHA.slice(0, 12)));
   }
   section.appendChild(shaRow);
+  if (status === 'approved' && cleanup) {
+    if (cleanup.branch_deleted) {
+      const brRow = el('div', 'ship-review-row');
+      brRow.appendChild(el('span', 'ship-review-row-label', 'Branch'));
+      if (cleanup.branch) brRow.appendChild(el('code', 'ship-review-branch', cleanup.branch));
+      brRow.appendChild(el('span', 'ship-review-branch-deleted', 'Branch deleted'));
+      section.appendChild(brRow);
+    } else if (cleanup.branch_delete_error) {
+      section.appendChild(renderBranchDeleteWarning(taskId, headSHA, mainSHA, cleanup));
+    }
+  }
   if (status === 'rejected' && rejectComment) {
     const fb = el('div', 'ship-review-feedback-box');
     fb.appendChild(el('div', 'ship-review-feedback-label', 'Rejection reason:'));
@@ -7603,6 +7616,42 @@ function renderFinalShipReviewCard(taskId, headSHA, status, mainSHA, rejectComme
     section.appendChild(fb);
   }
   return section;
+}
+
+// renderBranchDeleteWarning shows a non-blocking "merged; branch delete failed"
+// notice with a Retry button. The merge already stands; retry only re-runs the
+// branch cleanup.
+function renderBranchDeleteWarning(taskId, headSHA, mainSHA, cleanup) {
+  const warn = el('div', 'ship-review-head-moved-banner ship-review-branch-warning');
+  const text = el('span', 'ship-review-head-moved-text', `merged; branch delete failed: ${cleanup.branch_delete_error}`);
+  warn.appendChild(text);
+  const retry = el('button', 'ship-review-repin-btn ship-review-branch-retry-btn', 'Retry delete');
+  retry.addEventListener('click', async () => {
+    retry.disabled = true;
+    try {
+      const r = await withBoardWebAuthn((sessionToken, assertion) =>
+        fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/delete-branch`, {
+          method: 'POST',
+          headers: { ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+        })
+      );
+      if (r === null) { retry.disabled = false; return; }
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok && !body.card) throw new Error(body.message || body.error || `${r.status} ${r.statusText}`);
+      const next = {
+        branch: cleanup.branch,
+        branch_deleted: !!body.branch_deleted,
+        branch_delete_error: body.branch_delete_error || '',
+      };
+      const section = document.getElementById(`ship-review-${taskId}`);
+      if (section) section.replaceWith(renderFinalShipReviewCard(taskId, headSHA, 'approved', mainSHA, '', next));
+    } catch (e) {
+      text.textContent = `merged; branch delete failed: ${e.message || e}`;
+      retry.disabled = false;
+    }
+  });
+  warn.appendChild(retry);
+  return warn;
 }
 
 // renderShipReviewCardFromData renders the ship review card synchronously from
@@ -7636,7 +7685,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
   // Render collapsed final state for terminal statuses.
   if (card.status === 'approved' || card.status === 'rejected') {
     const existing = document.getElementById(`ship-review-${taskId}`);
-    const finalCard = renderFinalShipReviewCard(taskId, card.head_sha, card.status, card.main_sha, card.reject_comment);
+    const finalCard = renderFinalShipReviewCard(taskId, card.head_sha, card.status, card.main_sha, card.reject_comment, card);
     if (existing) existing.replaceWith(finalCard);
     else container.appendChild(finalCard);
     return;
@@ -7973,7 +8022,11 @@ function renderShipReviewCardFromData(container, taskId, card) {
         if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
         const result = await r.json();
         const mainSHA = result.main_sha || (result.card && result.card.main_sha) || '';
-        section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', mainSHA, ''));
+        section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', mainSHA, '', {
+          branch: card.branch,
+          branch_deleted: !!result.branch_deleted,
+          branch_delete_error: result.branch_delete_error || '',
+        }));
       } catch (e) {
         showErr('Approve failed: ' + (e.message || e));
         acMerge.disabled = false;

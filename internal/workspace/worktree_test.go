@@ -261,3 +261,40 @@ func TestWorktreeManager_SweepOrphans_NoWorktreesDir(t *testing.T) {
 		t.Errorf("SweepOrphans returned error on missing .worktrees: %v", err)
 	}
 }
+
+// TestWorktreeManager_Create_StaleWorktreeKeepsBranch: recovering a stale
+// worktree must not delete or reset the task branch, which holds committed
+// work and backs open ship-review previews (STA-637).
+func TestWorktreeManager_Create_StaleWorktreeKeepsBranch(t *testing.T) {
+	repoDir := setupTestGitRepo(t)
+	wm := NewWorktreeManager(repoDir, nil)
+	taskID := "task-stale-keep"
+
+	wtPath, err := wm.Create(taskID, "sess-1")
+	if err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	git := func(dir string, args ...string) string {
+		t.Helper()
+		out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if err := os.WriteFile(filepath.Join(wtPath, "work.txt"), []byte("work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(wtPath, "add", ".")
+	git(wtPath, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "task work")
+	tip := git(repoDir, "rev-parse", "staypoint/"+taskID)
+
+	// Worktree left behind (crash) → Create again.
+	if _, err := wm.Create(taskID, "sess-2"); err != nil {
+		t.Fatalf("second Create: %v", err)
+	}
+	if got := git(repoDir, "rev-parse", "staypoint/"+taskID); got != tip {
+		t.Errorf("branch tip = %s after stale recovery, want %s (committed work lost)", got, tip)
+	}
+	_ = wm.Prune(taskID)
+}

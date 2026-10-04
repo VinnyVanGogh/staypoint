@@ -49,9 +49,12 @@ func (w *WorktreeManager) CreateContext(ctx context.Context, taskID string, sess
 		return "", fmt.Errorf("create .worktrees dir: %w", err)
 	}
 
-	// Clean up stale worktree from a previous crash.
+	// Clean up stale worktree from a previous crash. Keep the branch: it holds
+	// the task's committed work, and while a ship review is open its remote
+	// copy backs the preview deployments (STA-637). The branch is deleted only
+	// after Approve & merge.
 	if _, err := os.Stat(wtPath); err == nil {
-		if pruneErr := w.PruneContext(ctx, taskID); pruneErr != nil {
+		if pruneErr := w.PruneWorktreeDirContext(ctx, taskID); pruneErr != nil {
 			return "", fmt.Errorf("stale worktree cleanup: %w", pruneErr)
 		}
 	}
@@ -77,7 +80,7 @@ func (w *WorktreeManager) Prune(taskID string) error {
 
 // PruneContext is the context-aware version of Prune.
 // It removes the worktree directory AND deletes the branch.
-// Use this for orphan sweep and stale-worktree recovery only.
+// Use this for orphan sweep only.
 // For normal run teardown use PruneWorktreeDirContext to preserve the branch.
 func (w *WorktreeManager) PruneContext(ctx context.Context, taskID string) error {
 	if err := w.PruneWorktreeDirContext(ctx, taskID); err != nil {
