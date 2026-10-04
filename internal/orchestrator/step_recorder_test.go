@@ -203,10 +203,50 @@ func TestStepRecorder_ErrorToolResult(t *testing.T) {
 }
 
 func TestExtractToolTitle_Command(t *testing.T) {
+	// With description: description is the title (plain-language summary wins).
 	got := extractToolTitle("Bash", `{"command":"go test ./internal/server/...","description":"run tests"}`, "")
+	want := "run tests"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExtractToolTitle_CommandNoDescription(t *testing.T) {
+	// Without description: fall back to raw command.
+	got := extractToolTitle("Bash", `{"command":"go test ./internal/server/..."}`, "")
 	want := "go test ./internal/server/..."
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExtractToolMeta_WithDescription(t *testing.T) {
+	title, cmd := extractToolMeta("Bash", `{"command":"sleep 20","description":"Wait 20 seconds"}`, "")
+	if title != "Wait 20 seconds" {
+		t.Errorf("title: got %q, want %q", title, "Wait 20 seconds")
+	}
+	if cmd != "sleep 20" {
+		t.Errorf("command: got %q, want %q", cmd, "sleep 20")
+	}
+}
+
+func TestExtractToolMeta_WithoutDescription(t *testing.T) {
+	title, cmd := extractToolMeta("Bash", `{"command":"echo hello"}`, "")
+	if title != "echo hello" {
+		t.Errorf("title: got %q, want %q", title, "echo hello")
+	}
+	if cmd != "echo hello" {
+		t.Errorf("command: got %q, want %q", cmd, "echo hello")
+	}
+}
+
+func TestExtractToolMeta_FileTool(t *testing.T) {
+	title, cmd := extractToolMeta("Read", `{"file_path":"internal/server/events.go"}`, "")
+	if title != "Read internal/server/events.go" {
+		t.Errorf("title: got %q, want %q", title, "Read internal/server/events.go")
+	}
+	if cmd != "" {
+		t.Errorf("command: got %q, want empty", cmd)
 	}
 }
 
@@ -272,10 +312,14 @@ func TestStepRecorder_ToolInputInTitle(t *testing.T) {
 	if len(published) != 2 {
 		t.Fatalf("expected 2 run.step events (live+final), got %d", len(published))
 	}
-	// Both events carry the title extracted from ToolInput.
+	// When description is present, it becomes the title (plain-language wins).
 	for i, s := range published {
-		if s.Title != "go test ./internal/server/..." {
-			t.Errorf("published[%d]: expected command as title, got %q", i, s.Title)
+		if s.Title != "run tests" {
+			t.Errorf("published[%d]: expected description as title, got %q", i, s.Title)
+		}
+		// Command field always holds the verbatim command regardless of description.
+		if s.Command != "go test ./internal/server/..." {
+			t.Errorf("published[%d]: expected command field to hold raw command, got %q", i, s.Command)
 		}
 	}
 	if published[0].ID != published[1].ID {

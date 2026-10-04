@@ -39,8 +39,16 @@ func main() {
 	rec := orchestrator.NewStepRecorder(store.DB(), func(string, any) {}, *runID, *taskID)
 	rec.EmitWake("ui-e2e: Run Now")
 	rec.Feed(orchestrator.StepDelta{Kind: orchestrator.StepDeltaThinking, Text: "Reading the task description"})
-	rec.Feed(orchestrator.StepDelta{Kind: orchestrator.StepDeltaToolUse, ToolName: "Read", ToolID: "t1", Text: "README.md"})
+	rec.Feed(orchestrator.StepDelta{Kind: orchestrator.StepDeltaToolUse, ToolName: "Read", ToolID: "t1", ToolInput: `{"file_path":"README.md"}`})
 	rec.Feed(orchestrator.StepDelta{Kind: orchestrator.StepDeltaToolResult, ToolID: "t1", Text: "ok"})
+	// Bash step with a description — title should show the description, not the command.
+	rec.Feed(orchestrator.StepDelta{Kind: orchestrator.StepDeltaToolUse, ToolName: "Bash", ToolID: "t2",
+		ToolInput: `{"description":"Wait 1 second","command":"sleep 1"}`})
+	rec.Feed(orchestrator.StepDelta{Kind: orchestrator.StepDeltaToolResult, ToolID: "t2", Text: ""})
+	// Bash step without a description — command is used as the fallback title.
+	rec.Feed(orchestrator.StepDelta{Kind: orchestrator.StepDeltaToolUse, ToolName: "Bash", ToolID: "t3",
+		ToolInput: `{"command":"echo hello"}`})
+	rec.Feed(orchestrator.StepDelta{Kind: orchestrator.StepDeltaToolResult, ToolID: "t3", Text: "hello"})
 	if !*partial {
 		rec.EmitState("done")
 	}

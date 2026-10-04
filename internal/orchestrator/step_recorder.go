@@ -75,6 +75,10 @@ type RunStep struct {
 	Kind      StepKind `json:"kind"`
 	Title     string   `json:"title"`
 	Body      string   `json:"body,omitempty"`
+	// Command holds the raw shell command for run/Bash steps. Title may be a
+	// plain-language description (from the agent's tool-call description field);
+	// Command is always the verbatim command shown in the expanded body.
+	Command   string   `json:"command,omitempty"`
 	Status    string   `json:"status"` // running | done | error
 	StartedAt string   `json:"started_at"`
 	EndedAt   *string  `json:"ended_at,omitempty"`
@@ -130,6 +134,7 @@ type openStep struct {
 	id        string // pre-assigned for tool_use steps so the live row can be updated on result
 	kind      StepKind
 	title     string
+	command   string // raw shell command for run steps; empty for non-Bash tools
 	body      strings.Builder
 	startedAt time.Time
 	toolID    string // for matching tool_use → tool_result
@@ -280,11 +285,13 @@ func (r *StepRecorder) Feed(d StepDelta) {
 		r.closeCurrentLocked()
 		r.seq++
 		liveID := uuid.New().String()
+		title, cmd := extractToolMeta(d.ToolName, d.ToolInput, r.worktreeRoot)
 		p := &openStep{
 			seq:       r.seq,
 			id:        liveID,
 			kind:      toolUseKind(d.ToolName),
-			title:     extractToolTitle(d.ToolName, d.ToolInput, r.worktreeRoot),
+			title:     title,
+			command:   cmd,
 			startedAt: time.Now().UTC(),
 			toolID:    d.ToolID,
 		}
@@ -308,6 +315,7 @@ func (r *StepRecorder) Feed(d StepDelta) {
 			Seq:       p.seq,
 			Kind:      p.kind,
 			Title:     p.title,
+			Command:   p.command,
 			Body:      p.body.String(),
 			Status:    "running",
 			StartedAt: p.startedAt.Format(time.RFC3339Nano),
@@ -483,6 +491,7 @@ func (r *StepRecorder) closePendingWithStatusLocked(p *openStep, status string) 
 		Seq:       p.seq,
 		Kind:      p.kind,
 		Title:     p.title,
+		Command:   p.command,
 		Body:      p.body.String(),
 		Status:    status,
 		StartedAt: p.startedAt.Format(time.RFC3339Nano),
@@ -510,6 +519,7 @@ func (r *StepRecorder) closeToolStepLocked(p *openStep, status string) {
 		Seq:       p.seq,
 		Kind:      p.kind,
 		Title:     p.title,
+		Command:   p.command,
 		Body:      p.body.String(),
 		Status:    status,
 		StartedAt: p.startedAt.Format(time.RFC3339Nano),
@@ -555,11 +565,11 @@ func (r *StepRecorder) persist(step RunStep) {
 	}
 
 	_, err := r.db.ExecContext(ctx, `
-		INSERT OR REPLACE INTO run_steps (id, run_id, task_id, seq, parent_seq, kind, title, body, status, started_at, ended_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT OR REPLACE INTO run_steps (id, run_id, task_id, seq, parent_seq, kind, title, body, status, started_at, ended_at, command)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		step.ID, step.RunID, step.TaskID, step.Seq, parentSeqNull,
 		string(step.Kind), step.Title, step.Body, step.Status,
-		step.StartedAt, endedAtNull,
+		step.StartedAt, endedAtNull, step.Command,
 	)
 	if err != nil {
 		slog.Warn("run_steps upsert failed", slog.Any("err", err))
@@ -583,18 +593,27 @@ func toolUseKind(name string) StepKind {
 	}
 }
 
-// extractToolTitle extracts a human-readable title from tool input JSON.
-// For Bash: uses "command"; for Read/Edit/Write: uses a verb + repo-relative path.
-// Falls back to toolUseTitle(name) if input is absent or unparseable.
-// root is the absolute task worktree path used to relativize file paths.
-func extractToolTitle(name, inputJSON, root string) string {
+// extractToolMeta extracts a plain-language title and the raw command from tool input JSON.
+// For Bash: uses "description" when present (plain-language summary the agent provided),
+// falls back to "command". For Read/Edit/Write: uses a verb + repo-relative path.
+// Returns (title, command) where command is the verbatim shell command (non-empty only for
+// Bash/run steps). root is the absolute task worktree path used to relativize file paths.
+func extractToolMeta(name, inputJSON, root string) (title, command string) {
 	if inputJSON != "" {
 		var m map[string]json.RawMessage
 		if json.Unmarshal([]byte(inputJSON), &m) == nil {
 			if v, ok := m["command"]; ok {
-				var s string
-				if json.Unmarshal(v, &s) == nil && s != "" {
-					return s
+				var cmd string
+				if json.Unmarshal(v, &cmd) == nil && cmd != "" {
+					command = cmd
+					// Use the agent's plain-language description when available.
+					if d, ok2 := m["description"]; ok2 {
+						var desc string
+						if json.Unmarshal(d, &desc) == nil && desc != "" {
+							return desc, command
+						}
+					}
+					return command, command
 				}
 			}
 			if v, ok := m["file_path"]; ok {
@@ -602,12 +621,18 @@ func extractToolTitle(name, inputJSON, root string) string {
 				if json.Unmarshal(v, &s) == nil && s != "" {
 					rel := relativizePath(s, root)
 					verb := fileToolVerb(name)
-					return verb + " " + rel
+					return verb + " " + rel, ""
 				}
 			}
 		}
 	}
-	return toolUseTitle(name)
+	return toolUseTitle(name), ""
+}
+
+// extractToolTitle is a compatibility shim used by tests and callers that only need the title.
+func extractToolTitle(name, inputJSON, root string) string {
+	title, _ := extractToolMeta(name, inputJSON, root)
+	return title
 }
 
 // relativizePath strips root from an absolute path, returning a repo-relative path.
