@@ -126,19 +126,25 @@ func TestValidateEffectiveSupabaseURLs(t *testing.T) {
 }
 
 // TestCopyAndValidateEnv_ProdURLInDotEnv_LocalMissing is the exact case the
-// Board identified: .env has a prod VITE_SUPABASE_URL, .env.local lacks it
-// (only has the anon key). Vite merges the files so the effective URL is prod.
+// Board identified: the branch's committed .env has a prod VITE_SUPABASE_URL,
+// .env.local lacks it (only has the anon key). Vite merges the files so the
+// effective URL is prod.
+//
+// The worktree simulates the git checkout: it has the committed .env. After
+// .env.local is copied in, loadEffectiveViteEnv(wtPath) sees the prod URL from
+// .env and the missing override in .env.local → refuse.
 func TestCopyAndValidateEnv_ProdURLInDotEnv_LocalMissing(t *testing.T) {
 	mainRepo := t.TempDir()
 	wt := t.TempDir()
 
-	// .env — prod URL (lower precedence but still loaded by Vite)
-	if err := os.WriteFile(filepath.Join(mainRepo, ".env"),
-		[]byte("VITE_SUPABASE_URL=https://prod.supabase.co\n"),
-		0o644); err != nil {
-		t.Fatal(err)
+	// Simulate committed .env in both mainRepo and worktree (same branch content).
+	prodEnv := []byte("VITE_SUPABASE_URL=https://prod.supabase.co\n")
+	for _, dir := range []string{mainRepo, wt} {
+		if err := os.WriteFile(filepath.Join(dir, ".env"), prodEnv, 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	// .env.local — only anon key, no URL override
+	// .env.local in mainRepo — only anon key, no URL override.
 	if err := os.WriteFile(filepath.Join(mainRepo, ".env.local"),
 		[]byte("VITE_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiJ9.local\n"),
 		0o600); err != nil {
@@ -146,7 +152,7 @@ func TestCopyAndValidateEnv_ProdURLInDotEnv_LocalMissing(t *testing.T) {
 	}
 
 	var msgs []string
-	report := func(step, msg string, ok bool) { msgs = append(msgs, msg) }
+	report := func(_, msg string, _ bool) { msgs = append(msgs, msg) }
 
 	err := shipreview.CopyAndValidateEnv(mainRepo, wt, report)
 	if err == nil {
@@ -155,15 +161,16 @@ func TestCopyAndValidateEnv_ProdURLInDotEnv_LocalMissing(t *testing.T) {
 }
 
 // TestCopyAndValidateEnv_ProdURLInDotEnv_OverriddenInLocal confirms that when
-// .env has prod and .env.local overrides with local, we accept.
+// the branch's committed .env has prod and .env.local overrides with local, we accept.
 func TestCopyAndValidateEnv_ProdURLInDotEnv_OverriddenInLocal(t *testing.T) {
 	mainRepo := t.TempDir()
 	wt := t.TempDir()
 
-	if err := os.WriteFile(filepath.Join(mainRepo, ".env"),
-		[]byte("VITE_SUPABASE_URL=https://prod.supabase.co\n"),
-		0o644); err != nil {
-		t.Fatal(err)
+	prodEnv := []byte("VITE_SUPABASE_URL=https://prod.supabase.co\n")
+	for _, dir := range []string{mainRepo, wt} {
+		if err := os.WriteFile(filepath.Join(dir, ".env"), prodEnv, 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.WriteFile(filepath.Join(mainRepo, ".env.local"),
 		[]byte("VITE_SUPABASE_URL=http://127.0.0.1:54321\nVITE_SUPABASE_ANON_KEY=local\n"),

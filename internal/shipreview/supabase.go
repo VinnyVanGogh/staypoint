@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
@@ -344,9 +345,20 @@ func loadEffectiveViteEnv(repoPath string) map[string]string {
 	return effective
 }
 
+// isLocalHost returns true when host resolves to the loopback interface.
+// Uses net.ParseIP so all 127.0.0.0/8 addresses and ::1 are accepted, and
+// arbitrary strings like "127.evil.com" are rejected.
+func isLocalHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // ValidateEffectiveSupabaseURLs checks the merged Vite env map. It returns an
 // error if:
-//   - any Supabase URL key resolves to a non-local host (127.0.0.1 / localhost), OR
+//   - any Supabase URL key resolves to a non-local host, OR
 //   - no Supabase URL key is present at all (cannot confirm local target).
 func ValidateEffectiveSupabaseURLs(effective map[string]string) error {
 	found := 0
@@ -360,9 +372,8 @@ func ValidateEffectiveSupabaseURLs(effective map[string]string) error {
 		if err != nil {
 			return fmt.Errorf("%s=%q is not a valid URL: %w", key, raw, err)
 		}
-		host := u.Hostname()
-		if host != "127.0.0.1" && host != "localhost" && !strings.HasPrefix(host, "127.") {
-			return fmt.Errorf("%s=%q (from merged Vite env) points at %q, not 127.0.0.1/localhost — refusing to start; check .env or .env.development", key, raw, host)
+		if !isLocalHost(u.Hostname()) {
+			return fmt.Errorf("%s=%q (from merged Vite env) points at %q, not 127.0.0.1/localhost — refusing to start; check .env or .env.development", key, raw, u.Hostname())
 		}
 	}
 	if found == 0 {
@@ -392,19 +403,26 @@ func CopyAndValidateEnv(mainRepoPath, wtPath string, prog func(step, msg string,
 		return fmt.Errorf("read .env.local: %w", err)
 	}
 
-	// Validate effective merged Vite env (catches keys set in .env but absent
-	// from .env.local that would fall back to the prod value at runtime).
-	effective := loadEffectiveViteEnv(mainRepoPath)
-	if err := ValidateEffectiveSupabaseURLs(effective); err != nil {
-		prog("env", "Effective Vite env failed safety check: "+err.Error(), false)
-		return err
-	}
-
+	// Copy .env.local into the worktree FIRST so loadEffectiveViteEnv(wtPath)
+	// sees the final set of files the app will actually use (committed .env /
+	// .env.development from the branch + our .env.local override).
 	dst := filepath.Join(wtPath, ".env.local")
 	if err := os.WriteFile(dst, data, 0o600); err != nil {
 		return fmt.Errorf("write .env.local: %w", err)
 	}
-	prog("env", "Copied .env.local (effective Vite env confirms all Supabase URLs local)", true)
+
+	// Validate the effective merged Vite env in wtPath — this is what Vite will
+	// actually load, so it catches a key absent from .env.local that falls back
+	// to a prod value in the branch's committed .env or .env.development.
+	effective := loadEffectiveViteEnv(wtPath)
+	if err := ValidateEffectiveSupabaseURLs(effective); err != nil {
+		// Remove the copied file so the worktree isn't left in a half-valid state.
+		_ = os.Remove(dst)
+		prog("env", "Effective Vite env (worktree) failed safety check: "+err.Error(), false)
+		return err
+	}
+
+	prog("env", "Copied .env.local (effective Vite env in worktree confirms all Supabase URLs local)", true)
 	return nil
 }
 
@@ -423,9 +441,8 @@ func ValidateSupabaseEnvURLs(content string) error {
 		if err != nil {
 			return fmt.Errorf("%s=%q is not a valid URL: %w", key, raw, err)
 		}
-		host := u.Hostname()
-		if host != "127.0.0.1" && host != "localhost" && !strings.HasPrefix(host, "127.") {
-			return fmt.Errorf("%s=%q points at %q, not 127.0.0.1 or localhost — refusing to start (would hit non-local DB)", key, raw, host)
+		if !isLocalHost(u.Hostname()) {
+			return fmt.Errorf("%s=%q points at %q, not 127.0.0.1 or localhost — refusing to start (would hit non-local DB)", key, raw, u.Hostname())
 		}
 	}
 	return nil
