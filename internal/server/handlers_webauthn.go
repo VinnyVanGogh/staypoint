@@ -203,19 +203,9 @@ func (h *WebAuthnHandler) RegisterFinish(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	sessionToken := r.Header.Get("X-WebAuthn-Session")
-	h.sessionMu.Lock()
-	sessionData := h.sessions[sessionToken]
-	if sessionData != nil {
-		delete(h.sessions, sessionToken)
-	}
-	h.sessionMu.Unlock()
-	if sessionData == nil {
-		writeBoardError(w, "board_passkey_session_invalid", "missing or expired registration session")
-		return
-	}
-
-	// Decode outer envelope: { "code": "123456", "credential": {...} }
+	// Decode outer envelope FIRST: { "code": "123456", "credential": {...} }
+	// Pairing code is the human-in-the-loop gate; check it before any session lookup
+	// so a request with the wrong code always gets board_passkey_pairing_required.
 	body, _ := io.ReadAll(r.Body)
 	var env struct {
 		Code       string          `json:"code"`
@@ -233,6 +223,18 @@ func (h *WebAuthnHandler) RegisterFinish(w http.ResponseWriter, r *http.Request)
 	h.pairingMu.Unlock()
 	if !validCode {
 		writeBoardError(w, "board_passkey_pairing_required", "missing, wrong, or expired pairing code")
+		return
+	}
+
+	sessionToken := r.Header.Get("X-WebAuthn-Session")
+	h.sessionMu.Lock()
+	sessionData := h.sessions[sessionToken]
+	if sessionData != nil {
+		delete(h.sessions, sessionToken)
+	}
+	h.sessionMu.Unlock()
+	if sessionData == nil {
+		writeBoardError(w, "board_passkey_session_invalid", "missing or expired registration session")
 		return
 	}
 

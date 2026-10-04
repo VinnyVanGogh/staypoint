@@ -225,6 +225,13 @@ func TestStaypointd_BoardToken_PersistedAndUsable(t *testing.T) {
 
 	store := openTestStore(t)
 
+	// Seed one Board passkey so WrapBoardAction passes the enrollment gate (post-STA-583).
+	if _, err := store.DB().Exec(`INSERT INTO board_webauthn_credentials (id, credential_id, public_key) VALUES (?, ?, ?)`,
+		"staypointd-test-passkey", []byte("cred-id-1"), []byte("pub-key-1"),
+	); err != nil {
+		t.Fatalf("seed board_webauthn_credentials: %v", err)
+	}
+
 	// Mirror the server.Options now used by runDaemon.
 	srv, err := server.New(server.Options{
 		BindHost:       "127.0.0.1",
@@ -244,6 +251,9 @@ func TestStaypointd_BoardToken_PersistedAndUsable(t *testing.T) {
 		defer cancel()
 		_ = srv.Shutdown(ctx)
 	})
+
+	// Stub out WebAuthn assertion verification so tests pass without Touch ID hardware.
+	srv.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
 
 	// 1. board_token file must have been written to DataDir.
 	data, err := os.ReadFile(boardTokenPath)
@@ -343,11 +353,13 @@ func TestStaypointd_BoardToken_PersistedAndUsable(t *testing.T) {
 		}
 	}
 
-	// 6. Board session → POST /api/settings/security-gate must return something other than 403.
-	// (It may return 400/422 due to missing body, but not 403 — the board gate is passed.)
+	// 6. Board session + WebAuthn assertion → POST /api/settings/security-gate must return
+	// something other than 403. (It may return 400/422 due to missing body, but not 403 —
+	// the board gate is passed.) Post-STA-583: a passkey assertion is also required.
 	req6, _ := http.NewRequest("POST", base+"/api/settings/security-gate", strings.NewReader(`{}`))
 	req6.Header.Set("Authorization", "Bearer "+authToken)
 	req6.Header.Set("Content-Type", "application/json")
+	req6.Header.Set("X-WebAuthn-Assertion", "mock-assertion-for-test")
 	for _, c := range jar.cookies {
 		req6.AddCookie(c)
 	}
