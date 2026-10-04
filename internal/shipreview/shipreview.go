@@ -555,14 +555,6 @@ func ensureDevWorktree(ctx context.Context, repoPath, wtPath, headSHA string) er
 		return fmt.Errorf("ensureDevWorktree: refusing non-devserver path %q", wtPath)
 	}
 
-	// If the directory already exists, check whether it is at the right commit.
-	if _, err := os.Stat(wtPath); err == nil {
-		sha, err := gitOutput(ctx, wtPath, "rev-parse", "HEAD")
-		if err == nil && sha == headSHA {
-			return nil // already set up at correct SHA; reuse
-		}
-	}
-
 	// Clear any stale git registration for this exact path.
 	// --force succeeds even when the directory is missing (post-daemon-restart).
 	_, _ = gitOutput(ctx, repoPath, "worktree", "remove", "--force", wtPath)
