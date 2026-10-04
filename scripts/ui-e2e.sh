@@ -88,6 +88,12 @@ start_daemon() { # start_daemon <name>; sets DAEMON_URL and DAEMON_PID
     cat "$dir/daemon.err" >&2
     exit 1
   fi
+  # BOARD_TOKEN is printed on the line after READY; wait for it too or the
+  # sed below can race the daemon and read an empty token.
+  if ! wait_for 5 grep -q '^BOARD_TOKEN ' "$dir/daemon.out"; then
+    echo "ui-e2e: $name daemon did not print BOARD_TOKEN" >&2
+    exit 1
+  fi
   DAEMON_URL="$(sed -n 's/^READY //p' "$dir/daemon.out")"
   DAEMON_BOARD_TOKEN="$(sed -n 's/^BOARD_TOKEN //p' "$dir/daemon.out")"
   case "$DAEMON_URL" in
