@@ -137,9 +137,16 @@ func (h *WebAuthnHandler) RegisterBegin(w http.ResponseWriter, r *http.Request) 
 
 	var count int
 	_ = h.db.QueryRow(`SELECT COUNT(*) FROM board_webauthn_credentials`).Scan(&count)
-	if count > 0 && r.Header.Get("X-WebAuthn-Assertion") == "" {
-		writeBoardError(w, "board_passkey_assertion_required", "an existing passkey assertion is required to register a second passkey")
-		return
+	if count > 0 {
+		assertion := r.Header.Get("X-WebAuthn-Assertion")
+		if assertion == "" {
+			writeBoardError(w, "board_passkey_assertion_required", "an existing passkey assertion is required to register a second passkey")
+			return
+		}
+		if err := h.VerifyAssertion(r, assertion); err != nil {
+			writeBoardError(w, "board_passkey_assertion_invalid", "forbidden: WebAuthn assertion verification failed for second passkey registration")
+			return
+		}
 	}
 
 	// Issue pairing code via macOS notification.
@@ -210,9 +217,8 @@ func (h *WebAuthnHandler) RegisterFinish(w http.ResponseWriter, r *http.Request)
 
 	h.pairingMu.Lock()
 	validCode := h.pairingCode != "" && env.Code == h.pairingCode && time.Now().Before(h.pairingExp)
-	if validCode {
-		h.pairingCode = ""
-	}
+	// Consume on any attempt (success or failure) to prevent brute-force.
+	h.pairingCode = ""
 	h.pairingMu.Unlock()
 	if !validCode {
 		writeBoardError(w, "board_passkey_pairing_required", "missing, wrong, or expired pairing code")
