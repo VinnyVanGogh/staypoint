@@ -1703,4 +1703,24 @@ func TestUpsertDevConfig_PartialUpdate(t *testing.T) {
 	if got["supabase_enabled"] != true {
 		t.Errorf("supabase_enabled: want true, got %v", got["supabase_enabled"])
 	}
+
+	// Clear dev_url explicitly by sending an empty string (non-nil *string).
+	clear := `{"repo_path":"/tmp/partial-repo","dev_url":""}`
+	resp3 := putJSON(clear)
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp3.Body)
+		t.Fatalf("clear PUT: want 200, got %d body=%s", resp3.StatusCode, b)
+	}
+	var got3 map[string]any
+	if err := json.NewDecoder(resp3.Body).Decode(&got3); err != nil {
+		t.Fatalf("decode clear response: %v", err)
+	}
+	if got3["dev_url"] != "" {
+		t.Errorf("clear dev_url: want '', got %v", got3["dev_url"])
+	}
+	// dev_command from the previous partial update must be preserved.
+	if got3["dev_command"] != "npm run dev" {
+		t.Errorf("dev_command after clear: want 'npm run dev', got %v", got3["dev_command"])
+	}
 }

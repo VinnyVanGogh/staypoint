@@ -450,18 +450,17 @@ func (h *ShipReviewHandler) ListProjectDevConfigs(w http.ResponseWriter, r *http
 }
 
 // devConfigUpdateReq is the partial-update request body for PUT /api/project-dev-configs.
-// Only fields present in the JSON are applied; absent fields keep their existing values.
-// SupabaseEnabled and SupabaseKeepUp use *bool so that an explicit false is distinguishable
-// from an absent field.
+// Pointer fields: nil means absent (keep existing value); non-nil applies the value,
+// including "" or [] to clear a field.
 type devConfigUpdateReq struct {
-	RepoPath        string   `json:"repo_path"`
-	DevCommand      string   `json:"dev_command"`
-	DevURL          string   `json:"dev_url"`
-	SetupSteps      []string `json:"setup_steps"`
-	MigrationGlobs  []string `json:"migration_globs"`
-	SQLEditorURL    string   `json:"sql_editor_url"`
-	SupabaseEnabled *bool    `json:"supabase_enabled"`
-	SupabaseKeepUp  *bool    `json:"supabase_keep_up"`
+	RepoPath        string    `json:"repo_path"`
+	DevCommand      *string   `json:"dev_command"`
+	DevURL          *string   `json:"dev_url"`
+	SetupSteps      *[]string `json:"setup_steps"`
+	MigrationGlobs  *[]string `json:"migration_globs"`
+	SQLEditorURL    *string   `json:"sql_editor_url"`
+	SupabaseEnabled *bool     `json:"supabase_enabled"`
+	SupabaseKeepUp  *bool     `json:"supabase_keep_up"`
 }
 
 // UpsertProjectDevConfig handles PUT /api/project-dev-configs.
@@ -477,45 +476,40 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusBadRequest, "repo_path required")
 		return
 	}
-	if req.DevURL != "" {
-		if err := shipreview.ValidateDevURL(req.DevURL); err != nil {
+	if req.DevURL != nil && *req.DevURL != "" {
+		if err := shipreview.ValidateDevURL(*req.DevURL); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
-	if req.SQLEditorURL != "" {
-		if err := shipreview.ValidateSQLEditorURL(req.SQLEditorURL); err != nil {
+	if req.SQLEditorURL != nil && *req.SQLEditorURL != "" {
+		if err := shipreview.ValidateSQLEditorURL(*req.SQLEditorURL); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
 
-	// Load existing config before the write.  A real DB error (not just NoRows) returns
-	// nil from GetProjectDevConfig; dereferencing nil panics, so we must check the error.
 	old, err := shipreview.GetProjectDevConfig(h.db, req.RepoPath)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load existing config: "+err.Error())
 		return
 	}
 
-	// Merge partial request onto existing config.  Fields absent from the request
-	// (zero/nil) keep their current values so a Settings form that only touches
-	// dev_command does not blank dev_url, sql_editor_url, or supabase_enabled.
 	cfg := *old
-	if req.DevCommand != "" {
-		cfg.DevCommand = req.DevCommand
+	if req.DevCommand != nil {
+		cfg.DevCommand = *req.DevCommand
 	}
-	if req.DevURL != "" {
-		cfg.DevURL = req.DevURL
+	if req.DevURL != nil {
+		cfg.DevURL = *req.DevURL
 	}
-	if req.SQLEditorURL != "" {
-		cfg.SQLEditorURL = req.SQLEditorURL
+	if req.SQLEditorURL != nil {
+		cfg.SQLEditorURL = *req.SQLEditorURL
 	}
-	if len(req.SetupSteps) > 0 {
-		cfg.SetupSteps = req.SetupSteps
+	if req.SetupSteps != nil {
+		cfg.SetupSteps = *req.SetupSteps
 	}
-	if len(req.MigrationGlobs) > 0 {
-		cfg.MigrationGlobs = req.MigrationGlobs
+	if req.MigrationGlobs != nil {
+		cfg.MigrationGlobs = *req.MigrationGlobs
 	}
 	if req.SupabaseEnabled != nil {
 		cfg.SupabaseEnabled = *req.SupabaseEnabled
@@ -524,8 +518,7 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 		cfg.SupabaseKeepUp = *req.SupabaseKeepUp
 	}
 
-	// Wrap config write and audit log insert in a single transaction so that a
-	// failed audit insert rolls back the config change (not the other way around).
+	// Audit failure must roll back the config write; both go in one transaction.
 	tx, txErr := h.db.Begin()
 	if txErr != nil {
 		writeError(w, http.StatusInternalServerError, "tx begin failed: "+txErr.Error())
@@ -538,8 +531,6 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Audit every Board-approved dev-config change via governance.LogBoardEventTx.
-	// Fail the whole request if the audit write fails (STA-520).
 	if err := governance.LogBoardEventTx(tx, "board", "dev_config_change", map[string]any{
 		"repo_path":       cfg.RepoPath,
 		"old_dev_command": old.DevCommand,
