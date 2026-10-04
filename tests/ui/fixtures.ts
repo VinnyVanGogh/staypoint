@@ -229,24 +229,115 @@ export const test = base.extend<Fixtures>({
     await expect(page).toHaveURL(`${baseURL}/`);
     await use(page);
   },
-  // boardPage is a page with a Board session cookie set.
-  // Requires STAYPOINT_BOARD_TOKEN (exported by scripts/ui-e2e.sh).
-  // Uses POST /api/board/fresh-nonce (STA-583 removed the ?board_token= URL bootstrap).
+  // boardPage is a page with a Board session cookie set AND a CDP virtual
+  // authenticator enrolled. Requires STAYPOINT_BOARD_TOKEN (exported by
+  // scripts/ui-e2e.sh) and a TestMode server (staypoint-apitest-server) so
+  // that GET /api/board/webauthn/test/last-pairing-code is available.
   boardPage: async ({ page, baseURL, request }, use) => {
     const bt = BOARD_TOKEN;
     if (!bt) throw new Error('STAYPOINT_BOARD_TOKEN is not set: run via scripts/ui-e2e.sh');
+
+    // 1. Mint a fresh nonce.
     const nonceRes = await request.post(`${baseURL}/api/board/fresh-nonce`, {
-      headers: {
-        'Authorization': `Bearer ${TOKEN}`,
-        'X-Board-Token': bt,
-      },
+      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Board-Token': bt },
     });
     if (!nonceRes.ok()) {
       throw new Error(`POST /api/board/fresh-nonce -> ${nonceRes.status()}: ${await nonceRes.text()}`);
     }
     const { nonce } = await nonceRes.json();
+
+    // 2. Bootstrap board session — sets staypoint_board cookie.
     await page.goto(`${baseURL}/?token=${encodeURIComponent(TOKEN)}&board_nonce=${encodeURIComponent(nonce)}`);
     await expect(page).toHaveURL(`${baseURL}/`);
+
+    // 3. Set up CDP virtual authenticator (transport: internal, userVerification on).
+    //    This intercepts navigator.credentials.create/get() so tests never need Touch ID.
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('WebAuthn.enable', { enableUI: false });
+    await cdp.send('WebAuthn.addVirtualAuthenticator', {
+      options: {
+        protocol: 'ctap2',
+        transport: 'internal',
+        hasResidentKey: false,
+        hasUserVerification: true,
+        isUserVerified: true,
+      },
+    });
+
+    // 4. Enroll a passkey from the browser context (has session + board cookies).
+    //    Uses the TestMode-only endpoint to retrieve the pairing code without a
+    //    macOS notification (the server is started with TestMode: true for e2e).
+    await page.evaluate(async (token: string) => {
+      function b64uToAb(b: string): ArrayBuffer {
+        const pad = b.replace(/-/g, '+').replace(/_/g, '/');
+        const bin = atob(pad);
+        const buf = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+        return buf.buffer;
+      }
+      function abToB64u(buf: ArrayBuffer): string {
+        const bytes = new Uint8Array(buf);
+        let bin = '';
+        for (const b of bytes) bin += String.fromCharCode(b);
+        return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      }
+
+      const headers: Record<string, string> = { 'Authorization': `Bearer ${token}` };
+
+      // begin registration
+      const br = await fetch('/api/board/webauthn/register/begin', {
+        method: 'POST', headers, body: JSON.stringify({}),
+      });
+      if (!br.ok) throw new Error(`register/begin failed: ${br.status} ${await br.text()}`);
+      const regSession = br.headers.get('X-WebAuthn-Session');
+      if (!regSession) throw new Error('register/begin: missing X-WebAuthn-Session header');
+      const regOpts = await br.json() as { publicKey: Record<string, unknown> };
+
+      const pk = regOpts.publicKey as {
+        challenge: string;
+        user: { id: string; [k: string]: unknown };
+        excludeCredentials?: Array<{ id: string; type: string }>;
+        [k: string]: unknown;
+      };
+      pk.challenge = b64uToAb(pk.challenge) as unknown as string;
+      pk.user.id = b64uToAb(pk.user.id as string) as unknown as string;
+      if (pk.excludeCredentials) {
+        pk.excludeCredentials = pk.excludeCredentials.map((c) => ({
+          ...c, id: b64uToAb(c.id) as unknown as string,
+        }));
+      }
+
+      // CDP handles navigator.credentials.create()
+      const newCred = await navigator.credentials.create({ publicKey: pk as unknown as PublicKeyCredentialCreationOptions }) as PublicKeyCredential;
+      const regResp = newCred.response as AuthenticatorAttestationResponse;
+
+      // Retrieve pairing code from TestMode-only endpoint (board cookie auto-included).
+      const codeRes = await fetch('/api/board/webauthn/test/last-pairing-code', { headers });
+      if (!codeRes.ok) throw new Error(`last-pairing-code failed: ${codeRes.status}`);
+      const { code } = await codeRes.json() as { code: string };
+      if (!code) throw new Error('last-pairing-code: no code available after register/begin');
+
+      const credential = {
+        id: newCred.id,
+        rawId: abToB64u(newCred.rawId),
+        type: newCred.type,
+        response: {
+          clientDataJSON: abToB64u(regResp.clientDataJSON),
+          attestationObject: abToB64u(regResp.attestationObject),
+        },
+      };
+
+      const fr = await fetch('/api/board/webauthn/register/finish', {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json', 'X-WebAuthn-Session': regSession },
+        body: JSON.stringify({ code, credential }),
+      });
+      if (!fr.ok) {
+        const e = await fr.json().catch(() => ({})) as { message?: string };
+        throw new Error(`register/finish failed: ${fr.status}: ${e.message || JSON.stringify(e)}`);
+      }
+    }, TOKEN);
+
     await use(page);
   },
 });

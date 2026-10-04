@@ -1409,18 +1409,27 @@ func TestServer_BoardToken_Required(t *testing.T) {
 	}
 
 	for _, ep := range boardEndpoints {
-		// Agent auth token alone → 403
+		// Agent auth token alone → 403 board_session_required
 		resp := authOnly(ep.method, base+ep.path, ep.body)
+		raw, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusForbidden {
 			t.Errorf("%s %s with agent token only: want 403, got %d", ep.method, ep.path, resp.StatusCode)
+		} else {
+			var e struct{ Error string `json:"error"` }
+			if _ = json.Unmarshal(raw, &e); e.Error != "board_session_required" {
+				t.Errorf("%s %s with agent token only: want error=board_session_required, got %s", ep.method, ep.path, raw)
+			}
 		}
 
-		// Board token included → not 403 (may be 404/409/etc depending on state, but not a token rejection)
+		// Board cookie + assertion + seeded passkey → board auth gate passes (not 403).
+		// The separate TestBoardAction_NoPasskeyRegistered_Returns403 covers the
+		// enrollment_required case; here we verify the full happy-path gate clears.
 		resp = withBoard(ep.method, base+ep.path, ep.body)
+		raw, _ = io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
-			t.Errorf("%s %s with board token: want not 401/403, got %d", ep.method, ep.path, resp.StatusCode)
+		if resp.StatusCode == http.StatusForbidden {
+			t.Errorf("%s %s with board cookie+passkey+assertion: want not 403, got %d %s", ep.method, ep.path, resp.StatusCode, raw)
 		}
 	}
 }

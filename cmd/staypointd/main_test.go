@@ -217,7 +217,7 @@ func TestWireOnWake_ParseDeltaUsesClaudeAdapter(t *testing.T) {
 //  3. GET /?token=…&board_nonce=… sets the staypoint_board cookie (nonce flow, STA-583).
 //  4. Reusing the same nonce does NOT set the cookie (single-use).
 //  5. The legacy ?board_token= URL bootstrap is rejected (removed in STA-583).
-//  6. A board session can call a WrapBoardAction-protected endpoint (not 403).
+//  6. A board session + assertion can call a WrapBoardAction-protected endpoint (not 403).
 //  7. An agent-only request (no board cookie) gets 403.
 func TestStaypointd_BoardToken_PersistedAndUsable(t *testing.T) {
 	dataDir := t.TempDir()
@@ -355,7 +355,8 @@ func TestStaypointd_BoardToken_PersistedAndUsable(t *testing.T) {
 
 	// 6. Board session + WebAuthn assertion → POST /api/settings/security-gate must return
 	// something other than 403. (It may return 400/422 due to missing body, but not 403 —
-	// the board gate is passed.) Post-STA-583: a passkey assertion is also required.
+	// the board gate and enrollment gate both pass.) Post-STA-583: passkey seeded and
+	// verifier stubbed so WrapBoardAction passes.
 	req6, _ := http.NewRequest("POST", base+"/api/settings/security-gate", strings.NewReader(`{}`))
 	req6.Header.Set("Authorization", "Bearer "+authToken)
 	req6.Header.Set("Content-Type", "application/json")
@@ -367,9 +368,10 @@ func TestStaypointd_BoardToken_PersistedAndUsable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("board-session POST: %v", err)
 	}
+	body6, _ := io.ReadAll(resp6.Body)
 	resp6.Body.Close()
-	if resp6.StatusCode == http.StatusForbidden {
-		t.Errorf("board session got 403 Forbidden on /api/settings/security-gate; board cookie gate is broken")
+	if resp6.StatusCode == http.StatusForbidden || resp6.StatusCode == http.StatusUnauthorized {
+		t.Errorf("board session with assertion: want not 401/403, got %d %s", resp6.StatusCode, body6)
 	}
 
 	// 7. Agent-only (no board cookie) → must get 403.

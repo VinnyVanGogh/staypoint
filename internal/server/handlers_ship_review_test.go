@@ -23,11 +23,11 @@ import (
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-// shipDoReq sends an authenticated request. boardToken is variadic:
-//
-//	boardToken[0] = staypoint_board cookie value
-//	boardToken[1] = X-WebAuthn-Assertion header value (required for WrapBoardAction routes)
-func shipDoReq(t *testing.T, client *http.Client, token, method, urlStr string, body []byte, boardToken ...string) (*http.Response, []byte) {
+// shipDoReq sends an authenticated request. Variadic opts:
+//   opts[0] = boardToken (staypoint_board cookie value)
+//   opts[1] = X-WebAuthn-Session header value
+//   opts[2] = X-WebAuthn-Assertion header value
+func shipDoReq(t *testing.T, client *http.Client, token, method, urlStr string, body []byte, opts ...string) (*http.Response, []byte) {
 	t.Helper()
 	var br io.Reader
 	if body != nil {
@@ -41,11 +41,14 @@ func shipDoReq(t *testing.T, client *http.Client, token, method, urlStr string, 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if len(boardToken) > 0 && boardToken[0] != "" {
-		req.AddCookie(&http.Cookie{Name: "staypoint_board", Value: boardToken[0]})
+	if len(opts) > 0 && opts[0] != "" {
+		req.AddCookie(&http.Cookie{Name: "staypoint_board", Value: opts[0]})
 	}
-	if len(boardToken) > 1 && boardToken[1] != "" {
-		req.Header.Set("X-WebAuthn-Assertion", boardToken[1])
+	if len(opts) > 1 && opts[1] != "" {
+		req.Header.Set("X-WebAuthn-Session", opts[1])
+	}
+	if len(opts) > 2 && opts[2] != "" {
+		req.Header.Set("X-WebAuthn-Assertion", opts[2])
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -185,9 +188,11 @@ func TestShipReview_ApproveReturns409WithBodyOnMovedHead(t *testing.T) {
 	database := setupTestDB(t)
 	seedBoardWebAuthnCredential(t, database)
 	srv, token := startTestServer(t, database)
-	if s, ok := any(srv).(webAuthnVerifierSetter); ok {
-		s.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
+	setter, ok := any(srv).(webAuthnVerifierSetter)
+	if !ok {
+		t.Fatal("*server.Server must implement SetWebAuthnVerifier")
 	}
+	setter.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
 	baseURL := srv.URL()
 	boardToken := srv.BoardToken()
 	client := &http.Client{}
@@ -222,7 +227,7 @@ func TestShipReview_ApproveReturns409WithBodyOnMovedHead(t *testing.T) {
 	run("checkout", "main")
 
 	// Approve should 409 because HEAD moved past pinned SHA.
-	resp3, rb3 := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", nil, boardToken, "stub-assertion")
+	resp3, rb3 := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", nil, boardToken, "", "mock-assertion")
 	if resp3.StatusCode != http.StatusConflict {
 		t.Fatalf("want 409 on moved head, got %d: %s", resp3.StatusCode, rb3)
 	}
@@ -250,9 +255,11 @@ func TestShipReview_ApproveMovesTaskToDone(t *testing.T) {
 	database := setupTestDB(t)
 	seedBoardWebAuthnCredential(t, database)
 	srv, token := startTestServer(t, database)
-	if s, ok := any(srv).(webAuthnVerifierSetter); ok {
-		s.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
+	setter, ok := any(srv).(webAuthnVerifierSetter)
+	if !ok {
+		t.Fatal("*server.Server must implement SetWebAuthnVerifier")
 	}
+	setter.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
 	baseURL := srv.URL()
 	boardToken := srv.BoardToken()
 	client := &http.Client{}
@@ -268,8 +275,8 @@ func TestShipReview_ApproveMovesTaskToDone(t *testing.T) {
 		t.Fatalf("UpsertCard: %d %s", resp.StatusCode, rb)
 	}
 
-	// Approve — must succeed (200).  Board session cookie + WebAuthn assertion required (post-STA-583).
-	resp2, rb2 := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", nil, boardToken, "stub-assertion")
+	// Approve — must succeed (200). Board session + WebAuthn assertion required (STA-583).
+	resp2, rb2 := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", nil, boardToken, "", "mock-assertion")
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("Approve: %d %s", resp2.StatusCode, rb2)
 	}

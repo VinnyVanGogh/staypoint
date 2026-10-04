@@ -37,9 +37,13 @@ type WebAuthnHandler struct {
 	waInitMu sync.Mutex
 	port     int // daemon TCP port; used for fixed RPID origin
 
-	pairingMu   sync.Mutex
-	pairingCode string
-	pairingExp  time.Time
+	pairingMu       sync.Mutex
+	pairingCode     string
+	pairingExp      time.Time
+	lastPairingCode string // kept for test-only endpoint; never cleared after use
+
+	pairingNotifierMu sync.RWMutex
+	pairingNotifier   func(code string) error // nil means use osascript
 
 	sessionMu sync.Mutex
 	sessions  map[string]*webauthn.SessionData
@@ -51,6 +55,30 @@ func NewWebAuthnHandler(db *sql.DB, hub *EventHub) *WebAuthnHandler {
 		hub:      hub,
 		sessions: make(map[string]*webauthn.SessionData),
 	}
+}
+
+// SetPairingNotifier replaces the macOS notification with a custom function.
+// When fn is non-nil, it is called instead of osascript. Used in tests and
+// for the Playwright e2e suite (via the test-only last-pairing-code endpoint).
+func (h *WebAuthnHandler) SetPairingNotifier(fn func(code string) error) {
+	h.pairingNotifierMu.Lock()
+	defer h.pairingNotifierMu.Unlock()
+	h.pairingNotifier = fn
+}
+
+// LastPairingCode returns the most recently generated pairing code (cleared on
+// expiry, but kept across successful RegisterFinish for test retrieval).
+// Must only be exposed via a TestMode-gated endpoint.
+func (h *WebAuthnHandler) LastPairingCode() string {
+	h.pairingMu.Lock()
+	defer h.pairingMu.Unlock()
+	return h.lastPairingCode
+}
+
+// TestLastPairingCode handles GET /api/board/webauthn/test/last-pairing-code.
+// Only registered when server.Options.TestMode is true.
+func (h *WebAuthnHandler) TestLastPairingCode(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]string{"code": h.LastPairingCode()})
 }
 
 // SetPort updates the port and resets the WebAuthn instance so initWebAuthn
@@ -153,7 +181,7 @@ func (h *WebAuthnHandler) RegisterBegin(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Issue pairing code via macOS notification.
+	// Issue pairing code via macOS notification (or test notifier).
 	n, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "pairing code generation failed")
@@ -162,11 +190,20 @@ func (h *WebAuthnHandler) RegisterBegin(w http.ResponseWriter, r *http.Request) 
 	code := fmt.Sprintf("%06d", n.Int64())
 	h.pairingMu.Lock()
 	h.pairingCode = code
+	h.lastPairingCode = code
 	h.pairingExp = time.Now().Add(2 * time.Minute)
 	h.pairingMu.Unlock()
-	go exec.Command("osascript", "-e",
-		fmt.Sprintf(`display notification "StayPoint Board registration code: %s" with title "StayPoint Board"`, code),
-	).Run() //nolint:errcheck
+
+	h.pairingNotifierMu.RLock()
+	notifier := h.pairingNotifier
+	h.pairingNotifierMu.RUnlock()
+	if notifier != nil {
+		go notifier(code) //nolint:errcheck
+	} else {
+		go exec.Command("osascript", "-e",
+			fmt.Sprintf(`display notification "StayPoint Board registration code: %s" with title "StayPoint Board"`, code),
+		).Run() //nolint:errcheck
+	}
 
 	user := h.loadUser()
 	// Residual risk: attestation statements are requested but not cryptographically

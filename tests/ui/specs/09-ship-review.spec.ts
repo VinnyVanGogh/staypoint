@@ -102,7 +102,7 @@ test.describe('ship review card', () => {
   });
 
   // ── Bug 2: head_moved alert includes new SHA ──────────────────────────────
-  test('Approve shows head_moved alert with new SHA when 409 head_moved', async ({ page, api: _api, request }) => {
+  test('Approve shows head_moved alert with new SHA when 409 head_moved', async ({ boardPage: page, api: _api, request }) => {
     const { task, cleanup } = await createShipReviewTask(request, 'Ship review head_moved');
     const res = await upsertShipReview(request, task.id);
     expect(res.ok(), `upsert failed: ${await res.text()}`).toBeTruthy();
@@ -149,7 +149,7 @@ test.describe('ship review card', () => {
   });
 
   // ── Bug 3: approved final state shows reviewed SHA → main SHA ─────────────
-  test('Approve renders approved final state card with main SHA', async ({ page, api: _api, request }) => {
+  test('Approve renders approved final state card with main SHA', async ({ boardPage: page, api: _api, request }) => {
     const { task, cleanup } = await createShipReviewTask(request, 'Ship review approve final');
     const upsert = await upsertShipReview(request, task.id);
     expect(upsert.ok(), `upsert failed: ${await upsert.text()}`).toBeTruthy();
@@ -199,7 +199,7 @@ test.describe('ship review card', () => {
   });
 
   // ── Bug 3b: rejected final state shows reject comment ────────────────────
-  test('Reject renders rejected final state card with comment', async ({ page, api: _api, request }) => {
+  test('Reject renders rejected final state card with comment', async ({ boardPage: page, api: _api, request }) => {
     const { task, cleanup } = await createShipReviewTask(request, 'Ship review reject final');
     const upsert = await upsertShipReview(request, task.id);
     expect(upsert.ok(), `upsert failed: ${await upsert.text()}`).toBeTruthy();
@@ -240,6 +240,62 @@ test.describe('ship review card', () => {
 
     // The reject comment must appear in the final card.
     await expect(finalCard).toContainText(rejectComment);
+    cleanup();
+  });
+
+  // ── Negative: no passkey enrolled → enrollment prompt, action NOT performed ─
+  // Intercepts /webauthn/challenge to return 412 (no credentials registered),
+  // simulating a board session holder who hasn't enrolled a passkey yet.
+  test('Board action without enrolled passkey shows enrollment prompt and does not call action endpoint', async ({ boardPage: page, request }) => {
+    const { task, cleanup } = await createShipReviewTask(request, 'WebAuthn negative enroll');
+
+    const res = await upsertShipReview(request, task.id);
+    expect(res.ok(), `upsert failed: ${await res.text()}`).toBeTruthy();
+
+    await gotoTaskPage(page, task);
+    const card = page.locator('.ship-review-card');
+    await expect(card).toBeVisible({ timeout: 10_000 });
+
+    // Intercept challenge → 412 (simulates no passkey enrolled for this board session).
+    await page.route('**/webauthn/challenge', async (route) => {
+      await route.fulfill({
+        status: 412,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'no credentials registered' }),
+      });
+    });
+
+    // Track whether the action endpoint was ever called.
+    let approveWasCalled = false;
+    await page.route('**/ship-review/approve', async (route) => {
+      approveWasCalled = true;
+      await route.continue();
+    });
+
+    // Handle dialogs in order:
+    //   1st confirm: "Approve and merge?" → accept
+    //   2nd confirm: enrollment offer → dismiss (decline enrollment)
+    let enrollmentPromptSeen = false;
+    let dialogIndex = 0;
+    page.on('dialog', async (d) => {
+      dialogIndex++;
+      if (dialogIndex === 1 && d.type() === 'confirm') {
+        await d.accept(); // accept the "Approve and merge?" gate
+      } else if (d.type() === 'confirm' && /enroll|passkey/i.test(d.message())) {
+        enrollmentPromptSeen = true;
+        await d.dismiss(); // decline enrollment
+      } else {
+        await d.dismiss();
+      }
+    });
+
+    await card.getByRole('button', { name: /Approve/i }).click();
+
+    // Give async operations time to settle.
+    await page.waitForTimeout(800);
+
+    expect(enrollmentPromptSeen).toBe(true);
+    expect(approveWasCalled).toBe(false);
     cleanup();
   });
 

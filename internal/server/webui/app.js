@@ -185,6 +185,150 @@ function authHeader() {
   return TOKEN ? { 'Authorization': `Bearer ${TOKEN}` } : {};
 }
 
+// ── Board WebAuthn helpers ────────────────────────────────────────────────────
+
+function base64urlToArrayBuffer(b64url) {
+  const b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(b64);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
+}
+
+function arrayBufferToBase64url(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// boardWebAuthnGetAssertion calls POST /api/board/webauthn/challenge, drives
+// navigator.credentials.get(), and returns { sessionToken, assertion } ready
+// to attach as X-WebAuthn-Session / X-WebAuthn-Assertion headers.
+// Throws with { needsEnrollment: true } on 412 (no credentials registered).
+async function boardWebAuthnGetAssertion() {
+  const cr = await fetch('/api/board/webauthn/challenge', {
+    method: 'POST',
+    headers: authHeader(),
+  });
+  if (cr.status === 412) {
+    const err = new Error('board_passkey_enrollment_required');
+    err.needsEnrollment = true;
+    throw err;
+  }
+  if (!cr.ok) throw new Error(`challenge failed: ${cr.status}`);
+  const sessionToken = cr.headers.get('X-WebAuthn-Session');
+  const opts = await cr.json();
+
+  // Convert base64url fields to ArrayBuffers for the browser API.
+  const publicKey = opts.publicKey;
+  publicKey.challenge = base64urlToArrayBuffer(
+    typeof publicKey.challenge === 'string' ? publicKey.challenge
+      : arrayBufferToBase64url(publicKey.challenge));
+  if (publicKey.allowCredentials) {
+    publicKey.allowCredentials = publicKey.allowCredentials.map(c => ({
+      ...c,
+      id: base64urlToArrayBuffer(typeof c.id === 'string' ? c.id : arrayBufferToBase64url(c.id)),
+    }));
+  }
+
+  const cred = await navigator.credentials.get({ publicKey });
+  const assertion = JSON.stringify({
+    id: cred.id,
+    rawId: arrayBufferToBase64url(cred.rawId),
+    type: cred.type,
+    response: {
+      clientDataJSON: arrayBufferToBase64url(cred.response.clientDataJSON),
+      authenticatorData: arrayBufferToBase64url(cred.response.authenticatorData),
+      signature: arrayBufferToBase64url(cred.response.signature),
+      userHandle: cred.response.userHandle ? arrayBufferToBase64url(cred.response.userHandle) : null,
+    },
+  });
+  return { sessionToken, assertion };
+}
+
+// boardEnrollPasskey drives the full enrollment flow:
+// begin → navigator.credentials.create() → fetch pairing code → finish.
+async function boardEnrollPasskey(existingSessionToken, existingAssertion) {
+  const extraHeaders = {};
+  if (existingSessionToken) extraHeaders['X-WebAuthn-Session'] = existingSessionToken;
+  if (existingAssertion) extraHeaders['X-WebAuthn-Assertion'] = existingAssertion;
+
+  const br = await fetch('/api/board/webauthn/register/begin', {
+    method: 'POST',
+    headers: { ...authHeader(), ...extraHeaders },
+    body: JSON.stringify({}),
+  });
+  if (!br.ok) {
+    const e = await br.json().catch(() => ({}));
+    throw new Error(e.message || `register/begin failed: ${br.status}`);
+  }
+  const regSessionToken = br.headers.get('X-WebAuthn-Session');
+  const regOpts = await br.json();
+
+  const pk = regOpts.publicKey;
+  pk.challenge = base64urlToArrayBuffer(typeof pk.challenge === 'string' ? pk.challenge : arrayBufferToBase64url(pk.challenge));
+  pk.user.id = base64urlToArrayBuffer(typeof pk.user.id === 'string' ? pk.user.id : arrayBufferToBase64url(pk.user.id));
+  if (pk.excludeCredentials) {
+    pk.excludeCredentials = pk.excludeCredentials.map(c => ({
+      ...c,
+      id: base64urlToArrayBuffer(typeof c.id === 'string' ? c.id : arrayBufferToBase64url(c.id)),
+    }));
+  }
+
+  const newCred = await navigator.credentials.create({ publicKey: pk });
+
+  const code = prompt('Enter the 6-digit pairing code from your macOS notification:');
+  if (!code || !code.trim()) throw new Error('Enrollment cancelled — no pairing code entered.');
+
+  const credential = {
+    id: newCred.id,
+    rawId: arrayBufferToBase64url(newCred.rawId),
+    type: newCred.type,
+    response: {
+      clientDataJSON: arrayBufferToBase64url(newCred.response.clientDataJSON),
+      attestationObject: arrayBufferToBase64url(newCred.response.attestationObject),
+    },
+  };
+
+  const fr = await fetch('/api/board/webauthn/register/finish', {
+    method: 'POST',
+    headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': regSessionToken },
+    body: JSON.stringify({ code: code.trim(), credential }),
+  });
+  if (!fr.ok) {
+    const e = await fr.json().catch(() => ({}));
+    throw new Error(e.message || `register/finish failed: ${fr.status}`);
+  }
+}
+
+// withBoardWebAuthn wraps a Board action fetch. It calls boardWebAuthnGetAssertion()
+// first and attaches the session/assertion headers. On 403 board_passkey_enrollment_required
+// it shows the enrollment prompt and does NOT perform the action.
+// Returns null if enrollment is required (caller should abort), or the fetch Response.
+async function withBoardWebAuthn(fetchFn) {
+  let sessionToken, assertion;
+  try {
+    ({ sessionToken, assertion } = await boardWebAuthnGetAssertion());
+  } catch (e) {
+    if (e.needsEnrollment) {
+      const doEnroll = confirm(
+        'Board actions require a registered passkey.\n\nClick OK to enroll a passkey now, or Cancel to abort.');
+      if (doEnroll) {
+        try {
+          await boardEnrollPasskey();
+          alert('Passkey enrolled! Please try your action again.');
+        } catch (ee) {
+          alert('Enrollment failed: ' + (ee.message || ee));
+        }
+      }
+      return null;
+    }
+    throw e;
+  }
+  return fetchFn(sessionToken, assertion);
+}
+
 // Close any open .report-dl-menu when clicking outside its wrapper.
 document.addEventListener('click', () => {
   document.querySelectorAll('.report-dl-menu').forEach(m => { m.hidden = true; });
@@ -4420,11 +4564,17 @@ function renderSettings() {
 
   gateToggle.addEventListener('change', () => {
     gateToggle.disabled = true;
-    fetch('/api/settings/security-gate', {
-      method: 'POST',
-      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeader()),
-      body: JSON.stringify({ main_merge_approval: gateToggle.checked }),
-    }).then(r => r.ok ? r.json() : null).then(data => {
+    const checked = gateToggle.checked;
+    withBoardWebAuthn((sessionToken, assertion) =>
+      fetch('/api/settings/security-gate', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion }, authHeader()),
+        body: JSON.stringify({ main_merge_approval: checked }),
+      })
+    ).then(r => {
+      if (r === null) { gateToggle.disabled = false; gateToggle.checked = !checked; return null; }
+      return r.ok ? r.json() : null;
+    }).then(data => {
       gateToggle.disabled = false;
       if (data) gateToggle.checked = data.main_merge_approval !== false;
     }).catch(() => { gateToggle.disabled = false; });
@@ -4458,11 +4608,17 @@ function renderSettings() {
 
   srToggle.addEventListener('change', () => {
     srToggle.disabled = true;
-    fetch('/api/settings/ship-review', {
-      method: 'POST',
-      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeader()),
-      body: JSON.stringify({ ship_review: srToggle.checked }),
-    }).then(r => r.ok ? r.json() : null).then(data => {
+    const checked = srToggle.checked;
+    withBoardWebAuthn((sessionToken, assertion) =>
+      fetch('/api/settings/ship-review', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion }, authHeader()),
+        body: JSON.stringify({ ship_review: checked }),
+      })
+    ).then(r => {
+      if (r === null) { srToggle.disabled = false; srToggle.checked = !checked; return null; }
+      return r.ok ? r.json() : null;
+    }).then(data => {
       srToggle.disabled = false;
       if (data) srToggle.checked = data.ship_review !== false;
     }).catch(() => { srToggle.disabled = false; });
@@ -7561,10 +7717,13 @@ function renderShipReviewCardFromData(container, taskId, card) {
     approveBtn.disabled = true;
     try {
       // Use raw fetch so we can inspect the 409 body before throwing.
-      const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/approve`, {
-        method: 'POST',
-        headers: authHeader(),
-      });
+      const r = await withBoardWebAuthn((sessionToken, assertion) =>
+        fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/approve`, {
+          method: 'POST',
+          headers: { ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+        })
+      );
+      if (r === null) { approveBtn.disabled = false; return; } // enrollment required
       if (r.status === 409) {
         const body = await r.json().catch(() => ({}));
         if (body.error === 'head_moved') {
@@ -7594,11 +7753,15 @@ function renderShipReviewCardFromData(container, taskId, card) {
     if (!comment || !comment.trim()) return;
     sendBackBtn.disabled = true;
     try {
-      await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/send-back`, {
-        method: 'POST',
-        headers: { ...authHeader(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ comment: comment.trim() }),
-      });
+      const r = await withBoardWebAuthn((sessionToken, assertion) =>
+        fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/send-back`, {
+          method: 'POST',
+          headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+          body: JSON.stringify({ comment: comment.trim() }),
+        })
+      );
+      if (r === null) { sendBackBtn.disabled = false; return; }
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
       section.remove();
     } catch (e) {
       alert('Send back failed: ' + (e.message || e));
@@ -7613,11 +7776,15 @@ function renderShipReviewCardFromData(container, taskId, card) {
     const delBranch = confirm('Also delete the remote branch?');
     rejectBtn.disabled = true;
     try {
-      await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/reject`, {
-        method: 'POST',
-        headers: { ...authHeader(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ comment: comment || '', delete_branch: delBranch }),
-      });
+      const r = await withBoardWebAuthn((sessionToken, assertion) =>
+        fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/reject`, {
+          method: 'POST',
+          headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+          body: JSON.stringify({ comment: comment || '', delete_branch: delBranch }),
+        })
+      );
+      if (r === null) { rejectBtn.disabled = false; return; }
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
       section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'rejected', '', comment || ''));
     } catch (e) {
       alert('Reject failed: ' + (e.message || e));
@@ -10300,13 +10467,17 @@ async function renderGatesPage() {
 
 async function decideGate(id, decision) {
   try {
-    const r = await fetch(`/api/security/gate-requests/${id}/decide`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeader() },
-      body: JSON.stringify({ decision }),
-    });
+    const r = await withBoardWebAuthn((sessionToken, assertion) =>
+      fetch(`/api/security/gate-requests/${id}/decide`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+        body: JSON.stringify({ decision }),
+      })
+    );
+    if (r === null) return; // enrollment required — user was prompted
     if (r.status === 403) {
-      alert('Board session required. Open StayPoint in a browser with your board token to approve/deny gates.');
+      const err = await r.json().catch(() => ({}));
+      alert(err.message || 'Board session required. Open StayPoint in a browser with your board token to approve/deny gates.');
       return;
     }
     if (!r.ok) {
