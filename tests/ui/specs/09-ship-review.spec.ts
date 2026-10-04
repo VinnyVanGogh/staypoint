@@ -107,6 +107,13 @@ test.describe('ship review card', () => {
     cleanup();
   });
 
+  // UI-state rendering only; enforcement covered by Gates specs + Go tests.
+  // These specs fulfill /ship-review/approve and /ship-review/reject with
+  // page.route, so the real server never decides anything. They prove the card
+  // renders each response shape correctly, NOT that the server enforces the
+  // Board passkey gate. Do not cite them as enforcement coverage.
+  test.describe('UI-state rendering only (route-faked action responses)', () => {
+
   // ── Bug 2 / STA-586 Bug 5: head_moved shows inline banner (no browser alert) ──
   test('Approve shows head_moved inline banner with new SHA when 409 head_moved', async ({ boardPage: page, api: _api, request }) => {
     const { task, cleanup } = await createShipReviewTask(request, 'Ship review head_moved');
@@ -360,29 +367,36 @@ test.describe('ship review card', () => {
     cleanup();
   });
 
+  });
+
   // ── Negative: no passkey enrolled → enrollment prompt, action NOT performed ─
-  // Intercepts /webauthn/challenge to return 412 (no credentials registered),
-  // simulating a board session holder who hasn't enrolled a passkey yet.
+  // Real server state, no faked responses: the boardPage fixture enrolls a
+  // passkey, then this spec wipes every stored credential through the
+  // TestMode-only DELETE /api/board/webauthn/test/clear-credentials. The real
+  // /webauthn/challenge must then answer 412, the client must offer enrollment
+  // and never reach /ship-review/approve, and the real WrapBoardAction gate must
+  // refuse a direct approve with 403 board_passkey_enrollment_required.
   test('Board action without enrolled passkey shows enrollment prompt and does not call action endpoint', async ({ boardPage: page, request }) => {
     const { task, cleanup } = await createShipReviewTask(request, 'WebAuthn negative enroll');
 
     const res = await upsertShipReview(request, task.id);
     expect(res.ok(), `upsert failed: ${await res.text()}`).toBeTruthy();
 
+    // page.request shares the browser context's cookies, so the staypoint_board
+    // session cookie set by the fixture rides along (the route is board-session gated).
+    const clear = await page.request.delete('/api/board/webauthn/test/clear-credentials', {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    expect(clear.ok(), `clear-credentials failed: ${clear.status()} ${await clear.text()}`).toBeTruthy();
+
+    const cardURL = `/api/tasks/${encodeURIComponent(task.id)}/ship-review`;
+    const before = await (await request.get(cardURL, { headers: { Authorization: `Bearer ${TOKEN}` } })).json();
+
     await gotoTaskPage(page, task);
     const card = page.locator('.ship-review-card');
     await expect(card).toBeVisible({ timeout: 10_000 });
 
-    // Intercept challenge → 412 (simulates no passkey enrolled for this board session).
-    await page.route('**/webauthn/challenge', async (route) => {
-      await route.fulfill({
-        status: 412,
-        contentType: 'application/json',
-        body: JSON.stringify({ error: 'no credentials registered' }),
-      });
-    });
-
-    // Track whether the action endpoint was ever called.
+    // Passthrough spy only: never fulfills, so any hit reaches the real server.
     let approveWasCalled = false;
     await page.route('**/ship-review/approve', async (route) => {
       approveWasCalled = true;
@@ -401,15 +415,32 @@ test.describe('ship review card', () => {
       }
     });
 
+    const challenge = page.waitForResponse((r) => r.url().includes('/api/board/webauthn/challenge'));
     await card.getByRole('button', { name: /Approve/i }).click();
     // Inline confirm form must appear; click Merge to main to trigger withBoardWebAuthn.
     await expect(card.locator('.ship-review-approve-confirm')).toBeVisible({ timeout: 3_000 });
     await card.getByRole('button', { name: /Merge to main/i }).click();
 
-    // Give async operations time to settle.
-    await page.waitForTimeout(800);
+    // The real server, not a route, must report zero passkeys.
+    const challengeRes = await challenge;
+    expect(challengeRes.status()).toBe(412);
 
-    expect(enrollmentPromptSeen).toBe(true);
+    await expect.poll(() => enrollmentPromptSeen, { timeout: 5_000 }).toBe(true);
+    expect(approveWasCalled).toBe(false);
+
+    // Server-side enforcement: even with the Board session cookie, a direct
+    // approve is refused before the handler runs.
+    const direct = await page.request.post(`${cardURL}/approve`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    expect(direct.status()).toBe(403);
+    expect((await direct.json()).error).toBe('board_passkey_enrollment_required');
+
+    // Card state is unchanged and the action is still offered.
+    const after = await (await request.get(cardURL, { headers: { Authorization: `Bearer ${TOKEN}` } })).json();
+    expect(after.status).toBe(before.status);
+    expect(after.head_sha).toBe(before.head_sha);
+    await expect(card.locator('.ship-review-approve-btn')).toBeEnabled();
     expect(approveWasCalled).toBe(false);
     cleanup();
   });
