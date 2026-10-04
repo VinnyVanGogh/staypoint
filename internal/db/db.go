@@ -979,7 +979,7 @@ var Migrations = []Migration{
 		},
 	},
 	{
-		Version: 22,
+		Version: 23,
 		Name:    "board_audit_log",
 		Up: func(conn *sql.DB) error {
 			for _, stmt := range []string{
