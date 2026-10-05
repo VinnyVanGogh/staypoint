@@ -292,7 +292,7 @@ func TestMigrationGate_MigrationPathWithSpaces(t *testing.T) {
 // Deleting a migration does not count as an unverified migration, so it does not
 // block approve or appear in unverified_migrations. Regression for STA-755.
 func TestMigrationGate_DeletedMigrationNotUnverified(t *testing.T) {
-	_, baseURL, token, boardToken, taskID, repoDir, _ := shipApproveServer(t)
+	_, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
 
 	// Commit migrations/005_to_delete.sql on main first
 	if err := os.MkdirAll(filepath.Join(repoDir, "migrations"), 0o755); err != nil {
@@ -314,6 +314,13 @@ func TestMigrationGate_DeletedMigrationNotUnverified(t *testing.T) {
 	gitOut(t, repoDir, "rm", migPath)
 	gitOut(t, repoDir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "task: delete migration")
 	gitOut(t, repoDir, "checkout", "main")
+
+	// Re-render card so head_sha matches the task branch commit
+	upsertBody, _ := json.Marshal(map[string]any{"test_steps": []string{"1. Open /"}})
+	respCard, rb := shipDoReq(t, client, token, "PUT", baseURL+"/api/tasks/"+taskID+"/ship-review", upsertBody)
+	if respCard.StatusCode != http.StatusOK && respCard.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT ship-review: %d %s", respCard.StatusCode, rb)
+	}
 
 	card := getCardMap(t, baseURL, token, taskID)
 	if v, ok := card["repo_error"]; ok {

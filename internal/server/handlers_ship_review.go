@@ -291,11 +291,31 @@ func unverifiedMigrations(ctx gocontext.Context, db *sql.DB, task *context.Task)
 
 	var unverified []string
 	for _, p := range migPaths {
-		if !appliedPaths[p] {
-			unverified = append(unverified, p)
+		if appliedPaths[p] {
+			continue
 		}
+		if !migrationFileExistsAtTask(ctx, task, workDir, hasWorktree, p) {
+			// Deleted migration files do not count as unverified migrations.
+			continue
+		}
+		unverified = append(unverified, p)
 	}
 	return unverified, nil
+}
+
+// migrationFileExistsAtTask checks whether the migration file exists in the task's
+// current working tree (if present) or at the task branch tip. Deleted migrations
+// return false so they do not count as unverified migrations.
+func migrationFileExistsAtTask(ctx gocontext.Context, task *context.Task, workDir string, hasWorktree bool, relPath string) bool {
+	if hasWorktree {
+		_, err := os.Stat(filepath.Join(workDir, relPath))
+		return err == nil
+	}
+	branch := "staypoint/" + task.ID
+	cmd := gitexec.Command(ctx, "cat-file", "-e", branch+":"+filepath.ToSlash(relPath))
+	cmd.Dir = task.RepoPath
+	cmd.Env = security.ChildEnv()
+	return cmd.Run() == nil
 }
 
 // nothingToDiff reports whether a failed migration diff failed only because

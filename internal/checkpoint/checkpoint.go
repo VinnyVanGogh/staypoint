@@ -340,26 +340,11 @@ func DiffCheckpointFilesAgainstRef(ctx context.Context, repoPath, checkpointID, 
 			targetRef = strings.TrimSpace(refs)
 		}
 	}
-	out, err := runGit(ctx, rootDir, nil, "diff", targetRef, ref, "--numstat")
+	out, err := runGit(ctx, rootDir, nil, "diff", targetRef, ref, "--numstat", "-z", "--no-renames")
 	if err != nil {
 		return nil, err
 	}
-
-	var stats []FileDiffStat
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.Fields(line)
-		if len(parts) < 3 {
-			continue
-		}
-		added, _ := strconv.Atoi(parts[0])
-		removed, _ := strconv.Atoi(parts[1])
-		stats = append(stats, FileDiffStat{Path: parts[2], Added: added, Removed: removed})
-	}
-	return stats, nil
+	return parseNumstat(out), nil
 }
 
 // DiffCheckpointFiles returns per-file add/remove counts between the working tree
@@ -380,26 +365,64 @@ func DiffCheckpointFiles(ctx context.Context, workDir, checkpointID string) ([]F
 			targetRef = strings.TrimSpace(refs)
 		}
 	}
-	out, err := runGit(ctx, rootDir, nil, "diff", targetRef, "--numstat")
+	out, err := runGit(ctx, rootDir, nil, "diff", targetRef, "--numstat", "-z", "--no-renames")
 	if err != nil {
 		return nil, err
 	}
+	return parseNumstat(out), nil
+}
 
+// parseNumstat parses git diff --numstat -z output into FileDiffStat records.
+// In -z mode records are NUL-delimited and formatted as:
+//   <added>\t<removed>\t<path>\0
+// If rename detection was enabled without --no-renames, rename records appear as:
+//   <added>\t<removed>\t\0<old_path>\0<new_path>\0
+// parseNumstat handles both, correctly preserving paths with spaces and
+// extracting the real destination path for renames.
+func parseNumstat(out string) []FileDiffStat {
+	parts := strings.Split(out, "\x00")
 	var stats []FileDiffStat
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	for i := 0; i < len(parts); i++ {
+		chunk := parts[i]
+		if chunk == "" {
 			continue
 		}
-		parts := strings.Fields(line)
-		if len(parts) < 3 {
+		tab1 := strings.IndexByte(chunk, '\t')
+		if tab1 == -1 {
 			continue
 		}
-		added, _ := strconv.Atoi(parts[0])
-		removed, _ := strconv.Atoi(parts[1])
-		stats = append(stats, FileDiffStat{Path: parts[2], Added: added, Removed: removed})
+		tab2 := strings.IndexByte(chunk[tab1+1:], '\t')
+		if tab2 == -1 {
+			continue
+		}
+		tab2 += tab1 + 1
+		addedStr := chunk[:tab1]
+		removedStr := chunk[tab1+1 : tab2]
+		path := chunk[tab2+1:]
+
+		added, _ := strconv.Atoi(addedStr)
+		removed, _ := strconv.Atoi(removedStr)
+
+		// Handle git diff -z rename records if present:
+		// <added>\t<removed>\t\0<old_path>\0<new_path>\0
+		if len(path) == 0 && i+2 < len(parts) {
+			newPath := parts[i+2]
+			i += 2
+			stats = append(stats, FileDiffStat{
+				Path:    newPath,
+				Added:   added,
+				Removed: removed,
+			})
+			continue
+		}
+
+		stats = append(stats, FileDiffStat{
+			Path:    path,
+			Added:   added,
+			Removed: removed,
+		})
 	}
-	return stats, nil
+	return stats
 }
 
 // validCheckpointID reports whether s is safe to pass to git.
