@@ -7780,14 +7780,18 @@ function renderShipReviewCardFromData(container, taskId, card) {
     } else {
       devRow.appendChild(el('span', 'ship-review-dev-link', card.dev_url + ' (invalid URL)'));
     }
-    const restartBtn = el('button', 'ship-review-restart-btn', '↺ Restart');
-    restartBtn.title = 'Restart dev server';
-    restartBtn.addEventListener('click', async () => {
-      restartBtn.disabled = true;
-      await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/start-dev`, { method: 'POST' }).catch(() => {});
-      restartBtn.disabled = false;
-    });
-    devRow.appendChild(restartBtn);
+    // start-dev only accepts pending cards (STA-654); a sent_back card's dev
+    // server was stopped and will 409.
+    if (card.status === 'pending') {
+      const restartBtn = el('button', 'ship-review-restart-btn', '↺ Restart');
+      restartBtn.title = 'Restart dev server';
+      restartBtn.addEventListener('click', async () => {
+        restartBtn.disabled = true;
+        await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/start-dev`, { method: 'POST' }).catch(() => {});
+        restartBtn.disabled = false;
+      });
+      devRow.appendChild(restartBtn);
+    }
     section.appendChild(devRow);
   }
 
