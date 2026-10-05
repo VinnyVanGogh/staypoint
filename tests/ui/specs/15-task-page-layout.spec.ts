@@ -43,7 +43,7 @@
 
 import type { Locator, Page } from '@playwright/test';
 import {
-  test, expect, gotoTaskPage, saveArtifactScreenshot,
+  test, expect, gotoTaskPage, knownBug, openTaskPanelTab, saveArtifactScreenshot,
   type StayPointAPI, type Task,
 } from '../fixtures';
 
@@ -487,6 +487,109 @@ test('step 5: full brief, dev-server log, agent summary and migration SQL open i
     await page.keyboard.press('Escape');
     await expect(page.getByRole('dialog')).toHaveCount(0);
   }
+});
+
+// STA-679 (Board, live screenshot after step 5): the clipped agent-summary
+// preview drew its last line under the green "Migration marked applied" banner.
+// The preview must be a real bounded box: overflow hidden, a bottom fade, and
+// the banner in normal flow below it. Written before the fix (STA-680); the
+// fixer must not edit or weaken these assertions.
+//
+// Fade check: the summary body has an ::after pseudo-element with a gradient
+// background-image and a non-zero height (the fade drawn over the clipped
+// bottom edge). A mask-image fade would not pass; that choice is deliberate so
+// the check is one concrete, observable thing.
+const SUMMARY_LAST_LINE = 'Which block I copied: SUMMARY-LAST-LINE-STA-679';
+
+function longSummary(): string {
+  const parts: string[] = ['## What changed', ''];
+  for (let i = 1; i <= 24; i++) {
+    parts.push(`Paragraph ${i}. The limiter now sets X-RateLimit-Remaining on every 2xx and Retry-After on the 429 path, and this paragraph wraps across several lines on purpose so the preview has real height to clip.`, '');
+  }
+  parts.push(SUMMARY_LAST_LINE);
+  return parts.join('\n');
+}
+
+function appliedMigrations() {
+  const m = migrations();
+  return {
+    ...m,
+    migrations: m.migrations.map((x) => ({ ...x, applied_at: '2026-10-04T12:00:00Z', applied_by: 'board' })),
+  };
+}
+
+test('STA-679: long agent-summary preview is clipped with a fade and stays above the applied-migration banner', async ({ page, api }) => {
+  knownBug('STA-679');
+  test.setTimeout(60_000);
+  await page.setViewportSize(WIDE);
+  const seed = await seedHeavyTask(page, api);
+  // Registered after seedHeavyTask's routes, so these win (Playwright runs the
+  // most recently registered matching route first).
+  const base = `**/api/tasks/${encodeURIComponent(seed.task.id)}`;
+  await page.route(`${base}/ship-review`, (r) =>
+    r.request().method() === 'GET'
+      ? r.fulfill(json({ ...shipCard(seed.task.id), agent_summary: longSummary() }))
+      : r.continue());
+  await page.route(`${base}/migrations`, (r) =>
+    r.request().method() === 'GET' ? r.fulfill(json(appliedMigrations())) : r.continue());
+  await gotoTaskPage(page, seed.task);
+  await openTaskPanelTab(page, 'Review');
+
+  const card = page.locator('#task-page-content .task-page-panel .ship-review-card');
+  const summary = card.locator('.ship-review-summary-body');
+  const banner = card.locator('.ship-review-migration-banner--applied');
+  // Visibility first, so a missing block fails here rather than as a timeout.
+  await expect(summary, 'no .ship-review-summary-body on the Review tab').toBeVisible();
+  await expect(summary).toContainText('Paragraph 1.');
+  await expect(banner, 'applied-migration banner did not render').toBeVisible({ timeout: 12_000 });
+  await expect(banner).toContainText('Migration marked applied');
+  await banner.scrollIntoViewIfNeeded(); // elementFromPoint below needs it on screen
+  await page.waitForTimeout(300); // let late async renders settle before measuring and the capture
+  await saveArtifactScreenshot(page, 'task-page-review-long-summary.png');
+
+  const m = await summary.evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    const section = el.closest('.ship-review-summary-section') || el;
+    const b = document.querySelector('#task-page-content .ship-review-migration-banner--applied')!.getBoundingClientRect();
+    const after = getComputedStyle(el, '::after');
+    return {
+      bottom: r.bottom,
+      sectionBottom: section.getBoundingClientRect().bottom,
+      height: r.height,
+      bannerTop: b.top,
+      overflowY: getComputedStyle(el).overflowY,
+      overflows: el.scrollHeight > el.clientHeight + 1,
+      afterContent: after.content,
+      afterBg: after.backgroundImage,
+      afterHeight: parseFloat(after.height) || 0,
+    };
+  });
+
+  expect(m.overflows, 'seeded summary is not long enough to be clipped').toBe(true);
+  expect(m.bottom, `summary bottom ${Math.round(m.bottom)} is below the banner top ${Math.round(m.bannerTop)}`)
+    .toBeLessThanOrEqual(m.bannerTop + 0.5);
+  expect(m.sectionBottom, `summary section bottom ${Math.round(m.sectionBottom)} is below the banner top ${Math.round(m.bannerTop)}`)
+    .toBeLessThanOrEqual(m.bannerTop + 0.5);
+  expect(m.overflowY, '.ship-review-summary-body overflow-y').toBe('hidden');
+  expect(m.height, `summary preview renders ${Math.round(m.height)}px tall`).toBeLessThanOrEqual(MAX_INLINE_PX);
+  expect(m.afterContent, '.ship-review-summary-body::after has no content (no fade)').not.toBe('none');
+  expect(m.afterBg, '.ship-review-summary-body::after background is not a gradient fade').toMatch(/gradient\(/);
+  expect(m.afterHeight, '.ship-review-summary-body::after has no height').toBeGreaterThan(0);
+
+  // The last line is not drawn on top of the banner: whatever paints at the
+  // banner's centre is the banner itself.
+  const hit = await banner.evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return !!top && (top === el || el.contains(top));
+  });
+  expect(hit, 'something other than the banner paints over its centre').toBe(true);
+
+  // The full summary, last line included, is one click away.
+  const trigger = card.locator('[data-modal-trigger="agent-summary"]');
+  await expect(trigger).toBeVisible();
+  await trigger.click();
+  await expect(page.getByRole('dialog').filter({ hasText: SUMMARY_LAST_LINE })).toBeVisible();
 });
 
 test('step 6: at 800x900 the page stacks, tabs are a segmented control, nothing overflows horizontally', async ({ page, api }) => {
