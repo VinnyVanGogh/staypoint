@@ -374,9 +374,13 @@ func DiffCheckpointFiles(ctx context.Context, workDir, checkpointID string) ([]F
 
 // parseNumstat parses git diff --numstat -z output into FileDiffStat records.
 // In -z mode records are NUL-delimited and formatted as:
-//   <added>\t<removed>\t<path>\0
+//
+//	<added>\t<removed>\t<path>\0
+//
 // If rename detection was enabled without --no-renames, rename records appear as:
-//   <added>\t<removed>\t\0<old_path>\0<new_path>\0
+//
+//	<added>\t<removed>\t\0<old_path>\0<new_path>\0
+//
 // parseNumstat handles both, correctly preserving paths with spaces and
 // extracting the real destination path for renames.
 func parseNumstat(out string) []FileDiffStat {
