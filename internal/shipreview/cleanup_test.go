@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 )
@@ -154,7 +155,10 @@ func TestCleanupMergedBranchKeepsUnmergedWork(t *testing.T) {
 
 func TestCleanupMergedBranchRejectsBadTaskID(t *testing.T) {
 	repoDir, card, mainSHA := mergedCard(t, "t-badid")
-	for _, id := range []string{"", "..", "../x", "a/b"} {
+	// A worktree and a dev worktree that a path-like ID would sweep away.
+	other := filepath.Join(repoDir, ".worktrees", "task-keep")
+	gitIn(t, repoDir, "worktree", "add", "--detach", other, "main")
+	for _, id := range []string{"", "/", ".", "..", "../x", "a/b", `a\b`} {
 		c := *card
 		c.TaskID = id
 		if err := shipreview.CleanupMergedBranch(context.Background(), repoDir, &c, mainSHA); err == nil {
@@ -163,5 +167,189 @@ func TestCleanupMergedBranchRejectsBadTaskID(t *testing.T) {
 	}
 	if !remoteHasBranch(t, repoDir, card.Branch) {
 		t.Error("branch deleted despite invalid task id")
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("unrelated worktree removed by an invalid task id: %v", err)
+	}
+}
+
+// STA-649: the ancestor checks run before any worktree is removed, so an
+// unmerged agent worktree keeps its uncommitted edits.
+func TestCleanupMergedBranchKeepsUnmergedAgentWorktree(t *testing.T) {
+	repoDir, card, mainSHA := mergedCard(t, "t-agentwt")
+	agentWT := filepath.Join(repoDir, ".worktrees", card.TaskID)
+	gitIn(t, repoDir, "worktree", "add", agentWT, card.Branch)
+
+	// The agent kept working after the review: one local commit, one
+	// uncommitted edit. Neither reached main.
+	if err := os.WriteFile(filepath.Join(agentWT, "late.txt"), []byte("late\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, agentWT, "add", ".")
+	gitIn(t, agentWT, "commit", "-m", "late commit")
+	dirty := filepath.Join(agentWT, "wip.txt")
+	if err := os.WriteFile(dirty, []byte("uncommitted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := shipreview.CleanupMergedBranch(context.Background(), repoDir, card, mainSHA)
+	if err == nil || !strings.Contains(err.Error(), "not in main") {
+		t.Fatalf("want 'not in main' error, got %v", err)
+	}
+	if _, err := os.Stat(dirty); err != nil {
+		t.Errorf("uncommitted work in unmerged agent worktree lost: %v", err)
+	}
+	if !localHasBranch(repoDir, card.Branch) || !remoteHasBranch(t, repoDir, card.Branch) {
+		t.Error("branch deleted although the agent worktree holds unmerged work")
+	}
+}
+
+// STA-649: a remote branch that moved past main blocks the whole cleanup,
+// including the worktree removal that used to happen first.
+func TestCleanupMergedBranchRemoteAheadRemovesNothing(t *testing.T) {
+	repoDir, card, mainSHA := mergedCard(t, "t-remoteahead")
+	agentWT := filepath.Join(repoDir, ".worktrees", card.TaskID)
+	gitIn(t, repoDir, "worktree", "add", agentWT, card.Branch)
+	dirty := filepath.Join(agentWT, "wip.txt")
+	if err := os.WriteFile(dirty, []byte("uncommitted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Someone else pushes to the task branch from another clone.
+	bare := gitIn(t, repoDir, "remote", "get-url", "origin")
+	other := filepath.Join(t.TempDir(), "other")
+	gitIn(t, filepath.Dir(other), "clone", "-q", "-b", card.Branch, bare, other)
+	if err := os.WriteFile(filepath.Join(other, "remote.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, other, "add", ".")
+	gitIn(t, other, "commit", "-m", "pushed elsewhere")
+	gitIn(t, other, "push", "origin", card.Branch)
+
+	err := shipreview.CleanupMergedBranch(context.Background(), repoDir, card, mainSHA)
+	if err == nil || !strings.Contains(err.Error(), "remote branch") {
+		t.Fatalf("want remote-branch refusal, got %v", err)
+	}
+	if _, err := os.Stat(dirty); err != nil {
+		t.Errorf("agent worktree removed before the remote check: %v", err)
+	}
+	if !localHasBranch(repoDir, card.Branch) || !remoteHasBranch(t, repoDir, card.Branch) {
+		t.Error("branch deleted although the remote holds unmerged work")
+	}
+}
+
+// STA-649: a failing fetch --prune aborts cleanup instead of deciding on a
+// stale view of the remote.
+func TestCleanupMergedBranchFetchFailureDeletesNothing(t *testing.T) {
+	repoDir, card, mainSHA := mergedCard(t, "t-fetchfail")
+	agentWT := filepath.Join(repoDir, ".worktrees", card.TaskID)
+	gitIn(t, repoDir, "worktree", "add", agentWT, card.Branch)
+	bare := gitIn(t, repoDir, "remote", "get-url", "origin")
+	gitIn(t, repoDir, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git"))
+
+	err := shipreview.CleanupMergedBranch(context.Background(), repoDir, card, mainSHA)
+	if err == nil || !strings.Contains(err.Error(), "fetch --prune") {
+		t.Fatalf("want fetch --prune error, got %v", err)
+	}
+	if _, err := os.Stat(agentWT); err != nil {
+		t.Errorf("agent worktree removed despite fetch failure: %v", err)
+	}
+	if !localHasBranch(repoDir, card.Branch) {
+		t.Error("local branch deleted despite fetch failure")
+	}
+
+	// Remote reachable again: the retry cleans everything up.
+	gitIn(t, repoDir, "remote", "set-url", "origin", bare)
+	if err := shipreview.CleanupMergedBranch(context.Background(), repoDir, card, mainSHA); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if remoteHasBranch(t, repoDir, card.Branch) || localHasBranch(repoDir, card.Branch) {
+		t.Error("branch survived the retry")
+	}
+}
+
+// STA-649: an async dev-server setup still running at approve is cancelled, so
+// it neither recreates devserver-<id> nor starts the server afterwards.
+func TestCleanupMergedBranchCancelsInFlightDevSetup(t *testing.T) {
+	db := openTestDB(t)
+	taskID := "t-devsetup"
+	if _, err := db.Exec(`INSERT INTO tasks (id, name) VALUES (?, 'dev')`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	repoDir, branch, featureSHA := setupGitRepo(t)
+	card, err := shipreview.CreateCard(db, taskID, branch, featureSHA, []string{"1. Verify"}, "", repoDir, nil)
+	if err != nil {
+		t.Fatalf("CreateCard: %v", err)
+	}
+
+	devWT := filepath.Join(repoDir, ".worktrees", "devserver-"+taskID)
+	started := filepath.Join(t.TempDir(), "server-started")
+	stepRunning := filepath.Join(t.TempDir(), "step-running")
+	cfg := &shipreview.ProjectDevConfig{
+		RepoPath:   repoDir,
+		DevCommand: "touch " + started + "; sleep 60",
+		DevURL:     "http://localhost:39999",
+		SetupSteps: []string{"touch " + stepRunning + "; sleep 30"},
+	}
+	if _, err := shipreview.StartDevServerAsync(db, card, cfg, repoDir, nil); err != nil {
+		t.Fatalf("StartDevServerAsync: %v", err)
+	}
+	waitFor(t, 10*time.Second, "setup step to start", func() bool {
+		_, err := os.Stat(stepRunning)
+		return err == nil
+	})
+
+	mainSHA, err := shipreview.ApproveAndMerge(context.Background(), db, card, repoDir, "main")
+	if err != nil {
+		t.Fatalf("ApproveAndMerge: %v", err)
+	}
+	if err := shipreview.CleanupMergedBranch(context.Background(), repoDir, card, mainSHA); err != nil {
+		t.Fatalf("CleanupMergedBranch: %v", err)
+	}
+
+	// The setup has unwound by now; give a late recreation a chance to show.
+	waitFor(t, 10*time.Second, "dev state to leave starting", func() bool {
+		c, err := shipreview.GetCard(db, taskID)
+		return err == nil && c.DevState != shipreview.DevStateStarting
+	})
+	time.Sleep(300 * time.Millisecond)
+	if _, err := os.Stat(devWT); !os.IsNotExist(err) {
+		t.Errorf("devserver worktree recreated after cleanup (stat err %v)", err)
+	}
+	if _, err := os.Stat(started); !os.IsNotExist(err) {
+		t.Error("dev server started after the review was approved and cleaned up")
+	}
+	if remoteHasBranch(t, repoDir, branch) || localHasBranch(repoDir, branch) {
+		t.Error("branch not deleted")
+	}
+}
+
+// STA-649 review: the leased local delete keeps branch -D's refusal to delete
+// a branch checked out in some other worktree.
+func TestCleanupMergedBranchKeepsBranchCheckedOutElsewhere(t *testing.T) {
+	repoDir, card, mainSHA := mergedCard(t, "t-elsewhere")
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	gitIn(t, repoDir, "worktree", "add", elsewhere, card.Branch)
+
+	err := shipreview.CleanupMergedBranch(context.Background(), repoDir, card, mainSHA)
+	if err == nil || !strings.Contains(err.Error(), "checked out in") {
+		t.Fatalf("want checked-out refusal, got %v", err)
+	}
+	if !localHasBranch(repoDir, card.Branch) {
+		t.Error("local branch deleted while checked out in another worktree")
+	}
+	if got := gitIn(t, elsewhere, "symbolic-ref", "HEAD"); got != "refs/heads/"+card.Branch {
+		t.Errorf("other worktree HEAD = %q", got)
+	}
+}
+
+func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

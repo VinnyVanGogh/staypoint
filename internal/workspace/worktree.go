@@ -42,6 +42,9 @@ func (w *WorktreeManager) Create(taskID string, sessionID string) (string, error
 
 // CreateContext is the context-aware version of Create.
 func (w *WorktreeManager) CreateContext(ctx context.Context, taskID string, sessionID string) (string, error) {
+	if err := ValidateTaskID(taskID); err != nil {
+		return "", err
+	}
 	wtPath := filepath.Join(w.RepoRoot, ".worktrees", taskID)
 	branch := fmt.Sprintf("staypoint/%s", taskID)
 
@@ -83,6 +86,9 @@ func (w *WorktreeManager) Prune(taskID string) error {
 // Use this for orphan sweep only.
 // For normal run teardown use PruneWorktreeDirContext to preserve the branch.
 func (w *WorktreeManager) PruneContext(ctx context.Context, taskID string) error {
+	if err := ValidateTaskID(taskID); err != nil {
+		return err
+	}
 	if err := w.PruneWorktreeDirContext(ctx, taskID); err != nil {
 		return err
 	}
@@ -94,6 +100,9 @@ func (w *WorktreeManager) PruneContext(ctx context.Context, taskID string) error
 // PruneWorktreeDirContext removes the worktree directory for the given task
 // but leaves the branch intact so committed work remains reachable.
 func (w *WorktreeManager) PruneWorktreeDirContext(ctx context.Context, taskID string) error {
+	if err := ValidateTaskID(taskID); err != nil {
+		return err
+	}
 	wtPath := filepath.Join(w.RepoRoot, ".worktrees", taskID)
 
 	if _, err := runGit(ctx, w.RepoRoot, "worktree", "remove", "--force", wtPath); err != nil {
