@@ -236,8 +236,9 @@ func (h *ShipReviewHandler) fileTestGapTask(card *shipreview.Card, task *context
 	if prURL != "" {
 		_ = context.AddWorkProduct(h.db, created.ID, "pull_request", prURL)
 	}
+	// Activity rows, not comments: a comment would wake the (done) task's agent.
 	_ = context.LogActivity(h.db, created.ID, "test_gap_filed", fmt.Sprintf(`{"source_task_id":%q,"card_id":%q,"pr_number":%d,"head_sha":%q}`, task.ID, card.ID, prNumber, card.HeadSHA))
-	_ = context.AddTaskComment(h.db, task.ID, "staypoint", "Merged without tests. Backlog task to add them: "+created.ID+" "+created.Name)
+	_ = context.LogActivity(h.db, task.ID, "merged_without_tests", fmt.Sprintf(`{"test_task_id":%q,"pr_number":%d,"head_sha":%q}`, created.ID, prNumber, card.HeadSHA))
 	h.hub.Publish("ship_review_test_task_created", map[string]any{"task_id": task.ID, "test_task_id": created.ID, "pr_number": prNumber})
 	return h.testTaskView(created.ID, true), nil
 }
