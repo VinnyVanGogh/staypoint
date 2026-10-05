@@ -8918,8 +8918,12 @@ function renderShipReviewCardFromData(container, taskId, card) {
     cancel.addEventListener('click', () => { anywayConfirmForm.style.display = 'none'; clearErr(); });
     go.addEventListener('click', () => doMerge(go, true, reason.value.trim()));
   }
-  actionsWrap.appendChild(mergeConfirmForm);
-  actionsWrap.appendChild(anywayConfirmForm);
+  // Only PR-mode cards get the merge forms, so every other card keeps its
+  // existing form order.
+  if (prActive) {
+    actionsWrap.appendChild(mergeConfirmForm);
+    actionsWrap.appendChild(anywayConfirmForm);
+  }
 
   // Warning buttons: Merge anyway / Send failures to agent.
   if (prActive) {
