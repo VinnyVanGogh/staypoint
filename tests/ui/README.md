@@ -55,7 +55,7 @@ the live Paperclip API are never touched.
 | `05-interactions` | Accept, Reject, and answering a question by picking an option (STA-350) |
 | `06-checklist` | Checklist items and the DoD commit-hash gate banner |
 | `07-errors` | Unknown task id shows an error; unknown route is a 404; daemon going down shows an error |
-| `15-task-page-layout` | Task page matches the STA-289 mock (STA-638): one screen at 1512×900, sticky header actions, stats strip, pinned composer, tabbed right panel, grouped timeline, modals for long content, 800px stacking. One test per step, each `knownBug('STA-638-<step>')` until that step lands. Saves `task-page-1512x900.png` to the artifacts dir for the side-by-side check. STA-679 test: a long agent summary on the Review tab is an overflow-hidden preview with a `::after` gradient fade, bounded height, and stays above the applied-migration banner; saves `task-page-review-long-summary.png` |
+| `15-task-page-layout` | Task page matches the STA-289 mock (STA-638): one screen at 1512×900, sticky header actions, stats strip, pinned composer, tabbed right panel, grouped timeline, modals for long content, 800px stacking. One test per step, each `knownBug('STA-638-<step>')` until that step lands. Saves `task-page-1512x900.png` to the artifacts dir for the side-by-side check. STA-679 test: a long agent summary on the Review tab is an overflow-hidden preview with a `::after` gradient fade, bounded height, and stays above the applied-migration banner, at 1512×900 and 800×900; saves `task-page-review-long-summary.png` (and `-800x900.png`) |
 
 The throwaway daemon has no agent runner, so Run Now cannot start a real run.
 `stepsim` stands in for one: it drives `orchestrator.StepRecorder` against the

@@ -43,7 +43,7 @@
 
 import type { Locator, Page } from '@playwright/test';
 import {
-  test, expect, gotoTaskPage, knownBug, openTaskPanelTab, saveArtifactScreenshot,
+  test, expect, gotoTaskPage, openTaskPanelTab, saveArtifactScreenshot,
   type StayPointAPI, type Task,
 } from '../fixtures';
 
@@ -518,10 +518,12 @@ function appliedMigrations() {
   };
 }
 
-test('STA-679: long agent-summary preview is clipped with a fade and stays above the applied-migration banner', async ({ page, api }) => {
-  knownBug('STA-679');
+// Board (STA-644): the same check at the stacked 800x900 layout too.
+for (const vp of [WIDE, NARROW]) {
+const shot = vp === WIDE ? 'task-page-review-long-summary.png' : `task-page-review-long-summary-${vp.width}x${vp.height}.png`;
+test(`STA-679: long agent-summary preview is clipped with a fade and stays above the applied-migration banner (${vp.width}x${vp.height})`, async ({ page, api }) => {
   test.setTimeout(60_000);
-  await page.setViewportSize(WIDE);
+  await page.setViewportSize(vp);
   const seed = await seedHeavyTask(page, api);
   // Registered after seedHeavyTask's routes, so these win (Playwright runs the
   // most recently registered matching route first).
@@ -545,7 +547,7 @@ test('STA-679: long agent-summary preview is clipped with a fade and stays above
   await expect(banner).toContainText('Migration marked applied');
   await banner.scrollIntoViewIfNeeded(); // elementFromPoint below needs it on screen
   await page.waitForTimeout(300); // let late async renders settle before measuring and the capture
-  await saveArtifactScreenshot(page, 'task-page-review-long-summary.png');
+  await saveArtifactScreenshot(page, shot);
 
   const m = await summary.evaluate((el) => {
     const r = el.getBoundingClientRect();
@@ -591,6 +593,7 @@ test('STA-679: long agent-summary preview is clipped with a fade and stays above
   await trigger.click();
   await expect(page.getByRole('dialog').filter({ hasText: SUMMARY_LAST_LINE })).toBeVisible();
 });
+}
 
 test('step 6: at 800x900 the page stacks, tabs are a segmented control, nothing overflows horizontally', async ({ page, api }) => {
   test.setTimeout(90_000);

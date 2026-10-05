@@ -3401,6 +3401,22 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   max-height: 14rem;
   overflow: auto;
 }
+/* The agent summary is a preview, not a scroller (Board, STA-644): clip it and
+   fade the cut edge; "Open" shows the rest. The fade is a sticky ::after after
+   the content, so a short summary keeps its last line and only gains a little
+   space before the block below; a long one gets the fade over the clipped edge.
+   Its colour is the ship-review card's tint over the page background. */
+.task-page-panel .ship-review-summary-body { overflow: hidden; }
+.task-page-panel .ship-review-summary-body::after {
+  content: '';
+  display: block;
+  position: sticky;
+  bottom: 0;
+  height: 1.75rem;
+  pointer-events: none;
+  background: linear-gradient(to bottom, transparent, color-mix(in srgb, #4f8ef7 7%, var(--bg)));
+}
+.ship-review-migration-banner { margin: 8px 0; }
 .ship-review-devenv-log {
   margin: 6px 0;
   padding: 8px 10px;
