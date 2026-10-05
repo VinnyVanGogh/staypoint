@@ -79,3 +79,24 @@ test('NUL characters in the input cannot forge a code placeholder', () => {
 test('bullet lists with * markers still render', () => {
   assert.equal(renderMarkdown('* one\n* two'), '<ul><li>one</li>\n<li>two</li></ul>');
 });
+
+test('dunder names like __init__.py stay literal', () => {
+  assert.equal(renderMarkdown('see __init__.py'), '<p>see __init__.py</p>');
+});
+
+// Agent comments often hold pasted JSON or logs on one long line. The italic
+// rules must stay linear on those, or rendering freezes the tab.
+test('long single lines with many markers render in linear time', () => {
+  const inputs = [
+    ' _a'.repeat(20000),
+    ' *a'.repeat(20000),
+    JSON.stringify(Object.fromEntries(
+      Array.from({ length: 5000 }, (_, i) => [`_key_${i}_name`, `_v ${i}`]))),
+  ];
+  for (const input of inputs) {
+    const start = performance.now();
+    renderMarkdown(input);
+    const ms = performance.now() - start;
+    assert.ok(ms < 200, `${input.length}-char line took ${ms.toFixed(0)} ms`);
+  }
+});
