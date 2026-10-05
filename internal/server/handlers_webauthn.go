@@ -114,9 +114,10 @@ const pairingDialogGrace = 1500 * time.Millisecond
 
 // showPairingCode is the default pairing notifier. The code goes in a modal
 // dialog, which is visible regardless of notification settings and which
-// agents cannot read, with a notification as a second channel. Only a dialog
-// failure is returned; a dropped notification is logged. Neither path logs the
-// code itself.
+// agents cannot read, with a best-effort notification as a second channel.
+// Only a dialog failure is returned. A notification that exits non-zero is
+// logged, but macOS can also drop one silently with exit 0, so the dialog is
+// the delivery channel. Neither path logs the code itself.
 func showPairingCode(code string) error {
 	text := "StayPoint Board pairing code: " + code
 	dialog := fmt.Sprintf(`display dialog %s with title "StayPoint Board" buttons {"OK"} default button "OK" giving up after 120`,

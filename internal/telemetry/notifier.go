@@ -166,9 +166,10 @@ func (n *RateLimitNotifier) check() {
 // runScript runs AppleScript; tests replace it.
 var runScript = osascript.Run
 
-// SendNotification shows a macOS notification. A failure (osascript denied
-// notification permission, no GUI session) is logged with its exit status and
-// stderr rather than dropped.
+// SendNotification shows a macOS notification. Delivery is best-effort: macOS
+// can drop a notification while osascript still exits 0 (see package
+// osascript). A non-zero exit, such as no GUI session, is logged with its exit
+// status and stderr rather than dropped.
 func SendNotification(title, message string) {
 	slog.Info("notify", slog.String("title", title), slog.String("message", message))
 

@@ -2,9 +2,12 @@
 // with the exit status and stderr instead of dropping them.
 //
 // From the launchd daemon, osascript output is attributed to osascript/Script
-// Editor. Notifications are silently discarded when that app lacks
-// notification permission or Focus is on, and dialogs fail when there is no GUI
-// session, so callers must look at the error.
+// Editor. `display notification` can exit 0 and still never appear: on the
+// Board's Mac it was dropped from an interactive shell too, with Script Editor
+// notifications allowed and Focus off. A notification is therefore best-effort
+// and a clean exit proves nothing. `display dialog` does appear, and fails with
+// a non-zero exit when there is no GUI session, so callers must look at the
+// error.
 package osascript
 
 import (
