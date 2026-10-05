@@ -10718,9 +10718,17 @@ async function updateGatesBadge() {
   } catch (_) {}
 }
 
+// renderGatesPage can be called again before an earlier call's fetch returns
+// (the security_gate_decided SSE event and decideGate both re-render), and the
+// responses can arrive out of order. Only the most recent call may touch the
+// DOM, otherwise a late 'pending' list wipes a row decideGate just rendered
+// under 'all' (STA-651).
+let gatesRenderSeq = 0;
+
 async function renderGatesPage() {
   const container = document.getElementById('gates-container');
   if (!container) return;
+  const seq = ++gatesRenderSeq;
   container.innerHTML = '<p class="muted-text" style="padding:20px;">Loading…</p>';
 
   const statusFilter = document.getElementById('gates-status-filter')?.value || 'pending';
@@ -10733,9 +10741,11 @@ async function renderGatesPage() {
     const data = await apiFetch(url);
     requests = data.gate_requests || [];
   } catch (e) {
+    if (seq !== gatesRenderSeq) return;
     container.innerHTML = `<p class="muted-text" style="padding:20px;">Failed to load gate requests: ${e.message}</p>`;
     return;
   }
+  if (seq !== gatesRenderSeq) return;
 
   container.innerHTML = '';
 
