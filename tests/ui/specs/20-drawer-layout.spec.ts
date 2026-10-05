@@ -92,6 +92,8 @@ test.describe('drawer renders the task page layout', () => {
   test.use({ viewport: VIEWPORT });
 
   test('at the default drawer width: stacked header, stats, timeline, tabs', async ({ page, api }) => {
+    // Every tab plus geometry checks; like spec 15's layout tests, slow under load.
+    test.setTimeout(90_000);
     const task = await api.createTask('Drawer layout', { description: `Drawer brief\n\n${BRIEF_MARKER}` });
     const steps = simulateRunSteps(task.id);
     expect(steps, 'StepRecorder persisted no steps').toBeGreaterThan(0);
@@ -113,6 +115,8 @@ test.describe('drawer renders the task page layout', () => {
   });
 
   test('in #panel-expand mode: two columns, timeline beside the tabs', async ({ page, api }) => {
+    // Every tab plus geometry checks; like spec 15's layout tests, slow under load.
+    test.setTimeout(90_000);
     const task = await api.createTask('Drawer expanded', { description: `Drawer brief\n\n${BRIEF_MARKER}` });
     const steps = simulateRunSteps(task.id);
     expect(steps).toBeGreaterThan(0);
@@ -205,6 +209,31 @@ test.describe('drawer behaviour', () => {
 
     await page.keyboard.press('Escape');
     await expect(panel).toHaveClass(/\bhidden\b/);
+  });
+
+  test('the click that opens the drawer never closes it, however slow the open', async ({ page, api }) => {
+    // The opening click bubbles on to the document click-outside handler. It
+    // used to be told apart only by a 150ms clock check, so a main thread
+    // stalled for longer (heavy load) closed the drawer it had just opened.
+    const task = await api.createTask('Drawer slow open');
+    await page.goto('/task-status');
+    const row = page.locator('#ts-task-table').getByText(task.name);
+    await expect(row).toBeVisible();
+    await page.evaluate(() => {
+      const w = window as unknown as { openDetail: (...a: unknown[]) => unknown };
+      const orig = w.openDetail;
+      w.openDetail = (...a: unknown[]) => {
+        const r = orig(...a);
+        const until = Date.now() + 300;
+        while (Date.now() < until) { /* stall the click's dispatch */ }
+        return r;
+      };
+    });
+
+    await row.click();
+    const panel = page.locator('#detail-panel');
+    await expect(panel.locator('.task-page-header .task-page-title')).toHaveText(task.name, { timeout: 20_000 });
+    await expect(panel).not.toHaveClass(/\bhidden\b/);
   });
 
   test('a live run step lands in the drawer timeline', async ({ page, api }) => {

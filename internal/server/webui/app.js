@@ -6824,6 +6824,10 @@ function isFleetTaskId(id) {
 }
 
 let lastDetailOpenTime = 0;
+// The click that opened the drawer. It bubbles on to the document
+// click-outside handler, which must never close what it just opened: the
+// 150ms clock check alone fails when the open stalls the main thread (STA-700).
+let detailOpenEvent = null;
 
 // Bumped by every openDetail / openTaskPage call. Their fetches can resolve out
 // of order (a second click, or ↗ while the drawer is still loading). Only the
@@ -6906,6 +6910,7 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
   stopChatPoll();
   stopElapsedTicker();
   lastDetailOpenTime = Date.now();
+  detailOpenEvent = window.event || null;
   if (panel) {
     panel.classList.remove('hidden');
     panel.classList.toggle('full-page', Boolean(state.taskDetailFullPage));
@@ -9562,7 +9567,7 @@ document.addEventListener('click', (e) => {
   const panel = document.getElementById('detail-panel');
   if (!panel || panel.classList.contains('hidden')) return;
   // If detail was just opened/switched in this click event, do not close
-  if (Date.now() - lastDetailOpenTime < 150) return;
+  if (e === detailOpenEvent || Date.now() - lastDetailOpenTime < 150) return;
   // If clicked inside the detail panel, do not close
   if (panel.contains(e.target)) return;
   // Nor for clicks in a dialog the drawer opened (body-level overlays), or on
