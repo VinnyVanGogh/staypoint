@@ -47,10 +47,14 @@ async function expectTaskLayout(page: Page, panel: Locator, task: Task) {
   for (const id of ['#panel-open', '#panel-expand', '#panel-close']) {
     await expect(page.locator(id)).toBeVisible();
   }
-  // The title stays clear of those controls.
-  const title = await box(header.locator('.task-page-title'));
+  // The title and the action buttons stay clear of those controls.
   const controls = await box(page.locator('#detail-panel > .panel-header-actions'));
-  expect(title.x + title.width).toBeLessThanOrEqual(controls.x + 1);
+  for (const sel of ['.task-page-title', '.task-page-actions .run-now-btn']) {
+    const b = await box(header.locator(sel));
+    const overlaps = b.x < controls.x + controls.width && controls.x < b.x + b.width
+      && b.y < controls.y + controls.height && controls.y < b.y + b.height;
+    expect(overlaps, `${sel} overlaps the drawer's ↗ / ⛶ / × controls`).toBe(false);
+  }
 
   const stats = panel.locator('.task-page-stats');
   await expect(stats).toBeVisible();

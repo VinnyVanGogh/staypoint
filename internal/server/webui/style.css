@@ -3265,6 +3265,9 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .task-page-drawer .task-page-tabpanel { overflow: visible; padding: 12px 16px; }
 .task-page-drawer > .task-page-dock { position: sticky; bottom: 0; z-index: 10; padding: 6px 16px 10px; }
 @container task-drawer (min-width: 900px) {
+  /* Title and actions share a row here, so the whole row clears the controls. */
+  .task-page-drawer > .task-page-header { padding-right: 124px; }
+  .task-page-drawer .task-page-header-main { padding-right: 0; }
   .task-page-drawer > .task-page-layout { grid-template-columns: minmax(0, 1fr) 440px; align-items: start; }
   .task-page-drawer .task-page-layout > .task-page-timeline { max-height: none; overflow-y: visible; padding: 16px 20px; }
   .task-page-drawer .task-page-layout > .task-page-side { border-top: 0; border-left: 1px solid var(--border); }
