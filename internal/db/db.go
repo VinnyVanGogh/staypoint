@@ -1053,11 +1053,13 @@ var Migrations = []Migration{
 		},
 	},
 	{
-		Version: 26,
+		Version: 29,
 		Name:    "ship_review_merge_modes",
 		Up: func(conn *sql.DB) error {
 			// STA-717: per-project merge mode (direct / open_pr / pr_merge) and
 			// the GitHub PR + CI checks a PR-mode card is pinned to.
+			// 29 is the Board's assignment (2026-10-05): #193 = 27,
+			// #196 = 28, #195 = 29, #192 = 30.
 			for _, stmt := range []string{
 				`ALTER TABLE project_dev_configs ADD COLUMN merge_mode    TEXT NOT NULL DEFAULT '';`,
 				`ALTER TABLE project_dev_configs ADD COLUMN gh_config_dir TEXT NOT NULL DEFAULT '';`,
