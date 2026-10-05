@@ -235,6 +235,7 @@ export async function saveArtifactScreenshot(page: Page, name: string): Promise<
  */
 export const KNOWN_BUGS = {
   'STA-378': 'StepRecorder inserts run_steps.status and expects an integer id, but the run_steps table has no status column and a TEXT id: every step insert fails',
+  'STA-679': 'Review tab: the agent-summary preview scrolls (overflow auto) with no fade instead of a bounded overflow-hidden preview with a bottom fade; the Board saw its last line drawn under the applied-migration banner',
 } as const;
 
 export type KnownBug = keyof typeof KNOWN_BUGS;
