@@ -248,6 +248,39 @@ else
 fi
 
 TOKEN=$(cat "$HOME/.staypoint/auth_token" 2>/dev/null || echo "")
+
+# Repo access self-check (STA-687). A rebuilt binary can lose macOS folder
+# access; the daemon then hangs in any repo under ~/Documents until the Board
+# answers the privacy prompt. The daemon probes every repo at startup and
+# reports the result in /api/health; wait for that check and flag blocked repos.
+REPO_CHECK_TIMEOUT="${STAYPOINT_REPO_CHECK_TIMEOUT:-30}"
+HEALTH_BODY=""
+deadline=$((SECONDS + REPO_CHECK_TIMEOUT))
+while [ -n "$TOKEN" ] && [ "$SECONDS" -lt "$deadline" ]; do
+    HEALTH_BODY="$(curl -s -m 2 -H "Authorization: Bearer $TOKEN" "$HEALTH_URL" 2>/dev/null || true)"
+    case "$HEALTH_BODY" in *'"repo_access":{"checked":true'*) break ;; esac
+    HEALTH_BODY=""
+    sleep 1
+done
+if [ -z "$HEALTH_BODY" ]; then
+    echo "  ! Repo access check did not finish within ${REPO_CHECK_TIMEOUT}s; see repo_access in $HEALTH_URL."
+else
+    BLOCKED="$(printf '%s' "$HEALTH_BODY" | grep -oE '"path":"[^"]*","status":"(timeout|denied)"' \
+        | sed -E 's/"path":"([^"]*)","status":"([a-z]*)"/\1 (\2)/' || true)"
+    MISSING_COUNT="$(printf '%s' "$HEALTH_BODY" | { grep -oE '"status":"missing"' || true; } | wc -l | tr -d ' ')"
+    if [ -n "$BLOCKED" ]; then
+        echo "!!! staypointd can't access these repos: macOS permission needed."
+        echo "    Answer the macOS privacy prompt for staypointd (or grant it in System Settings >"
+        echo "    Privacy & Security > Files and Folders). The daemon rechecks every 10 minutes:"
+        printf '%s\n' "$BLOCKED" | sed 's/^/      ✗ /'
+    else
+        echo "✓ Repo access check: every repo is reachable."
+    fi
+    if [ "$MISSING_COUNT" -gt 0 ]; then
+        echo "  ($MISSING_COUNT repo path(s) on active tasks no longer exist; see repo_access in $HEALTH_URL.)"
+    fi
+fi
+
 if [ -n "$TOKEN" ]; then
     PORT=$(grep "HTTP and SSE server active" /tmp/staypointd.err 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | tail -1 | cut -d: -f2 || echo "41421")
     echo ""

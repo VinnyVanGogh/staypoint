@@ -2,12 +2,20 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/VinnyVanGogh/staypoint/internal/repoaccess"
 )
+
+// RepoAccessReporter supplies the latest repo access check (repoaccess.Checker).
+type RepoAccessReporter interface {
+	Snapshot() repoaccess.Snapshot
+}
 
 // Server is the StayPoint local HTTP and SSE daemon server.
 type Server struct {
@@ -98,8 +106,18 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// Health check (within security wrapper)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
+		repoAccess := repoaccess.Snapshot{Inaccessible: []repoaccess.Result{}}
+		if s.opts.RepoAccess != nil {
+			repoAccess = s.opts.RepoAccess.Snapshot()
+		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","version":"1.0","git_commit":%q,"commit":%q}`, s.opts.GitCommit, s.opts.GitCommit)
+		_ = json.NewEncoder(w).Encode(struct {
+			Status     string              `json:"status"`
+			Version    string              `json:"version"`
+			GitCommit  string              `json:"git_commit"`
+			Commit     string              `json:"commit"`
+			RepoAccess repoaccess.Snapshot `json:"repo_access"`
+		}{"ok", "1.0", s.opts.GitCommit, s.opts.GitCommit, repoAccess})
 	})
 
 	// Tasks REST API

@@ -22,6 +22,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/logging"
 	"github.com/VinnyVanGogh/staypoint/internal/mcp"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
+	"github.com/VinnyVanGogh/staypoint/internal/repoaccess"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/server"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
@@ -186,6 +187,10 @@ func runDaemon(ctx context.Context) error {
 	}
 
 	// 4. Start HTTP & SSE Local Daemon Server (127.0.0.1 only)
+	repoChecker := &repoaccess.Checker{
+		Timeout: repoaccess.DefaultTimeout,
+		Notify:  telemetry.SendNotification,
+	}
 	var httpServer *server.Server
 	tokenPath := filepath.Join(cfg.DataDir, "auth_token")
 	boardTokenPath := filepath.Join(cfg.DataDir, "board_token")
@@ -197,6 +202,7 @@ func runDaemon(ctx context.Context) error {
 		DB:             dbStore.DB(),
 		GitCommit:      GitCommit,
 		CORSAllowAll:   cfg.CORSAllowAll,
+		RepoAccess:     repoChecker,
 	}); err != nil {
 		slog.Warn("Failed to initialize HTTP server", slog.Any("error", err))
 	} else if err := s.Start(); err != nil {
@@ -217,6 +223,22 @@ func runDaemon(ctx context.Context) error {
 			fmt.Printf("  Board URL:  %s\n", boardURL)
 		}
 	}
+
+	// 4b. Repo access self-check (STA-687). After a redeploy, macOS can block
+	// the daemon from repos in ~/Documents until the Board answers a privacy
+	// prompt; git children then hang in open() instead of failing. Probe every
+	// repo now and every 10 minutes, and tell the Board which ones are blocked.
+	if httpServer != nil {
+		hub := httpServer.Hub()
+		repoChecker.Publish = func(eventType string, data any) { hub.Publish(eventType, data) }
+	}
+	go repoChecker.Run(ctx, 10*time.Minute, func() []string {
+		paths, err := repoaccess.RepoPaths(dbStore.DB(), cfg.HarnessRepoRoot)
+		if err != nil {
+			slog.Warn("repo access check: listing repo paths failed", slog.Any("error", err))
+		}
+		return paths
+	})
 
 	// 5. Wire GlobalDispatcher.OnWake to launch harness runs.
 	// HarnessRepoRoot comes from STAYPOINT_REPO_ROOT env or harness_repo_root config key.
