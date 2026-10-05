@@ -1,22 +1,33 @@
-// Package repoaccess checks that the daemon can still reach the repos it works
-// in. Under launchd, macOS can withhold folder access (e.g. ~/Documents) until
-// someone answers a privacy prompt. Until then, any child the daemon starts in
-// that repo blocks inside open() rather than failing, so requests hang with no
-// error. This package probes each repo in a short-lived child with a deadline
-// and tells the Board which ones are blocked.
+// Package repoaccess checks that the daemon can still use the repos it works
+// in, and says exactly what is wrong when it can't.
+//
+// Each repo is probed step by step: stat the path, open and read it, then
+// `git rev-parse --show-toplevel` and `git status --porcelain`. Every step has
+// its own deadline, judged from outside the process doing the work, because a
+// blocked open() never returns. The result names the first step that failed,
+// how it failed and the raw error (errno or git's stderr), plus the daemon's
+// uid, executable and the time of the check. There is no catch-all
+// diagnosis: a timeout is reported as blocked with possible causes, not as a
+// specific one.
 package repoaccess
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,191 +36,507 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 )
 
-// Status is the outcome of probing one repo path.
-type Status string
+// Step is a probe step.
+type Step string
 
 const (
-	StatusOK      Status = "ok"
-	StatusTimeout Status = "timeout" // the probe hung: typically a pending macOS privacy prompt
-	StatusDenied  Status = "denied"  // the OS refused access
-	StatusMissing Status = "missing" // the path no longer exists
-	StatusError   Status = "error"   // the probe itself failed or was cancelled; says nothing about the repo
+	StepStat        Step = "stat"
+	StepOpen        Step = "open"
+	StepGitRevParse Step = "git rev-parse"
+	StepGitStatus   Step = "git status"
+	StepProbe       Step = "probe" // the probe itself, not the repo
 )
 
-// DefaultTimeout bounds each probe. A reachable repo answers in milliseconds.
+// Cause is what the failing step found.
+type Cause string
+
+const (
+	CauseOK               Cause = "ok"
+	CauseMissing          Cause = "missing"           // ENOENT: path missing or moved
+	CauseNotDirectory     Cause = "not_directory"     // ENOTDIR, or not a directory
+	CausePrivacy          Cause = "macos_privacy"     // EPERM: a macOS privacy (TCC) setting
+	CauseUnixPermissions  Cause = "unix_permissions"  // EACCES: owner/mode vs the daemon's uid
+	CauseBlocked          Cause = "blocked"           // the step never returned
+	CauseNotGitRepo       Cause = "not_git_repo"      // git: not a git repository
+	CauseDubiousOwnership Cause = "dubious_ownership" // git: safe.directory
+	CauseIndexLock        Cause = "index_lock"        // git: index.lock exists
+	CauseGitError         Cause = "git_error"         // other git failure; stderr shown verbatim
+	CauseFSError          Cause = "fs_error"          // other errno; shown raw
+	CauseProbeFailed      Cause = "probe_failed"      // the probe could not run; says nothing about the repo
+)
+
+// DefaultTimeout bounds each step. A reachable repo answers in milliseconds.
 const DefaultTimeout = 3 * time.Second
 
-// maxParallel caps concurrent probe children.
+// maxParallel caps concurrent probes.
 const maxParallel = 8
 
-// Result is the outcome of probing one path.
+// startupAllowance bounds how long the probe child may take to start and
+// report its first step. Starting a process is not a repo step: macOS can
+// take hundreds of milliseconds to launch a freshly built binary.
+const startupAllowance = 10 * time.Second
+
+var blockedCauses = []string{
+	"macOS privacy prompt pending",
+	"file provider (e.g. iCloud Drive) not responding",
+	"network mount not responding",
+}
+
+// Target is a repo path to check, with a short name for messages.
+type Target struct {
+	Path  string `json:"path"`
+	Label string `json:"label,omitempty"`
+}
+
+// Owner is the owner and mode of a path that returned EACCES.
+type Owner struct {
+	UID  int
+	Mode fs.FileMode
+}
+
+// Result is the outcome of probing one repo.
 type Result struct {
-	Path      string    `json:"path"`
-	Status    Status    `json:"status"`
-	Detail    string    `json:"detail,omitempty"`
-	CheckedAt time.Time `json:"checked_at"`
+	Path           string    `json:"path"`
+	Label          string    `json:"label,omitempty"`
+	OK             bool      `json:"ok"`
+	Step           Step      `json:"step,omitempty"`
+	Cause          Cause     `json:"cause"`
+	Errno          string    `json:"errno,omitempty"`
+	ExitCode       int       `json:"exit_code,omitempty"`
+	RawError       string    `json:"raw_error,omitempty"`
+	OwnerUID       *int      `json:"owner_uid,omitempty"`
+	Mode           string    `json:"mode,omitempty"`
+	PossibleCauses []string  `json:"possible_causes,omitempty"`
+	Message        string    `json:"message"`
+	DaemonUID      int       `json:"daemon_uid"`
+	Executable     string    `json:"executable"`
+	CheckedAt      time.Time `json:"checked_at"`
+
+	explanation string
+	blockedFor  time.Duration
 }
 
-// PermissionNeeded reports whether the Board has to grant access before the
-// daemon can use this path again.
-func (r Result) PermissionNeeded() bool {
-	return r.Status == StatusTimeout || r.Status == StatusDenied
+// Notifiable reports whether the Board should get a desktop alert for this
+// result. Missing paths are reported in health and on the SSE stream but do
+// not alert: active tasks keep stale repo paths, and every restart would
+// re-alert for each one. A probe that could not run is not a repo verdict.
+func (r Result) Notifiable() bool {
+	return !r.OK && r.Cause != CauseMissing && r.Cause != CauseProbeFailed
 }
 
-// Snapshot is the latest check, as reported by /api/health.
-type Snapshot struct {
-	Checked      bool       `json:"checked"`
-	CheckedAt    *time.Time `json:"checked_at,omitempty"`
-	Inaccessible []Result   `json:"inaccessible"`
+// Options configures a probe.
+type Options struct {
+	// Timeout bounds each step. Zero means DefaultTimeout.
+	Timeout time.Duration
+	// Command builds the filesystem probe child. Nil means DefaultCommand.
+	Command CommandFunc
+	// Git is the git binary. Empty means "git" from PATH.
+	Git string
 }
 
-// CommandFunc builds the child process that probes path.
+func (o Options) withDefaults() Options {
+	if o.Timeout <= 0 {
+		o.Timeout = DefaultTimeout
+	}
+	if o.Command == nil {
+		o.Command = DefaultCommand
+	}
+	if o.Git == "" {
+		o.Git = "git"
+	}
+	return o
+}
+
+// CommandFunc builds the child process that runs the filesystem steps.
 type CommandFunc func(path string) *exec.Cmd
 
-// probeEnv carries the path to a probe child. See RunProbeChild.
-const probeEnv = "STAYPOINT_REPO_PROBE_PATH"
-
-// Probe child exit codes. Anything else means the probe itself failed.
+// probeEnv carries the path to a probe child; probeFlag must be its first
+// argument. See RunProbeChild.
 const (
-	exitMissing = 3
-	exitDenied  = 4
+	probeEnv  = "STAYPOINT_REPO_PROBE_PATH"
+	probeFlag = "-staypoint-repo-probe"
 )
 
 // DefaultCommand re-runs the current binary as a probe child (RunProbeChild).
-// The child classifies the failure by errno and reports it in its exit code,
-// so the result does not depend on any shell's or locale's error wording.
-// Everything happens after exec, so a hang is inside the child and the
+// The filesystem steps run after exec, so a hang is inside the child and the
 // parent's deadline still applies. (Setting cmd.Dir instead would chdir
-// before exec, where a hang would block Start.)
-//
-// The flag argument is only a guard: a binary without the RunProbeChild hook
-// (e.g. a test binary) rejects the unknown flag and exits instead of running.
+// before exec, where a hang would block Start.) A binary without the
+// RunProbeChild hook (e.g. a test binary) rejects the flag and exits.
 func DefaultCommand(path string) *exec.Cmd {
-	exe, err := os.Executable()
-	if err != nil {
-		exe = os.Args[0]
-	}
-	cmd := exec.Command(exe, "-staypoint-repo-probe")
+	cmd := exec.Command(executable(), probeFlag)
 	cmd.Env = append(os.Environ(), probeEnv+"="+path, "LC_ALL=C")
 	return cmd
 }
 
 // RunProbeChild turns this process into a probe child when DefaultCommand
 // started it, and exits. Call it first thing in main (and in TestMain for
-// packages whose tests use DefaultCommand). Otherwise it returns at once.
+// packages whose tests probe). Otherwise it returns at once.
 func RunProbeChild() {
 	path, ok := os.LookupEnv(probeEnv)
-	if !ok {
+	if !ok || len(os.Args) < 2 || os.Args[1] != probeFlag {
 		return
 	}
-	os.Exit(probeChild(path))
+	probeChild(path, os.Stdout)
+	os.Exit(0)
 }
 
-// probeChild enters path and opens it, as git does on startup (chdir, then
-// open "." to resolve the working directory).
-func probeChild(path string) int {
-	err := os.Chdir(path)
+// childEvent is one line of the probe child's report: a step beginning, or
+// its result.
+type childEvent struct {
+	Step     Step   `json:"step"`
+	Event    string `json:"event"` // begin | ok | fail
+	Errno    int    `json:"errno,omitempty"`
+	Error    string `json:"error,omitempty"`
+	OwnerUID *int   `json:"owner_uid,omitempty"`
+	Mode     uint32 `json:"mode,omitempty"`
+}
+
+// probeChild stats the path, then opens it and reads one entry, reporting
+// each step as a JSON line before and after it runs. If a call never
+// returns, the last line the parent saw is that step's "begin".
+func probeChild(path string, out io.Writer) {
+	enc := json.NewEncoder(out)
+	emit := func(e childEvent) { _ = enc.Encode(e) }
+	fail := func(step Step, err error, owner *Owner) {
+		e := childEvent{Step: step, Event: "fail", Error: err.Error()}
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			e.Errno = int(errno)
+		}
+		if owner != nil {
+			uid := owner.UID
+			e.OwnerUID = &uid
+			e.Mode = uint32(owner.Mode)
+		}
+		emit(e)
+	}
+
+	emit(childEvent{Step: StepStat, Event: "begin"})
+	fi, err := os.Stat(path)
+	if err != nil {
+		fail(StepStat, err, nil)
+		return
+	}
+	if fi.Mode().IsRegular() {
+		fail(StepStat, syscall.ENOTDIR, nil)
+		return
+	}
+	emit(childEvent{Step: StepStat, Event: "ok"})
+
+	owner := ownerOf(fi)
+	emit(childEvent{Step: StepOpen, Event: "begin"})
+	f, err := os.Open(path)
 	if err == nil {
-		_, err = os.ReadDir(".")
+		_, err = f.ReadDir(1)
+		if errors.Is(err, io.EOF) {
+			err = nil
+		}
+		_ = f.Close()
 	}
-	if err == nil {
-		return 0
+	if err != nil {
+		fail(StepOpen, err, owner)
+		return
 	}
-	fmt.Fprintln(os.Stderr, err)
-	switch {
-	case errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR):
-		return exitMissing
-	case errors.Is(err, fs.ErrPermission): // EACCES and EPERM; TCC denials are EPERM
-		return exitDenied
-	default:
-		return 1
-	}
+	emit(childEvent{Step: StepOpen, Event: "ok"})
 }
 
-// Message is the Board-facing text for a path that needs permission.
-func Message(path string) string {
-	return fmt.Sprintf("staypointd can't access %s: macOS permission needed", path)
+// Probe checks one repo step by step and returns the first failure, or OK.
+// It returns within about one step deadline per step even if a step hangs.
+func Probe(ctx context.Context, t Target, o Options) Result {
+	o = o.withDefaults()
+	if r, ok := probeFS(ctx, t, o); !ok {
+		return r
+	}
+	for _, g := range []struct {
+		step Step
+		args []string
+	}{
+		{StepGitRevParse, []string{"rev-parse", "--show-toplevel"}},
+		{StepGitStatus, []string{"status", "--porcelain"}},
+	} {
+		if r, ok := runGit(ctx, t, o, g.step, g.args); !ok {
+			return r
+		}
+	}
+	return finish(Result{Path: t.Path, Label: t.Label, OK: true, Cause: CauseOK})
 }
 
-// Probe checks path in a child process and returns within timeout even if the
-// child is stuck in the kernel. A nil cmdFn uses DefaultCommand.
-func Probe(ctx context.Context, path string, timeout time.Duration, cmdFn CommandFunc) Result {
-	if cmdFn == nil {
-		cmdFn = DefaultCommand
-	}
-	if timeout <= 0 {
-		timeout = DefaultTimeout
-	}
-	res := Result{Path: path, CheckedAt: time.Now().UTC()}
+// childMsg is one message from the goroutine reading a probe child.
+type childMsg struct {
+	ev      *childEvent
+	waitErr error
+	exited  bool
+}
 
-	cmd := cmdFn(path)
+func probeFS(ctx context.Context, t Target, o Options) (Result, bool) {
+	cmd := o.Command(t.Path)
 	var stderr bytes.Buffer
-	cmd.Stdout = nil
 	cmd.Stderr = &stderr
-	// After a kill, stop waiting on the stderr pipe even if something still
-	// holds it open.
+	cmd.WaitDelay = time.Second
+	ownProcessGroup(cmd)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return probeFailed(t, "probe setup: "+err.Error()), false
+	}
+	if err := cmd.Start(); err != nil {
+		return probeFailed(t, "start probe: "+err.Error()), false
+	}
+
+	msgs := make(chan childMsg, 32)
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			var ev childEvent
+			if json.Unmarshal(sc.Bytes(), &ev) == nil && ev.Step != "" {
+				msgs <- childMsg{ev: &ev}
+			}
+		}
+		msgs <- childMsg{exited: true, waitErr: cmd.Wait()}
+	}()
+
+	// The deadline covers one step at a time and restarts when the child
+	// reports the next step. Before the first report it covers startup.
+	deadline := time.NewTimer(max(o.Timeout, startupAllowance))
+	defer deadline.Stop()
+	var current Step
+	for {
+		select {
+		case m := <-msgs:
+			switch {
+			case m.exited:
+				detail := strings.TrimSpace(stderr.String())
+				if detail == "" && m.waitErr != nil {
+					detail = m.waitErr.Error()
+				}
+				return probeFailed(t, "probe exited without a result: "+detail), false
+			case m.ev.Event == "begin":
+				current = m.ev.Step
+				deadline.Reset(o.Timeout)
+			case m.ev.Event == "ok" && m.ev.Step == StepOpen:
+				// The last filesystem step passed. The child exits on its
+				// own and the reader goroutine reaps it.
+				return Result{}, true
+			case m.ev.Event == "fail":
+				killProbe(cmd)
+				var owner *Owner
+				if m.ev.OwnerUID != nil {
+					owner = &Owner{UID: *m.ev.OwnerUID, Mode: fs.FileMode(m.ev.Mode)}
+				}
+				var err error = errors.New(m.ev.Error)
+				if m.ev.Errno != 0 {
+					err = syscall.Errno(m.ev.Errno)
+				}
+				return FSFailure(t, m.ev.Step, err, owner), false
+			}
+		case <-ctx.Done():
+			killProbe(cmd)
+			return probeFailed(t, "check cancelled"), false
+		case <-deadline.C:
+			// Kill the stuck child. The reader goroutine reaps it once the
+			// kernel lets it die; we do not wait for that. A child that
+			// cannot die leaks until the kernel releases it.
+			killProbe(cmd)
+			if current == "" {
+				return probeFailed(t, fmt.Sprintf("probe reported nothing within %s", max(o.Timeout, startupAllowance))), false
+			}
+			return blocked(t, current, fmt.Sprintf("%s(%s)", current, t.Path), o.Timeout), false
+		}
+	}
+}
+
+func runGit(ctx context.Context, t Target, o Options, step Step, args []string) (Result, bool) {
+	cmd := exec.Command(o.Git, append([]string{"-C", t.Path}, args...)...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	cmd.WaitDelay = time.Second
 	ownProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
-		res.Status = StatusError
-		res.Detail = "start probe: " + err.Error()
-		return res
+		return probeFailed(t, "start git: "+err.Error()), false
 	}
-
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
-	timer := time.NewTimer(timeout)
+	timer := time.NewTimer(o.Timeout)
 	defer timer.Stop()
 	select {
 	case err := <-done:
 		if err == nil {
-			res.Status = StatusOK
-			return res
-		}
-		res.Detail = strings.TrimSpace(stderr.String())
-		if res.Detail == "" {
-			res.Detail = err.Error()
+			return Result{}, true
 		}
 		var exitErr *exec.ExitError
-		code := -1
-		if errors.As(err, &exitErr) {
-			code = exitErr.ExitCode()
+		if !errors.As(err, &exitErr) {
+			return probeFailed(t, "git: "+err.Error()), false
 		}
-		switch code {
-		case exitMissing:
-			res.Status = StatusMissing
-		case exitDenied:
-			res.Status = StatusDenied
-		default:
-			res.Status = StatusError
-		}
-		return res
+		return GitFailure(t, step, exitErr.ExitCode(), stderr.String()), false
 	case <-ctx.Done():
 		killProbe(cmd)
-		res.Status = StatusError
-		res.Detail = "check cancelled"
-		return res
+		return probeFailed(t, "check cancelled"), false
 	case <-timer.C:
+		killProbe(cmd)
+		return blocked(t, step, gitCommand(step), o.Timeout), false
 	}
-
-	// Kill the stuck child. The Wait goroutine reaps it once the kernel lets
-	// it die; the caller does not wait for that. If the child cannot die
-	// (stuck uninterruptibly), that goroutine and the process leak until the
-	// kernel releases it. TCC-blocked children observed so far die on SIGKILL.
-	killProbe(cmd)
-	res.Status = StatusTimeout
-	res.Detail = fmt.Sprintf("no response within %s: %s", timeout, Message(path))
-	return res
 }
 
-// Checker probes a set of repo paths and keeps the latest result per path.
-// Board notices fire on transitions only, so periodic rechecks stay quiet
-// while a path remains blocked.
+// FSFailure classifies a failed filesystem step from its error. owner, when
+// known, is reported for EACCES.
+func FSFailure(t Target, step Step, err error, owner *Owner) Result {
+	r := Result{Path: t.Path, Label: t.Label, Step: step, RawError: err.Error()}
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		r.Cause = CauseFSError
+		return finish(r)
+	}
+	r.Errno = errnoName(errno)
+	r.RawError = errno.Error()
+	switch errno {
+	case syscall.ENOENT:
+		r.Cause, r.explanation = CauseMissing, "path missing or moved"
+	case syscall.ENOTDIR:
+		r.Cause, r.explanation = CauseNotDirectory, "the configured repo path is not a directory"
+	case syscall.EPERM:
+		r.Cause, r.explanation = CausePrivacy, "macOS privacy setting is blocking staypointd"
+	case syscall.EACCES:
+		r.Cause = CauseUnixPermissions
+		uid := os.Getuid()
+		if owner != nil {
+			ownerUID := owner.UID
+			r.OwnerUID = &ownerUID
+			r.Mode = owner.Mode.String()
+			r.explanation = fmt.Sprintf("Unix file permissions: owner uid %d%s, mode %s; staypointd runs as uid %d%s",
+				owner.UID, userName(owner.UID), r.Mode, uid, userName(uid))
+		} else {
+			r.explanation = fmt.Sprintf("Unix file permissions; staypointd runs as uid %d%s", uid, userName(uid))
+		}
+	default:
+		r.Cause = CauseFSError
+	}
+	return finish(r)
+}
+
+// GitFailure classifies a failed git step from its exit code and stderr.
+// The stderr is kept verbatim; known messages add an explanation.
+func GitFailure(t Target, step Step, exitCode int, stderr string) Result {
+	r := Result{Path: t.Path, Label: t.Label, Step: step, ExitCode: exitCode, RawError: strings.TrimSpace(stderr)}
+	switch {
+	case strings.Contains(stderr, "detected dubious ownership"):
+		r.Cause, r.explanation = CauseDubiousOwnership, "git safe.directory: the repo is owned by a different user than staypointd"
+	case strings.Contains(stderr, "index.lock"):
+		r.Cause, r.explanation = CauseIndexLock, "index.lock exists: another git process is running, or one crashed and left the lock"
+	case strings.Contains(stderr, "not a git repository"):
+		r.Cause, r.explanation = CauseNotGitRepo, "the configured repo path is not inside a git repo"
+	default:
+		r.Cause = CauseGitError
+	}
+	return finish(r)
+}
+
+func blocked(t Target, step Step, call string, d time.Duration) Result {
+	return finish(Result{
+		Path: t.Path, Label: t.Label, Step: step, Cause: CauseBlocked,
+		RawError:       call + " did not return",
+		PossibleCauses: append([]string(nil), blockedCauses...),
+		blockedFor:     d,
+	})
+}
+
+func probeFailed(t Target, detail string) Result {
+	return finish(Result{Path: t.Path, Label: t.Label, Step: StepProbe, Cause: CauseProbeFailed, RawError: detail})
+}
+
+func gitCommand(step Step) string {
+	switch step {
+	case StepGitRevParse:
+		return "git rev-parse --show-toplevel"
+	case StepGitStatus:
+		return "git status --porcelain"
+	}
+	return string(step)
+}
+
+// finish stamps the daemon evidence and builds the Board-facing message from
+// the step and the raw error.
+func finish(r Result) Result {
+	r.DaemonUID = os.Getuid()
+	r.Executable = executable()
+	r.CheckedAt = time.Now().UTC()
+
+	var b strings.Builder
+	if r.Label != "" {
+		b.WriteString(r.Label + ": ")
+	}
+	switch {
+	case r.OK:
+		fmt.Fprintf(&b, "%s is readable and a working git repo", r.Path)
+	case r.Step == StepProbe:
+		fmt.Fprintf(&b, "couldn't check %s: %s", r.Path, r.RawError)
+	case r.Step == StepGitRevParse || r.Step == StepGitStatus:
+		fmt.Fprintf(&b, "git can't use %s: ", r.Path)
+		if r.Cause == CauseBlocked {
+			fmt.Fprintf(&b, "%s blocked for %s (possible causes: %s)", gitCommand(r.Step), r.blockedFor, strings.Join(r.PossibleCauses, ", "))
+		} else {
+			fmt.Fprintf(&b, "%s failed (exit %d): %s", gitCommand(r.Step), r.ExitCode, r.RawError)
+		}
+	default:
+		fmt.Fprintf(&b, "can't read %s: ", r.Path)
+		if r.Cause == CauseBlocked {
+			fmt.Fprintf(&b, "%s(%s) blocked for %s (possible causes: %s)", r.Step, r.Path, r.blockedFor, strings.Join(r.PossibleCauses, ", "))
+		} else if r.Errno != "" {
+			fmt.Fprintf(&b, "%s(%s) failed: %s: %s", r.Step, r.Path, r.Errno, r.RawError)
+		} else {
+			fmt.Fprintf(&b, "%s(%s) failed: %s", r.Step, r.Path, r.RawError)
+		}
+	}
+	if r.explanation != "" {
+		fmt.Fprintf(&b, " (%s)", r.explanation)
+	}
+	if !r.OK {
+		fmt.Fprintf(&b, " [step %s; staypointd uid %d %s; %s]", r.Step, r.DaemonUID, r.Executable, r.CheckedAt.Format(time.RFC3339))
+	}
+	r.Message = b.String()
+	return r
+}
+
+func executable() string {
+	if exe, err := os.Executable(); err == nil {
+		return exe
+	}
+	return os.Args[0]
+}
+
+func userName(uid int) string {
+	if u, err := user.LookupId(strconv.Itoa(uid)); err == nil && u.Username != "" {
+		return " (" + u.Username + ")"
+	}
+	return ""
+}
+
+// Snapshot is the latest check, as served by /api/health and /api/health/repos.
+type Snapshot struct {
+	Checked    bool       `json:"checked"`
+	CheckedAt  *time.Time `json:"checked_at,omitempty"`
+	DaemonUID  int        `json:"daemon_uid"`
+	Executable string     `json:"executable"`
+	Repos      []Result   `json:"repos"`
+}
+
+// Failing returns the repos whose latest result is not OK.
+func (s Snapshot) Failing() []Result {
+	out := []Result{}
+	for _, r := range s.Repos {
+		if !r.OK {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// Checker probes a set of repos and keeps the latest result per path.
+// Board alerts fire when a repo's cause changes, so periodic rechecks stay
+// quiet while a problem persists.
 type Checker struct {
-	Timeout time.Duration
-	Command CommandFunc
-	// Notify raises a loud desktop notification (telemetry.SendNotification).
+	Options
+	// Notify raises a desktop notification (telemetry.SendNotification).
 	Notify func(title, msg string)
 	// Publish sends an SSE event to the Board UI (EventHub.Publish).
 	Publish func(eventType string, data any)
@@ -220,24 +547,23 @@ type Checker struct {
 	results   map[string]Result
 }
 
-// Check probes every path in parallel and returns the results in path order.
-func (c *Checker) Check(ctx context.Context, paths []string) []Result {
-	results := make([]Result, len(paths))
+// Check probes every target in parallel and returns the results in order.
+func (c *Checker) Check(ctx context.Context, targets []Target) []Result {
+	results := make([]Result, len(targets))
 	sem := make(chan struct{}, maxParallel)
 	var wg sync.WaitGroup
-	for i, p := range paths {
+	for i, t := range targets {
 		wg.Add(1)
-		go func(i int, p string) {
+		go func(i int, t Target) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			results[i] = Probe(ctx, p, c.Timeout, c.Command)
-		}(i, p)
+			results[i] = Probe(ctx, t, c.Options)
+		}(i, t)
 	}
 	wg.Wait()
 
-	// A cancelled check (daemon shutdown) did not learn anything about the
-	// repos; recording it would announce every in-flight probe as lost.
+	// A cancelled check (daemon shutdown) learned nothing about the repos.
 	if ctx.Err() != nil {
 		return results
 	}
@@ -247,12 +573,25 @@ func (c *Checker) Check(ctx context.Context, paths []string) []Result {
 	next := make(map[string]Result, len(results))
 	var lost, restored []Result
 	for _, r := range results {
+		old, had := prev[r.Path]
+		if r.Cause == CauseProbeFailed {
+			// The probe could not run, so it says nothing about the repo.
+			// Keep the previous verdict so this is neither a loss nor a
+			// recovery (STA-692).
+			slog.Warn("repo check: probe failed", slog.String("path", r.Path), slog.String("detail", r.RawError))
+			if had {
+				next[r.Path] = old
+			} else {
+				next[r.Path] = r
+			}
+			continue
+		}
 		next[r.Path] = r
-		wasBlocked := prev[r.Path].PermissionNeeded()
+		known := had && old.Cause != CauseProbeFailed
 		switch {
-		case r.PermissionNeeded() && !wasBlocked:
+		case !r.OK && (!known || old.Cause != r.Cause):
 			lost = append(lost, r)
-		case !r.PermissionNeeded() && wasBlocked:
+		case r.OK && known && !old.OK:
 			restored = append(restored, r)
 		}
 	}
@@ -262,16 +601,20 @@ func (c *Checker) Check(ctx context.Context, paths []string) []Result {
 	c.mu.Unlock()
 
 	for _, r := range lost {
-		slog.Error("repo access lost", slog.String("path", r.Path), slog.String("status", string(r.Status)), slog.String("detail", r.Detail))
-		if c.Notify != nil {
-			c.Notify("[StayPoint] Repo access lost", Message(r.Path))
+		slog.Error("repo check failed", slog.String("path", r.Path), slog.String("cause", string(r.Cause)), slog.String("message", r.Message))
+		if c.Notify != nil && r.Notifiable() {
+			name := r.Label
+			if name == "" {
+				name = r.Path
+			}
+			c.Notify("[StayPoint] Repo check: "+name, r.Message)
 		}
 		if c.Publish != nil {
 			c.Publish("repo_access_lost", r)
 		}
 	}
 	for _, r := range restored {
-		slog.Info("repo access restored", slog.String("path", r.Path))
+		slog.Info("repo check recovered", slog.String("path", r.Path))
 		if c.Publish != nil {
 			c.Publish("repo_access_restored", r)
 		}
@@ -279,31 +622,29 @@ func (c *Checker) Check(ctx context.Context, paths []string) []Result {
 	return results
 }
 
-// Snapshot returns the paths that failed the latest check, sorted by path.
+// Snapshot returns every repo's latest result, sorted by path.
 func (c *Checker) Snapshot() Snapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	snap := Snapshot{Checked: c.checked, Inaccessible: []Result{}}
+	snap := Snapshot{Checked: c.checked, DaemonUID: os.Getuid(), Executable: executable(), Repos: []Result{}}
 	if c.checked {
 		at := c.checkedAt
 		snap.CheckedAt = &at
 	}
 	for _, r := range c.results {
-		if r.Status != StatusOK {
-			snap.Inaccessible = append(snap.Inaccessible, r)
-		}
+		snap.Repos = append(snap.Repos, r)
 	}
-	sort.Slice(snap.Inaccessible, func(i, j int) bool { return snap.Inaccessible[i].Path < snap.Inaccessible[j].Path })
+	sort.Slice(snap.Repos, func(i, j int) bool { return snap.Repos[i].Path < snap.Repos[j].Path })
 	return snap
 }
 
 // Run checks once immediately, then every interval until ctx is done.
-// paths is re-read before each check so new tasks and dev configs are covered.
-func (c *Checker) Run(ctx context.Context, interval time.Duration, paths func() []string) {
+// targets is re-read before each check so new tasks and dev configs are covered.
+func (c *Checker) Run(ctx context.Context, interval time.Duration, targets func() []Target) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		c.Check(ctx, paths())
+		c.Check(ctx, targets())
 		select {
 		case <-ctx.Done():
 			return
@@ -312,14 +653,15 @@ func (c *Checker) Run(ctx context.Context, interval time.Duration, paths func() 
 	}
 }
 
-// RepoPaths returns the distinct repo paths the daemon may run git or agents
-// in: every project dev config, every active task's repo_path, and extra
-// (e.g. the harness repo root). Empty values are dropped; output is sorted.
-func RepoPaths(db *sql.DB, extra ...string) ([]string, error) {
-	seen := map[string]bool{}
+// RepoTargets returns the distinct repos the daemon may run git or agents in:
+// every project dev config, every active task's repo_path, and extra (e.g.
+// the harness repo root). A repo's label is its project when its active tasks
+// name exactly one project, otherwise the directory name. Sorted by path.
+func RepoTargets(db *sql.DB, extra ...string) ([]Target, error) {
+	projects := map[string]map[string]bool{}
 	add := func(p string) {
-		if p = strings.TrimSpace(p); p != "" {
-			seen[p] = true
+		if p = strings.TrimSpace(p); p != "" && projects[p] == nil {
+			projects[p] = map[string]bool{}
 		}
 	}
 	for _, p := range extra {
@@ -334,26 +676,39 @@ func RepoPaths(db *sql.DB, extra ...string) ([]string, error) {
 		add(c.RepoPath)
 	}
 
-	rows, err := db.Query(`SELECT DISTINCT repo_path FROM tasks WHERE status = 'active'`)
+	rows, err := db.Query(`SELECT repo_path, COALESCE(project, '') FROM tasks WHERE status = 'active'`)
 	if err != nil {
 		return nil, fmt.Errorf("list task repo paths: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err != nil {
+		var p, project string
+		if err := rows.Scan(&p, &project); err != nil {
 			return nil, err
 		}
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
 		add(p)
+		if project = strings.TrimSpace(project); project != "" {
+			projects[p][project] = true
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	out := make([]string, 0, len(seen))
-	for p := range seen {
-		out = append(out, p)
+	out := make([]Target, 0, len(projects))
+	for p, names := range projects {
+		label := filepath.Base(p)
+		if len(names) == 1 {
+			for n := range names {
+				label = n
+			}
+		}
+		out = append(out, Target{Path: p, Label: label})
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, nil
 }

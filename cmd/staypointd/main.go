@@ -191,7 +191,7 @@ func runDaemon(ctx context.Context) error {
 
 	// 4. Start HTTP & SSE Local Daemon Server (127.0.0.1 only)
 	repoChecker := &repoaccess.Checker{
-		Timeout: repoaccess.DefaultTimeout,
+		Options: repoaccess.Options{Timeout: repoaccess.DefaultTimeout},
 		Notify:  telemetry.SendNotification,
 	}
 	var httpServer *server.Server
@@ -227,20 +227,20 @@ func runDaemon(ctx context.Context) error {
 		}
 	}
 
-	// 4b. Repo access self-check (STA-687). After a redeploy, macOS can block
-	// the daemon from repos in ~/Documents until the Board answers a privacy
-	// prompt; git children then hang in open() instead of failing. Probe every
-	// repo now and every 10 minutes, and tell the Board which ones are blocked.
+	// 4b. Repo self-check (STA-687). After a redeploy, git children in a repo
+	// have hung in open() with no error (2026-10-04). Probe every repo now and
+	// every 10 minutes, step by step, and tell the Board which step failed and
+	// the raw error, instead of letting requests hang.
 	if httpServer != nil {
 		hub := httpServer.Hub()
 		repoChecker.Publish = func(eventType string, data any) { hub.Publish(eventType, data) }
 	}
-	go repoChecker.Run(ctx, 10*time.Minute, func() []string {
-		paths, err := repoaccess.RepoPaths(dbStore.DB(), cfg.HarnessRepoRoot)
+	go repoChecker.Run(ctx, 10*time.Minute, func() []repoaccess.Target {
+		targets, err := repoaccess.RepoTargets(dbStore.DB(), cfg.HarnessRepoRoot)
 		if err != nil {
 			slog.Warn("repo access check: listing repo paths failed", slog.Any("error", err))
 		}
-		return paths
+		return targets
 	})
 
 	// 5. Wire GlobalDispatcher.OnWake to launch harness runs.

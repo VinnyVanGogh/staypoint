@@ -22,9 +22,15 @@ import (
 // failure names the probe step that failed and carries the raw error.
 const retiredMessage = "macOS permission needed"
 
+// fastTimeout is the step deadline for tests that expect a step to hang, so
+// they finish quickly. Tests that expect real steps to finish use the
+// production deadline: a real git process can take longer than 300ms on a
+// loaded machine.
 const fastTimeout = 300 * time.Millisecond
 
-func opts() repoaccess.Options { return repoaccess.Options{Timeout: fastTimeout} }
+func opts() repoaccess.Options { return repoaccess.Options{Timeout: repoaccess.DefaultTimeout} }
+
+func hangOpts() repoaccess.Options { return repoaccess.Options{Timeout: fastTimeout} }
 
 func target(p string) repoaccess.Target { return repoaccess.Target{Path: p, Label: "Proj"} }
 
@@ -143,7 +149,7 @@ func TestProbe_Chmod000IsUnixPermissions(t *testing.T) {
 func TestProbe_FIFOBlockedOpenIsBlockedNotDiagnosed(t *testing.T) {
 	fifo := mkfifo(t)
 	var child *exec.Cmd
-	o := opts()
+	o := hangOpts()
 	o.Command = func(p string) *exec.Cmd {
 		child = repoaccess.DefaultCommand(p)
 		return child
@@ -200,7 +206,7 @@ func TestProbe_HungGitIsBlocked(t *testing.T) {
 	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	o := opts()
+	o := hangOpts()
 	o.Git = fakeGit
 	start := time.Now()
 	r := repoaccess.Probe(context.Background(), target(t.TempDir()), o)
@@ -289,7 +295,7 @@ func TestChecker_AlertsOncePerProblemWithTheRealMessage(t *testing.T) {
 	targets := []repoaccess.Target{target(ok), target(fifo), target(missing)}
 
 	rec := &recorder{}
-	c := &repoaccess.Checker{Options: opts(), Notify: rec.notify, Publish: rec.publish}
+	c := &repoaccess.Checker{Options: repoaccess.Options{Timeout: time.Second}, Notify: rec.notify, Publish: rec.publish}
 	if c.Snapshot().Checked {
 		t.Fatal("Snapshot reports checked before any check ran")
 	}
@@ -350,7 +356,7 @@ func TestChecker_AlertsOncePerProblemWithTheRealMessage(t *testing.T) {
 func TestChecker_ProbeFailureKeepsThePreviousVerdict(t *testing.T) {
 	fifo := mkfifo(t)
 	rec := &recorder{}
-	c := &repoaccess.Checker{Options: opts(), Notify: rec.notify, Publish: rec.publish}
+	c := &repoaccess.Checker{Options: hangOpts(), Notify: rec.notify, Publish: rec.publish}
 	targets := []repoaccess.Target{target(fifo)}
 
 	c.Check(context.Background(), targets)
@@ -397,7 +403,7 @@ func TestChecker_ManyBlockedPathsCheckInParallel(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		targets = append(targets, target(mkfifo(t)))
 	}
-	c := &repoaccess.Checker{Options: opts()}
+	c := &repoaccess.Checker{Options: hangOpts()}
 	start := time.Now()
 	c.Check(context.Background(), targets)
 	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {

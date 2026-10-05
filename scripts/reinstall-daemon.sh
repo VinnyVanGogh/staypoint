@@ -249,11 +249,13 @@ fi
 
 TOKEN=$(cat "$HOME/.staypoint/auth_token" 2>/dev/null || echo "")
 
-# Repo access self-check (STA-687). A rebuilt binary can lose macOS folder
-# access; the daemon then hangs in any repo under ~/Documents until the Board
-# answers the privacy prompt. The daemon probes every repo at startup and
-# reports the result in /api/health; wait for that check and flag blocked repos.
+# Repo self-check (STA-687). After a redeploy, git children in a repo have
+# hung with no error. The daemon probes every repo at startup (stat, open,
+# git rev-parse, git status) and reports the first failing step and its raw
+# error in /api/health. Wait for that check and print each failing repo's
+# message as the daemon wrote it.
 REPO_CHECK_TIMEOUT="${STAYPOINT_REPO_CHECK_TIMEOUT:-30}"
+REPOS_URL="http://127.0.0.1:41421/api/health/repos"
 HEALTH_BODY=""
 deadline=$((SECONDS + REPO_CHECK_TIMEOUT))
 while [ -n "$TOKEN" ] && [ "$SECONDS" -lt "$deadline" ]; do
@@ -263,27 +265,35 @@ while [ -n "$TOKEN" ] && [ "$SECONDS" -lt "$deadline" ]; do
     sleep 1
 done
 if [ -z "$TOKEN" ]; then
-    echo "  ! No auth token at ~/.staypoint/auth_token; skipped the repo access check. See repo_access in $HEALTH_URL."
+    echo "  ! No auth token at ~/.staypoint/auth_token; skipped the repo check. See $REPOS_URL."
 elif [ -z "$HEALTH_BODY" ]; then
-    echo "  ! Repo access check did not finish within ${REPO_CHECK_TIMEOUT}s; see repo_access in $HEALTH_URL."
+    echo "  ! Repo check did not finish within ${REPO_CHECK_TIMEOUT}s; see $REPOS_URL."
+elif ! command -v plutil >/dev/null 2>&1; then
+    echo "  ! plutil not found; can't summarise the repo check. See $REPOS_URL."
 else
-    BLOCKED="$(printf '%s' "$HEALTH_BODY" | grep -oE '"path":"[^"]*","status":"(timeout|denied)"' \
-        | sed -E 's/"path":"([^"]*)","status":"([a-z]*)"/\1 (\2)/' || true)"
-    MISSING_COUNT="$(printf '%s' "$HEALTH_BODY" | { grep -oE '"status":"missing"' || true; } | wc -l | tr -d ' ')"
-    ERROR_COUNT="$(printf '%s' "$HEALTH_BODY" | { grep -oE '"status":"error"' || true; } | wc -l | tr -d ' ')"
-    if [ -n "$BLOCKED" ]; then
-        echo "!!! staypointd can't access these repos: macOS permission needed."
-        echo "    Answer the macOS privacy prompt for staypointd (or grant it in System Settings >"
-        echo "    Privacy & Security > Files and Folders). The daemon rechecks every 10 minutes:"
-        printf '%s\n' "$BLOCKED" | sed 's/^/      ✗ /'
+    PROBLEMS=""
+    MISSING=""
+    i=0
+    while CAUSE="$(printf '%s' "$HEALTH_BODY" | plutil -extract "repo_access.inaccessible.$i.cause" raw -o - - 2>/dev/null)"; do
+        MSG="$(printf '%s' "$HEALTH_BODY" | plutil -extract "repo_access.inaccessible.$i.message" raw -o - - 2>/dev/null || true)"
+        case "$CAUSE" in
+            missing) MISSING="$MISSING      - $MSG
+" ;;
+            *) PROBLEMS="$PROBLEMS      ✗ $MSG
+" ;;
+        esac
+        i=$((i + 1))
+    done
+    if [ -n "$PROBLEMS" ]; then
+        echo "!!! staypointd's repo check failed for these repos (first failing step and raw error):"
+        printf '%s' "$PROBLEMS"
+        echo "    The daemon rechecks every 10 minutes. Full detail: $REPOS_URL"
     else
-        echo "✓ Repo access check: no repo needs macOS permission."
+        echo "✓ Repo check: every existing repo is readable and git works in it."
     fi
-    if [ "$MISSING_COUNT" -gt 0 ]; then
-        echo "  ($MISSING_COUNT checked repo path(s) no longer exist (dev configs, active tasks, harness root); see repo_access in $HEALTH_URL.)"
-    fi
-    if [ "$ERROR_COUNT" -gt 0 ]; then
-        echo "  ! $ERROR_COUNT repo probe(s) failed to run, so those repos are unverified; see repo_access in $HEALTH_URL."
+    if [ -n "$MISSING" ]; then
+        echo "  These checked repo paths no longer exist (from dev configs, active tasks or the harness root):"
+        printf '%s' "$MISSING"
     fi
 fi
 
