@@ -8038,6 +8038,9 @@ function renderFinalShipReviewCard(taskId, headSHA, status, mainSHA, rejectComme
       section.appendChild(renderBranchDeleteWarning(taskId, headSHA, mainSHA, cleanup));
     }
   }
+  if (status === 'approved' && cleanup && cleanup.test_task) {
+    section.appendChild(renderTestTaskRow(cleanup.test_task));
+  }
   if (status === 'rejected' && rejectComment) {
     const fb = el('div', 'ship-review-feedback-box');
     fb.appendChild(el('div', 'ship-review-feedback-label', 'Rejection reason:'));
@@ -8319,6 +8322,117 @@ function renderPRStatusSection(taskId, card) {
   return wrap;
 }
 
+// ── Merge test gate (STA-734) ──────────────────────────────────────────────
+// The "Test coverage" section: CI, test changes and coverage for the card's
+// head. A blocking warning keeps Merge disabled until the Board picks
+// "Merge without tests", which also files a backlog "Add tests" task.
+
+const TEST_GATE_ICONS = { no_ci: '⚠', no_tests: '⚠', uncovered: '⚠', untested_sources: 'ℹ', no_coverage_data: 'ℹ' };
+
+// renderTestTaskRow links the backlog task a bypassed merge filed.
+function renderTestTaskRow(tt) {
+  const row = el('div', 'ship-review-row ship-review-test-task');
+  row.appendChild(el('span', 'ship-review-row-label', 'Tests task'));
+  const a = el('a', 'ship-review-test-task-link', tt.name || tt.id);
+  a.href = tt.url || '#';
+  a.addEventListener('click', (e) => { e.preventDefault(); openTaskPage(tt.id); });
+  row.appendChild(a);
+  row.appendChild(el('span', 'ship-review-test-task-note',
+    tt.created ? 'Merged without tests: backlog task created.' : 'Merged without tests: backlog task for this PR.'));
+  return row;
+}
+
+// fetchTestCoverage reads the card's test gate report. The error carries the
+// server's message (the gate fails closed when the change can't be read).
+async function fetchTestCoverage(taskId) {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/test-coverage`, { headers: authHeader() });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.message || body.error || `${r.status} ${r.statusText}`);
+  return body;
+}
+
+// renderTestCoverageSection returns the section and a handle. onState fires
+// with { loaded, blocking, missing, report, error } whenever the verdict
+// changes; apply(report) lets a 409 "untested" response update it in place.
+function renderTestCoverageSection(taskId, onState) {
+  const sec = el('div', 'ship-review-test-coverage');
+  sec.dataset.state = 'loading';
+  const title = el('div', 'ship-review-section-title', 'Test coverage');
+  const status = el('span', 'ship-review-test-coverage-status', 'checking…');
+  title.appendChild(status);
+  sec.appendChild(title);
+  const body = el('div', 'ship-review-test-coverage-body');
+  body.appendChild(el('div', 'ship-review-test-coverage-note', 'Checking tests and CI for this head…'));
+  sec.appendChild(body);
+  const actions = el('div', 'ship-review-form-row ship-review-test-coverage-actions');
+  const bypassBtn = el('button', 'ship-review-merge-without-tests-btn', 'Merge without tests');
+  actions.appendChild(bypassBtn);
+  actions.style.display = 'none';
+  sec.appendChild(actions);
+  const state = { loaded: false, blocking: true, missing: [], report: null, error: '' };
+  const emit = () => onState && onState(state);
+
+  const apply = (report) => {
+    state.loaded = true;
+    state.error = '';
+    state.report = report || null;
+    state.blocking = !!(report && report.blocking);
+    state.missing = (report && report.missing) || [];
+    const warnings = (report && report.warnings) || [];
+    const nodes = [];
+    if (!report) {
+      nodes.push(el('div', 'ship-review-test-coverage-note', 'No test coverage report for this card.'));
+    } else if (report.exempt_only) {
+      nodes.push(el('div', 'ship-review-test-ok', '✓ Docs, config or style only: no tests needed.'));
+    } else if (!warnings.length) {
+      nodes.push(el('div', 'ship-review-test-ok',
+        (report.sources || []).length ? '✓ Tests changed, and CI runs them.' : '✓ No source files changed.'));
+    }
+    for (const w of warnings) {
+      const box = el('div', `ship-review-test-warning ship-review-test-warning--${w.kind}${w.blocking ? ' ship-review-test-warning--blocking' : ''}`);
+      box.dataset.kind = w.kind;
+      box.appendChild(el('div', 'ship-review-test-warning-msg', `${TEST_GATE_ICONS[w.kind] || '⚠'} ${w.message}`));
+      if (w.items && w.items.length) {
+        const ul = el('ul', 'ship-review-test-warning-items');
+        for (const it of w.items) ul.appendChild(el('li', 'ship-review-test-warning-item', it));
+        box.appendChild(ul);
+      }
+      nodes.push(box);
+    }
+    if (report && report.coverage && report.coverage.available && !warnings.some((w) => w.kind === 'uncovered')) {
+      nodes.push(el('div', 'ship-review-test-coverage-note', `Coverage from ${report.coverage.source}: every changed line runs under a test.`));
+    }
+    body.replaceChildren(...nodes);
+    status.textContent = state.blocking ? `not tested: ${state.missing.join(', ')}` : 'ok';
+    sec.dataset.state = state.blocking ? 'blocking' : 'ok';
+    actions.style.display = state.blocking ? '' : 'none';
+    emit();
+  };
+
+  const fail = (msg) => {
+    state.loaded = true;
+    state.error = msg;
+    state.blocking = true;
+    state.missing = ['test coverage unknown'];
+    const err = el('div', 'ship-review-test-warning ship-review-test-warning--blocking ship-review-test-warning--error', `⚠ Could not check test coverage: ${msg}`);
+    const retry = el('button', 'ship-review-repin-btn ship-review-test-coverage-retry', 'Retry');
+    retry.addEventListener('click', () => load());
+    err.appendChild(retry);
+    body.replaceChildren(err);
+    status.textContent = 'unknown';
+    sec.dataset.state = 'error';
+    actions.style.display = '';
+    emit();
+  };
+
+  const load = () => {
+    status.textContent = 'checking…';
+    fetchTestCoverage(taskId).then((res) => apply(res.report)).catch((e) => fail(e.message || String(e)));
+  };
+  load();
+  return { el: sec, state, apply, bypassBtn, reload: load };
+}
+
 function renderShipReviewCardFromData(container, taskId, card) {
   if (!card || !taskId) return;
   clearShipReviewHeaderActions(taskId);
@@ -8329,6 +8443,14 @@ function renderShipReviewCardFromData(container, taskId, card) {
     const finalCard = renderFinalShipReviewCard(taskId, card.head_sha, card.status, card.main_sha, card.reject_comment, card);
     if (existing) existing.replaceWith(finalCard);
     else container.appendChild(finalCard);
+    // STA-734: link the "Add tests" task a bypassed merge filed.
+    if (card.status === 'approved') {
+      fetchTestCoverage(taskId).then((res) => {
+        if (res.test_task && finalCard.isConnected && !finalCard.querySelector('.ship-review-test-task')) {
+          finalCard.appendChild(renderTestTaskRow(res.test_task));
+        }
+      }).catch(() => {});
+    }
     return;
   }
 
@@ -8534,6 +8656,13 @@ function renderShipReviewCardFromData(container, taskId, card) {
       });
     }
     section.appendChild(prSec);
+  }
+
+  // Test coverage (STA-734): Merge waits for this verdict.
+  let testGate = null;
+  if (card.status === 'pending') {
+    testGate = renderTestCoverageSection(taskId, () => section.dispatchEvent(new CustomEvent('test-gate')));
+    section.appendChild(testGate.el);
   }
 
   // What to test
@@ -8745,7 +8874,10 @@ function renderShipReviewCardFromData(container, taskId, card) {
     acRow.appendChild(acCancel);
     approveConfirmForm.appendChild(acRow);
     acCancel.addEventListener('click', () => { approveConfirmForm.style.display = 'none'; clearErr(); });
-    acMerge.addEventListener('click', async () => {
+    acMerge.addEventListener('click', () => doApprove(acMerge, {}));
+  }
+  // doApprove posts Approve; extra carries the test-gate bypass (STA-734).
+  async function doApprove(acMerge, extra) {
       clearErr();
       acMerge.disabled = true;
       try {
@@ -8753,12 +8885,18 @@ function renderShipReviewCardFromData(container, taskId, card) {
           fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/approve`, {
             method: 'POST',
             headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-            body: JSON.stringify({ head_sha: card.head_sha }),
+            body: JSON.stringify({ head_sha: card.head_sha, ...(extra || {}) }),
           }), approveMode === 'direct' ? 'merging to main' : 'opening the PR',
         );
         if (r === null) { acMerge.disabled = false; return; }
         if (r.status === 409) {
           const body = await r.json().catch(() => ({}));
+          if (body.error === 'untested') {
+            if (testGate) testGate.apply(body.test_coverage);
+            acMerge.disabled = false;
+            showBypassConfirm(body.missing || []);
+            return;
+          }
           if (body.error === 'head_moved') {
             const newSHA = body.new_head_sha || '?';
             headMovedBanner.querySelector('.ship-review-head-moved-text').textContent =
@@ -8775,7 +8913,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
         if (result.merge_mode === 'open_pr' || result.merge_mode === 'pr_merge') {
           clearShipReviewHeaderActions(taskId);
           if (result.merge_mode === 'open_pr') {
-            section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', '', '', result.card || {}));
+            section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', '', '', { ...(result.card || {}), test_task: result.test_task }));
           } else {
             section.remove();
             renderShipReviewCardFromData(container, taskId, result.card);
@@ -8788,12 +8926,12 @@ function renderShipReviewCardFromData(container, taskId, card) {
           branch: card.branch,
           branch_deleted: !!result.branch_deleted,
           branch_delete_error: result.branch_delete_error || '',
+          test_task: result.test_task,
         }));
       } catch (e) {
         showErr('Approve failed: ' + (e.message || e));
         acMerge.disabled = false;
       }
-    });
   }
   actionsWrap.appendChild(approveConfirmForm);
 
@@ -8804,7 +8942,12 @@ function renderShipReviewCardFromData(container, taskId, card) {
   const anywayConfirmForm = el('div', 'ship-review-inline-form ship-review-merge-anyway-confirm');
   anywayConfirmForm.style.display = 'none';
   const anywayLabel = el('div', 'ship-review-form-label', '');
-  const allForms = [sendBackForm, rejectForm, approveConfirmForm, mergeConfirmForm, anywayConfirmForm];
+  // "Merge without tests" confirm (STA-734): names what is missing.
+  const bypassConfirmForm = el('div', 'ship-review-inline-form ship-review-merge-without-tests-confirm');
+  bypassConfirmForm.style.display = 'none';
+  const bypassLabel = el('div', 'ship-review-form-label', '');
+  const bypassMissing = el('ul', 'ship-review-merge-without-tests-missing');
+  const allForms = [sendBackForm, rejectForm, approveConfirmForm, mergeConfirmForm, anywayConfirmForm, bypassConfirmForm];
   const showOnly = (form) => {
     for (const f of allForms) f.style.display = (f === form && f.style.display === 'none') ? '' : 'none';
     headMovedBanner.style.display = 'none';
@@ -8815,7 +8958,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
       el('span', 'ship-review-github-refusal-text', msg));
     errBanner.style.display = '';
   };
-  const doMerge = async (btn, override, reason) => {
+  const doMerge = async (btn, override, reason, extra) => {
     clearErr();
     btn.disabled = true;
     try {
@@ -8824,23 +8967,32 @@ function renderShipReviewCardFromData(container, taskId, card) {
           method: 'POST',
           headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
           // head_sha pins the merge to the head on screen (STA-717).
-          body: JSON.stringify(override
-            ? { head_sha: card.head_sha, override: true, override_reason: reason || '' }
-            : { head_sha: card.head_sha }),
+          body: JSON.stringify({
+            head_sha: card.head_sha,
+            ...(override ? { override: true, override_reason: reason || '' } : {}),
+            ...(extra || {}),
+          }),
         }), override ? 'merging the PR anyway' : 'merging the PR',
       );
       if (r === null) { btn.disabled = false; return; }
       const body = await r.json().catch(() => ({}));
       if (r.ok) {
         clearShipReviewHeaderActions(taskId);
-        section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', body.main_sha || '', '', body.card || {
-          branch: card.branch, branch_deleted: !!body.branch_deleted, branch_delete_error: body.branch_delete_error || '',
+        section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', body.main_sha || '', '', {
+          ...(body.card || { branch: card.branch, branch_deleted: !!body.branch_deleted, branch_delete_error: body.branch_delete_error || '' }),
+          test_task: body.test_task,
         }));
         return;
       }
       btn.disabled = false;
       mergeConfirmForm.style.display = 'none';
       anywayConfirmForm.style.display = 'none';
+      bypassConfirmForm.style.display = 'none';
+      if (body.error === 'untested') {
+        if (testGate) testGate.apply(body.test_coverage);
+        showBypassConfirm(body.missing || []);
+        return;
+      }
       if (body.error === 'head_moved') {
         headMovedBanner.querySelector('.ship-review-head-moved-text').textContent =
           `Branch moved to ${(body.new_head_sha || '?').slice(0, 12)} after the checks started. Merge blocked until the card is re-pinned and checks re-run. `;
@@ -8898,6 +9050,47 @@ function renderShipReviewCardFromData(container, taskId, card) {
     actionsWrap.appendChild(anywayConfirmForm);
   }
 
+  // checksGreen tracks the PR checks (pr_merge); the test gate is separate.
+  let checksGreen = card.pr_checks_summary === 'passed';
+  function showBypassConfirm(missing) {
+    const list = (missing && missing.length) ? missing : ((testGate && testGate.state.missing) || []);
+    const target = prActive ? `PR #${card.pr_number} ${shortHead}` : shortHead;
+    bypassLabel.textContent = `Merge ${target} → main without tests? Missing:`;
+    bypassMissing.replaceChildren(...list.map((m) => el('li', 'ship-review-merge-without-tests-missing-item', m)));
+    bypassNote.textContent = (prActive && !checksGreen)
+      ? 'Checks are not all green either, so this also overrides them. Both are logged, and a backlog task to add the tests is created.'
+      : 'This is logged, and a backlog task to add the tests is created.';
+    for (const f of allForms) f.style.display = f === bypassConfirmForm ? '' : 'none';
+    headMovedBanner.style.display = 'none';
+    clearErr();
+  }
+  const bypassNote = el('div', 'ship-review-merge-without-tests-note', '');
+  {
+    bypassConfirmForm.appendChild(bypassLabel);
+    bypassConfirmForm.appendChild(bypassMissing);
+    bypassConfirmForm.appendChild(bypassNote);
+    const reason = document.createElement('input');
+    reason.type = 'text';
+    reason.className = 'ship-review-form-input ship-review-merge-without-tests-reason';
+    reason.placeholder = 'Why merge without tests? (logged)';
+    bypassConfirmForm.appendChild(reason);
+    const row = el('div', 'ship-review-form-row');
+    const go = el('button', 'ship-review-reject-submit-btn ship-review-merge-without-tests-submit', 'Merge without tests');
+    const cancel = el('button', 'ship-review-form-cancel', 'Cancel');
+    row.appendChild(go);
+    row.appendChild(cancel);
+    bypassConfirmForm.appendChild(row);
+    cancel.addEventListener('click', () => { bypassConfirmForm.style.display = 'none'; clearErr(); });
+    go.addEventListener('click', () => {
+      const extra = { merge_without_tests: true, merge_without_tests_reason: reason.value.trim() };
+      if (prActive) doMerge(go, !checksGreen, reason.value.trim(), extra);
+      else doApprove(go, extra);
+    });
+  }
+  // Before the reject form: specs and the tray expect Reject's form last.
+  actionsWrap.insertBefore(bypassConfirmForm, rejectForm);
+  if (testGate) testGate.bypassBtn.addEventListener('click', () => showBypassConfirm());
+
   // Warning buttons: Merge anyway / Send failures to agent.
   if (prActive) {
     const warnRow = el('div', 'ship-review-form-row ship-review-pr-warning-actions');
@@ -8938,12 +9131,21 @@ function renderShipReviewCardFromData(container, taskId, card) {
     mergeBtn.title = 'Enabled when all checks are green';
     mergeBtn.addEventListener('click', () => showOnly(mergeConfirmForm));
     actions.appendChild(mergeBtn);
+    // Merge needs green checks and a passing test gate (STA-734).
+    const updateMergeBtn = () => {
+      const gate = testGate ? testGate.state : { loaded: true, blocking: false };
+      const gateOK = gate.loaded && !gate.blocking;
+      mergeBtn.disabled = !checksGreen || !gateOK;
+      mergeBtn.title = !checksGreen ? 'Enabled when all checks are green'
+        : !gate.loaded ? 'Checking test coverage…'
+        : !gateOK ? 'Not tested: see Test coverage. Use Merge without tests to bypass.' : '';
+      if (mergeBtn.disabled) mergeConfirmForm.style.display = 'none';
+    };
     section.addEventListener('pr-checks', (e) => {
-      const green = e.detail.summary === 'passed';
-      mergeBtn.disabled = !green;
-      mergeBtn.title = green ? '' : 'Enabled when all checks are green';
-      if (!green) mergeConfirmForm.style.display = 'none';
+      checksGreen = e.detail.summary === 'passed';
+      updateMergeBtn();
     });
+    section.addEventListener('test-gate', updateMergeBtn);
     section.addEventListener('pr-head-moved', (e) => {
       mergeBtn.disabled = true;
       headMovedBanner.querySelector('.ship-review-head-moved-text').textContent =
@@ -8957,6 +9159,19 @@ function renderShipReviewCardFromData(container, taskId, card) {
     const approveBtn = el('button', 'ship-review-approve-btn', approveLabel);
     approveBtn.addEventListener('click', () => showOnly(approveConfirmForm));
     actions.appendChild(approveBtn);
+    // direct and open_pr Approve land on main, so they wait for the test
+    // gate (STA-734); pr_merge Approve only opens the PR.
+    if (testGate && approveMode !== 'pr_merge') {
+      const updateApproveBtn = () => {
+        const g = testGate.state;
+        approveBtn.disabled = !g.loaded || g.blocking;
+        approveBtn.title = !g.loaded ? 'Checking test coverage…'
+          : g.blocking ? 'Not tested: see Test coverage. Use Merge without tests to bypass.' : '';
+        if (approveBtn.disabled) approveConfirmForm.style.display = 'none';
+      };
+      updateApproveBtn();
+      section.addEventListener('test-gate', updateApproveBtn);
+    }
   }
 
   const sendBackBtn = el('button', 'ship-review-sendback-btn', '↩ Send Back');

@@ -4828,3 +4828,44 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .ship-review-status-badge.status-checks-none { background: rgba(248,196,54,.15); color: #f8c436; }
 .ship-review-status-badge.status-checks-passed { background: rgba(40,167,69,.15); color: #28a745; }
 .ship-review-status-badge.status-checks-failed { background: rgba(248,81,73,.12); color: var(--red, #f85149); }
+
+/* ── Merge test gate (STA-734) ─────────────────────────────────────────── */
+.ship-review-test-coverage {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0;
+}
+.ship-review-test-coverage-status {
+  margin-left: 8px;
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--text-muted, #8b949e);
+}
+.ship-review-test-coverage[data-state="blocking"] .ship-review-test-coverage-status,
+.ship-review-test-coverage[data-state="error"] .ship-review-test-coverage-status { color: #f8c436; }
+.ship-review-test-coverage[data-state="ok"] .ship-review-test-coverage-status { color: var(--green, #3fb950); }
+.ship-review-test-coverage-body { display: flex; flex-direction: column; gap: 6px; }
+.ship-review-test-coverage-note { font-size: 12px; color: var(--text-muted, #8b949e); }
+.ship-review-test-ok { font-size: 13px; color: var(--green, #3fb950); }
+.ship-review-test-warning {
+  padding: 7px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  border: 1px solid var(--border, #30363d);
+  color: var(--text-muted, #8b949e);
+  overflow-wrap: anywhere;
+}
+.ship-review-test-warning--blocking {
+  background: rgba(248,196,54,.1);
+  border-color: rgba(248,196,54,.35);
+  color: #f8c436;
+}
+.ship-review-test-warning-msg { font-weight: 600; }
+.ship-review-test-warning:not(.ship-review-test-warning--blocking) .ship-review-test-warning-msg { font-weight: 400; }
+.ship-review-test-warning-items { margin: 4px 0 0 16px; padding: 0; font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; }
+.ship-review-test-warning .ship-review-test-coverage-retry { margin-left: 8px; }
+.ship-review-merge-without-tests-missing { margin: 4px 0 4px 16px; padding: 0; }
+.ship-review-merge-without-tests-note { font-size: 12px; color: var(--text-muted, #8b949e); margin-bottom: 4px; }
+.ship-review-test-task-link { overflow-wrap: anywhere; }
+.ship-review-test-task-note { margin-left: 8px; font-size: 12px; color: var(--text-muted, #8b949e); }
