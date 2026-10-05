@@ -514,6 +514,10 @@ function handleEvent(evt) {
       appendRunStepToTimeline(tid, step);
       // Stop ticking when a terminal state step arrives (Finished: …)
       if (step.kind === 'state') stopElapsedTicker();
+      // Edits and checkpoints change the diff the Lines stat sums.
+      if ((step.kind === 'edit' || step.kind === 'checkpoint') && step.status !== 'running' && !isFleetTaskId(tid)) {
+        scheduleTaskDiffRefresh(tid);
+      }
     }
     return;
   }
@@ -6953,6 +6957,35 @@ async function fetchTaskDiff(taskId, checkpointId) {
   }
 }
 
+// The stats strip's Lines +/- sums the whole-run diff kept in
+// state.tasks[id]._diffData, which the page loads once. Re-fetch it after run
+// steps that change files (debounced, so a burst of edits costs one /diff call)
+// and whenever the diff pane re-fetches the whole run. Only the newest fetch
+// writes, so a slow response cannot roll the numbers back.
+const DIFF_REFRESH_DEBOUNCE_MS = 1000;
+const diffRefreshTimers = {};
+const wholeRunDiffSeq = {};
+
+function scheduleTaskDiffRefresh(taskId) {
+  clearTimeout(diffRefreshTimers[taskId]);
+  diffRefreshTimers[taskId] = setTimeout(() => {
+    delete diffRefreshTimers[taskId];
+    fetchWholeRunDiff(taskId, '');
+  }, DIFF_REFRESH_DEBOUNCE_MS);
+}
+
+async function fetchWholeRunDiff(taskId, checkpointId) {
+  const seq = wholeRunDiffSeq[taskId] = (wholeRunDiffSeq[taskId] || 0) + 1;
+  const fresh = await fetchTaskDiff(taskId, checkpointId);
+  // fetchTaskDiff turns errors into an empty diff without file_stats; keep the
+  // last good numbers rather than zeroing the strip.
+  if (seq === wholeRunDiffSeq[taskId] && fresh && 'file_stats' in fresh && state.tasks[taskId]) {
+    state.tasks[taskId]._diffData = fresh;
+    refreshTaskStatsBar(taskId);
+  }
+  return fresh;
+}
+
 async function fetchTaskCheckpoints(taskId) {
   try {
     const r = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/checkpoints`);
@@ -7069,6 +7102,12 @@ function renderDiffPane(container, task, checkpoints, diffData) {
   }))];
 
   let activeCP = diffData.checkpoint_id || '';
+  // The pane opens on the whole-run diff, which the server pins to the pre-run
+  // checkpoint id. Re-fetches of it also refresh the stats strip's Lines.
+  const wholeRunCP = activeCP;
+  const refetch = (cpId) => (cpId === '' || cpId === wholeRunCP)
+    ? fetchWholeRunDiff(task.id, cpId)
+    : fetchTaskDiff(task.id, cpId);
   const fileStats = diffData.file_stats || (diffData.files || []).map(f => ({ path: f, added: 0, removed: 0 }));
 
   const fileList = el('ul', 'diff-file-list');
@@ -7123,7 +7162,7 @@ function renderDiffPane(container, task, checkpoints, diffData) {
           });
           undoBtn.textContent = '✓';
           setTimeout(async () => {
-            const fresh = await fetchTaskDiff(task.id, cpId);
+            const fresh = await refetch(cpId);
             renderFiles(fresh.file_stats || (fresh.files || []).map(f => ({ path: f, added: 0, removed: 0 })), cpId);
           }, 400);
         } catch {
@@ -7144,7 +7183,7 @@ function renderDiffPane(container, task, checkpoints, diffData) {
       btn.classList.add('active');
       activeCP = opt.id;
       btn.textContent = '…';
-      const fresh = await fetchTaskDiff(task.id, opt.id);
+      const fresh = await refetch(opt.id);
       btn.textContent = opt.label;
       renderFiles(fresh.file_stats || (fresh.files || []).map(f => ({ path: f, added: 0, removed: 0 })), opt.id);
     });
@@ -7157,7 +7196,7 @@ function renderDiffPane(container, task, checkpoints, diffData) {
 
   refreshBtn.addEventListener('click', async () => {
     refreshBtn.textContent = '…';
-    const fresh = await fetchTaskDiff(task.id, activeCP);
+    const fresh = await refetch(activeCP);
     refreshBtn.textContent = '↺';
     renderFiles(fresh.file_stats || (fresh.files || []).map(f => ({ path: f, added: 0, removed: 0 })), activeCP);
   });
