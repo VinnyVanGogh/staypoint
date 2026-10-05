@@ -1154,7 +1154,16 @@ func Open(dbPath string) (*Store, error) {
 
 	conn.SetMaxOpenConns(1)
 
-	if err := applyMigrations(dbPath, conn); err != nil {
+	// applyMigrations reads the ledger only after the lock is held, so an
+	// opener that waited sees the winner's migrations as applied and runs none.
+	unlock, err := lockMigrations(dbPath)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	err = applyMigrations(dbPath, conn)
+	unlock()
+	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to migrate schema: %w", err)
 	}
