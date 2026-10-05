@@ -43,7 +43,7 @@
 
 import type { Locator, Page } from '@playwright/test';
 import {
-  test, expect, knownBug, gotoTaskPage, saveArtifactScreenshot,
+  test, expect, gotoTaskPage, saveArtifactScreenshot,
   type StayPointAPI, type Task,
 } from '../fixtures';
 
@@ -490,7 +490,6 @@ test('step 5: full brief, dev-server log, agent summary and migration SQL open i
 });
 
 test('step 6: at 800x900 the page stacks, tabs are a segmented control, nothing overflows horizontally', async ({ page, api }) => {
-  knownBug('STA-638-6');
   test.setTimeout(90_000);
   await openHeavyTask(page, api, NARROW);
 
@@ -508,6 +507,7 @@ test('step 6: at 800x900 the page stacks, tabs are a segmented control, nothing 
   expect(pb.width, 'panel does not take the full width').toBeGreaterThanOrEqual(cw * 0.8);
 
   // Segmented control: all tabs on one row, filling the tablist, no overflow.
+  await expect(panel.getByRole('tablist'), 'no tablist in .task-page-panel').toBeVisible();
   const seg = await panel.getByRole('tablist').evaluate((list) => {
     const tabs = Array.from(list.querySelectorAll('[role="tab"]')).map((t) => t.getBoundingClientRect());
     const tops = tabs.map((r) => Math.round(r.top));

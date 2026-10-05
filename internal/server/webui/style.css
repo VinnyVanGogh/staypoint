@@ -3032,6 +3032,7 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   white-space: nowrap;
 }
 .task-page-stats .timeline-stat-step .timeline-stat-val { font-size: 13px; line-height: 23px; }
+.task-page-stats .timeline-stat-label { overflow: hidden; text-overflow: ellipsis; }
 .lines-added { color: var(--green, #3fb950); }
 .lines-removed { color: var(--red, #f85149); }
 .task-page-content > .task-page-layout {
@@ -3137,15 +3138,44 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 @media (max-width: 1100px) {
   .task-page-content > .task-page-layout { grid-template-columns: minmax(0, 1fr) 360px; }
 }
-/* Narrow screens: the page scrolls again until the stacked layout lands (STA-644). */
+/* Narrow screens (STA-644): the page scrolls as a whole. The header (title and
+   primary actions) sticks to the top and the composer to the bottom; the body
+   stacks timeline then panel, and the timeline keeps its own scroll so the
+   panel is never a full run's length away. Tabs become a segmented control. */
 @media (max-width: 900px) {
   #main-content:has(> #view-task-page.active) { overflow-y: auto; }
+  .task-page-view.active { height: auto; min-height: 100%; overflow: visible; }
   .task-page-content:has(> .task-page-header) { overflow: visible; }
-  .task-page-content > .task-page-layout { grid-template-columns: 1fr; }
-  .task-page-layout > .task-page-timeline,
+  .task-page-header { padding: 10px 16px; }
+  .task-page-actions { margin-left: 0; }
+  .task-page-stats .timeline-stat { padding: 8px 12px; }
+  .task-page-content > .task-page-layout { flex: none; grid-template-columns: minmax(0, 1fr); }
+  .task-page-layout > .task-page-timeline { max-height: 60vh; padding: 12px 16px; }
   .task-page-layout > .task-page-side,
   .task-page-side .task-page-tabpanel { overflow: visible; }
   .task-page-layout > .task-page-side { border-left: 0; border-top: 1px solid var(--border); }
+  .task-page-tabs {
+    gap: 2px;
+    margin: 12px 16px 0;
+    padding: 3px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface2);
+    overflow-x: visible;
+  }
+  .task-page-tab {
+    flex: 1 1 0;
+    min-width: 0;
+    justify-content: center;
+    margin: 0;
+    padding: 6px 8px;
+    border-bottom: 0;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .task-page-tab[aria-selected="true"] { background: var(--surface); box-shadow: inset 0 0 0 1px var(--accent); }
+  .task-page-tabpanel { padding: 12px 16px; }
+  .task-page-dock { position: sticky; bottom: 0; z-index: 10; padding: 6px 16px 10px; }
 }
 .task-page-back-btn {
   background: none;
