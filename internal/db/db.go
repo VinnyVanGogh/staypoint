@@ -1093,7 +1093,7 @@ var Migrations = []Migration{
 		},
 	},
 	{
-		Version: 26,
+		Version: 30,
 		Name:    "board_alerts",
 		Up: func(conn *sql.DB) error {
 			// STA-705: daemon and hook CLI alerts persisted for the Board UI.
