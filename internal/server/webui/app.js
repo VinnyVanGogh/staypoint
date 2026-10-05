@@ -4880,6 +4880,19 @@ function renderSettings() {
       const row = el('div', 'settings-dev-config-row');
       row.appendChild(el('code', 'settings-dev-config-repo', c.repo_path));
       row.appendChild(el('span', 'settings-dev-config-cmd', c.dev_command || '—'));
+      const mode = c.effective_merge_mode || 'direct';
+      row.appendChild(el('span', 'settings-dev-config-merge-mode',
+        `${MERGE_MODE_LABELS[mode] || mode}${c.merge_mode ? '' : ' (default)'}${c.is_work_repo ? ' · work repo' : ''}`));
+      row.title = 'Click to edit';
+      row.style.cursor = 'pointer';
+      // Load the saved values so a save never blanks fields it did not show.
+      row.addEventListener('click', () => {
+        repoInput.value = c.repo_path || '';
+        cmdInput.value = c.dev_command || '';
+        stepsInput.value = (c.setup_steps || []).join('\n');
+        mergeModeSelect.value = c.merge_mode || '';
+        ghDirInput.value = c.gh_config_dir || '';
+      });
       devConfigList.appendChild(row);
     }
   }
@@ -4906,6 +4919,19 @@ function renderSettings() {
   stepsInput.className = 'settings-dev-config-input';
   stepsInput.placeholder = 'Setup steps, one per line (e.g. npm ci)';
   stepsInput.rows = 3;
+  // STA-717: how Approve lands the branch for this repo.
+  const mergeModeSelect = el('select', 'settings-dev-config-input settings-dev-config-merge-mode-select');
+  for (const [value, label] of [['', 'Default (work repo: Open PR; otherwise Merge to main)'],
+    ['direct', MERGE_MODE_LABELS.direct], ['open_pr', MERGE_MODE_LABELS.open_pr], ['pr_merge', MERGE_MODE_LABELS.pr_merge]]) {
+    const o = document.createElement('option');
+    o.value = value;
+    o.textContent = label;
+    mergeModeSelect.appendChild(o);
+  }
+  const ghDirInput = el('input');
+  ghDirInput.type = 'text';
+  ghDirInput.className = 'settings-dev-config-input settings-dev-config-gh-dir';
+  ghDirInput.placeholder = 'Optional GH_CONFIG_DIR override (blank: the repo\'s normal gh login)';
   const saveBtn = el('button', 'settings-dev-config-save', 'Save config');
   const saveStatus = el('span', 'settings-dev-config-status', '');
   devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Repo path'));
@@ -4914,6 +4940,10 @@ function renderSettings() {
   devForm.appendChild(cmdInput);
   devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Setup steps'));
   devForm.appendChild(stepsInput);
+  devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Merge mode'));
+  devForm.appendChild(mergeModeSelect);
+  devForm.appendChild(el('div', 'settings-dev-config-field-label', 'gh config dir'));
+  devForm.appendChild(ghDirInput);
   devForm.appendChild(saveBtn);
   devForm.appendChild(saveStatus);
   devSec.appendChild(devForm);
@@ -4928,6 +4958,8 @@ function renderSettings() {
       repo_path: repoPath,
       dev_command: devCommand,
       setup_steps: stepsInput.value.split('\n').map(s => s.trim()).filter(Boolean),
+      merge_mode: mergeModeSelect.value,
+      gh_config_dir: ghDirInput.value.trim(),
     };
     const r = await withBoardWebAuthn((sessionToken, assertion) =>
       fetch('/api/project-dev-configs', {
@@ -7992,6 +8024,9 @@ function renderFinalShipReviewCard(taskId, headSHA, status, mainSHA, rejectComme
     shaRow.appendChild(el('code', 'ship-review-sha ship-review-sha--main', mainSHA.slice(0, 12)));
   }
   section.appendChild(shaRow);
+  if (status === 'approved' && cleanup && cleanup.pr_number > 0) {
+    section.appendChild(renderPRStatusSection(taskId, cleanup));
+  }
   if (status === 'approved' && cleanup) {
     if (cleanup.branch_deleted) {
       const brRow = el('div', 'ship-review-row');
@@ -8087,6 +8122,140 @@ function devLogTrigger(logEl) {
     () => el('pre', 'content-modal-pre', logEl.textContent));
 }
 
+// ── Ship review PR modes (STA-717) ───────────────────────────────────────────
+// A project's merge mode decides what Approve does: "direct" merges to main
+// as before, "open_pr" opens a GitHub PR and stops, "pr_merge" opens a PR,
+// waits for CI on the pinned head and merges through GitHub from the card.
+
+const MERGE_MODE_LABELS = {
+  direct: 'Merge to main',
+  open_pr: 'Open PR',
+  pr_merge: 'Open PR + merge after CI',
+};
+
+const PR_CHECK_ICONS = { pass: '✓', fail: '✗', pending: '⏳', skipping: '–', cancel: '⊘' };
+const PR_CHECKS_LABELS = {
+  running: 'Checks running',
+  passed: 'Checks passed',
+  failed: 'Checks failed',
+  none: 'Waiting for checks',
+};
+const PR_CHECKS_POLL_MS = 10_000;
+
+function fmtCheckDuration(sec) {
+  if (!sec || sec < 0) return '';
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return m ? `${m}m ${s}s` : `${s}s`;
+}
+
+// safeHttpURL returns url only when it is http(s), so a check link can never
+// become a javascript: href.
+function safeHttpURL(url) {
+  try {
+    const u = new URL(url);
+    return (u.protocol === 'https:' || u.protocol === 'http:') ? u.toString() : '';
+  } catch { return ''; }
+}
+
+function prLinkRow(card) {
+  const row = el('div', 'ship-review-row ship-review-pr-row');
+  row.appendChild(el('span', 'ship-review-row-label', 'Pull request'));
+  const href = safeHttpURL(card.pr_url || '');
+  if (href) {
+    const a = el('a', 'ship-review-pr-link', `PR #${card.pr_number}`);
+    a.href = href;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    row.appendChild(a);
+  } else {
+    row.appendChild(el('span', 'ship-review-pr-link', `PR #${card.pr_number}`));
+  }
+  return row;
+}
+
+// renderPRChecksTable lists each check: state, name, duration, log link.
+function renderPRChecksTable(checks) {
+  const list = el('ul', 'ship-review-pr-checks');
+  if (!checks || !checks.length) {
+    list.appendChild(el('li', 'ship-review-pr-check ship-review-pr-check--empty', 'No checks reported for this head yet.'));
+    return list;
+  }
+  for (const c of checks) {
+    const bucket = c.bucket || 'pending';
+    const li = el('li', `ship-review-pr-check ship-review-pr-check--${bucket}`);
+    li.dataset.bucket = bucket;
+    li.appendChild(el('span', 'ship-review-pr-check-icon', PR_CHECK_ICONS[bucket] || '?'));
+    li.appendChild(el('span', 'ship-review-pr-check-name', c.name || '(unnamed)'));
+    li.appendChild(el('span', 'ship-review-pr-check-state', (c.state || bucket).toLowerCase().replace(/_/g, ' ')));
+    const dur = fmtCheckDuration(c.duration_sec);
+    if (dur) li.appendChild(el('span', 'ship-review-pr-check-duration', dur));
+    const href = safeHttpURL(c.link || '');
+    if (href) {
+      const a = el('a', 'ship-review-pr-check-link', 'log');
+      a.href = href;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      li.appendChild(a);
+    }
+    list.appendChild(li);
+  }
+  return list;
+}
+
+// startPRChecksPoll polls the card's checks every PR_CHECKS_POLL_MS until the
+// summary settles or the card leaves the DOM. onResult gets each response.
+function startPRChecksPoll(taskId, anchor, onResult, { once = false } = {}) {
+  let stopped = false;
+  let attached = false;
+  let waits = 0;
+  const tick = async () => {
+    if (stopped) return;
+    // The card may be built before it is attached; wait for that, then stop
+    // for good once it leaves the DOM.
+    if (!anchor.isConnected) {
+      if (!attached && waits++ < 40) setTimeout(tick, 250);
+      return;
+    }
+    attached = true;
+    let res = null;
+    try {
+      res = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/checks`);
+    } catch { /* GitHub unreachable: keep the last snapshot */ }
+    if (stopped || !anchor.isConnected) return;
+    if (res) onResult(res);
+    const settled = res && !res.head_moved && (res.summary === 'passed' || res.summary === 'failed');
+    if (!once && !settled) setTimeout(tick, PR_CHECKS_POLL_MS);
+  };
+  setTimeout(tick, 0);
+  return () => { stopped = true; };
+}
+
+// renderPRStatusSection shows the PR link and checks on a closed open_pr card.
+function renderPRStatusSection(taskId, card) {
+  const wrap = el('div', 'ship-review-pr-section');
+  wrap.appendChild(prLinkRow(card));
+  if (!card.main_sha) {
+    wrap.appendChild(el('div', 'ship-review-pr-note', 'PR opened for review on GitHub. StayPoint does not merge it.'));
+  }
+  const title = el('div', 'ship-review-section-title', 'Checks');
+  const summary = el('span', 'ship-review-pr-summary', card.pr_checks_summary ? (PR_CHECKS_LABELS[card.pr_checks_summary] || '') : '');
+  title.appendChild(summary);
+  wrap.appendChild(title);
+  let table = renderPRChecksTable(card.pr_checks || []);
+  wrap.appendChild(table);
+  if (!card.main_sha) {
+    startPRChecksPoll(taskId, wrap, (res) => {
+      if (res.head_moved) return;
+      const next = renderPRChecksTable(res.checks || []);
+      table.replaceWith(next);
+      table = next;
+      summary.textContent = PR_CHECKS_LABELS[res.summary] || '';
+    });
+  }
+  return wrap;
+}
+
 function renderShipReviewCardFromData(container, taskId, card) {
   if (!card || !taskId) return;
   clearShipReviewHeaderActions(taskId);
@@ -8108,8 +8277,14 @@ function renderShipReviewCardFromData(container, taskId, card) {
   // Header
   const hdr = el('div', 'ship-review-header');
   const badge = el('span', 'ship-review-badge', 'Ship Review');
+  // STA-717: a pr_merge card whose head is on the PR waits for CI, then merges.
+  const prActive = card.status === 'pending' && card.merge_mode === 'pr_merge' && card.pr_number > 0 &&
+    !!card.pr_checks_sha && card.pr_checks_sha === card.head_sha;
+  const approveMode = card.effective_merge_mode || 'direct';
   const statusBadge = el('span', `ship-review-status-badge status-${card.status}`,
-    card.status === 'sent_back' ? 'Sent Back' : 'Pending Approval');
+    card.status === 'sent_back' ? 'Sent Back'
+      : prActive ? (PR_CHECKS_LABELS[card.pr_checks_summary] || PR_CHECKS_LABELS.running)
+      : 'Pending Approval');
   hdr.appendChild(badge);
   hdr.appendChild(statusBadge);
   section.appendChild(hdr);
@@ -8217,6 +8392,64 @@ function renderShipReviewCardFromData(container, taskId, card) {
   shaRow.appendChild(el('span', 'ship-review-branch', card.branch || ''));
   section.appendChild(shaRow);
 
+  // PR + CI checks (STA-717). applyPRChecks is wired to the actions below.
+  let applyPRChecks = null;
+  const prWarning = el('div', 'ship-review-pr-warning');
+  prWarning.style.display = 'none';
+  const prWarningList = el('ul', 'ship-review-pr-warning-list');
+  if (card.pr_number > 0 && card.status === 'pending') {
+    const prSec = el('div', 'ship-review-pr-section');
+    prSec.appendChild(prLinkRow(card));
+    if (!prActive) {
+      prSec.appendChild(el('div', 'ship-review-pr-note',
+        `This head is not on PR #${card.pr_number} yet. Approve pushes it to the PR and re-runs the checks.`));
+    } else {
+      const title = el('div', 'ship-review-section-title', 'Checks');
+      const summaryEl = el('span', 'ship-review-pr-summary', '');
+      title.appendChild(summaryEl);
+      prSec.appendChild(title);
+      let table = renderPRChecksTable(card.pr_checks || []);
+      prSec.appendChild(table);
+      prWarning.appendChild(el('div', 'ship-review-pr-warning-title', ''));
+      prWarning.appendChild(prWarningList);
+      prSec.appendChild(prWarning);
+      if (card.pr_merge_error) {
+        const refusal = el('div', 'ship-review-github-refusal');
+        refusal.appendChild(el('span', 'ship-review-github-refusal-label', 'GitHub refused the last merge: '));
+        refusal.appendChild(el('span', 'ship-review-github-refusal-text', card.pr_merge_error));
+        prSec.appendChild(refusal);
+      }
+      applyPRChecks = (summary, checks) => {
+        const next = renderPRChecksTable(checks || []);
+        table.replaceWith(next);
+        table = next;
+        const label = PR_CHECKS_LABELS[summary] || PR_CHECKS_LABELS.running;
+        summaryEl.textContent = label;
+        statusBadge.textContent = label;
+        statusBadge.className = `ship-review-status-badge status-checks-${summary || 'running'}`;
+        const blocking = (checks || []).filter((c) => c.bucket !== 'pass' && c.bucket !== 'skipping');
+        const green = summary === 'passed';
+        prWarning.style.display = green ? 'none' : '';
+        prWarning.querySelector('.ship-review-pr-warning-title').textContent =
+          summary === 'failed' ? `⚠ ${blocking.length} check${blocking.length === 1 ? '' : 's'} not green. Merging now needs an override.`
+            : summary === 'none' ? '⚠ No checks reported for this head yet. Merging now needs an override.'
+            : `⚠ ${blocking.length} check${blocking.length === 1 ? '' : 's'} still running. Merging now needs an override.`;
+        prWarningList.replaceChildren(...blocking.map((c) => el('li', `ship-review-pr-warning-item ship-review-pr-check--${c.bucket || 'pending'}`,
+          `${PR_CHECK_ICONS[c.bucket] || '?'} ${c.name} (${(c.state || c.bucket || '').toLowerCase().replace(/_/g, ' ')})`)));
+        section.dataset.checks = summary || 'running';
+        section.dispatchEvent(new CustomEvent('pr-checks', { detail: { summary, blocking } }));
+      };
+      startPRChecksPoll(taskId, prSec, (res) => {
+        if (res.head_moved) {
+          section.dispatchEvent(new CustomEvent('pr-head-moved', { detail: { sha: res.pr_head_sha || '' } }));
+          return;
+        }
+        applyPRChecks(res.summary, res.checks);
+      });
+    }
+    section.appendChild(prSec);
+  }
+
   // What to test
   if (card.test_steps && card.test_steps.length > 0) {
     const testSection = el('div', 'ship-review-test-section');
@@ -8309,9 +8542,15 @@ function renderShipReviewCardFromData(container, taskId, card) {
   // ── Send-back inline form (hidden until "↩ Send Back" clicked) ──
   const sendBackForm = el('div', 'ship-review-inline-form');
   sendBackForm.style.display = 'none';
+  // Set by "Send failures to agent": the send-back carries ci_failures so the
+  // agent's fix is pushed to the PR and its checks re-run (STA-717).
+  let sendBackCI = false;
+  let sbTextareaRef = null;
+  const sbLabel = el('label', 'ship-review-form-label', 'Feedback for the agent (required):');
   {
-    sendBackForm.appendChild(el('label', 'ship-review-form-label', 'Feedback for the agent (required):'));
+    sendBackForm.appendChild(sbLabel);
     const sbTextarea = document.createElement('textarea');
+    sbTextareaRef = sbTextarea;
     sbTextarea.className = 'ship-review-form-textarea';
     sbTextarea.rows = 3;
     sbTextarea.placeholder = 'What should the agent fix or improve?';
@@ -8333,7 +8572,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
           fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/send-back`, {
             method: 'POST',
             headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-            body: JSON.stringify({ comment }),
+            body: JSON.stringify(sendBackCI ? { comment, ci_failures: true } : { comment }),
           }), 'sending the review back',
         );
         if (r === null) { sbSubmit.disabled = false; return; }
@@ -8406,10 +8645,15 @@ function renderShipReviewCardFromData(container, taskId, card) {
   {
     const shortSHA = card.head_sha ? card.head_sha.slice(0, 12) : '—';
     const repoName = card.repo_name || '';
+    const repoSuffix = repoName ? ` (${repoName})` : '';
+    const prTarget = card.pr_number > 0 ? `PR #${card.pr_number}` : 'a PR';
     approveConfirmForm.appendChild(el('div', 'ship-review-form-label',
-      repoName ? `Merge ${shortSHA} → main (${repoName})` : `Merge ${shortSHA} → main`));
+      approveMode === 'open_pr' ? `Push ${shortSHA} and open ${prTarget} → main${repoSuffix}. StayPoint will not merge it.`
+        : approveMode === 'pr_merge' ? `Push ${shortSHA} to ${prTarget} → main${repoSuffix} and run the checks. Merge comes after CI.`
+        : `Merge ${shortSHA} → main${repoSuffix}`));
     const acRow = el('div', 'ship-review-form-row');
-    const acMerge = el('button', 'ship-review-form-submit', 'Merge to main');
+    const acMerge = el('button', 'ship-review-form-submit',
+      approveMode === 'direct' ? 'Merge to main' : approveMode === 'open_pr' ? 'Open PR' : 'Push & run checks');
     const acCancel = el('button', 'ship-review-form-cancel', 'Cancel');
     acRow.appendChild(acMerge);
     acRow.appendChild(acCancel);
@@ -8422,8 +8666,9 @@ function renderShipReviewCardFromData(container, taskId, card) {
         const r = await withBoardWebAuthn((sessionToken, assertion) =>
           fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/approve`, {
             method: 'POST',
-            headers: { ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-          }), 'merging to main',
+            headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+            body: JSON.stringify({ head_sha: card.head_sha }),
+          }), approveMode === 'direct' ? 'merging to main' : 'opening the PR',
         );
         if (r === null) { acMerge.disabled = false; return; }
         if (r.status === 409) {
@@ -8441,6 +8686,16 @@ function renderShipReviewCardFromData(container, taskId, card) {
         }
         if (!r.ok) throw await boardActionError(r);
         const result = await r.json();
+        if (result.merge_mode === 'open_pr' || result.merge_mode === 'pr_merge') {
+          clearShipReviewHeaderActions(taskId);
+          if (result.merge_mode === 'open_pr') {
+            section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', '', '', result.card || {}));
+          } else {
+            section.remove();
+            renderShipReviewCardFromData(container, taskId, result.card);
+          }
+          return;
+        }
         const mainSHA = result.main_sha || (result.card && result.card.main_sha) || '';
         clearShipReviewHeaderActions(taskId);
         section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', mainSHA, '', {
@@ -8456,37 +8711,183 @@ function renderShipReviewCardFromData(container, taskId, card) {
   }
   actionsWrap.appendChild(approveConfirmForm);
 
+  // ── PR merge (pr_merge mode, STA-717) ──
+  const shortHead = card.head_sha ? card.head_sha.slice(0, 12) : '—';
+  const mergeConfirmForm = el('div', 'ship-review-inline-form ship-review-merge-confirm');
+  mergeConfirmForm.style.display = 'none';
+  const anywayConfirmForm = el('div', 'ship-review-inline-form ship-review-merge-anyway-confirm');
+  anywayConfirmForm.style.display = 'none';
+  const anywayLabel = el('div', 'ship-review-form-label', '');
+  const allForms = [sendBackForm, rejectForm, approveConfirmForm, mergeConfirmForm, anywayConfirmForm];
+  const showOnly = (form) => {
+    for (const f of allForms) f.style.display = (f === form && f.style.display === 'none') ? '' : 'none';
+    headMovedBanner.style.display = 'none';
+    clearErr();
+  };
+  const showGitHubRefusal = (msg) => {
+    errBanner.replaceChildren(el('span', 'ship-review-github-refusal-label', 'GitHub refused the merge: '),
+      el('span', 'ship-review-github-refusal-text', msg));
+    errBanner.style.display = '';
+  };
+  const doMerge = async (btn, override, reason) => {
+    clearErr();
+    btn.disabled = true;
+    try {
+      const r = await withBoardWebAuthn((sessionToken, assertion) =>
+        fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/merge`, {
+          method: 'POST',
+          headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+          // head_sha pins the merge to the head on screen (STA-717).
+          body: JSON.stringify(override
+            ? { head_sha: card.head_sha, override: true, override_reason: reason || '' }
+            : { head_sha: card.head_sha }),
+        }), override ? 'merging the PR anyway' : 'merging the PR',
+      );
+      if (r === null) { btn.disabled = false; return; }
+      const body = await r.json().catch(() => ({}));
+      if (r.ok) {
+        clearShipReviewHeaderActions(taskId);
+        section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', body.main_sha || '', '', body.card || {
+          branch: card.branch, branch_deleted: !!body.branch_deleted, branch_delete_error: body.branch_delete_error || '',
+        }));
+        return;
+      }
+      btn.disabled = false;
+      mergeConfirmForm.style.display = 'none';
+      anywayConfirmForm.style.display = 'none';
+      if (body.error === 'head_moved') {
+        headMovedBanner.querySelector('.ship-review-head-moved-text').textContent =
+          `Branch moved to ${(body.new_head_sha || '?').slice(0, 12)} after the checks started. Merge blocked until the card is re-pinned and checks re-run. `;
+        headMovedBanner.style.display = '';
+        if (applyPRChecks) applyPRChecks('running', []);
+        return;
+      }
+      if (body.error === 'checks_not_green') {
+        if (applyPRChecks) applyPRChecks(body.not_green && body.not_green.some((c) => c.bucket === 'fail' || c.bucket === 'cancel') ? 'failed' : 'running', body.checks || []);
+        showErr('Checks are not all green: ' + (body.not_green || []).map((c) => c.name).join(', '));
+        return;
+      }
+      if (body.error === 'github_refused') { showGitHubRefusal(body.message || ''); return; }
+      if (body.error === 'unverified_migrations') {
+        showErr(`${body.message} (${(body.unverified_migrations || []).join(', ')})`);
+        return;
+      }
+      showErr('Merge failed: ' + (body.message || body.error || `${r.status} ${r.statusText}`));
+    } catch (e) {
+      btn.disabled = false;
+      showErr('Merge failed: ' + (e.message || e));
+    }
+  };
+  {
+    mergeConfirmForm.appendChild(el('div', 'ship-review-form-label', `Merge PR #${card.pr_number} ${shortHead} → main`));
+    const row = el('div', 'ship-review-form-row');
+    const go = el('button', 'ship-review-form-submit ship-review-merge-submit', 'Merge PR');
+    const cancel = el('button', 'ship-review-form-cancel', 'Cancel');
+    row.appendChild(go);
+    row.appendChild(cancel);
+    mergeConfirmForm.appendChild(row);
+    cancel.addEventListener('click', () => { mergeConfirmForm.style.display = 'none'; clearErr(); });
+    go.addEventListener('click', () => doMerge(go, false));
+  }
+  {
+    anywayConfirmForm.appendChild(anywayLabel);
+    const reason = document.createElement('input');
+    reason.type = 'text';
+    reason.className = 'ship-review-form-input ship-review-override-reason';
+    reason.placeholder = 'Why merge anyway? (logged)';
+    anywayConfirmForm.appendChild(reason);
+    const row = el('div', 'ship-review-form-row');
+    const go = el('button', 'ship-review-reject-submit-btn ship-review-merge-anyway-submit', 'Merge anyway');
+    const cancel = el('button', 'ship-review-form-cancel', 'Cancel');
+    row.appendChild(go);
+    row.appendChild(cancel);
+    anywayConfirmForm.appendChild(row);
+    cancel.addEventListener('click', () => { anywayConfirmForm.style.display = 'none'; clearErr(); });
+    go.addEventListener('click', () => doMerge(go, true, reason.value.trim()));
+  }
+  // Only PR-mode cards get the merge forms, so every other card keeps its
+  // existing form order.
+  if (prActive) {
+    actionsWrap.appendChild(mergeConfirmForm);
+    actionsWrap.appendChild(anywayConfirmForm);
+  }
+
+  // Warning buttons: Merge anyway / Send failures to agent.
+  if (prActive) {
+    const warnRow = el('div', 'ship-review-form-row ship-review-pr-warning-actions');
+    const anywayBtn = el('button', 'ship-review-merge-anyway-btn', 'Merge anyway');
+    const failuresBtn = el('button', 'ship-review-send-failures-btn', '↩ Send failures to agent');
+    warnRow.appendChild(anywayBtn);
+    warnRow.appendChild(failuresBtn);
+    prWarning.appendChild(warnRow);
+    anywayBtn.addEventListener('click', () => {
+      const n = prWarningList.children.length;
+      anywayLabel.textContent = `Merge PR #${card.pr_number} ${shortHead} → main with ${n} check${n === 1 ? '' : 's'} not green? This is logged as an override.`;
+      showOnly(anywayConfirmForm);
+    });
+    failuresBtn.addEventListener('click', async () => {
+      failuresBtn.disabled = true;
+      clearErr();
+      try {
+        const f = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/check-failures`);
+        for (const x of allForms) x.style.display = 'none';
+        sendBackCI = true;
+        sbLabel.textContent = 'CI failures for the agent (edit before sending):';
+        sbTextareaRef.value = f.comment || '';
+        sbTextareaRef.rows = 10;
+        sendBackForm.style.display = '';
+      } catch (e) {
+        showErr('Could not read the failing checks: ' + (e.message || e));
+      }
+      failuresBtn.disabled = false;
+    });
+  }
+
   // ── Primary action buttons ──
   const actions = el('div', 'ship-review-actions');
 
-  const approveBtn = el('button', 'ship-review-approve-btn', '✓ Approve & Merge');
-  approveBtn.addEventListener('click', () => {
-    sendBackForm.style.display = 'none';
-    rejectForm.style.display = 'none';
-    approveConfirmForm.style.display = approveConfirmForm.style.display === 'none' ? '' : 'none';
-    headMovedBanner.style.display = 'none';
-    clearErr();
-  });
-  actions.appendChild(approveBtn);
+  if (prActive) {
+    const mergeBtn = el('button', 'ship-review-merge-btn', `✓ Merge PR #${card.pr_number}`);
+    mergeBtn.disabled = true;
+    mergeBtn.title = 'Enabled when all checks are green';
+    mergeBtn.addEventListener('click', () => showOnly(mergeConfirmForm));
+    actions.appendChild(mergeBtn);
+    section.addEventListener('pr-checks', (e) => {
+      const green = e.detail.summary === 'passed';
+      mergeBtn.disabled = !green;
+      mergeBtn.title = green ? '' : 'Enabled when all checks are green';
+      if (!green) mergeConfirmForm.style.display = 'none';
+    });
+    section.addEventListener('pr-head-moved', (e) => {
+      mergeBtn.disabled = true;
+      headMovedBanner.querySelector('.ship-review-head-moved-text').textContent =
+        `PR head moved to ${(e.detail.sha || '?').slice(0, 12)} after the checks started. Merge blocked until the card is re-pinned and checks re-run. `;
+      headMovedBanner.style.display = '';
+    });
+  } else {
+    const approveLabel = approveMode === 'open_pr' ? '✓ Approve & open PR'
+      : approveMode === 'pr_merge' ? (card.pr_number > 0 ? `✓ Approve & push to PR #${card.pr_number}` : '✓ Approve & open PR')
+      : '✓ Approve & Merge';
+    const approveBtn = el('button', 'ship-review-approve-btn', approveLabel);
+    approveBtn.addEventListener('click', () => showOnly(approveConfirmForm));
+    actions.appendChild(approveBtn);
+  }
 
   const sendBackBtn = el('button', 'ship-review-sendback-btn', '↩ Send Back');
   sendBackBtn.addEventListener('click', () => {
-    rejectForm.style.display = 'none';
-    approveConfirmForm.style.display = 'none';
-    headMovedBanner.style.display = 'none';
-    clearErr();
-    sendBackForm.style.display = sendBackForm.style.display === 'none' ? '' : 'none';
+    if (sendBackCI) {
+      sendBackCI = false;
+      sbLabel.textContent = 'Feedback for the agent (required):';
+      sbTextareaRef.value = '';
+      sbTextareaRef.rows = 3;
+      sendBackForm.style.display = 'none';
+    }
+    showOnly(sendBackForm);
   });
   actions.appendChild(sendBackBtn);
 
   const rejectBtn = el('button', 'ship-review-reject-btn', '✕ Reject');
-  rejectBtn.addEventListener('click', () => {
-    sendBackForm.style.display = 'none';
-    approveConfirmForm.style.display = 'none';
-    headMovedBanner.style.display = 'none';
-    clearErr();
-    rejectForm.style.display = rejectForm.style.display === 'none' ? '' : 'none';
-  });
+  rejectBtn.addEventListener('click', () => showOnly(rejectForm));
   actions.appendChild(rejectBtn);
 
   // On the task page the buttons sit in the sticky header and their forms
@@ -8501,6 +8902,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
     section.appendChild(actionsWrap);
   }
   container.appendChild(section);
+  if (applyPRChecks) applyPRChecks(card.pr_checks_summary || 'running', card.pr_checks || []);
 
   // For SSE-driven re-renders the buttons may already be in the DOM.
   // Hide them so they don't sit alongside the card's own action buttons.

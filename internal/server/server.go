@@ -234,6 +234,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.Handle("POST /api/tasks/{id}/ship-review/send-back", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.SendBack)))
 		mux.Handle("POST /api/tasks/{id}/ship-review/reject", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.Reject)))
 		mux.Handle("POST /api/tasks/{id}/ship-review/delete-branch", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.DeleteMergedBranch)))
+		// STA-717: PR-mode checks are read-only polls; merging the PR is a Board action.
+		mux.HandleFunc("GET /api/tasks/{id}/ship-review/checks", shipH.Checks)
+		mux.HandleFunc("GET /api/tasks/{id}/ship-review/check-failures", shipH.CheckFailures)
+		mux.Handle("POST /api/tasks/{id}/ship-review/merge", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.MergePR)))
 		mux.HandleFunc("GET /api/settings/ship-review", shipH.GetSettings)
 		// Board-only: disabling ship review is a Board action.
 		mux.Handle("POST /api/settings/ship-review", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.SetSettings)))
