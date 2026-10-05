@@ -3,8 +3,10 @@ package server_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +78,40 @@ func TestHealth_ReportsInaccessibleRepoPaths(t *testing.T) {
 	if len(body.RepoAccess.Inaccessible) != 1 || body.RepoAccess.Inaccessible[0].Path != blocked.Path ||
 		body.RepoAccess.Inaccessible[0].Status != repoaccess.StatusTimeout {
 		t.Fatalf("repo_access.inaccessible = %+v, want the blocked path", body.RepoAccess.Inaccessible)
+	}
+}
+
+// Before the first check there is no check time, so health must not invent
+// one (a zero time.Time encodes as 0001-01-01T00:00:00Z).
+func TestHealth_NoCheckedAtBeforeFirstCheck(t *testing.T) {
+	token := "test-secret-token-1234567890abcdef"
+	srv, err := server.New(server.Options{
+		BindHost:        "127.0.0.1",
+		AuthToken:       token,
+		TelemetryDBPath: filepath.Join(t.TempDir(), "t.db"),
+		RepoAccess:      fakeRepoAccess{repoaccess.Snapshot{Inaccessible: []repoaccess.Result{}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+	req, _ := http.NewRequest(http.MethodGet, srv.URL()+"/api/health", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(raw), "checked_at") {
+		t.Fatalf("unchecked health reports a check time: %s", raw)
 	}
 }
 
