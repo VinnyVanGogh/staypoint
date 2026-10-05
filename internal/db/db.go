@@ -1062,7 +1062,15 @@ func copyFile(src, dst string) error {
 	return os.WriteFile(dst, input, 0644)
 }
 
+func validateMigrations(ms []Migration) error {
+	return nil
+}
+
 func applyMigrations(dbPath string, conn *sql.DB) error {
+	return applyMigrationSet(dbPath, conn, Migrations)
+}
+
+func applyMigrationSet(dbPath string, conn *sql.DB, ms []Migration) error {
 	if _, err := conn.Exec(`
 		CREATE TABLE IF NOT EXISTS schema_versions (
 			version INTEGER PRIMARY KEY,
@@ -1094,7 +1102,7 @@ func applyMigrations(dbPath string, conn *sql.DB) error {
 	}
 
 	var pending []Migration
-	for _, m := range Migrations {
+	for _, m := range ms {
 		if !applied[m.Version] {
 			pending = append(pending, m)
 		}
