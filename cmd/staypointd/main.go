@@ -44,6 +44,9 @@ func init() {
 }
 
 func main() {
+	// A repo access probe child (STA-687) exits here, before any daemon setup.
+	repoaccess.RunProbeChild()
+
 	// Subcommands dispatch before flag.Parse so they own their own flag sets.
 	if len(os.Args) > 1 && os.Args[1] == "eval-contracts" {
 		if err := runEvalContracts(os.Args[2:]); err != nil {

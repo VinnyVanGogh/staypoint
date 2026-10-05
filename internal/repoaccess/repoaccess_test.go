@@ -29,8 +29,15 @@ func mkfifo(t *testing.T) string {
 }
 
 // catProbe opens the path in a child process: instant for a regular file,
-// blocked in open() for a FIFO.
-func catProbe(path string) *exec.Cmd { return exec.Command("/bin/cat", path) }
+// blocked in open() for a FIFO. A path that does not exist goes to the real
+// probe child, which reports "missing" by exit code; cat's exit code does not
+// say why it failed.
+func catProbe(path string) *exec.Cmd {
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
+		return repoaccess.DefaultCommand(path)
+	}
+	return exec.Command("/bin/cat", path)
+}
 
 func TestProbe_AccessibleDirIsOK(t *testing.T) {
 	r := repoaccess.Probe(context.Background(), t.TempDir(), 3*time.Second, nil)

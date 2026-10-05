@@ -262,22 +262,28 @@ while [ -n "$TOKEN" ] && [ "$SECONDS" -lt "$deadline" ]; do
     HEALTH_BODY=""
     sleep 1
 done
-if [ -z "$HEALTH_BODY" ]; then
+if [ -z "$TOKEN" ]; then
+    echo "  ! No auth token at ~/.staypoint/auth_token; skipped the repo access check. See repo_access in $HEALTH_URL."
+elif [ -z "$HEALTH_BODY" ]; then
     echo "  ! Repo access check did not finish within ${REPO_CHECK_TIMEOUT}s; see repo_access in $HEALTH_URL."
 else
     BLOCKED="$(printf '%s' "$HEALTH_BODY" | grep -oE '"path":"[^"]*","status":"(timeout|denied)"' \
         | sed -E 's/"path":"([^"]*)","status":"([a-z]*)"/\1 (\2)/' || true)"
     MISSING_COUNT="$(printf '%s' "$HEALTH_BODY" | { grep -oE '"status":"missing"' || true; } | wc -l | tr -d ' ')"
+    ERROR_COUNT="$(printf '%s' "$HEALTH_BODY" | { grep -oE '"status":"error"' || true; } | wc -l | tr -d ' ')"
     if [ -n "$BLOCKED" ]; then
         echo "!!! staypointd can't access these repos: macOS permission needed."
         echo "    Answer the macOS privacy prompt for staypointd (or grant it in System Settings >"
         echo "    Privacy & Security > Files and Folders). The daemon rechecks every 10 minutes:"
         printf '%s\n' "$BLOCKED" | sed 's/^/      ✗ /'
     else
-        echo "✓ Repo access check: every repo is reachable."
+        echo "✓ Repo access check: no repo needs macOS permission."
     fi
     if [ "$MISSING_COUNT" -gt 0 ]; then
-        echo "  ($MISSING_COUNT repo path(s) on active tasks no longer exist; see repo_access in $HEALTH_URL.)"
+        echo "  ($MISSING_COUNT checked repo path(s) no longer exist (dev configs, active tasks, harness root); see repo_access in $HEALTH_URL.)"
+    fi
+    if [ "$ERROR_COUNT" -gt 0 ]; then
+        echo "  ! $ERROR_COUNT repo probe(s) failed to run, so those repos are unverified; see repo_access in $HEALTH_URL."
     fi
 fi
 

@@ -10,12 +10,16 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
@@ -29,6 +33,7 @@ const (
 	StatusTimeout Status = "timeout" // the probe hung: typically a pending macOS privacy prompt
 	StatusDenied  Status = "denied"  // the OS refused access
 	StatusMissing Status = "missing" // the path no longer exists
+	StatusError   Status = "error"   // the probe itself failed or was cancelled; says nothing about the repo
 )
 
 // DefaultTimeout bounds each probe. A reachable repo answers in milliseconds.
@@ -53,21 +58,72 @@ func (r Result) PermissionNeeded() bool {
 
 // Snapshot is the latest check, as reported by /api/health.
 type Snapshot struct {
-	Checked      bool      `json:"checked"`
-	CheckedAt    time.Time `json:"checked_at,omitempty"`
-	Inaccessible []Result  `json:"inaccessible"`
+	Checked      bool       `json:"checked"`
+	CheckedAt    *time.Time `json:"checked_at,omitempty"`
+	Inaccessible []Result   `json:"inaccessible"`
 }
 
 // CommandFunc builds the child process that probes path.
 type CommandFunc func(path string) *exec.Cmd
 
-// DefaultCommand enters path and reads it the way git does on startup: chdir,
-// getcwd, then list the directory. Everything happens after exec, so a hang
-// is inside the child and the parent's deadline still applies. (Setting
-// cmd.Dir instead would chdir before exec, where a hang would block Start.)
+// probeEnv carries the path to a probe child. See RunProbeChild.
+const probeEnv = "STAYPOINT_REPO_PROBE_PATH"
+
+// Probe child exit codes. Anything else means the probe itself failed.
+const (
+	exitMissing = 3
+	exitDenied  = 4
+)
+
+// DefaultCommand re-runs the current binary as a probe child (RunProbeChild).
+// The child classifies the failure by errno and reports it in its exit code,
+// so the result does not depend on any shell's or locale's error wording.
+// Everything happens after exec, so a hang is inside the child and the
+// parent's deadline still applies. (Setting cmd.Dir instead would chdir
+// before exec, where a hang would block Start.)
+//
+// The flag argument is only a guard: a binary without the RunProbeChild hook
+// (e.g. a test binary) rejects the unknown flag and exits instead of running.
 func DefaultCommand(path string) *exec.Cmd {
-	return exec.Command("/bin/sh", "-c", `cd -- "$1" && /bin/pwd -P >/dev/null && /bin/ls -a >/dev/null`,
-		"staypoint-repo-probe", path)
+	exe, err := os.Executable()
+	if err != nil {
+		exe = os.Args[0]
+	}
+	cmd := exec.Command(exe, "-staypoint-repo-probe")
+	cmd.Env = append(os.Environ(), probeEnv+"="+path, "LC_ALL=C")
+	return cmd
+}
+
+// RunProbeChild turns this process into a probe child when DefaultCommand
+// started it, and exits. Call it first thing in main (and in TestMain for
+// packages whose tests use DefaultCommand). Otherwise it returns at once.
+func RunProbeChild() {
+	path, ok := os.LookupEnv(probeEnv)
+	if !ok {
+		return
+	}
+	os.Exit(probeChild(path))
+}
+
+// probeChild enters path and opens it, as git does on startup (chdir, then
+// open "." to resolve the working directory).
+func probeChild(path string) int {
+	err := os.Chdir(path)
+	if err == nil {
+		_, err = os.ReadDir(".")
+	}
+	if err == nil {
+		return 0
+	}
+	fmt.Fprintln(os.Stderr, err)
+	switch {
+	case errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR):
+		return exitMissing
+	case errors.Is(err, fs.ErrPermission): // EACCES and EPERM; TCC denials are EPERM
+		return exitDenied
+	default:
+		return 1
+	}
 }
 
 // Message is the Board-facing text for a path that needs permission.
@@ -95,7 +151,7 @@ func Probe(ctx context.Context, path string, timeout time.Duration, cmdFn Comman
 	cmd.WaitDelay = time.Second
 	ownProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
-		res.Status = StatusDenied
+		res.Status = StatusError
 		res.Detail = "start probe: " + err.Error()
 		return res
 	}
@@ -111,23 +167,36 @@ func Probe(ctx context.Context, path string, timeout time.Duration, cmdFn Comman
 			res.Status = StatusOK
 			return res
 		}
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
+		res.Detail = strings.TrimSpace(stderr.String())
+		if res.Detail == "" {
+			res.Detail = err.Error()
 		}
-		res.Detail = msg
-		if strings.Contains(msg, "No such file or directory") || strings.Contains(msg, "Not a directory") {
+		var exitErr *exec.ExitError
+		code := -1
+		if errors.As(err, &exitErr) {
+			code = exitErr.ExitCode()
+		}
+		switch code {
+		case exitMissing:
 			res.Status = StatusMissing
-		} else {
+		case exitDenied:
 			res.Status = StatusDenied
+		default:
+			res.Status = StatusError
 		}
 		return res
-	case <-timer.C:
 	case <-ctx.Done():
+		killProbe(cmd)
+		res.Status = StatusError
+		res.Detail = "check cancelled"
+		return res
+	case <-timer.C:
 	}
 
 	// Kill the stuck child. The Wait goroutine reaps it once the kernel lets
-	// it die; the caller does not wait for that.
+	// it die; the caller does not wait for that. If the child cannot die
+	// (stuck uninterruptibly), that goroutine and the process leak until the
+	// kernel releases it. TCC-blocked children observed so far die on SIGKILL.
 	killProbe(cmd)
 	res.Status = StatusTimeout
 	res.Detail = fmt.Sprintf("no response within %s: %s", timeout, Message(path))
@@ -166,6 +235,12 @@ func (c *Checker) Check(ctx context.Context, paths []string) []Result {
 		}(i, p)
 	}
 	wg.Wait()
+
+	// A cancelled check (daemon shutdown) did not learn anything about the
+	// repos; recording it would announce every in-flight probe as lost.
+	if ctx.Err() != nil {
+		return results
+	}
 
 	c.mu.Lock()
 	prev := c.results
@@ -208,7 +283,11 @@ func (c *Checker) Check(ctx context.Context, paths []string) []Result {
 func (c *Checker) Snapshot() Snapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	snap := Snapshot{Checked: c.checked, CheckedAt: c.checkedAt, Inaccessible: []Result{}}
+	snap := Snapshot{Checked: c.checked, Inaccessible: []Result{}}
+	if c.checked {
+		at := c.checkedAt
+		snap.CheckedAt = &at
+	}
 	for _, r := range c.results {
 		if r.Status != StatusOK {
 			snap.Inaccessible = append(snap.Inaccessible, r)
