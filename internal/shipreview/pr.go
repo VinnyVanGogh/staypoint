@@ -317,12 +317,15 @@ type PRInfo struct {
 	HeadRefOid  string `json:"headRefOid"`
 	HeadRefName string `json:"headRefName"`
 	BaseRefName string `json:"baseRefName"`
-	MergeCommit *struct {
+	// IsCrossRepository is true for a PR from a fork, which StayPoint never
+	// treats as the task's PR even when the branch name matches.
+	IsCrossRepository bool `json:"isCrossRepository"`
+	MergeCommit       *struct {
 		Oid string `json:"oid"`
 	} `json:"mergeCommit"`
 }
 
-const prViewFields = "number,url,state,headRefOid,headRefName,baseRefName,mergeCommit"
+const prViewFields = "number,url,state,headRefOid,headRefName,baseRefName,isCrossRepository,mergeCommit"
 
 // ViewPR reads one PR.
 func (a GHAuth) ViewPR(ctx context.Context, number int) (*PRInfo, error) {
@@ -337,9 +340,11 @@ func (a GHAuth) ViewPR(ctx context.Context, number int) (*PRInfo, error) {
 	return &pr, nil
 }
 
-// findOpenPR returns the open PR whose head is branch, or nil.
+// findOpenPR returns the open same-repo PR whose head is branch, or nil.
+// `--head` matches by branch name only, so a fork's PR from a branch with the
+// same name is skipped.
 func (a GHAuth) findOpenPR(ctx context.Context, branch string) (*PRInfo, error) {
-	out, err := a.gh(ctx, "pr", "list", "--head", branch, "--state", "open", "--json", prViewFields, "--limit", "1")
+	out, err := a.gh(ctx, "pr", "list", "--head", branch, "--state", "open", "--json", prViewFields, "--limit", "20")
 	if err != nil {
 		return nil, err
 	}
@@ -347,11 +352,15 @@ func (a GHAuth) findOpenPR(ctx context.Context, branch string) (*PRInfo, error) 
 	if err := json.Unmarshal([]byte(out), &prs); err != nil {
 		return nil, fmt.Errorf("parse gh pr list: %w", err)
 	}
-	if len(prs) == 0 {
-		return nil, nil
+	for i := range prs {
+		if !prs[i].IsCrossRepository && prs[i].HeadRefName == branch {
+			return &prs[i], nil
+		}
 	}
-	return &prs[0], nil
+	return nil, nil
 }
+
+var prURLNumberRe = regexp.MustCompile(`/pull/(\d+)\s*$`)
 
 // defaultBranch is the repo's default branch on GitHub.
 func (a GHAuth) defaultBranch(ctx context.Context) (string, error) {
@@ -438,13 +447,24 @@ func OpenOrUpdatePR(ctx context.Context, a GHAuth, card *Card, force bool) (*PRI
 		if err != nil {
 			return nil, fmt.Errorf("default branch: %w", err)
 		}
-		if _, err := a.gh(ctx, "pr", "create", "--head", card.Branch, "--base", base,
-			"--title", prTitle(ctx, a, card), "--body", prBody(card)); err != nil {
+		out, err := a.gh(ctx, "pr", "create", "--head", card.Branch, "--base", base,
+			"--title", prTitle(ctx, a, card), "--body", prBody(card))
+		if err != nil {
 			return nil, fmt.Errorf("gh pr create: %w", err)
 		}
-		if pr, err = a.findOpenPR(ctx, card.Branch); err != nil || pr == nil {
-			return nil, fmt.Errorf("PR created but not found for %s: %v", card.Branch, err)
+		// Take the PR gh just created by its URL, not by a second branch lookup.
+		m := prURLNumberRe.FindStringSubmatch(strings.TrimSpace(out))
+		if m == nil {
+			return nil, fmt.Errorf("gh pr create: no PR URL in output %q", strings.TrimSpace(out))
 		}
+		n, _ := strconv.Atoi(m[1])
+		if pr, err = a.ViewPR(ctx, n); err != nil {
+			return nil, fmt.Errorf("read created PR #%d: %w", n, err)
+		}
+	}
+	if pr.IsCrossRepository || pr.HeadRefName != card.Branch || pr.HeadRefOid != card.HeadSHA {
+		return nil, fmt.Errorf("PR #%d is not this task's branch at %s (head %s@%s, cross-repo %v)",
+			pr.Number, card.HeadSHA, pr.HeadRefName, pr.HeadRefOid, pr.IsCrossRepository)
 	}
 	return pr, nil
 }

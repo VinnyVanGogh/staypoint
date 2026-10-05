@@ -32,6 +32,7 @@ pr_json() {
 case "$1 $2" in
 "repo view") echo main ;;
 "pr list")
+  if [ -f "$D/pr_list_raw" ]; then cat "$D/pr_list_raw"; rm "$D/pr_list_raw"; exit 0; fi
   if [ -f "$D/pr" ]; then set -- $(cat "$D/pr"); echo "[$(pr_json "$1" "$2" "$3")]"; else echo "[]"; fi ;;
 "pr create")
   br=""; while [ $# -gt 0 ]; do [ "$1" = "--head" ] && br="$2"; shift; done
@@ -609,6 +610,71 @@ func TestShipReviewPR_DevConfigMergeMode(t *testing.T) {
 	resp, rb := shipDoReq(t, client, token, "GET", baseURL+"/api/project-dev-configs", nil)
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(rb), `"effective_merge_mode":"pr_merge"`) {
 		t.Errorf("list configs: %d %s", resp.StatusCode, rb)
+	}
+}
+
+// A fork's open PR from a same-named branch is not this task's PR: a new
+// PR is created for the task branch instead.
+func TestShipReviewPR_IgnoresForkPRWithSameBranch(t *testing.T) {
+	notWork(t)
+	state := installFakeGH(t)
+	database, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	setMergeMode(t, database, repoDir, shipreview.MergeModePRMerge, "")
+	head := gitOut(t, repoDir, "rev-parse", "staypoint/"+taskID)
+	writeState(t, state, "pr_list_raw", `[{"number":99,"url":"https://github.com/o/r/pull/99","state":"OPEN","headRefOid":"`+head+
+		`","headRefName":"staypoint/`+taskID+`","baseRefName":"main","isCrossRepository":true,"mergeCommit":null}]`)
+
+	if code, rb := prApprove(t, client, baseURL, token, boardToken, taskID); code != http.StatusOK {
+		t.Fatalf("Approve: %d %s", code, rb)
+	}
+	if !hasCall(ghCalls(t, state), "pr create") {
+		t.Fatalf("fork PR was reused, calls: %v", ghCalls(t, state))
+	}
+	if c := getPRCard(t, client, baseURL, token, taskID); c.PRNumber != 7 {
+		t.Errorf("card PR = #%d, want the task's own #7", c.PRNumber)
+	}
+}
+
+// Merge re-runs Approve's migration gate: a fix re-pushed after "Send
+// failures to agent" that adds a migration cannot be merged until the
+// migration is marked applied (or explicitly overridden).
+func TestShipReviewPR_MergeRechecksMigrations(t *testing.T) {
+	notWork(t)
+	state := installFakeGH(t)
+	database, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	setMergeMode(t, database, repoDir, shipreview.MergeModePRMerge, "")
+	if code, rb := prApprove(t, client, baseURL, token, boardToken, taskID); code != http.StatusOK {
+		t.Fatalf("Approve: %d %s", code, rb)
+	}
+	sb, _ := json.Marshal(map[string]any{"comment": "CI red", "ci_failures": true})
+	if resp, rb := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/send-back", sb, boardToken, "", "mock-assertion"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("send-back: %d %s", resp.StatusCode, rb)
+	}
+	branch := "staypoint/" + taskID
+	gitOut(t, repoDir, "checkout", branch)
+	if err := os.MkdirAll(filepath.Join(repoDir, "supabase", "migrations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "supabase", "migrations", "001_x.sql"), []byte("select 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repoDir, "add", ".")
+	gitOut(t, repoDir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "fix with migration")
+	gitOut(t, repoDir, "checkout", "main")
+	up, _ := json.Marshal(map[string]any{"test_steps": []string{"1. ok"}})
+	if resp, rb := shipDoReq(t, client, token, "PUT", baseURL+"/api/tasks/"+taskID+"/ship-review", up); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("resubmit: %d %s", resp.StatusCode, rb)
+	}
+	writeState(t, state, "checks.json", greenChecks)
+	// The migration diff is taken against the task's checkpoint ref.
+	gitOut(t, repoDir, "update-ref", "refs/staypoint/checkpoints/latest", "main")
+
+	code, rb := prMerge(t, client, baseURL, token, boardToken, taskID, "")
+	if code != http.StatusConflict || !strings.Contains(string(rb), "unverified_migrations") || !strings.Contains(string(rb), "001_x.sql") {
+		t.Fatalf("Merge with an unverified migration: %d %s", code, rb)
+	}
+	if hasCall(ghCalls(t, state), "pr merge") {
+		t.Fatal("gh pr merge ran with an unverified migration")
 	}
 }
 

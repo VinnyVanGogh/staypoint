@@ -198,10 +198,35 @@ func (h *ShipReviewHandler) MergePR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Override       bool   `json:"override"`
-		OverrideReason string `json:"override_reason"`
+		Override                bool   `json:"override"`
+		OverrideReason          string `json:"override_reason"`
+		MigrationOverrideReason string `json:"migration_override_reason"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	// The head being merged may be a re-push the Board has not Approved (the
+	// fix after "Send failures to agent"), so the migration gate Approve
+	// applies runs again here, fail-closed.
+	if req.MigrationOverrideReason == "" {
+		ctx, cancel := gitRequestContext(r)
+		unverified, uErr := unverifiedMigrations(ctx, h.db, task)
+		cancel()
+		if uErr != nil {
+			writeError(w, gitErrorStatus(uErr), "could not check migration verification status: "+uErr.Error())
+			return
+		}
+		if len(unverified) > 0 {
+			writeJSONStatus(w, http.StatusConflict, map[string]any{
+				"error":                 "unverified_migrations",
+				"message":               "one or more migration files have not been verified; mark them applied or supply migration_override_reason",
+				"unverified_migrations": unverified,
+			})
+			return
+		}
+	} else {
+		logPayload, _ := json.Marshal(map[string]string{"override_reason": req.MigrationOverrideReason})
+		_ = context.LogActivity(h.db, taskID, "migration_override", string(logPayload))
+	}
 
 	auth, ok := h.requireGHAuth(w, task)
 	if !ok {
