@@ -111,6 +111,29 @@ test.describe('ship review card', () => {
     cleanup();
   });
 
+  // ── STA-660: Send Back stops the dev server, so no Preview link ──────────
+  test('sent_back card hides the Preview dev_url link', async ({ page, request }) => {
+    const { task, cleanup } = await createShipReviewTask(request, 'Ship review sent_back preview');
+    const res = await upsertShipReview(request, task.id, { devUrl: 'http://127.0.0.1:8799' });
+    expect(res.ok(), `upsert failed: ${await res.text()}`).toBeTruthy();
+
+    // Serve the real card as sent_back; Send Back itself is a Board action.
+    await page.route(`**/api/tasks/${encodeURIComponent(task.id)}/ship-review`, async (route) => {
+      if (route.request().method() !== 'GET') return route.continue();
+      const resp = await route.fetch();
+      const card = await resp.json();
+      expect(card.dev_url).toBe('http://127.0.0.1:8799');
+      await route.fulfill({ response: resp, json: { ...card, status: 'sent_back', send_back_comment: 'Fix it' } });
+    });
+
+    await gotoTaskPage(page, task);
+    const card = page.locator('.ship-review-card');
+    await expect(card.locator('.ship-review-status-badge')).toContainText('Sent Back', { timeout: 10_000 });
+    await expect(card.locator('.ship-review-row', { hasText: 'Preview' })).toHaveCount(0);
+    await expect(card.locator('.ship-review-dev-link')).toHaveCount(0);
+    cleanup();
+  });
+
   // UI-state rendering only; enforcement covered by Gates specs + Go tests.
   // These specs fulfill /ship-review/approve and /ship-review/reject with
   // page.route, so the real server never decides anything. They prove the card

@@ -343,6 +343,108 @@ func TestCleanupMergedBranchKeepsBranchCheckedOutElsewhere(t *testing.T) {
 	}
 }
 
+// STA-660: a branch being rebased in another worktree has a detached HEAD
+// there, but must survive cleanup just like a checked-out one.
+func TestCleanupMergedBranchKeepsBranchBeingRebased(t *testing.T) {
+	repoDir, card, mainSHA := mergedCard(t, "t-rebasing")
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	gitIn(t, repoDir, "worktree", "add", elsewhere, card.Branch)
+	// The failing exec stops the rebase mid-way, HEAD detached.
+	cmd := exec.Command("git", "rebase", "--exec", "false", "HEAD~1")
+	cmd.Dir = elsewhere
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("rebase did not stop:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(gitIn(t, elsewhere, "rev-parse", "--absolute-git-dir"), "rebase-merge", "head-name")); err != nil {
+		t.Fatalf("rebase not in progress: %v", err)
+	}
+
+	err := shipreview.CleanupMergedBranch(context.Background(), repoDir, card, mainSHA)
+	if err == nil || !strings.Contains(err.Error(), "rebase or bisect in progress") {
+		t.Fatalf("want rebase refusal, got %v", err)
+	}
+	if !localHasBranch(repoDir, card.Branch) {
+		t.Error("local branch deleted while being rebased in another worktree")
+	}
+}
+
+// STA-660: likewise for a bisect started from the branch.
+func TestCleanupMergedBranchKeepsBranchBeingBisected(t *testing.T) {
+	repoDir, card, mainSHA := mergedCard(t, "t-bisecting")
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	gitIn(t, repoDir, "worktree", "add", elsewhere, card.Branch)
+	gitIn(t, elsewhere, "bisect", "start")
+	gitIn(t, elsewhere, "checkout", "-q", "--detach")
+
+	err := shipreview.CleanupMergedBranch(context.Background(), repoDir, card, mainSHA)
+	if err == nil || !strings.Contains(err.Error(), "rebase or bisect in progress") {
+		t.Fatalf("want bisect refusal, got %v", err)
+	}
+	if !localHasBranch(repoDir, card.Branch) {
+		t.Error("local branch deleted while being bisected in another worktree")
+	}
+}
+
+// STA-660: Reject and SendBack stop the dev server through StopDevServer; a
+// setup still running from a Restart must not go on to start a server.
+func TestStopDevServerCancelsInFlightDevSetup(t *testing.T) {
+	db := openTestDB(t)
+	// Each pooled connection to :memory: is its own empty database; the setup
+	// goroutine and StopDevServer write concurrently, so keep them on one.
+	db.SetMaxOpenConns(1)
+	taskID := "t-stopsetup"
+	if _, err := db.Exec(`INSERT INTO tasks (id, name) VALUES (?, 'dev')`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	repoDir, branch, featureSHA := setupGitRepo(t)
+	card, err := shipreview.CreateCard(db, taskID, branch, featureSHA, []string{"1. Verify"}, "", repoDir, nil)
+	if err != nil {
+		t.Fatalf("CreateCard: %v", err)
+	}
+
+	devWT := filepath.Join(repoDir, ".worktrees", "devserver-"+taskID)
+	started := filepath.Join(t.TempDir(), "server-started")
+	stepRunning := filepath.Join(t.TempDir(), "step-running")
+	cfg := &shipreview.ProjectDevConfig{
+		RepoPath:   repoDir,
+		DevCommand: "touch " + started + "; sleep 60",
+		DevURL:     "http://localhost:39998",
+		SetupSteps: []string{"touch " + stepRunning + "; sleep 30"},
+	}
+	if _, err := shipreview.StartDevServerAsync(db, card, cfg, repoDir, nil); err != nil {
+		t.Fatalf("StartDevServerAsync: %v", err)
+	}
+	waitFor(t, 10*time.Second, "setup step to start", func() bool {
+		_, err := os.Stat(stepRunning)
+		return err == nil
+	})
+
+	begin := time.Now()
+	shipreview.StopDevServer(db, card)
+	if d := time.Since(begin); d > 10*time.Second {
+		t.Errorf("StopDevServer took %v; the setup step was not cancelled", d)
+	}
+
+	waitFor(t, 10*time.Second, "dev state to leave starting", func() bool {
+		c, err := shipreview.GetCard(db, taskID)
+		return err == nil && c.DevState != shipreview.DevStateStarting
+	})
+	time.Sleep(300 * time.Millisecond)
+	if _, err := os.Stat(devWT); !os.IsNotExist(err) {
+		t.Errorf("devserver worktree left behind after StopDevServer (stat err %v)", err)
+	}
+	if _, err := os.Stat(started); !os.IsNotExist(err) {
+		t.Error("dev server started after StopDevServer")
+	}
+	c, err := shipreview.GetCard(db, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DevPID != 0 {
+		t.Errorf("dev_pid = %d, want 0", c.DevPID)
+	}
+}
+
 func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
