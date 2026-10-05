@@ -61,10 +61,14 @@ func TestOutput_DefaultTimeoutWhenContextHasNoDeadline(t *testing.T) {
 		t.Errorf("IsTimeout(%v) = false", err)
 	}
 	msg := err.Error()
-	for _, want := range []string{"rev-parse --show-toplevel", repo, "macOS"} {
+	for _, want := range []string{"rev-parse --show-toplevel", repo, "blocked for", "possible causes:"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error %q missing %q", msg, want)
 		}
+	}
+	// A timeout has several causes; the message must not assert just one.
+	if strings.Contains(msg, "may be waiting on a privacy permission") {
+		t.Errorf("error %q names a single cause", msg)
 	}
 }
 
