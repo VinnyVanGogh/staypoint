@@ -34,8 +34,10 @@
     s = s.replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>');
     s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
     s = s.replace(/\*(?=\S)([^*\n]*?\S)\*/g, '<em>$1</em>');
-    // _x_ only at word boundaries, so snake_case names stay literal.
-    s = s.replace(/(^|\W)_(?=\S)([^\n]*?\S)_(?!\w)/gm, '$1<em>$2</em>');
+    // _x_ only at word boundaries, so snake_case names stay literal. Inside
+    // the span an underscore is consumed only between word characters, so a
+    // failed match stops at the next other underscore: linear on long lines.
+    s = s.replace(/(^|\W)_(?=[^\s_])((?:[^\W_]_(?=\w)|[^_\n])*?[^\s_])_(?!\w)/gm, '$1<em>$2</em>');
     s = s.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
     s = s.replace(/^[-*] (.+)$/gm, '<li>$1</li>');
     s = s.replace(/(<li>[\s\S]*?<\/li>)(\n<li>[\s\S]*?<\/li>)*/g, m => `<ul>${m}</ul>`);
