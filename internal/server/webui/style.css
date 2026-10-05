@@ -4254,7 +4254,30 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   border-top: 1px solid var(--border, #30363d);
   margin-top: 4px;
 }
-.timeline-run-header:first-child { border-top: none; margin-top: 0; padding-top: 2px; }
+.timeline-run:first-child > .timeline-run-header { border-top: none; margin-top: 0; padding-top: 2px; }
+
+/* ── Timeline grouping (STA-638): run → subtask → step ──────────────────── */
+.timeline-run,
+.timeline-subtask,
+.timeline-subtask-children { display: flex; flex-direction: column; gap: 2px; }
+.timeline-run + .timeline-run { margin-top: 6px; }
+.timeline-subtask > .timeline-row:first-child .timeline-title { font-weight: 600; }
+.timeline-subtask > .timeline-row:first-child > .timeline-row-summary { cursor: pointer; }
+.timeline-subtask > .timeline-row:first-child > .timeline-row-summary::before {
+  content: '▾';
+  flex-shrink: 0;
+  width: 12px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--muted);
+}
+.timeline-subtask.timeline-subtask-collapsed > .timeline-row:first-child > .timeline-row-summary::before { content: '▸'; }
+.timeline-subtask-children {
+  margin-left: 11px;
+  padding-left: 12px;
+  border-left: 1px solid var(--border, #30363d);
+}
+.timeline-subtask-collapsed > .timeline-subtask-children { display: none; }
 
 /* ── Migrations panel ─────────────────────────────────────────────────────── */
 .migrations-section { margin-top: 16px; }

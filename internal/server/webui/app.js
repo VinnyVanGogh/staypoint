@@ -7503,6 +7503,122 @@ function buildRunStepRow(s) {
   return row;
 }
 
+// ── Timeline grouping (STA-638): run → subtask → step ──────
+// Each run gets a .timeline-run wrapper. A subtask is a top-level step that
+// other steps of the same run point at via parent_seq; its .timeline-subtask
+// wrapper holds its own row and the rows of everything under it.
+
+function timelineStepRow(s) {
+  const row = buildRunStepRow(s);
+  if (s.seq != null) row.setAttribute('data-step-seq', String(s.seq));
+  if (s.parent_seq != null) row.setAttribute('data-parent-seq', String(s.parent_seq));
+  return row;
+}
+
+function buildTimelineRun(runId) {
+  const run = el('div', 'timeline-run');
+  run.setAttribute('data-run-id', runId || '');
+  return run;
+}
+
+function buildTimelineSubtask(parentRow) {
+  const sub = el('div', 'timeline-subtask');
+  sub.setAttribute('data-subtask-step-id', parentRow.getAttribute('data-step-id') || '');
+  sub.appendChild(parentRow);
+  sub.appendChild(el('div', 'timeline-subtask-children'));
+  // Clicking the subtask's own row folds its children, unless that row has a
+  // body of its own to expand. Delegated so it survives row upserts.
+  sub.addEventListener('click', (e) => {
+    const own = sub.firstElementChild;
+    const summary = e.target.closest('.timeline-row-summary');
+    if (!summary || summary.parentElement !== own) return;
+    if (own.querySelector(':scope > .timeline-body')) return;
+    sub.classList.toggle('timeline-subtask-collapsed');
+  });
+  return sub;
+}
+
+function timelineRunEl(stepList, runId) {
+  return stepList.querySelector(`:scope > .timeline-run[data-run-id="${CSS.escape(runId || '')}"]`);
+}
+
+// Fill a run wrapper from that run's steps (seq order).
+function fillTimelineRun(runEl, group) {
+  const bySeq = new Map();
+  for (const s of group) if (s.seq != null) bySeq.set(s.seq, s);
+  // Subtask root of each nested step: walk parent_seq up to a top-level step.
+  const rootOf = new Map();
+  for (const s of group) {
+    let cur = s;
+    for (let i = 0; i < 64 && cur.parent_seq != null && bySeq.has(cur.parent_seq); i++) {
+      cur = bySeq.get(cur.parent_seq);
+    }
+    if (cur !== s) rootOf.set(s, cur.seq);
+  }
+  const rootSeqs = new Set(rootOf.values());
+  const children = new Map();
+  for (const s of group) {
+    const row = timelineStepRow(s);
+    const root = rootOf.get(s);
+    if (root != null && children.has(root)) {
+      children.get(root).appendChild(row);
+    } else if (rootSeqs.has(s.seq) && !rootOf.has(s)) {
+      const sub = buildTimelineSubtask(row);
+      children.set(s.seq, sub.lastElementChild);
+      runEl.appendChild(sub);
+    } else {
+      runEl.appendChild(row);
+    }
+  }
+}
+
+// Place one live step's row in its run: under its subtask when its parent
+// row is already on the page, else at the end of the run.
+function placeTimelineRow(runEl, row, s) {
+  let root = null;
+  let parentSeq = s.parent_seq;
+  for (let i = 0; i < 64 && parentSeq != null; i++) {
+    const p = runEl.querySelector(`.timeline-row[data-step-seq="${CSS.escape(String(parentSeq))}"]`);
+    if (!p) break;
+    root = p;
+    const up = p.getAttribute('data-parent-seq');
+    parentSeq = up == null ? null : up;
+  }
+  if (!root) { runEl.appendChild(row); return; }
+  // Subtasks are one level deep: a row already under a subtask is a sibling.
+  const siblings = root.closest('.timeline-subtask-children');
+  if (siblings) { siblings.appendChild(row); return; }
+  let sub =root.parentElement && root.parentElement.classList.contains('timeline-subtask')
+    ? root.parentElement : null;
+  if (!sub) {
+    const at = root.nextSibling;
+    sub = buildTimelineSubtask(root);
+    runEl.insertBefore(sub, at);
+  }
+  sub.querySelector(':scope > .timeline-subtask-children').appendChild(row);
+}
+
+// "Run N" headers, only once the task has more than one real run.
+function syncTimelineRunHeaders(stepList, allSteps) {
+  const groups = groupStepsByRun(allSteps || []);
+  const multi = groups.filter(isRealRunGroup).length > 1;
+  let runNum = 0;
+  for (const group of groups) {
+    const real = isRealRunGroup(group);
+    if (real) runNum++;
+    const runEl = timelineRunEl(stepList, (group[0] && group[0].run_id) || '');
+    if (!runEl) continue;
+    let hdr = runEl.querySelector(':scope > .timeline-run-header');
+    if (!multi || !real) { if (hdr) hdr.remove(); continue; }
+    if (!hdr) { hdr = el('div', 'timeline-run-header'); runEl.prepend(hdr); }
+    const firstStep = group[0];
+    const stateStep = [...group].reverse().find(s => s.kind === 'state');
+    const startTime = firstStep ? fmtDateTime(firstStep.created_at) : '';
+    const endTime = stateStep ? fmtDateTime(stateStep.created_at) : '';
+    hdr.textContent = `Run ${runNum}` + (startTime ? `  ·  started ${startTime}` : '') + (endTime ? `  ·  ended ${endTime}` : '');
+  }
+}
+
 function appendRunStepToTimeline(taskId, step) {
   const stepList = document.getElementById(`timeline-steps-${taskId}`);
   if (!stepList) return;
@@ -7510,14 +7626,23 @@ function appendRunStepToTimeline(taskId, step) {
   const empty = stepList.querySelector('.timeline-empty');
   if (empty) empty.remove();
   // Upsert: if a row with this step id already exists (e.g. status:running → status:done),
-  // replace it in-place instead of appending a duplicate.
-  const existingRow = step.id ? stepList.querySelector(`[data-step-id="${CSS.escape(step.id)}"]`) : null;
-  const newRow = buildRunStepRow(step);
+  // replace it in-place instead of appending a duplicate, keeping it open if it was.
+  const existingRow = step.id ? stepList.querySelector(`.timeline-row[data-step-id="${CSS.escape(step.id)}"]`) : null;
+  const newRow = timelineStepRow(step);
   if (existingRow) {
+    const wasOpen = existingRow.querySelector(':scope > .timeline-body:not(.hidden)');
+    const body = newRow.querySelector(':scope > .timeline-body');
+    if (wasOpen && body) body.classList.remove('hidden');
     existingRow.replaceWith(newRow);
   } else {
-    stepList.appendChild(newRow);
+    let runEl = timelineRunEl(stepList, step.run_id);
+    if (!runEl) {
+      runEl = buildTimelineRun(step.run_id);
+      stepList.appendChild(runEl);
+    }
+    placeTimelineRow(runEl, newRow, step);
   }
+  syncTimelineRunHeaders(stepList, (state.tasks[taskId] && state.tasks[taskId].runSteps) || [step]);
 
   // Update section title count
   const section = document.getElementById(`timeline-section-${taskId}`);
@@ -8927,32 +9052,23 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   rcBar.id = `run-control-bar-${task.id}`;
   headerActions.appendChild(rcBar);
 
-  // Step rows — grouped by run so each send-back creates a new "Run N" header.
+  // Step rows — grouped run → subtask → step (STA-638); each send-back
+  // starts a new run, headed "Run N" once there is more than one real run.
   const stepList = el('div', 'timeline-steps');
   stepList.id = `timeline-steps-${task.id}`;
   if (runSteps.length === 0) {
     stepList.appendChild(el('p', 'panel-field-muted timeline-empty', 'No steps yet. Steps will appear here during a run.'));
   } else {
     const runGroups = groupStepsByRun(runSteps);
-    const realGroups = runGroups.filter(isRealRunGroup);
-    // Only add run headers when there is more than one real run.
-    if (realGroups.length <= 1) {
-      for (const s of runSteps) stepList.appendChild(buildRunStepRow(s));
-    } else {
-      let runNum = 0;
-      for (const group of runGroups) {
-        if (!isRealRunGroup(group)) continue;
-        runNum++;
-        const firstStep = group[0];
-        const stateStep = [...group].reverse().find(s => s.kind === 'state');
-        const startTime = firstStep ? fmtDateTime(firstStep.created_at) : '';
-        const endTime = stateStep ? fmtDateTime(stateStep.created_at) : '';
-        const hdr = el('div', 'timeline-run-header');
-        hdr.textContent = `Run ${runNum}` + (startTime ? `  ·  started ${startTime}` : '') + (endTime ? `  ·  ended ${endTime}` : '');
-        stepList.appendChild(hdr);
-        for (const s of group) stepList.appendChild(buildRunStepRow(s));
-      }
+    // With several real runs, refused runs (wake/route/state only) are noise.
+    const multi = runGroups.filter(isRealRunGroup).length > 1;
+    for (const group of runGroups) {
+      if (multi && !isRealRunGroup(group)) continue;
+      const runEl = buildTimelineRun((group[0] && group[0].run_id) || '');
+      fillTimelineRun(runEl, group);
+      stepList.appendChild(runEl);
     }
+    syncTimelineRunHeaders(stepList, runSteps);
   }
   timelineSection.appendChild(stepList);
   main.appendChild(timelineSection);

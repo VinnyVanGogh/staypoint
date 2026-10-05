@@ -389,7 +389,6 @@ test('step 3: right panel tabs Review / Diff / Migrations / Brief swap the exist
 });
 
 test('step 4: timeline scrolls in its column, grouped run -> subtask -> step, rows expand in place', async ({ page, api }) => {
-  knownBug('STA-638-4');
   test.setTimeout(60_000);
   const { steps, runIds } = await openHeavyTask(page, api);
 
