@@ -8083,6 +8083,69 @@ function renderBranchDeleteWarning(taskId, headSHA, mainSHA, cleanup) {
   return warn;
 }
 
+// SHIP_REVIEW_LIVE_WARNING matches liveDevWarning in handlers_ship_review.go.
+const SHIP_REVIEW_LIVE_WARNING = 'LIVE PRODUCTION DATA. Actions in this preview are real.';
+
+function markShipReviewLiveButton(btn, liveClass) {
+  btn.classList.add(liveClass);
+  btn.appendChild(el('span', 'ship-review-live-tag', 'LIVE'));
+}
+
+// showShipReviewLiveConfirm shows the inline confirm a live_credentials dev
+// server start needs every time (STA-727). Confirm sends start-dev with the
+// Board passkey headers and {"confirm_live": true}; Cancel sends nothing.
+function showShipReviewLiveConfirm(section, afterRow, taskId, triggerBtn) {
+  const existing = section.querySelector('.ship-review-live-confirm');
+  if (existing) existing.remove();
+  const box = el('div', 'ship-review-live-confirm');
+  box.appendChild(el('div', 'ship-review-live-confirm-warning', SHIP_REVIEW_LIVE_WARNING));
+  box.appendChild(el('div', 'ship-review-live-confirm-text',
+    'This dev server runs with production credentials. Anything you do in the preview changes real data.'));
+  const err = el('div', 'ship-review-live-confirm-error');
+  err.hidden = true;
+  const actions = el('div', 'ship-review-live-confirm-actions');
+  const ok = el('button', 'ship-review-live-confirm-btn', 'Start LIVE dev server');
+  const cancel = el('button', 'ship-review-live-cancel-btn', 'Cancel');
+  const close = () => { box.remove(); triggerBtn.disabled = false; };
+  cancel.addEventListener('click', close);
+  ok.addEventListener('click', async () => {
+    ok.disabled = true;
+    cancel.disabled = true;
+    err.hidden = true;
+    try {
+      const r = await withBoardWebAuthn((sessionToken, assertion) =>
+        fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/start-dev`, {
+          method: 'POST',
+          headers: {
+            ...authHeader(),
+            'Content-Type': 'application/json',
+            'X-WebAuthn-Session': sessionToken,
+            'X-WebAuthn-Assertion': assertion,
+          },
+          body: JSON.stringify({ confirm_live: true }),
+        })
+      );
+      if (r === null) { ok.disabled = false; cancel.disabled = false; return; }
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        throw new Error(body.message || body.error || `${r.status} ${r.statusText}`);
+      }
+      close();
+    } catch (e) {
+      err.textContent = `Could not start the dev server: ${e.message || e}`;
+      err.hidden = false;
+      ok.disabled = false;
+      cancel.disabled = false;
+    }
+  });
+  actions.appendChild(ok);
+  actions.appendChild(cancel);
+  box.appendChild(err);
+  box.appendChild(actions);
+  triggerBtn.disabled = true;
+  afterRow.after(box);
+}
+
 // renderShipReviewCardFromData renders the ship review card synchronously from
 // updateDevProgressUI appends a progress line to the dev env log UI element
 // for a task that is in async setup. Called from the SSE ship_review_dev_progress handler.
@@ -8331,6 +8394,13 @@ function renderShipReviewCardFromData(container, taskId, card) {
     }).catch(() => {});
   }
 
+  // STA-727: previews of a live_credentials project hit production. The red
+  // banner sits above the dev env / Preview rows and the Start button.
+  const live = !!card.live_credentials;
+  if (live) {
+    section.appendChild(el('div', 'ship-review-live-banner', SHIP_REVIEW_LIVE_WARNING));
+  }
+
   // Dev env state (async setup progress).
   if (card.dev_state === 'starting' || card.dev_state === 'error' || (card.dev_log && card.dev_log.length > 0)) {
     const devEnvRow = el('div', 'ship-review-devenv-row');
@@ -8375,7 +8445,9 @@ function renderShipReviewCardFromData(container, taskId, card) {
     if (card.status === 'pending') {
       const restartBtn = el('button', 'ship-review-restart-btn', '↺ Restart');
       restartBtn.title = 'Restart dev server';
+      if (live) markShipReviewLiveButton(restartBtn, 'ship-review-restart-btn--live');
       restartBtn.addEventListener('click', async () => {
+        if (live) { showShipReviewLiveConfirm(section, devRow, taskId, restartBtn); return; }
         restartBtn.disabled = true;
         await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/start-dev`, { method: 'POST' }).catch(() => {});
         restartBtn.disabled = false;
@@ -8383,6 +8455,20 @@ function renderShipReviewCardFromData(container, taskId, card) {
       devRow.appendChild(restartBtn);
     }
     section.appendChild(devRow);
+  } else if (card.status === 'pending' && card.dev_configured !== false && card.dev_state !== 'starting') {
+    // No dev server yet: offer to start one (a live project never auto-starts).
+    const startRow = el('div', 'ship-review-row');
+    startRow.appendChild(el('span', 'ship-review-row-label', 'Preview'));
+    const startBtn = el('button', 'ship-review-start-dev-btn', '▶ Start dev server');
+    if (live) markShipReviewLiveButton(startBtn, 'ship-review-start-dev-btn--live');
+    startBtn.addEventListener('click', async () => {
+      if (live) { showShipReviewLiveConfirm(section, startRow, taskId, startBtn); return; }
+      startBtn.disabled = true;
+      await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/start-dev`, { method: 'POST' }).catch(() => {});
+      startBtn.disabled = false;
+    });
+    startRow.appendChild(startBtn);
+    section.appendChild(startRow);
   }
 
   // SHA pin

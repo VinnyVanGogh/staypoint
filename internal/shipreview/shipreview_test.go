@@ -86,6 +86,7 @@ func openTestDB(t *testing.T) *sql.DB {
 			supabase_keep_up INTEGER NOT NULL DEFAULT 0,
 			merge_mode TEXT NOT NULL DEFAULT '',
 			gh_config_dir TEXT NOT NULL DEFAULT '',
+			live_credentials INTEGER NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		);
 		CREATE TABLE IF NOT EXISTS task_comments (
