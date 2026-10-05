@@ -1093,6 +1093,35 @@ var Migrations = []Migration{
 		},
 	},
 	{
+		Version: 26,
+		Name:    "board_alerts",
+		Up: func(conn *sql.DB) error {
+			// STA-705: daemon and hook CLI alerts persisted for the Board UI.
+			// Timestamps are fixed-width RFC3339 UTC so TEXT order is time order.
+			for _, stmt := range []string{
+				`CREATE TABLE IF NOT EXISTS board_alerts (
+					id              INTEGER PRIMARY KEY AUTOINCREMENT,
+					kind            TEXT NOT NULL,
+					severity        TEXT NOT NULL CHECK (severity IN ('critical', 'warning', 'info')),
+					title           TEXT NOT NULL,
+					message         TEXT NOT NULL,
+					dedupe_key      TEXT,
+					occurrences     INTEGER NOT NULL DEFAULT 1,
+					created_at      TEXT NOT NULL,
+					last_seen_at    TEXT NOT NULL,
+					acknowledged_at TEXT
+				);`,
+				`CREATE INDEX IF NOT EXISTS idx_board_alerts_unack ON board_alerts (acknowledged_at, last_seen_at DESC);`,
+				`CREATE INDEX IF NOT EXISTS idx_board_alerts_seen ON board_alerts (last_seen_at);`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	},
+	{
 		Version: 31,
 		Name:    "ship_review_test_gate",
 		Up: func(conn *sql.DB) error {

@@ -114,6 +114,9 @@ func handleHookPrompt() {
 		if store, err := db.Open(cfg.DBPath); err == nil {
 			dbConn = store.DB()
 			defer store.Close()
+			// Alerts raised by this hook reach the Board through board_alerts.
+			telemetry.SetAlertSink(telemetry.DBAlertSink(dbConn))
+			defer telemetry.SetAlertSink(nil)
 		}
 	}
 
@@ -313,7 +316,7 @@ func handleHookPrompt() {
 					DB:                dbConn,
 				})
 
-				telemetry.SendNotification(
+				telemetry.SendQuotaAlert(triggeredPool.ID, telemetry.QuotaWarning,
 					"[Staypoint] Quota Limit Warning (15% left)",
 					fmt.Sprintf("%s %s. Handoff staged in clipboard. Switch to %s.", triggeredPool.Name, warningReason, targetDisplay),
 				)

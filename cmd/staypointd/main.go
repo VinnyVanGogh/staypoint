@@ -213,6 +213,9 @@ func runDaemon(ctx context.Context) error {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
 	defer dbStore.Close()
+	// Breaker and quota alerts reach the Board through board_alerts (STA-705).
+	telemetry.SetAlertSink(telemetry.DBAlertSink(dbStore.DB()))
+	defer telemetry.SetAlertSink(nil)
 	_ = orchestrator.RecoveryScan(ctx, dbStore.DB())
 
 	// 1. Start Rate Limit Notifier

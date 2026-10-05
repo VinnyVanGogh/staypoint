@@ -30,6 +30,7 @@ type Server struct {
 	port       int
 	mu         sync.Mutex
 	running    bool
+	stopAlerts chan struct{}
 }
 
 // New creates and configures a new Server instance.
@@ -303,6 +304,15 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 			mux.HandleFunc("PUT /api/tasks/{id}/ship-review/seed", shipH.SeedCard)
 		}
 
+		// Board alert feed (STA-705). Reading is open to the session token;
+		// dismissing needs a Board session so agents can't silence alerts.
+		alertsH := NewBoardAlertsHandler(s.opts.DB, s.hub)
+		mux.HandleFunc("GET /api/board/alerts", alertsH.List)
+		mux.Handle("POST /api/board/alerts/{id}/ack", s.secMid.WrapBoardSession(http.HandlerFunc(alertsH.Ack)))
+		if s.opts.TestMode {
+			mux.HandleFunc("POST /api/board/alerts/test/seed", alertsH.Seed)
+		}
+
 		// WebAuthn / passkey endpoints (Board session required; assertion enforced on delete)
 		webAuthnH := s.webAuthnH
 		if webAuthnH == nil {
@@ -363,6 +373,11 @@ func (s *Server) Start() error {
 
 	s.running = true
 
+	if s.opts.DB != nil {
+		s.stopAlerts = make(chan struct{})
+		go s.pollAlerts(s.stopAlerts, time.Now(), s.opts.AlertPollInterval)
+	}
+
 	go func() {
 		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			// server closed unexpectedly
@@ -382,6 +397,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	s.running = false
+	if s.stopAlerts != nil {
+		close(s.stopAlerts)
+		s.stopAlerts = nil
+	}
 	return s.httpServer.Shutdown(ctx)
 }
 

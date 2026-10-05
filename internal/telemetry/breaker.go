@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/VinnyVanGogh/staypoint/internal/alerts"
 )
 
 var whitespaceRegex = regexp.MustCompile(`\s+`)
@@ -104,14 +106,19 @@ func (b *BreakerTracker) RecordFailure(meshDB *sql.DB, sessionID, repoPath, agen
 
 	isTripped := false
 	var reason string
+	// alertReason is reason without the command or error text, which can
+	// hold tokens or env values. It is what reaches the Board alert feed.
+	var alertReason string
 
 	if consecutiveSame >= 3 {
 		isTripped = true
 		reason = fmt.Sprintf("Repeating failure loop: %d consecutive identical failures of tool %q (%s)", consecutiveSame, tool, command)
+		alertReason = fmt.Sprintf("repeating failure loop, %d consecutive identical failures of tool %q", consecutiveSame, tool)
 	} else if len(active) >= 5 {
 		// Check 2: High frequency burst failure (>= 5 failures within 5 minutes)
 		isTripped = true
 		reason = fmt.Sprintf("Failure spiral: %d errors encountered in under 5 minutes (last: %s)", len(active), tool)
+		alertReason = fmt.Sprintf("failure spiral, %d errors in under 5 minutes (last tool %q)", len(active), tool)
 	}
 
 	if isTripped && meshDB != nil {
@@ -138,10 +145,13 @@ func (b *BreakerTracker) RecordFailure(meshDB *sql.DB, sessionID, repoPath, agen
 		if repoName == "" || repoName == "." {
 			repoName = "workspace"
 		}
-		SendNotification(
-			"[Staypoint] Circuit Breaker Tripped!",
-			fmt.Sprintf("Agent %s in %s paused: %s", agentType, repoName, reason),
-		)
+		SendAlert(alerts.Alert{
+			Kind:      "circuit_breaker_tripped",
+			Severity:  alerts.SeverityCritical,
+			Title:     "[Staypoint] Circuit Breaker Tripped!",
+			Message:   fmt.Sprintf("Agent %s in %s paused: %s", agentType, repoName, alertReason),
+			DedupeKey: "circuit_breaker:" + sessionID,
+		})
 	}
 
 	return isTripped, reason, nil

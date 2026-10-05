@@ -594,6 +594,8 @@ function connectSSE() {
     badge.className = 'badge badge-live';
     badge.textContent = 'live';
     if (sseRetryTimer) { clearTimeout(sseRetryTimer); sseRetryTimer = null; }
+    // Catch up on alerts raised or dismissed while disconnected.
+    loadBoardAlerts();
   };
   sseSource.onerror = () => {
     badge.className = 'badge badge-error';
@@ -610,12 +612,161 @@ function connectSSE() {
   };
 }
 
+// ── Board alerts (STA-705) ───────────────────────────────
+// Breaker trips and quota alerts from the daemon and the hook CLI, persisted
+// in board_alerts and pushed over SSE. Shown until the Board dismisses them.
+const BOARD_ALERTS_VISIBLE = 3;
+const BOARD_ALERT_SEVERITY_RANK = { critical: 0, warning: 1, info: 2 };
+const boardAlerts = {
+  byId: new Map(),
+  errors: new Map(),   // id -> dismiss error text
+  expanded: false,
+  seq: 0,              // bumped on every SSE change
+  touched: new Map(),  // id -> seq of its latest SSE change
+  loadSeq: 0,
+};
+
+// loadBoardAlerts replaces the list from GET /api/board/alerts. SSE changes
+// that land while the fetch is in flight win over the (older) response, and
+// an older fetch never overwrites a newer one.
+async function loadBoardAlerts() {
+  const loadSeq = ++boardAlerts.loadSeq;
+  const startSeq = boardAlerts.seq;
+  let resp;
+  try {
+    resp = await apiFetch('/api/board/alerts');
+  } catch (err) {
+    console.warn('board alerts load failed', err);
+    return;
+  }
+  if (loadSeq !== boardAlerts.loadSeq) return;
+  const next = new Map();
+  for (const a of (resp.alerts || [])) next.set(a.id, a);
+  for (const [id, seq] of boardAlerts.touched) {
+    if (seq <= startSeq) continue;
+    if (boardAlerts.byId.has(id)) next.set(id, boardAlerts.byId.get(id));
+    else next.delete(id);
+  }
+  boardAlerts.byId = next;
+  boardAlerts.touched.clear();
+  renderBoardAlerts();
+}
+
+function upsertBoardAlert(a) {
+  if (!a || a.id == null) return;
+  boardAlerts.touched.set(a.id, ++boardAlerts.seq);
+  if (a.acknowledged_at) {
+    boardAlerts.byId.delete(a.id);
+  } else {
+    boardAlerts.byId.set(a.id, a);
+  }
+  renderBoardAlerts();
+}
+
+function removeBoardAlert(id) {
+  if (id == null) return;
+  boardAlerts.touched.set(id, ++boardAlerts.seq);
+  boardAlerts.byId.delete(id);
+  boardAlerts.errors.delete(id);
+  renderBoardAlerts();
+}
+
+function sortedBoardAlerts() {
+  return [...boardAlerts.byId.values()].sort((a, b) => {
+    const ra = BOARD_ALERT_SEVERITY_RANK[a.severity] ?? 3;
+    const rb = BOARD_ALERT_SEVERITY_RANK[b.severity] ?? 3;
+    if (ra !== rb) return ra - rb;
+    return new Date(b.last_seen_at).getTime() - new Date(a.last_seen_at).getTime();
+  });
+}
+
+async function dismissBoardAlert(id) {
+  boardAlerts.errors.delete(id);
+  renderBoardAlerts();
+  let r;
+  try {
+    r = await fetch(`/api/board/alerts/${encodeURIComponent(id)}/ack`, { method: 'POST', headers: authHeader() });
+  } catch {
+    boardAlerts.errors.set(id, 'Dismiss failed: daemon unreachable.');
+    renderBoardAlerts();
+    return;
+  }
+  if (r.ok) {
+    removeBoardAlert(id);
+    return;
+  }
+  boardAlerts.errors.set(id, (r.status === 401 || r.status === 403)
+    ? 'Dismiss needs a Board session.'
+    : `Dismiss failed (${r.status}).`);
+  renderBoardAlerts();
+}
+
+function renderBoardAlerts() {
+  const box = document.getElementById('board-alerts');
+  if (!box) return;
+  const list = sortedBoardAlerts();
+  box.innerHTML = '';
+  box.hidden = list.length === 0;
+  if (!list.length) {
+    boardAlerts.expanded = false;
+    return;
+  }
+  const shown = boardAlerts.expanded ? list : list.slice(0, BOARD_ALERTS_VISIBLE);
+  for (const a of shown) {
+    const sev = BOARD_ALERT_SEVERITY_RANK[a.severity] !== undefined ? a.severity : 'info';
+    const row = el('div', `board-alert board-alert-${sev}`);
+    row.setAttribute('data-testid', 'board-alert');
+    row.dataset.alertId = String(a.id);
+    row.dataset.severity = sev;
+    row.setAttribute('role', sev === 'critical' ? 'alert' : 'status');
+
+    const body = el('div', 'board-alert-body');
+    const head = el('div', 'board-alert-head');
+    head.appendChild(el('span', 'board-alert-title', a.title || a.kind || 'Alert'));
+    if (a.occurrences > 1) head.appendChild(el('span', 'board-alert-count', `×${a.occurrences}`));
+    const when = el('span', 'board-alert-time', fmtRelTime(a.last_seen_at));
+    if (a.last_seen_at) when.title = new Date(a.last_seen_at).toLocaleString();
+    head.appendChild(when);
+    body.appendChild(head);
+    if (a.message) body.appendChild(el('div', 'board-alert-message', a.message));
+    const err = boardAlerts.errors.get(a.id);
+    if (err) body.appendChild(el('div', 'board-alert-error', err));
+    row.appendChild(body);
+
+    const btn = el('button', 'board-alert-dismiss', 'Dismiss');
+    btn.type = 'button';
+    btn.setAttribute('data-testid', 'board-alert-dismiss');
+    btn.addEventListener('click', () => dismissBoardAlert(a.id));
+    row.appendChild(btn);
+    box.appendChild(row);
+  }
+  const hidden = list.length - BOARD_ALERTS_VISIBLE;
+  if (hidden > 0) {
+    const toggle = el('button', 'board-alerts-toggle', boardAlerts.expanded ? 'Show fewer' : `+${hidden} more`);
+    toggle.type = 'button';
+    toggle.setAttribute('aria-expanded', String(boardAlerts.expanded));
+    toggle.addEventListener('click', () => {
+      boardAlerts.expanded = !boardAlerts.expanded;
+      renderBoardAlerts();
+    });
+    box.appendChild(toggle);
+  }
+}
+
 // ── Event dispatch ────────────────────────────────────────
 function handleEvent(evt) {
   state.events.unshift(evt);
   if (state.events.length > state.maxEvents) state.events.pop();
 
   const type = evt.type || '';
+  if (type === 'board_alert' && evt.data) {
+    upsertBoardAlert(evt.data);
+    return;
+  }
+  if (type === 'board_alert_acknowledged' && evt.data) {
+    removeBoardAlert(evt.data.id);
+    return;
+  }
   if (type === 'run.step' && evt.data) {
     const step = evt.data;
     const tid = step.task_id;
@@ -12511,6 +12662,7 @@ document.getElementById('projects-org-filter')?.addEventListener('change', (e) =
     bannerEnrollBtn.disabled = true;
     try { await enrollBoardPasskey(); } finally { bannerEnrollBtn.disabled = false; }
   });
+  loadBoardAlerts();
   updateDevTourToggleUI();
   if (isWalkthroughActive()) {
     renderWalkthroughHUD();
