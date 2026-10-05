@@ -1,8 +1,11 @@
+//go:build !windows
+
 package repoaccess_test
 
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -15,12 +18,34 @@ import (
 
 // EPERM is what a macOS privacy (TCC) denial returns. Non-root tests can't
 // produce it without TCC.
-func TestFSFailure_EPERMIsMacOSPrivacy(t *testing.T) {
-	r := repoaccess.FSFailure(target("/Users/x/Documents/dev/repo"), repoaccess.StepOpen, syscall.EPERM, nil)
+func TestFSFailure_EPERMIsMacOSPrivacyOnDarwin(t *testing.T) {
+	r := repoaccess.FSFailureOn("darwin", target("/Users/x/Documents/dev/repo"), repoaccess.StepOpen, syscall.EPERM, nil)
 	assertCause(t, r, repoaccess.CausePrivacy, repoaccess.StepOpen,
 		"open(", "EPERM", "operation not permitted", "macOS privacy setting is blocking staypointd")
 	if strings.Contains(r.Message, "Unix file permissions") {
 		t.Errorf("EPERM was described as Unix permissions: %s", r.Message)
+	}
+}
+
+// Other OSes have no TCC, so there EPERM is shown raw with no privacy claim.
+func TestFSFailure_EPERMOffDarwinIsTheRawErrno(t *testing.T) {
+	for _, goos := range []string{"linux", "freebsd", "windows"} {
+		r := repoaccess.FSFailureOn(goos, target("/srv/repo"), repoaccess.StepOpen, syscall.EPERM, nil)
+		assertCause(t, r, repoaccess.CauseFSError, repoaccess.StepOpen, "open(", "EPERM", "operation not permitted")
+		for _, claim := range []string{"macOS", "privacy", "TCC"} {
+			if strings.Contains(r.Message, claim) {
+				t.Errorf("%s: EPERM message claims %q: %s", goos, claim, r.Message)
+			}
+		}
+	}
+}
+
+// FSFailure classifies for the OS the daemon runs on.
+func TestFSFailure_UsesTheRunningOS(t *testing.T) {
+	got := repoaccess.FSFailure(target("/srv/repo"), repoaccess.StepOpen, syscall.EPERM, nil)
+	want := repoaccess.FSFailureOn(runtime.GOOS, target("/srv/repo"), repoaccess.StepOpen, syscall.EPERM, nil)
+	if got.Cause != want.Cause {
+		t.Fatalf("FSFailure cause = %q, want %q (as on %s)", got.Cause, want.Cause, runtime.GOOS)
 	}
 }
 

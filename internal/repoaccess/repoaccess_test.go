@@ -1,7 +1,10 @@
+//go:build !windows
+
 package repoaccess_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -374,6 +377,56 @@ func TestChecker_ProbeFailureKeepsThePreviousVerdict(t *testing.T) {
 	}
 	if got := failingByPath(c.Snapshot())[fifo].Cause; got != repoaccess.CauseBlocked {
 		t.Fatalf("after a failed probe the verdict became %q, want blocked kept", got)
+	}
+}
+
+// A failed repo listing (e.g. a transient DB error) says nothing about the
+// repos. It must not wipe the verdicts, or the next good listing re-alerts
+// every failing repo (STA-697).
+func TestChecker_RunKeepsVerdictsWhenListingFails(t *testing.T) {
+	fifo := mkfifo(t)
+	rec := &recorder{}
+	c := &repoaccess.Checker{Options: hangOpts(), Notify: rec.notify, Publish: rec.publish}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var afterFailure repoaccess.Snapshot
+	calls := 0
+	listErr := errors.New("list task repo paths: database is locked")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.Run(ctx, 10*time.Millisecond, func() ([]repoaccess.Target, error) {
+			calls++
+			switch calls {
+			case 1, 3:
+				if calls == 3 {
+					afterFailure = c.Snapshot()
+				}
+				return []repoaccess.Target{target(fifo)}, nil
+			case 2:
+				return nil, listErr
+			default:
+				cancel()
+				return nil, listErr
+			}
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+
+	if got := failingByPath(afterFailure)[fifo].Cause; got != repoaccess.CauseBlocked {
+		t.Fatalf("after a failed listing the verdict for %s became %q, want blocked kept; snapshot %+v", fifo, got, afterFailure)
+	}
+	notices, published := rec.snapshot()
+	if len(notices) != 1 {
+		t.Fatalf("notices = %q, want the single original alert", notices)
+	}
+	if len(published) != 1 || published[0] != "repo_access_lost "+fifo {
+		t.Fatalf("published = %q, want only the original repo_access_lost", published)
 	}
 }
 
