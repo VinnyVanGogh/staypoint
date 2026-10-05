@@ -1191,7 +1191,8 @@ func recordMigration(conn *sql.DB, m Migration) error {
 // into schema_migrations. It copies the recorded set rather than assuming
 // 1..MAX: a DB migrated by sibling branch builds can hold 1..26,28 with 27
 // never run, and 27 must stay pending. Runs on every open, so a version an
-// older binary recorded after a downgrade is not run twice.
+// older binary recorded after a downgrade is not run twice. OR IGNORE: two
+// processes opening the same pre-ledger DB both see the rows missing.
 func backfillSchemaMigrations(conn *sql.DB, ms []Migration) error {
 	names := make(map[int]string, len(ms))
 	for _, m := range ms {
@@ -1233,7 +1234,7 @@ func backfillSchemaMigrations(conn *sql.DB, ms []Migration) error {
 	}
 	defer tx.Rollback()
 	for _, r := range missing {
-		if _, err := tx.Exec(`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,
 			r.version, names[r.version], r.appliedAt); err != nil {
 			return fmt.Errorf("failed to backfill schema_migrations version %d: %w", r.version, err)
 		}
