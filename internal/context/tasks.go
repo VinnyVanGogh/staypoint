@@ -512,6 +512,12 @@ func GetTask(db *sql.DB, id string) (*Task, error) {
 	if deletedAt.Valid {
 		t.DeletedAt = &deletedAt.String
 	}
+	if org.Valid {
+		t.Organization = org.String
+	}
+	if proj.Valid {
+		t.Project = proj.String
+	}
 	t.BlockedBy, _ = GetTaskBlockedBy(db, t.ID)
 	t.Blocks, _ = GetTaskBlocks(db, t.ID)
 	if cRows, err := db.Query(`SELECT id, task_id, author, message, created_at FROM task_comments WHERE task_id = ? ORDER BY created_at ASC`, t.ID); err == nil {
