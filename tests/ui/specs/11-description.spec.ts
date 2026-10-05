@@ -1,4 +1,4 @@
-import { test, expect, gotoTaskPage } from '../fixtures';
+import { test, expect, gotoTaskPage, openTaskPanelTab } from '../fixtures';
 
 test.describe('task description', () => {
   test('new-task form sends description, task page shows it', async ({ page, api }) => {
@@ -28,6 +28,7 @@ test.describe('task description', () => {
   test('task page description is editable and persists across reload', async ({ page, api }) => {
     const task = await api.createTask('EditDesc', { description: 'Original desc' });
     await gotoTaskPage(page, task);
+    await openTaskPanelTab(page, 'Brief');
 
     const descSection = page.locator('.task-page-section').filter({ hasText: 'Description' }).first();
 
@@ -63,6 +64,7 @@ test.describe('task description', () => {
   test('cancel edit restores original view without saving', async ({ page, api }) => {
     const task = await api.createTask('CancelDesc', { description: 'Keep this' });
     await gotoTaskPage(page, task);
+    await openTaskPanelTab(page, 'Brief');
 
     const descSection = page.locator('.task-page-section').filter({ hasText: 'Description' }).first();
     await descSection.locator('.desc-edit-btn').click();

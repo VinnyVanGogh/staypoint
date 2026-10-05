@@ -359,7 +359,6 @@ test('step 2: one screen at 1512x900 with sticky header actions, stats strip and
 });
 
 test('step 3: right panel tabs Review / Diff / Migrations / Brief swap the existing content', async ({ page, api }) => {
-  knownBug('STA-638-3');
   test.setTimeout(60_000);
   await openHeavyTask(page, api);
 

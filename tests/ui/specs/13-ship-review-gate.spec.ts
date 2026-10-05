@@ -1,4 +1,4 @@
-import { test, expect, gotoTaskPage } from '../fixtures';
+import { test, expect, gotoTaskPage, openTaskPanelTab } from '../fixtures';
 
 // STA-568: while a ship review card is pending/sent_back, Run Now and Mark done
 // must be absent. The card itself must appear within 1 s of the page title.
@@ -34,6 +34,8 @@ test('sent_back card: no Run Now, no Mark done, card visible within 1s', async (
   await api.upsertShipReview(task.id, 'sent_back');
 
   await gotoTaskPage(page, task);
+  // Only a pending review opens the panel on Review (STA-641).
+  await openTaskPanelTab(page, 'Review');
   const content = page.locator('#task-page-content');
 
   await expect(content.locator('.run-now-btn')).toHaveCount(0);
@@ -62,6 +64,8 @@ test('approved card: no Run Now, no Mark done, final card visible', async ({ pag
   await api.upsertShipReview(task.id, 'approved');
 
   await gotoTaskPage(page, task);
+  // Only a pending review opens the panel on Review (STA-641).
+  await openTaskPanelTab(page, 'Review');
   const content = page.locator('#task-page-content');
 
   await expect(content.locator('.run-now-btn')).toHaveCount(0);

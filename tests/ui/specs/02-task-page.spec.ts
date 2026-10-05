@@ -1,4 +1,4 @@
-import { test, expect, gotoTaskPage, taskPagePath } from '../fixtures';
+import { test, expect, gotoTaskPage, openTaskPanelTab, taskPagePath } from '../fixtures';
 
 test.describe('task detail full page', () => {
   test('renders the task and survives a reload of the deep link', async ({ page, api }) => {
@@ -7,6 +7,7 @@ test.describe('task detail full page', () => {
 
     await gotoTaskPage(page, task);
     const content = page.locator('#task-page-content');
+    await openTaskPanelTab(page, 'Review');
     await expect(content.getByText('Internal ID')).toBeVisible();
     await expect(content.locator('.panel-field-value', { hasText: task.id })).toBeVisible();
 
