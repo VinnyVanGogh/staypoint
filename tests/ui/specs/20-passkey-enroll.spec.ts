@@ -21,7 +21,7 @@ const passkeyRows = (page: Page) => securitySection(page).locator('.passkey-row'
 /**
  * Answers the browser dialogs the enrollment flow raises: the pairing-code
  * prompt gets the code from the TestMode-only last-pairing-code endpoint (the
- * real daemon sends it as a macOS notification), and every confirm is
+ * real daemon shows it in a StayPoint Board dialog), and every confirm is
  * accepted. Returns the messages seen, in order.
  */
 function answerEnrollDialogs(page: Page): Array<{ type: string; message: string }> {
@@ -43,6 +43,15 @@ function answerEnrollDialogs(page: Page): Array<{ type: string; message: string 
     await d.dismiss();
   });
   return seen;
+}
+
+/** Makes the daemon's pairing notifier fail with stderr ('' restores it). TestMode-only (STA-696). */
+async function failPairingNotifier(page: Page, stderr: string) {
+  const res = await page.request.put('/api/board/webauthn/test/pairing-notifier', {
+    headers: { Authorization: `Bearer ${TOKEN}` },
+    data: { error: stderr },
+  });
+  expect(res.ok(), `pairing-notifier: ${res.status()} ${await res.text()}`).toBeTruthy();
 }
 
 async function registered(page: Page): Promise<boolean> {
@@ -147,5 +156,59 @@ test.describe('Board passkey enrollment (STA-694)', () => {
     await toggle.click();
     expect((await restored).status()).toBe(200);
     await expect(toggle).toBeChecked({ checked: before });
+  });
+
+  // STA-696 made register/begin fail with "Couldn't show the pairing code: …"
+  // when the daemon cannot show the code. The explicit Enroll buttons must
+  // surface that cause and never ask for a code that never arrived.
+  test('Settings and banner Enroll passkey surface a pairing-code delivery failure', async ({ boardSessionPage: page }) => {
+    const stderr = 'execution error: No user interaction allowed. (-1713)';
+    const dialogs = answerEnrollDialogs(page);
+    await failPairingNotifier(page, stderr);
+    try {
+      await page.goto('/settings');
+      await expect(banner(page)).toBeVisible();
+
+      for (const button of [
+        securitySection(page).getByRole('button', { name: 'Enroll passkey' }),
+        banner(page).getByRole('button', { name: 'Enroll passkey' }),
+      ]) {
+        dialogs.length = 0;
+        const begin = page.waitForResponse((r) => r.url().includes('/api/board/webauthn/register/begin'));
+        await button.click();
+        expect((await begin).ok()).toBe(false);
+        await expect.poll(() => dialogs.find((d) => d.type === 'alert')?.message ?? '').toContain("Couldn't show the pairing code:");
+        const alert = dialogs.find((d) => d.type === 'alert')!;
+        expect(alert.message).toContain(stderr);
+        expect(alert.message).not.toContain('board_passkey_enrollment_required');
+        expect(dialogs.map((d) => d.type)).not.toContain('prompt');
+        await expect(button).toBeEnabled();
+      }
+      await expect(banner(page)).toBeVisible();
+      expect(await registered(page)).toBe(false);
+    } finally {
+      await failPairingNotifier(page, '');
+    }
+  });
+
+  // The page caches whether a passkey exists. If every passkey is removed
+  // without a board_passkey_deleted event reaching the page, enrolling must
+  // still work instead of demanding an assertion from a passkey that is gone.
+  test('enrolling works when passkeys were removed behind the page\'s back', async ({ boardPage: page }) => {
+    // boardPage enrolled after the page loaded; wait for the SSE refresh.
+    await expect.poll(() => page.evaluate(() => (window as any).eval('boardPasskeyState.registered'))).toBe(true);
+    const clear = await page.request.delete('/api/board/webauthn/test/clear-credentials', {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    expect(clear.ok()).toBeTruthy();
+
+    const dialogs = answerEnrollDialogs(page);
+    const result = await page.evaluate(async () =>
+      (await (window as any).withBoardWebAuthn(async () => 'action ran', 'the test action')) ?? null);
+
+    expect(result, `dialogs seen: ${JSON.stringify(dialogs)}`).toBe('action ran');
+    expect(dialogs.some((d) => /enrollment_required|Enrollment failed/.test(d.message))).toBe(false);
+    expect(dialogs.some((d) => d.message === 'Passkey enrolled. Continue with the test action?')).toBe(true);
+    expect(await registered(page)).toBe(true);
   });
 });
