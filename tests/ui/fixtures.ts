@@ -268,6 +268,9 @@ async function openBoardSession(page: Page, baseURL: string, request: APIRequest
   await page.goto(`${baseURL}/?token=${encodeURIComponent(TOKEN)}&board_nonce=${encodeURIComponent(nonce)}`);
   await expect(page).toHaveURL(`${baseURL}/`);
 
+  // Backup eligible and backed up (BE=1, BS=1) like an iCloud Keychain passkey:
+  // CDP defaults both to 0, which hid STA-716 (stored BE lost, every Board
+  // action 403).
   const cdp = await page.context().newCDPSession(page);
   await cdp.send('WebAuthn.enable', { enableUI: false });
   await cdp.send('WebAuthn.addVirtualAuthenticator', {
@@ -277,6 +280,8 @@ async function openBoardSession(page: Page, baseURL: string, request: APIRequest
       hasResidentKey: false,
       hasUserVerification: true,
       isUserVerified: true,
+      defaultBackupEligibility: true,
+      defaultBackupState: true,
     },
   });
 }
