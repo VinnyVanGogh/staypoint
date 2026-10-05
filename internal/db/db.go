@@ -1028,6 +1028,29 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version: 27,
+		Name:    "board_webauthn_credential_flags",
+		Up: func(conn *sql.DB) error {
+			// 27, not 26: PR #192 (board_alerts) claims 26 and already ran on the live DB.
+			// STA-716: go-webauthn checks the stored BackupEligible flag on every
+			// login, so it has to be persisted. The flag columns stay NULL on rows
+			// enrolled before this migration; the first valid assertion fills them.
+			for _, stmt := range []string{
+				`ALTER TABLE board_webauthn_credentials ADD COLUMN flags_user_present    INTEGER;`,
+				`ALTER TABLE board_webauthn_credentials ADD COLUMN flags_user_verified   INTEGER;`,
+				`ALTER TABLE board_webauthn_credentials ADD COLUMN flags_backup_eligible INTEGER;`,
+				`ALTER TABLE board_webauthn_credentials ADD COLUMN flags_backup_state    INTEGER;`,
+				`ALTER TABLE board_webauthn_credentials ADD COLUMN attestation_type      TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE board_webauthn_credentials ADD COLUMN transports            TEXT NOT NULL DEFAULT '[]';`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {

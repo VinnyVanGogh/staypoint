@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -185,6 +186,10 @@ func (sm *SecurityMiddleware) WrapBoardAction(next http.Handler) http.Handler {
 			return
 		}
 		if err := verifier(r, assertion); err != nil {
+			// The reason stays out of the response but must reach the daemon log;
+			// without it a rejected passkey is undiagnosable (STA-716).
+			slog.Warn("board action: passkey assertion rejected",
+				slog.String("path", r.URL.Path), slog.String("error", err.Error()))
 			writeBoardError(w, "board_passkey_assertion_invalid", "forbidden: WebAuthn assertion verification failed")
 			return
 		}
