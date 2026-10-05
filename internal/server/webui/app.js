@@ -9230,6 +9230,9 @@ document.querySelectorAll('.agent-filter-pill').forEach(btn => {
 
 let checklistItems = [];   // local cache
 let checklistCommitVerification = null;
+// The checklist re-renders after boot once the fleet load lands (STA-670), so
+// the warning log's open state lives here rather than in the DOM.
+let checklistGateLogOpen = false;
 
 function isItemCommitBlocked(itemId) {
   if (!checklistCommitVerification) return false;
@@ -9400,14 +9403,15 @@ function renderChecklist() {
     content.appendChild(desc);
     content.appendChild(meta);
 
-    const toggleBtn = el('button', 'cl-gate-toggle-btn', `Show Warning Log (${missing.length})`);
+    const toggleLabel = () => `${checklistGateLogOpen ? 'Hide' : 'Show'} Warning Log (${missing.length})`;
+    const toggleBtn = el('button', 'cl-gate-toggle-btn', toggleLabel());
     header.appendChild(icon);
     header.appendChild(content);
     header.appendChild(toggleBtn);
     banner.appendChild(header);
 
     const logContainer = el('div', 'cl-gate-log-container');
-    logContainer.style.display = 'none';
+    logContainer.style.display = checklistGateLogOpen ? 'block' : 'none';
 
     const table = el('table', 'cl-gate-log-table');
     table.innerHTML = `<thead><tr><th>Commit</th><th>Section / Item</th><th>Status in main</th><th>Status in daemon</th><th>Reason</th></tr></thead>`;
@@ -9428,9 +9432,9 @@ function renderChecklist() {
     banner.appendChild(logContainer);
 
     toggleBtn.addEventListener('click', () => {
-      const isHidden = logContainer.style.display === 'none';
-      logContainer.style.display = isHidden ? 'block' : 'none';
-      toggleBtn.textContent = isHidden ? `Hide Warning Log (${missing.length})` : `Show Warning Log (${missing.length})`;
+      checklistGateLogOpen = !checklistGateLogOpen;
+      logContainer.style.display = checklistGateLogOpen ? 'block' : 'none';
+      toggleBtn.textContent = toggleLabel();
     });
 
     container.appendChild(banner);
