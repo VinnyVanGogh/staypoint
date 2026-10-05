@@ -1062,7 +1062,19 @@ func copyFile(src, dst string) error {
 	return os.WriteFile(dst, input, 0644)
 }
 
+// validateMigrations rejects a migration list that two PRs both numbered
+// the same way. Run at startup and in CI (TestMigrations_VersionsUnique).
 func validateMigrations(ms []Migration) error {
+	seen := make(map[int]string, len(ms))
+	for _, m := range ms {
+		if m.Version <= 0 {
+			return fmt.Errorf("migration %q has invalid version %d", m.Name, m.Version)
+		}
+		if prev, dup := seen[m.Version]; dup {
+			return fmt.Errorf("duplicate migration version %d: %q and %q; renumber one of them", m.Version, prev, m.Name)
+		}
+		seen[m.Version] = m.Name
+	}
 	return nil
 }
 
@@ -1070,35 +1082,50 @@ func applyMigrations(dbPath string, conn *sql.DB) error {
 	return applyMigrationSet(dbPath, conn, Migrations)
 }
 
+// applyMigrationSet runs every migration not recorded in schema_migrations, in
+// version order. Parallel PRs can merge a lower version after a higher one has
+// already run (STA-744); comparing against MAX(version) skipped those silently.
 func applyMigrationSet(dbPath string, conn *sql.DB, ms []Migration) error {
+	if err := validateMigrations(ms); err != nil {
+		return err
+	}
+
+	// schema_versions is the pre-STA-744 ledger. It is still written so an
+	// older binary, which reads MAX(version), sees the DB as current.
 	if _, err := conn.Exec(`
 		CREATE TABLE IF NOT EXISTS schema_versions (
 			version INTEGER PRIMARY KEY,
 			applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 		);
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version    INTEGER PRIMARY KEY,
+			name       TEXT NOT NULL DEFAULT '',
+			applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+		);
 	`); err != nil {
-		return fmt.Errorf("failed to create schema_versions: %w", err)
+		return fmt.Errorf("failed to create migration tables: %w", err)
 	}
 
-	// Apply every migration not yet recorded, not just those above MAX(version):
-	// branch builds of parallel PRs migrate the live DB, so it can already hold
-	// a higher version while a lower one from another branch never ran (STA-716).
-	rows, err := conn.Query(`SELECT version FROM schema_versions;`)
-	if err != nil {
-		return fmt.Errorf("failed to read applied versions: %w", err)
+	if err := backfillSchemaMigrations(conn, ms); err != nil {
+		return err
 	}
+
 	applied := map[int]bool{}
+	rows, err := conn.Query(`SELECT version FROM schema_migrations;`)
+	if err != nil {
+		return fmt.Errorf("failed to read applied migrations: %w", err)
+	}
 	for rows.Next() {
 		var v int
 		if err := rows.Scan(&v); err != nil {
 			rows.Close()
-			return fmt.Errorf("failed to read applied versions: %w", err)
+			return fmt.Errorf("failed to read applied migrations: %w", err)
 		}
 		applied[v] = true
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("failed to read applied versions: %w", err)
+		return fmt.Errorf("failed to read applied migrations: %w", err)
 	}
 
 	var pending []Migration
@@ -1132,7 +1159,7 @@ func applyMigrationSet(dbPath string, conn *sql.DB, ms []Migration) error {
 			_ = os.Remove(dbPath + "-shm")
 			return fmt.Errorf("migration %d (%s) failed, database restored from backup: %w", m.Version, m.Name, err)
 		}
-		if _, err := conn.Exec(`INSERT INTO schema_versions (version) VALUES (?)`, m.Version); err != nil {
+		if err := recordMigration(conn, m); err != nil {
 			conn.Close()
 			_ = copyFile(backupPath, dbPath)
 			_ = os.Remove(dbPath + "-wal")
@@ -1142,6 +1169,78 @@ func applyMigrationSet(dbPath string, conn *sql.DB, ms []Migration) error {
 	}
 
 	_ = os.Remove(backupPath)
+	return nil
+}
+
+func recordMigration(conn *sql.DB, m Migration) error {
+	tx, err := conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO schema_migrations (version, name) VALUES (?, ?)`, m.Version, m.Name); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO schema_versions (version) VALUES (?)`, m.Version); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// backfillSchemaMigrations copies every version recorded in schema_versions
+// into schema_migrations. It copies the recorded set rather than assuming
+// 1..MAX: a DB migrated by sibling branch builds can hold 1..26,28 with 27
+// never run, and 27 must stay pending. Runs on every open, so a version an
+// older binary recorded after a downgrade is not run twice.
+func backfillSchemaMigrations(conn *sql.DB, ms []Migration) error {
+	names := make(map[int]string, len(ms))
+	for _, m := range ms {
+		names[m.Version] = m.Name
+	}
+
+	type legacyRow struct {
+		version   int
+		appliedAt string
+	}
+	rows, err := conn.Query(`
+		SELECT version, applied_at FROM schema_versions
+		WHERE version NOT IN (SELECT version FROM schema_migrations)
+		ORDER BY version;
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to read schema_versions for backfill: %w", err)
+	}
+	var missing []legacyRow
+	for rows.Next() {
+		var r legacyRow
+		if err := rows.Scan(&r.version, &r.appliedAt); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to read schema_versions for backfill: %w", err)
+		}
+		missing = append(missing, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read schema_versions for backfill: %w", err)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	tx, err := conn.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to backfill schema_migrations: %w", err)
+	}
+	defer tx.Rollback()
+	for _, r := range missing {
+		if _, err := tx.Exec(`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,
+			r.version, names[r.version], r.appliedAt); err != nil {
+			return fmt.Errorf("failed to backfill schema_migrations version %d: %w", r.version, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to backfill schema_migrations: %w", err)
+	}
 	return nil
 }
 
