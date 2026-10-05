@@ -55,3 +55,40 @@ func TestDeleteRemoteBranchLeasedRefusesMovedTip(t *testing.T) {
 		t.Fatalf("feature still on remote: %q", out)
 	}
 }
+
+// STA-660: worktree paths are read with -z, so one containing a newline is
+// reported whole.
+func TestWorktreeWithBranchNewlineInPath(t *testing.T) {
+	base := t.TempDir()
+	work := filepath.Join(base, "work")
+	git := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=t@t.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=t@t.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git(base, "init", "-q", "-b", "main", work)
+	git(work, "commit", "-q", "--allow-empty", "-m", "init")
+	git(work, "branch", "feature")
+	odd := filepath.Join(base, "odd\nworktree branch refs/heads/main")
+	git(work, "worktree", "add", "-q", odd, "feature")
+
+	got, err := worktreeWithBranch(context.Background(), work, "feature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotReal, _ := filepath.EvalSymlinks(got)
+	wantReal, _ := filepath.EvalSymlinks(odd)
+	if gotReal != wantReal {
+		t.Fatalf("worktreeWithBranch = %q, want %q", got, odd)
+	}
+	if got, err := worktreeWithBranch(context.Background(), work, "nope"); err != nil || got != "" {
+		t.Fatalf("unchecked-out branch: got %q, %v", got, err)
+	}
+}

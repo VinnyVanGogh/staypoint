@@ -7786,7 +7786,8 @@ function renderShipReviewCardFromData(container, taskId, card) {
   }
 
   // Dev URL — only render http/https loopback URLs to prevent XSS via javascript: etc.
-  if (card.dev_url) {
+  // Send Back stops the dev server, so a sent_back card has nothing to preview.
+  if (card.dev_url && card.status !== 'sent_back') {
     let safeDevURL = null;
     try {
       const u = new URL(card.dev_url);

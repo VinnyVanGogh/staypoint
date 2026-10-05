@@ -275,8 +275,8 @@ func (m *procManager) storeIfActive(taskID string, s *devSetup, p *os.Process, r
 	return true
 }
 
-// devSetupWait bounds how long CleanupMergedBranch waits for a cancelled
-// dev-server setup to unwind. Variable so tests can shorten it.
+// devSetupWait bounds how long CleanupMergedBranch and StopDevServer wait for
+// a cancelled dev-server setup to unwind. Variable so tests can shorten it.
 var devSetupWait = 30 * time.Second
 
 // ErrDevSetupCanceled is returned by dev-server setup that was cancelled,
@@ -799,6 +799,10 @@ func min(a, b int) int {
 // If the project config has SupabaseEnabled and !SupabaseKeepUp, also stops
 // the local Supabase stack (data volumes are kept for fast next startup).
 func StopDevServer(db *sql.DB, card *Card) {
+	// A setup still running from a Restart would otherwise go on to create
+	// devserver-<id> and start a server for a card that is now closed.
+	devServerManager.cancelSetup(card.TaskID, devSetupWait)
+
 	// Determine the worktree path to pass to supabase stop.
 	repoPath, wtPath := devServerManager.paths(card.TaskID)
 
@@ -1095,21 +1099,60 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 }
 
 // worktreeWithBranch returns the path of a worktree that has branch checked
-// out, or "" when none does.
+// out, or is rebasing or bisecting it, or "" when none does. These are the
+// cases where branch -D refuses; a rebase or bisect detaches HEAD, so the
+// worktree list alone does not show them.
 func worktreeWithBranch(ctx context.Context, repoDir, branch string) (string, error) {
-	out, err := gitOutput(ctx, repoDir, "worktree", "list", "--porcelain")
+	ref := "refs/heads/" + branch
+	// -z: a worktree path may itself contain a newline.
+	out, err := gitOutput(ctx, repoDir, "worktree", "list", "--porcelain", "-z")
 	if err != nil {
 		return "", err
 	}
 	wt := ""
-	for _, line := range strings.Split(out, "\n") {
-		if p, ok := strings.CutPrefix(line, "worktree "); ok {
+	for _, field := range strings.Split(out, "\x00") {
+		if p, ok := strings.CutPrefix(field, "worktree "); ok {
 			wt = p
-		} else if line == "branch refs/heads/"+branch {
+		} else if field == "branch "+ref {
 			return wt, nil
 		}
 	}
+
+	commonDir, err := gitOutput(ctx, repoDir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	gitDirs := []string{commonDir}
+	linked, _ := filepath.Glob(filepath.Join(commonDir, "worktrees", "*"))
+	gitDirs = append(gitDirs, linked...)
+	for _, gd := range gitDirs {
+		if !worktreeGitDirHolds(gd, ref) {
+			continue
+		}
+		if gd == commonDir {
+			return filepath.Dir(commonDir) + " (rebase or bisect in progress)", nil
+		}
+		// gitdir holds the path of the linked worktree's .git file.
+		if b, err := os.ReadFile(filepath.Join(gd, "gitdir")); err == nil {
+			return filepath.Dir(strings.TrimSpace(string(b))) + " (rebase or bisect in progress)", nil
+		}
+		return gd + " (rebase or bisect in progress)", nil
+	}
 	return "", nil
+}
+
+// worktreeGitDirHolds reports whether the worktree whose git dir is gd is
+// rebasing or bisecting ref, mirroring git's is_worktree_being_rebased and
+// is_worktree_being_bisected.
+func worktreeGitDirHolds(gd, ref string) bool {
+	for _, f := range []string{"rebase-merge/head-name", "rebase-apply/head-name"} {
+		if b, err := os.ReadFile(filepath.Join(gd, f)); err == nil && strings.TrimSpace(string(b)) == ref {
+			return true
+		}
+	}
+	// BISECT_START holds the short name of the branch bisect started from.
+	b, err := os.ReadFile(filepath.Join(gd, "BISECT_START"))
+	return err == nil && strings.TrimSpace(string(b)) == strings.TrimPrefix(ref, "refs/heads/")
 }
 
 // deleteRemoteBranchLeased deletes refs/heads/<branch> on origin only while
