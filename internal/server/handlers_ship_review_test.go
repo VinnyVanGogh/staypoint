@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 )
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -500,5 +502,66 @@ func TestShipReview_DeleteBranchRequiresApprovedCard(t *testing.T) {
 	}
 	if out := gitOut(t, bare, "branch", "--list", "staypoint/"+taskID); out == "" {
 		t.Error("branch deleted while review still open")
+	}
+}
+
+// ── STA-654: start-dev refuses closed cards ────────────────────────────────
+
+// TestShipReview_StartDevRefusesNonPendingCard: once a review is closed
+// (approved, rejected, or sent back), start-dev returns 409 and never
+// recreates .worktrees/devserver-<id> or touches the card's dev state. A dev
+// command is configured so the only thing standing between the request and
+// StartDevServerAsync is the status check.
+func TestShipReview_StartDevRefusesNonPendingCard(t *testing.T) {
+	cases := []struct {
+		status string
+		action string
+		body   []byte
+	}{
+		{"approved", "approve", nil},
+		{"rejected", "reject", []byte(`{"comment":"no"}`)},
+		{"sent_back", "send-back", []byte(`{"comment":"rework"}`)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.status, func(t *testing.T) {
+			database, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+			if err := shipreview.UpsertProjectDevConfig(database, &shipreview.ProjectDevConfig{
+				RepoPath:   repoDir,
+				DevCommand: "true",
+				DevURL:     "http://localhost:3999",
+			}); err != nil {
+				t.Fatalf("UpsertProjectDevConfig: %v", err)
+			}
+
+			cardURL := baseURL + "/api/tasks/" + taskID + "/ship-review"
+			resp, rb := shipDoReq(t, client, token, "POST", cardURL+"/"+tc.action, tc.body, boardToken, "", "mock-assertion")
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("%s: %d %s", tc.action, resp.StatusCode, rb)
+			}
+
+			resp, rb = shipDoReq(t, client, token, "POST", cardURL+"/start-dev", nil)
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("start-dev on %s card: want 409, got %d %s", tc.status, resp.StatusCode, rb)
+			}
+			if !strings.Contains(string(rb), "card is not pending") {
+				t.Errorf("start-dev body = %s, want \"card is not pending\"", rb)
+			}
+
+			devDir := filepath.Join(repoDir, ".worktrees", "devserver-"+taskID)
+			if _, err := os.Stat(devDir); !os.IsNotExist(err) {
+				t.Errorf("devserver worktree %s exists after refused start-dev (stat err=%v)", devDir, err)
+			}
+
+			card, err := shipreview.GetCard(database, taskID)
+			if err != nil {
+				t.Fatalf("GetCard: %v", err)
+			}
+			if card.Status != tc.status {
+				t.Errorf("card status = %q, want %q", card.Status, tc.status)
+			}
+			if card.DevState == shipreview.DevStateStarting {
+				t.Errorf("card dev_state = %q after refused start-dev", card.DevState)
+			}
+		})
 	}
 }

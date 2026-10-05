@@ -140,6 +140,14 @@ func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// STA-654: only an open review gets a dev server. Approve/Reject stop it and
+	// cleanup removes .worktrees/devserver-<id>; starting here would recreate
+	// both. A sent_back card is also closed: the agent's resubmit replaces it
+	// with a fresh pending card for the new head.
+	if card.Status != shipreview.StatusPending {
+		writeError(w, http.StatusConflict, "card is not pending")
+		return
+	}
 
 	cfg, err := shipreview.GetProjectDevConfig(h.db, task.RepoPath)
 	if err != nil {
