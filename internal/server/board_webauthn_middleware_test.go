@@ -377,3 +377,83 @@ func TestBoardAuditLog_LogBoardEvent_ReadBack(t *testing.T) {
 		t.Error("created_at is empty")
 	}
 }
+
+// (e) STA-696: when the pairing code cannot be shown (osascript denied, no GUI
+// session), register/begin must fail with the real cause instead of letting the
+// UI ask for a code that never arrived. The code itself must not leak into the
+// response, and it must not stay valid.
+func TestPasskeyRegisterBegin_NotifierError_Surfaced(t *testing.T) {
+	database := setupTestDB(t)
+	srv, token := startTestServer(t, database)
+
+	// A session from an earlier, successful begin. The failed begin below must
+	// not leave a pairing code this session could finish with.
+	silencePairingNotifier(srv)
+	sessionToken := beginRegistrationSession(t, srv, token)
+
+	const cause = "osascript exit 1: execution error: No user interaction allowed. (-1713)"
+	var mu sync.Mutex
+	var shown string
+	s, ok := any(srv).(pairingNotifierSetter)
+	if !ok {
+		t.Fatal("server has no SetPairingNotifier seam")
+	}
+	s.SetPairingNotifier(func(code string) error {
+		mu.Lock()
+		shown = code
+		mu.Unlock()
+		// Echo the code in the error to prove the handler scrubs it.
+		return errors.New(cause + " code=" + code)
+	})
+
+	req, _ := http.NewRequest("POST", srv.URL()+"/api/board/webauthn/register/begin", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "staypoint_board", Value: srv.BoardToken()})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("register/begin: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var out struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	_ = json.Unmarshal(raw, &out)
+	if resp.StatusCode != http.StatusInternalServerError || out.Error != "board_pairing_code_undelivered" {
+		t.Fatalf("register/begin with failing notifier: want 500 board_pairing_code_undelivered, got %d %s",
+			resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	if want := "Couldn't show the pairing code: " + cause; !strings.HasPrefix(out.Message, want) {
+		t.Errorf("message = %q, want prefix %q", out.Message, want)
+	}
+	if resp.Header.Get("X-WebAuthn-Session") != "" {
+		t.Error("register/begin failed but still issued an X-WebAuthn-Session")
+	}
+
+	mu.Lock()
+	code := shown
+	mu.Unlock()
+	if code == "" {
+		t.Fatal("notifier was never called")
+	}
+	if strings.Contains(string(raw), code) {
+		t.Errorf("response leaks the pairing code: %s", raw)
+	}
+
+	// The undelivered code must not be usable.
+	credential := `{"id":"Y3JlZC0x","rawId":"Y3JlZC0x","type":"public-key","response":{"clientDataJSON":"e30","attestationObject":"o2NmbXRkbm9uZQ"}}`
+	status, errCode, body := doBoard(t, srv, token, boardReq{
+		method:  "POST",
+		path:    "/api/board/webauthn/register/finish",
+		body:    `{"code":"` + code + `","credential":` + credential + `}`,
+		cookie:  true,
+		session: sessionToken,
+	})
+	if status != http.StatusForbidden || errCode != "board_passkey_pairing_required" {
+		t.Errorf("register/finish with undelivered code: want 403 board_passkey_pairing_required, got %d %s",
+			status, strings.TrimSpace(body))
+	}
+}
