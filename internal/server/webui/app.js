@@ -280,7 +280,7 @@ async function boardEnrollPasskey(existingSessionToken, existingAssertion) {
 
   const newCred = await navigator.credentials.create({ publicKey: pk });
 
-  const code = prompt('Enter the 6-digit pairing code from your macOS notification:');
+  const code = prompt('Enter the 6-digit pairing code shown in the StayPoint Board dialog:');
   if (!code || !code.trim()) throw new Error('Enrollment cancelled — no pairing code entered.');
 
   const credential = {

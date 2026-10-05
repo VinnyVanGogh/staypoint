@@ -58,6 +58,11 @@ func New(opts Options) (*Server, error) {
 		// Tests may override this via SetWebAuthnVerifier.
 		s.webAuthnH = NewWebAuthnHandler(opts.DB, hub)
 		secMid.setWebAuthnVerifier(s.webAuthnH.VerifyAssertion)
+		if opts.TestMode {
+			// Never pop a real macOS dialog from e2e; the code is read back
+			// through the TestMode last-pairing-code endpoint instead.
+			s.webAuthnH.SetPairingNotifier(func(string) error { return nil })
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -229,10 +234,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.Handle("DELETE /api/board/webauthn/credentials/{id}", s.secMid.WrapBoardAction(http.HandlerFunc(webAuthnH.DeleteCredential)))
 		if s.opts.TestMode {
 			// Test-only: expose the last generated pairing code so Playwright's CDP
-			// enrollment helper can finish registration without a macOS notification.
+			// enrollment helper can finish registration without the macOS dialog.
 			mux.Handle("GET /api/board/webauthn/test/last-pairing-code", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.TestLastPairingCode)))
 			// Test-only: wipe all passkeys so boardPage fixture can re-enroll on each test.
 			mux.Handle("DELETE /api/board/webauthn/test/clear-credentials", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.TestClearCredentials)))
+			// Test-only: make the pairing notifier fail like a denied osascript (STA-696).
+			mux.Handle("PUT /api/board/webauthn/test/pairing-notifier", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.TestSetPairingNotifierError)))
 		}
 	}
 
@@ -344,8 +351,8 @@ func (s *Server) SetWebAuthnVerifier(fn func(r *http.Request, assertion string) 
 	s.secMid.setWebAuthnVerifier(fn)
 }
 
-// SetPairingNotifier replaces the macOS notification with a custom function for
-// the WebAuthn registration pairing code. Used in tests and the Playwright e2e suite.
+// SetPairingNotifier replaces the macOS pairing-code dialog with a custom function
+// for the WebAuthn registration pairing code. Used in tests and the Playwright e2e suite.
 func (s *Server) SetPairingNotifier(fn func(code string) error) {
 	if s.webAuthnH != nil {
 		s.webAuthnH.SetPairingNotifier(fn)

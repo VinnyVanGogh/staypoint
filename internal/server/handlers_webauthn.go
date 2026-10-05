@@ -2,18 +2,22 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net/http"
-	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
+	"github.com/VinnyVanGogh/staypoint/internal/osascript"
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/google/uuid"
@@ -43,7 +47,7 @@ type WebAuthnHandler struct {
 	lastPairingCode string // kept for test-only endpoint; never cleared after use
 
 	pairingNotifierMu sync.RWMutex
-	pairingNotifier   func(code string) error // nil means use osascript
+	pairingNotifier   func(code string) error // nil means showPairingCode
 
 	sessionMu sync.Mutex
 	sessions  map[string]*webauthn.SessionData
@@ -57,8 +61,8 @@ func NewWebAuthnHandler(db *sql.DB, hub *EventHub) *WebAuthnHandler {
 	}
 }
 
-// SetPairingNotifier replaces the macOS notification with a custom function.
-// When fn is non-nil, it is called instead of osascript. Used in tests and
+// SetPairingNotifier replaces the macOS pairing-code dialog with a custom function.
+// When fn is non-nil, it is called instead of showPairingCode. Used in tests and
 // for the Playwright e2e suite (via the test-only last-pairing-code endpoint).
 func (h *WebAuthnHandler) SetPairingNotifier(fn func(code string) error) {
 	h.pairingNotifierMu.Lock()
@@ -79,6 +83,68 @@ func (h *WebAuthnHandler) LastPairingCode() string {
 // Only registered when server.Options.TestMode is true.
 func (h *WebAuthnHandler) TestLastPairingCode(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]string{"code": h.LastPairingCode()})
+}
+
+// TestSetPairingNotifierError handles PUT /api/board/webauthn/test/pairing-notifier.
+// Only registered when server.Options.TestMode is true. A non-empty "error" makes
+// every later pairing notifier call fail with that text, as a denied osascript
+// would; an empty one restores a notifier that succeeds without showing anything.
+func (h *WebAuthnHandler) TestSetPairingNotifierError(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if body.Error == "" {
+		h.SetPairingNotifier(func(string) error { return nil })
+	} else {
+		msg := body.Error
+		h.SetPairingNotifier(func(string) error { return errors.New(msg) })
+	}
+	writeJSON(w, map[string]string{"ok": "set"})
+}
+
+// pairingDialogGrace is how long register/begin waits for the pairing dialog to
+// fail before treating it as shown. A modal dialog keeps osascript running
+// until the Board clicks OK; a denied permission or missing GUI session makes it
+// exit almost at once.
+const pairingDialogGrace = 1500 * time.Millisecond
+
+// showPairingCode is the default pairing notifier. The code goes in a modal
+// dialog, which is visible regardless of notification settings and which
+// agents cannot read, with a notification as a second channel. Only a dialog
+// failure is returned; a dropped notification is logged. Neither path logs the
+// code itself.
+func showPairingCode(code string) error {
+	text := "StayPoint Board pairing code: " + code
+	dialog := fmt.Sprintf(`display dialog %s with title "StayPoint Board" buttons {"OK"} default button "OK" giving up after 120`,
+		osascript.Quote(text))
+	err := osascript.Start(dialog, pairingDialogGrace, func(err error) {
+		slog.Warn("pairing code dialog failed", slog.String("error", redactPairingCode(err.Error(), code)))
+	})
+	if err != nil {
+		return err
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		notification := fmt.Sprintf(`display notification %s with title "StayPoint Board"`, osascript.Quote(text))
+		if err := osascript.Run(ctx, notification); err != nil {
+			slog.Warn("pairing code notification failed", slog.String("error", redactPairingCode(err.Error(), code)))
+		}
+	}()
+	return nil
+}
+
+// redactPairingCode keeps the pairing code out of logs and API errors, in case
+// osascript echoes part of the script in its stderr.
+func redactPairingCode(s, code string) string {
+	if code == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, code, "******")
 }
 
 // TestClearCredentials handles DELETE /api/board/webauthn/test/clear-credentials.
@@ -193,7 +259,7 @@ func (h *WebAuthnHandler) RegisterBegin(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Issue pairing code via macOS notification (or test notifier).
+	// Issue pairing code via the macOS dialog (or test notifier).
 	n, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "pairing code generation failed")
@@ -209,17 +275,29 @@ func (h *WebAuthnHandler) RegisterBegin(w http.ResponseWriter, r *http.Request) 
 	h.pairingNotifierMu.RLock()
 	notifier := h.pairingNotifier
 	h.pairingNotifierMu.RUnlock()
-	if notifier != nil {
-		go notifier(code) //nolint:errcheck
-	} else {
-		go exec.Command("osascript", "-e",
-			fmt.Sprintf(`display notification "StayPoint Board registration code: %s" with title "StayPoint Board"`, code),
-		).Run() //nolint:errcheck
+	if notifier == nil {
+		notifier = showPairingCode
+	}
+	if err := notifier(code); err != nil {
+		// The Board never saw this code, so it must not stay valid, and the UI
+		// must say why instead of asking for it.
+		h.pairingMu.Lock()
+		if h.pairingCode == code {
+			h.pairingCode = ""
+		}
+		h.pairingMu.Unlock()
+		msg := "Couldn't show the pairing code: " + redactPairingCode(err.Error(), code)
+		slog.Warn("register/begin: " + msg)
+		writeErrorJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":   "board_pairing_code_undelivered",
+			"message": msg,
+		})
+		return
 	}
 
 	user := h.loadUser()
 	// Residual risk: attestation statements are requested but not cryptographically
-	// verified against a trusted AAGUID list. The macOS notification pairing code is
+	// verified against a trusted AAGUID list. The macOS dialog pairing code is
 	// the sole anti-automation barrier during first enrollment.
 	options, sessionData, err := wa.BeginRegistration(user,
 		webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
