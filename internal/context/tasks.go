@@ -102,6 +102,9 @@ type TaskCreateOptions struct {
 	// TODO(STA-316): validate and persist.
 	WorkKind    string
 	Description string
+	// ExecutionStage overrides the initial stage (default "todo"). A
+	// "backlog" task is parked: it is created without waking an agent.
+	ExecutionStage string
 }
 
 // GetCurrentGitBranch returns the current active git branch for a directory.
@@ -170,14 +173,19 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 		workKind = "coding"
 	}
 
+	stage := strings.TrimSpace(opts.ExecutionStage)
+	if stage == "" {
+		stage = "todo"
+	}
+
 	query := `
 		INSERT INTO tasks (
 			id, name, repo_path, git_branch, status, account_role,
 			max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 			organization, project, parent_id, assignee_agent_id, work_kind,
-			created_at, updated_at
+			execution_stage, created_at, updated_at
 		)
-		VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+		VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 	`
 
 	var parentID interface{}
@@ -190,7 +198,7 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 		assigneeAgentID = opts.AssigneeAgentID
 	}
 
-	if _, err := db.Exec(query, taskID, name, repoPath, gitBranch, role, opts.MaxBudgetUSD, opts.MaxTurns, opts.Organization, opts.Project, parentID, assigneeAgentID, workKind); err != nil {
+	if _, err := db.Exec(query, taskID, name, repoPath, gitBranch, role, opts.MaxBudgetUSD, opts.MaxTurns, opts.Organization, opts.Project, parentID, assigneeAgentID, workKind, stage); err != nil {
 		return nil, fmt.Errorf("failed to insert task: %w", err)
 	}
 
@@ -200,8 +208,11 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 		}
 	}
 
-	// Waking the agent as the task is ready for assignment/pickup
-	_ = orchestrator.NotifyDaemon(taskID, "assignment", "")
+	// Waking the agent as the task is ready for assignment/pickup. Backlog
+	// tasks are parked, so nothing picks them up yet.
+	if stage != "backlog" {
+		_ = orchestrator.NotifyDaemon(taskID, "assignment", "")
+	}
 
 	return GetTask(db, taskID)
 }
