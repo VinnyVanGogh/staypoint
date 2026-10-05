@@ -4,10 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os/exec"
-	"strings"
 	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/osascript"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 )
 
@@ -164,16 +163,21 @@ func (n *RateLimitNotifier) check() {
 	n.lastPersLocked = isPersLocked
 }
 
+// runScript runs AppleScript; tests replace it.
+var runScript = osascript.Run
+
+// SendNotification shows a macOS notification. Delivery is best-effort: macOS
+// can drop a notification while osascript still exits 0 (see package
+// osascript). A non-zero exit, such as no GUI session, is logged with its exit
+// status and stderr rather than dropped.
 func SendNotification(title, message string) {
 	slog.Info("notify", slog.String("title", title), slog.String("message", message))
 
-	// Safely escape quotes and backslashes for AppleScript string literals
-	safeTitle := strings.ReplaceAll(title, `\`, `\\`)
-	safeTitle = strings.ReplaceAll(safeTitle, `"`, `\"`)
-	safeMsg := strings.ReplaceAll(message, `\`, `\\`)
-	safeMsg = strings.ReplaceAll(safeMsg, `"`, `\"`)
-
-	// AppleScript notification
-	script := fmt.Sprintf(`display notification "%s" with title "%s" sound name "Glass"`, safeMsg, safeTitle)
-	_ = exec.Command("osascript", "-e", script).Run()
+	script := fmt.Sprintf(`display notification %s with title %s sound name "Glass"`,
+		osascript.Quote(message), osascript.Quote(title))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := runScript(ctx, script); err != nil {
+		slog.Warn("notification failed", slog.String("title", title), slog.String("error", err.Error()))
+	}
 }
