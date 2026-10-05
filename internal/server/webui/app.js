@@ -578,6 +578,9 @@ function handleEvent(evt) {
       if (side) {
         const existing = document.getElementById(`ship-review-${tid}`);
         if (existing) existing.remove();
+        // Clear the header buttons too: if the refetch fails no card renders,
+        // and they would stay wired to the removed card (STA-657).
+        clearShipReviewHeaderActions(tid);
         renderShipReviewCard(side, tid);
       }
     }
