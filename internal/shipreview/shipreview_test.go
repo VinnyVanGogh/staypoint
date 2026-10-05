@@ -64,6 +64,14 @@ func openTestDB(t *testing.T) *sql.DB {
 			check_runs_json TEXT NOT NULL DEFAULT '[]',
 			branch_deleted INTEGER NOT NULL DEFAULT 0,
 			branch_delete_error TEXT NOT NULL DEFAULT '',
+			merge_mode TEXT NOT NULL DEFAULT '',
+			pr_number INTEGER NOT NULL DEFAULT 0,
+			pr_url TEXT NOT NULL DEFAULT '',
+			pr_checks_json TEXT NOT NULL DEFAULT '[]',
+			pr_checks_sha TEXT NOT NULL DEFAULT '',
+			pr_checks_at TEXT NOT NULL DEFAULT '',
+			pr_merge_error TEXT NOT NULL DEFAULT '',
+			ci_fix_requested INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 			updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		);
@@ -76,6 +84,8 @@ func openTestDB(t *testing.T) *sql.DB {
 			sql_editor_url TEXT NOT NULL DEFAULT '',
 			supabase_enabled INTEGER NOT NULL DEFAULT 0,
 			supabase_keep_up INTEGER NOT NULL DEFAULT 0,
+			merge_mode TEXT NOT NULL DEFAULT '',
+			gh_config_dir TEXT NOT NULL DEFAULT '',
 			updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		);
 		CREATE TABLE IF NOT EXISTS task_comments (

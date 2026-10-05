@@ -83,6 +83,23 @@ type Card struct {
 	BranchDeleted bool `json:"branch_deleted"`
 	// BranchDeleteError holds the last cleanup failure; the merge still stands.
 	BranchDeleteError string `json:"branch_delete_error,omitempty"`
+	// MergeMode is the project's effective merge mode when the card was
+	// approved (STA-717): "direct", "open_pr" or "pr_merge". Empty until then.
+	MergeMode string `json:"merge_mode,omitempty"`
+	// PRNumber / PRURL identify the GitHub PR a PR-mode Approve opened or reused.
+	PRNumber int    `json:"pr_number,omitempty"`
+	PRURL    string `json:"pr_url,omitempty"`
+	// PRChecks is the last checks snapshot polled from GitHub, for the head
+	// in PRChecksSHA. PRChecksSummary is derived at read time.
+	PRChecks        []PRCheck `json:"pr_checks"`
+	PRChecksSHA     string    `json:"pr_checks_sha,omitempty"`
+	PRChecksAt      string    `json:"pr_checks_at,omitempty"`
+	PRChecksSummary string    `json:"pr_checks_summary,omitempty"`
+	// PRMergeError is GitHub's verbatim refusal from the last merge attempt.
+	PRMergeError string `json:"pr_merge_error,omitempty"`
+	// CIFixRequested is set when the Board sent CI failures back to the agent;
+	// the agent's resubmitted card then re-pushes the PR and re-runs checks.
+	CIFixRequested bool `json:"ci_fix_requested,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -373,6 +390,10 @@ func CreateCard(db *sql.DB, taskID, branch, headSHA string, testSteps []string, 
 		return nil, fmt.Errorf("marshal check_runs: %w", err)
 	}
 
+	// The PR outlives the card it was opened from: a resubmitted card keeps
+	// it, with its checks reset until the new head is pushed (STA-717).
+	prev := previousOpenPR(db, taskID)
+
 	// Replace any existing pending card for this task (agent iterating).
 	_, _ = db.Exec(`DELETE FROM ship_review_cards WHERE task_id = ? AND status IN ('pending', 'sent_back')`, taskID)
 
@@ -381,10 +402,10 @@ func CreateCard(db *sql.DB, taskID, branch, headSHA string, testSteps []string, 
 	_, err = db.Exec(`
 		INSERT INTO ship_review_cards
 			(id, task_id, branch, head_sha, test_steps_json, dev_url, dev_pid, status,
-			 files_changed_json, check_runs_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?)`,
+			 files_changed_json, check_runs_json, merge_mode, pr_number, pr_url, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
 		id, taskID, branch, headSHA, string(stepsJSON), devURL,
-		string(filesJSON), string(checksJSON),
+		string(filesJSON), string(checksJSON), prev.mode, prev.number, prev.url,
 		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -437,13 +458,16 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 		       COALESCE(files_changed_json, '[]'), COALESCE(check_runs_json, '[]'),
 		       COALESCE(dev_state,''), COALESCE(dev_log_json,'[]'),
 		       COALESCE(branch_deleted,0), COALESCE(branch_delete_error,''),
+		       COALESCE(merge_mode,''), COALESCE(pr_number,0), COALESCE(pr_url,''),
+		       COALESCE(pr_checks_json,'[]'), COALESCE(pr_checks_sha,''), COALESCE(pr_checks_at,''),
+		       COALESCE(pr_merge_error,''), COALESCE(ci_fix_requested,0),
 		       created_at, updated_at
 		FROM ship_review_cards
 		WHERE task_id = ?
 		ORDER BY created_at DESC LIMIT 1`, taskID)
 
 	var c Card
-	var stepsJSON, filesJSON, checksJSON, devLogJSON string
+	var stepsJSON, filesJSON, checksJSON, devLogJSON, prChecksJSON string
 	var approvedSHA, mainSHA, sendBack, reject sql.NullString
 	var createdAt, updatedAt string
 
@@ -453,6 +477,9 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 		&filesJSON, &checksJSON,
 		&c.DevState, &devLogJSON,
 		&c.BranchDeleted, &c.BranchDeleteError,
+		&c.MergeMode, &c.PRNumber, &c.PRURL,
+		&prChecksJSON, &c.PRChecksSHA, &c.PRChecksAt,
+		&c.PRMergeError, &c.CIFixRequested,
 		&createdAt, &updatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -471,6 +498,12 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 	}
 	if err := json.Unmarshal([]byte(devLogJSON), &c.DevLog); err != nil {
 		c.DevLog = []string{}
+	}
+	if err := json.Unmarshal([]byte(prChecksJSON), &c.PRChecks); err != nil || c.PRChecks == nil {
+		c.PRChecks = []PRCheck{}
+	}
+	if c.PRNumber > 0 && c.PRChecksSHA != "" {
+		c.PRChecksSummary = SummarizeChecks(c.PRChecks)
 	}
 	c.ApprovedSHA = approvedSHA.String
 	c.MainSHA = mainSHA.String
@@ -862,9 +895,27 @@ func BuildAndStartCard(ctx context.Context, db *sql.DB, taskID, repoPath string,
 		return nil, fmt.Errorf("cannot resolve branch HEAD for %q: %w", branch, err)
 	}
 
+	prev := previousOpenPR(db, taskID)
 	card, err := CreateCard(db, taskID, branch, headSHA, testSteps, devURL, repoPath, checkRuns)
 	if err != nil {
 		return nil, err
+	}
+
+	// STA-717: the Board sent CI failures back with "Send failures to agent",
+	// which asks for exactly this: push the fix to the PR and re-run checks.
+	// Fast-forward only; anything else waits for the Board's Approve.
+	if prev.ciFixReq && prev.mode == MergeModePRMerge && prev.number > 0 {
+		cfg, _ := GetProjectDevConfig(db, repoPath)
+		if auth, aErr := ResolveGHAuth(cfg, repoPath, IsWorkRepo(repoPath)); aErr != nil {
+			_ = SetPRMergeError(db, card.ID, "re-push to PR failed: "+aErr.Error())
+		} else if pr, pErr := OpenOrUpdatePR(ctx, auth, card, false); pErr != nil {
+			_ = SetPRMergeError(db, card.ID, "re-push to PR failed: "+pErr.Error())
+		} else {
+			_ = SetPROpened(db, card.ID, MergeModePRMerge, pr, card.HeadSHA)
+		}
+		if refreshed, gErr := GetCard(db, taskID); gErr == nil {
+			card = refreshed
+		}
 	}
 
 	// Auto-start dev server only from an explicitly human-saved project config.
@@ -1209,6 +1260,9 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 	defer cancel()
 	cmd := gitexec.Command(ctx, args...) //nolint:gosec
 	cmd.Dir = dir
+	if env := gitEnvFrom(ctx); env != nil {
+		cmd.Env = env
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -1251,19 +1305,29 @@ type ProjectDevConfig struct {
 	SupabaseEnabled bool     `json:"supabase_enabled"`
 	// SupabaseKeepUp prevents auto-stop of the local DB after review. Default false.
 	SupabaseKeepUp  bool     `json:"supabase_keep_up"`
+	// MergeMode is how Approve lands the branch (STA-717): "direct" merges
+	// locally and pushes main, "open_pr" only opens a GitHub PR, "pr_merge"
+	// opens a PR and merges it once CI is green. Empty means unset; see
+	// EffectiveMergeMode for the default.
+	MergeMode string `json:"merge_mode"`
+	// GHConfigDir is the GH_CONFIG_DIR used for this repo's gh and git push
+	// calls. Work repos must set it in the PR modes so the personal gh login
+	// is never used on them.
+	GHConfigDir string `json:"gh_config_dir"`
 }
 
 // GetProjectDevConfig loads the dev config for a repo path, or returns defaults.
 func GetProjectDevConfig(db *sql.DB, repoPath string) (*ProjectDevConfig, error) {
-	var stepsJSON, devCommand, devURL, migGlobsJSON, sqlEditorURL string
+	var stepsJSON, devCommand, devURL, migGlobsJSON, sqlEditorURL, mergeMode, ghConfigDir string
 	var supabaseEnabled, supabaseKeepUp int
 	err := db.QueryRow(
 		`SELECT dev_command, dev_url, setup_steps_json,
 		        COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
-		        COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0)
+		        COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0),
+		        COALESCE(merge_mode,''), COALESCE(gh_config_dir,'')
 		 FROM project_dev_configs WHERE repo_path = ?`,
 		repoPath,
-	).Scan(&devCommand, &devURL, &stepsJSON, &migGlobsJSON, &sqlEditorURL, &supabaseEnabled, &supabaseKeepUp)
+	).Scan(&devCommand, &devURL, &stepsJSON, &migGlobsJSON, &sqlEditorURL, &supabaseEnabled, &supabaseKeepUp, &mergeMode, &ghConfigDir)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return &ProjectDevConfig{RepoPath: repoPath}, nil
@@ -1277,6 +1341,8 @@ func GetProjectDevConfig(db *sql.DB, repoPath string) (*ProjectDevConfig, error)
 		SQLEditorURL:    sqlEditorURL,
 		SupabaseEnabled: supabaseEnabled != 0,
 		SupabaseKeepUp:  supabaseKeepUp != 0,
+		MergeMode:       mergeMode,
+		GHConfigDir:     ghConfigDir,
 	}
 	if err := json.Unmarshal([]byte(stepsJSON), &cfg.SetupSteps); err != nil {
 		cfg.SetupSteps = []string{}
@@ -1322,8 +1388,8 @@ func upsertDevConfig(exec devExecer, cfg *ProjectDevConfig) error {
 	_, err = exec.Exec(`
 		INSERT INTO project_dev_configs
 			(repo_path, dev_command, dev_url, setup_steps_json, migration_globs_json,
-			 sql_editor_url, supabase_enabled, supabase_keep_up, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			 sql_editor_url, supabase_enabled, supabase_keep_up, merge_mode, gh_config_dir, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 		ON CONFLICT(repo_path) DO UPDATE SET
 			dev_command          = excluded.dev_command,
 			dev_url              = excluded.dev_url,
@@ -1332,10 +1398,12 @@ func upsertDevConfig(exec devExecer, cfg *ProjectDevConfig) error {
 			sql_editor_url       = excluded.sql_editor_url,
 			supabase_enabled     = excluded.supabase_enabled,
 			supabase_keep_up     = excluded.supabase_keep_up,
+			merge_mode           = excluded.merge_mode,
+			gh_config_dir        = excluded.gh_config_dir,
 			updated_at           = excluded.updated_at`,
 		cfg.RepoPath, cfg.DevCommand, cfg.DevURL,
 		string(stepsJSON), string(migGlobsJSON), cfg.SQLEditorURL,
-		supabaseEnabled, supabaseKeepUp,
+		supabaseEnabled, supabaseKeepUp, cfg.MergeMode, cfg.GHConfigDir,
 	)
 	return err
 }
@@ -1345,7 +1413,8 @@ func ListProjectDevConfigs(db *sql.DB) ([]*ProjectDevConfig, error) {
 	rows, err := db.Query(`
 		SELECT repo_path, dev_command, dev_url, setup_steps_json,
 		       COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
-		       COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0)
+		       COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0),
+		       COALESCE(merge_mode,''), COALESCE(gh_config_dir,'')
 		FROM project_dev_configs ORDER BY repo_path`)
 	if err != nil {
 		return nil, err
@@ -1356,7 +1425,7 @@ func ListProjectDevConfigs(db *sql.DB) ([]*ProjectDevConfig, error) {
 		var c ProjectDevConfig
 		var stepsJSON, migGlobsJSON string
 		var supEnabled, supKeepUp int
-		if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL, &supEnabled, &supKeepUp); err != nil {
+		if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL, &supEnabled, &supKeepUp, &c.MergeMode, &c.GHConfigDir); err != nil {
 			continue
 		}
 		c.SupabaseEnabled = supEnabled != 0

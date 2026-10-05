@@ -1052,6 +1052,31 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version: 26,
+		Name:    "ship_review_merge_modes",
+		Up: func(conn *sql.DB) error {
+			// STA-717: per-project merge mode (direct / open_pr / pr_merge) and
+			// the GitHub PR + CI checks a PR-mode card is pinned to.
+			for _, stmt := range []string{
+				`ALTER TABLE project_dev_configs ADD COLUMN merge_mode    TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE project_dev_configs ADD COLUMN gh_config_dir TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN merge_mode       TEXT    NOT NULL DEFAULT '';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN pr_number        INTEGER NOT NULL DEFAULT 0;`,
+				`ALTER TABLE ship_review_cards ADD COLUMN pr_url           TEXT    NOT NULL DEFAULT '';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN pr_checks_json   TEXT    NOT NULL DEFAULT '[]';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN pr_checks_sha    TEXT    NOT NULL DEFAULT '';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN pr_checks_at     TEXT    NOT NULL DEFAULT '';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN pr_merge_error   TEXT    NOT NULL DEFAULT '';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN ci_fix_requested INTEGER NOT NULL DEFAULT 0;`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {

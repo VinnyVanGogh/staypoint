@@ -144,6 +144,14 @@ CREATE TABLE IF NOT EXISTS ship_review_cards (
     check_runs_json     TEXT NOT NULL DEFAULT '[]',
     branch_deleted      INTEGER NOT NULL DEFAULT 0,
     branch_delete_error TEXT NOT NULL DEFAULT '',
+    merge_mode          TEXT NOT NULL DEFAULT '',
+    pr_number           INTEGER NOT NULL DEFAULT 0,
+    pr_url              TEXT NOT NULL DEFAULT '',
+    pr_checks_json      TEXT NOT NULL DEFAULT '[]',
+    pr_checks_sha       TEXT NOT NULL DEFAULT '',
+    pr_checks_at        TEXT NOT NULL DEFAULT '',
+    pr_merge_error      TEXT NOT NULL DEFAULT '',
+    ci_fix_requested    INTEGER NOT NULL DEFAULT 0,
     created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );

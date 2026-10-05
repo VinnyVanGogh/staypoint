@@ -69,6 +69,11 @@ func (h *ShipReviewHandler) GetCard(w http.ResponseWriter, r *http.Request) {
 		if jsonErr := json.Unmarshal(cardBytes, &merged); jsonErr == nil {
 			merged["unverified_migrations"] = unverified
 			merged["repo_name"] = filepath.Base(task.RepoPath)
+			if cfg, cfgErr := shipreview.GetProjectDevConfig(h.db, task.RepoPath); cfgErr == nil {
+				isWork := shipreview.IsWorkRepo(task.RepoPath)
+				merged["is_work_repo"] = isWork
+				merged["effective_merge_mode"] = shipreview.EffectiveMergeMode(cfg, isWork)
+			}
 			if gitErr != nil {
 				// The card itself is DB-only; return it and say why the
 				// migration check is missing rather than hanging or erroring.
@@ -394,6 +399,18 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 		_ = context.LogActivity(h.db, taskID, "migration_override", string(logPayload))
 	}
 
+	// STA-717: projects in a PR mode land through GitHub instead.
+	cfg, err := shipreview.GetProjectDevConfig(h.db, task.RepoPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
+		return
+	}
+	isWork := shipreview.IsWorkRepo(task.RepoPath)
+	if mode := shipreview.EffectiveMergeMode(cfg, isWork); mode != shipreview.MergeModeDirect {
+		h.approvePR(w, r, card, task, cfg, mode, isWork)
+		return
+	}
+
 	// Always merge from the repo root (on main), never from a task worktree which
 	// may be gone or have main checked out elsewhere (causing checkout conflicts).
 	mainSHA, err := shipreview.ApproveAndMerge(r.Context(), h.db, card, task.RepoPath, "main")
@@ -421,7 +438,7 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 	// STA-637: the task branch is kept while the review is open and deleted
 	// once merged. A failed delete never undoes the merge; the Board retries
 	// from the final card via POST .../ship-review/delete-branch.
-	deleteErr := h.cleanupMergedBranch(r, card, task, mainSHA)
+	deleteErr := h.cleanupMergedBranch(r.Context(), card, task, mainSHA)
 
 	_ = governance.LogEvent(h.db, taskID, "board", governance.AuditBoardAction, nil, nil,
 		map[string]any{"action": "approve", "ip": r.RemoteAddr, "user_agent": r.UserAgent(),
@@ -463,7 +480,16 @@ func (h *ShipReviewHandler) DeleteMergedBranch(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	deleteErr := h.cleanupMergedBranch(r, card, task, card.MainSHA)
+	ctx := r.Context()
+	if card.PRNumber > 0 {
+		// Merged through GitHub: delete with the repo's own gh identity.
+		auth, ok := h.requireGHAuth(w, task)
+		if !ok {
+			return
+		}
+		ctx = auth.WithAuth(ctx)
+	}
+	deleteErr := h.cleanupMergedBranch(ctx, card, task, card.MainSHA)
 	_ = governance.LogBoardEvent(h.db, "board", governance.AuditBoardAction,
 		branchAuditPayload(r, "delete_branch_retry", taskID, card.Branch, card.MainSHA, deleteErr))
 	h.hub.Publish("ship_review_branch_cleanup", map[string]any{
@@ -487,10 +513,10 @@ func (h *ShipReviewHandler) DeleteMergedBranch(w http.ResponseWriter, r *http.Re
 
 // cleanupMergedBranch deletes the merged task branch and records the outcome
 // on the card. Returns the failure message, or "" when the branch is gone.
-func (h *ShipReviewHandler) cleanupMergedBranch(r *http.Request, card *shipreview.Card, task *context.Task, mainSHA string) string {
+func (h *ShipReviewHandler) cleanupMergedBranch(reqCtx gocontext.Context, card *shipreview.Card, task *context.Task, mainSHA string) string {
 	// Detach from the request so a closed browser tab can't abort the git
 	// commands halfway through.
-	ctx := gocontext.WithoutCancel(r.Context())
+	ctx := gocontext.WithoutCancel(reqCtx)
 	errMsg := ""
 	if err := shipreview.CleanupMergedBranch(ctx, task.RepoPath, card, mainSHA); err != nil {
 		errMsg = err.Error()
@@ -521,6 +547,9 @@ func (h *ShipReviewHandler) SendBack(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Comment string `json:"comment"`
+		// CIFailures marks a "Send failures to agent": the agent's resubmitted
+		// card is pushed to the PR and its checks re-run (STA-717).
+		CIFailures bool `json:"ci_failures"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.Comment == "" {
@@ -532,11 +561,18 @@ func (h *ShipReviewHandler) SendBack(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	ciFix := req.CIFailures && card.MergeMode == shipreview.MergeModePRMerge && card.PRNumber > 0
+	if ciFix {
+		if err := shipreview.SetCIFixRequested(h.db, card.ID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 
 	shipreview.StopDevServer(h.db, card)
 	_ = context.AddTaskComment(h.db, taskID, "board", req.Comment)
 	_ = governance.LogEvent(h.db, taskID, "board", governance.AuditBoardAction, nil, nil,
-		map[string]string{"action": "send_back", "ip": r.RemoteAddr, "user_agent": r.UserAgent()})
+		map[string]any{"action": "send_back", "ci_failures": ciFix, "ip": r.RemoteAddr, "user_agent": r.UserAgent()})
 
 	h.hub.Publish("ship_review_sent_back", map[string]any{
 		"task_id": taskID,
@@ -566,7 +602,15 @@ func (h *ShipReviewHandler) Reject(w http.ResponseWriter, r *http.Request) {
 	shipreview.StopDevServer(h.db, card)
 
 	if req.DeleteBranch {
-		if err := shipreview.DeleteBranch(r.Context(), task.RepoPath, card.Branch); err != nil {
+		ctx := r.Context()
+		if card.PRNumber > 0 {
+			auth, ok := h.requireGHAuth(w, task)
+			if !ok {
+				return
+			}
+			ctx = auth.WithAuth(ctx)
+		}
+		if err := shipreview.DeleteBranch(ctx, task.RepoPath, card.Branch); err != nil {
 			writeError(w, http.StatusConflict, "delete branch failed: "+err.Error())
 			return
 		}
@@ -623,10 +667,17 @@ func (h *ShipReviewHandler) ListProjectDevConfigs(w http.ResponseWriter, r *http
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if cfgs == nil {
-		cfgs = []*shipreview.ProjectDevConfig{}
+	type configView struct {
+		*shipreview.ProjectDevConfig
+		IsWorkRepo         bool   `json:"is_work_repo"`
+		EffectiveMergeMode string `json:"effective_merge_mode"`
 	}
-	writeJSON(w, map[string]any{"configs": cfgs})
+	views := make([]configView, 0, len(cfgs))
+	for _, c := range cfgs {
+		isWork := shipreview.IsWorkRepo(c.RepoPath)
+		views = append(views, configView{c, isWork, shipreview.EffectiveMergeMode(c, isWork)})
+	}
+	writeJSON(w, map[string]any{"configs": views})
 }
 
 // devConfigUpdateReq is the partial-update request body for PUT /api/project-dev-configs.
@@ -641,6 +692,8 @@ type devConfigUpdateReq struct {
 	SQLEditorURL    *string   `json:"sql_editor_url"`
 	SupabaseEnabled *bool     `json:"supabase_enabled"`
 	SupabaseKeepUp  *bool     `json:"supabase_keep_up"`
+	MergeMode       *string   `json:"merge_mode"`
+	GHConfigDir     *string   `json:"gh_config_dir"`
 }
 
 // UpsertProjectDevConfig handles PUT /api/project-dev-configs.
@@ -667,6 +720,14 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+	}
+	if req.MergeMode != nil && !shipreview.ValidMergeMode(*req.MergeMode) {
+		writeError(w, http.StatusBadRequest, shipreview.ErrInvalidMergeMode.Error())
+		return
+	}
+	if req.GHConfigDir != nil && *req.GHConfigDir != "" && !filepath.IsAbs(*req.GHConfigDir) {
+		writeError(w, http.StatusBadRequest, "gh_config_dir must be an absolute path")
+		return
 	}
 
 	old, err := shipreview.GetProjectDevConfig(h.db, req.RepoPath)
@@ -697,6 +758,12 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 	if req.SupabaseKeepUp != nil {
 		cfg.SupabaseKeepUp = *req.SupabaseKeepUp
 	}
+	if req.MergeMode != nil {
+		cfg.MergeMode = *req.MergeMode
+	}
+	if req.GHConfigDir != nil {
+		cfg.GHConfigDir = *req.GHConfigDir
+	}
 
 	// Audit failure must roll back the config write; both go in one transaction.
 	tx, txErr := h.db.Begin()
@@ -717,6 +784,10 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 		"new_dev_command": cfg.DevCommand,
 		"old_setup_steps": old.SetupSteps,
 		"new_setup_steps": cfg.SetupSteps,
+		"old_merge_mode":    old.MergeMode,
+		"new_merge_mode":    cfg.MergeMode,
+		"old_gh_config_dir": old.GHConfigDir,
+		"new_gh_config_dir": cfg.GHConfigDir,
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "audit log write failed: "+err.Error())
 		return
