@@ -48,6 +48,8 @@ const state = {
 const STORAGE_PROJECTS_ORGS_KEY = 'staypoint_projects_selected_orgs';
 const STORAGE_PROJECTS_STATUS_KEY = 'staypoint_projects_status_filter';
 const STORAGE_PROJECTS_CARD_STATUS_KEY = 'staypoint_projects_card_status';
+// Task page "Messages (n)" thread toggle (STA-643).
+const STORAGE_TASK_PAGE_CHAT_OPEN_KEY = 'staypoint_task_page_chat_open';
 
 function loadProjectsFilters() {
   try {
@@ -6224,7 +6226,13 @@ async function refreshChatMessages(taskId) {
     renderChatMessages(messagesDiv, comments);
     if (atBottom) messagesDiv.scrollTop = messagesDiv.scrollHeight;
     if (titleEl) titleEl.textContent = `Chat (${comments.length})`;
+    const pageToggle = document.getElementById('page-chat-toggle');
+    if (pageToggle) pageToggle.textContent = chatToggleLabel(comments.length);
   } catch { /* silent */ }
+}
+
+function chatToggleLabel(n) {
+  return `Messages (${n})`;
 }
 
 function renderChatMessages(container, comments) {
@@ -7003,6 +7011,86 @@ async function fetchFileDiff(taskId, filePath, checkpointId) {
   } catch {
     return { path: filePath, content: '', binary: false, truncated: false, status: 'modified' };
   }
+}
+
+// ── Long-content modal (STA-643) ─────────────────────────────
+// Long blocks on the task page (brief, dev-server log, agent summary,
+// migration SQL) show a bounded preview plus an "Open" button that shows the
+// whole thing in this one shared dialog. getContent runs at click time, so
+// the dialog includes live updates (dev log progress, an edited brief).
+function longContentTrigger(key, title, getContent) {
+  const btn = el('button', 'btn btn-secondary btn-sm long-content-open', 'Open');
+  btn.type = 'button';
+  btn.dataset.modalTrigger = key;
+  btn.setAttribute('aria-haspopup', 'dialog');
+  btn.setAttribute('aria-label', `Open full ${title.toLowerCase()}`);
+  btn.addEventListener('click', () => openContentModal(title, getContent()));
+  return btn;
+}
+
+// Copies a rendered block's children (already sanitized markdown) for the dialog.
+function cloneChildren(src, cls) {
+  const out = el('div', cls);
+  if (src) src.childNodes.forEach((n) => out.appendChild(n.cloneNode(true)));
+  return out;
+}
+
+function closeContentModal() {
+  const open = document.querySelector('.content-modal');
+  if (open && open._close) open._close();
+}
+
+function openContentModal(title, content) {
+  closeContentModal();
+  const opener = document.activeElement;
+
+  const overlay = el('div', 'content-modal');
+  const box = el('div', 'content-modal-box');
+  const titleId = `content-modal-title-${Date.now()}`;
+  box.setAttribute('role', 'dialog');
+  box.setAttribute('aria-modal', 'true');
+  box.setAttribute('aria-labelledby', titleId);
+
+  const header = el('div', 'content-modal-header');
+  const h = el('h2', 'content-modal-title', title);
+  h.id = titleId;
+  header.appendChild(h);
+  const closeBtn = el('button', 'content-modal-close', '✕');
+  closeBtn.type = 'button';
+  closeBtn.setAttribute('aria-label', 'Close');
+  header.appendChild(closeBtn);
+  box.appendChild(header);
+
+  const body = el('div', 'content-modal-body');
+  body.tabIndex = 0; // keyboard scrolling
+  body.appendChild(content);
+  box.appendChild(body);
+  overlay.appendChild(box);
+
+  const onKey = (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); return; }
+    if (e.key !== 'Tab') return;
+    // Keep focus inside the dialog.
+    const focusables = [...box.querySelectorAll('button, [href], [tabindex]:not([tabindex="-1"])')];
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  };
+  function close() {
+    document.removeEventListener('keydown', onKey, true);
+    overlay.remove();
+    if (opener && opener.isConnected && typeof opener.focus === 'function') opener.focus();
+  }
+  overlay._close = close;
+  closeBtn.addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  // Capture phase + stopPropagation: Escape closes only this dialog, not the
+  // detail panel or task page behind it.
+  document.addEventListener('keydown', onKey, true);
+
+  document.body.appendChild(overlay);
+  closeBtn.focus();
 }
 
 // ── File diff modal ──────────────────────────────────────────
@@ -7854,6 +7942,7 @@ function updateDevProgressUI(taskId, step, message, ok) {
   if (!logEl) {
     logEl = el('pre', 'ship-review-devenv-log', '');
     row.appendChild(logEl);
+    row.appendChild(devLogTrigger(logEl));
   }
   const icon = ok ? '✓' : '✗';
   logEl.textContent += `${icon} ${message}\n`;
@@ -7869,6 +7958,11 @@ function clearShipReviewHeaderActions(taskId) {
   document.getElementById(`task-page-review-actions-${taskId}`)?.replaceChildren();
   document.getElementById(`task-page-action-tray-${taskId}`)
     ?.querySelectorAll('.ship-review-actions-wrap').forEach((n) => n.remove());
+}
+
+function devLogTrigger(logEl) {
+  return longContentTrigger('dev-log', 'Dev-server log',
+    () => el('pre', 'content-modal-pre', logEl.textContent));
 }
 
 function renderShipReviewCardFromData(container, taskId, card) {
@@ -7908,8 +8002,12 @@ function renderShipReviewCardFromData(container, taskId, card) {
   // Agent summary — most recent harness-posted run summary for this task.
   if (card.agent_summary) {
     const summarySection = el('div', 'ship-review-summary-section');
-    summarySection.appendChild(el('div', 'ship-review-section-title', 'Agent summary'));
     const summaryBody = el('div', 'ship-review-summary-body markdown-body');
+    const summaryHead = el('div', 'long-content-head');
+    summaryHead.appendChild(el('div', 'ship-review-section-title', 'Agent summary'));
+    summaryHead.appendChild(longContentTrigger('agent-summary', 'Agent summary',
+      () => cloneChildren(summaryBody, 'markdown-body')));
+    summarySection.appendChild(summaryHead);
     // The completion marker is harness plumbing, not part of the summary.
     summaryBody.innerHTML = renderMarkdown(card.agent_summary.replace(/^\s*\[\[TASK_COMPLETE\]\]\s*$/gm, '').trim());
     summarySection.appendChild(summaryBody);
@@ -7948,6 +8046,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
     if (card.dev_log && card.dev_log.length > 0) {
       const logEl = el('pre', 'ship-review-devenv-log', card.dev_log.join('\n'));
       devEnvRow.appendChild(logEl);
+      devEnvRow.appendChild(devLogTrigger(logEl));
     }
     section.appendChild(devEnvRow);
   }
@@ -8558,6 +8657,14 @@ async function renderMigrationsPanel(container, taskId) {
     // Action row: Copy + Mark applied
     const actions = el('div', 'migration-actions');
 
+    actions.appendChild(longContentTrigger('migration-sql', `Migration SQL: ${mig.path}`, () => {
+      const full = el('pre', 'content-modal-pre migration-sql-full');
+      const c = document.createElement('code');
+      c.innerHTML = highlightSQL(mig.sql || '');
+      full.appendChild(c);
+      return full;
+    }));
+
     const copyBtn = el('button', 'btn btn-secondary btn-sm migration-copy-btn', 'Copy SQL');
     copyBtn.title = 'Copy SQL to clipboard';
     copyBtn.disabled = !mig.sql;
@@ -8950,6 +9057,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   descEditBtn.title = 'Edit description';
   descEditBtn.style.cssText = 'font-size:0.85rem;padding:2px 6px;cursor:pointer;opacity:0.6;';
   descTitleRow.appendChild(descEditBtn);
+  descTitleRow.appendChild(longContentTrigger('brief', 'Brief', () => cloneChildren(descView, 'desc-full')));
   descSection.appendChild(descTitleRow);
   let desc = (task.description || '').trim();
   const descView = el('div', 'desc-view');
@@ -9122,8 +9230,9 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     showNoMigrations();
   }
 
-  // Agent interaction (chat): recent messages above a composer pinned to the
-  // bottom of the page.
+  // Agent interaction (chat): only the composer row is pinned to the bottom of
+  // the page. The thread sits behind a "Messages (n)" toggle in that row and
+  // opens in place above it (STA-643).
   const chatSection = el('div', 'task-page-dock');
   chatSection.id = 'page-chat-section';
 
@@ -9132,7 +9241,24 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   renderChatMessages(messagesDiv, comments || []);
   chatSection.appendChild(messagesDiv);
 
+  const chatToggle = el('button', 'btn btn-secondary btn-sm task-page-chat-toggle', chatToggleLabel((comments || []).length));
+  chatToggle.type = 'button';
+  chatToggle.id = 'page-chat-toggle';
+  chatToggle.setAttribute('aria-controls', 'page-chat-messages');
+  // Open/closed is the Board's preference, so it survives reloads.
+  const setChatOpen = (open) => {
+    try { localStorage.setItem(STORAGE_TASK_PAGE_CHAT_OPEN_KEY, open ? '1' : '0'); } catch { /* storage blocked */ }
+    messagesDiv.hidden = !open;
+    chatToggle.setAttribute('aria-expanded', String(open));
+    if (open) messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  };
+  let chatOpen = false;
+  try { chatOpen = localStorage.getItem(STORAGE_TASK_PAGE_CHAT_OPEN_KEY) === '1'; } catch { /* storage blocked */ }
+  setChatOpen(chatOpen);
+  chatToggle.addEventListener('click', () => setChatOpen(messagesDiv.hidden));
+
   const compose = el('div', 'chat-compose task-page-composer');
+  compose.appendChild(chatToggle);
   const textarea = document.createElement('textarea');
   textarea.className = 'chat-textarea';
   textarea.placeholder = 'Message the agent. Delivered at the next step boundary (⌘↵ to send)';
@@ -9154,6 +9280,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     try {
       await sendComment(taskId, body);
       await refreshChatMessages(taskId);
+      setChatOpen(true); // show the message that was just sent
     } catch { /* silent */ } finally {
       sendBtn.disabled = false;
       textarea.focus();
