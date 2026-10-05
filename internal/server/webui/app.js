@@ -328,8 +328,10 @@ async function refreshBoardPasskeyStatus() {
 
 // enrollBoardPasskey runs boardEnrollPasskey for an explicit "Enroll passkey"
 // click. A second passkey needs an assertion from an existing one, so that is
-// collected first when one is already enrolled. Returns true on success;
-// failures are reported with an alert.
+// collected first when one is believed enrolled; if the server says none is
+// (the cached state was stale), it enrolls as the first passkey instead.
+// Returns true on success; failures, including the daemon's "Couldn't show
+// the pairing code: …" (STA-696), are reported with an alert.
 let boardEnrollInFlight = false;
 async function enrollBoardPasskey() {
   if (boardEnrollInFlight) return false;
@@ -337,7 +339,12 @@ async function enrollBoardPasskey() {
   try {
     let sessionToken, assertion;
     if (boardPasskeyState.registered) {
-      ({ sessionToken, assertion } = await boardWebAuthnGetAssertion());
+      try {
+        ({ sessionToken, assertion } = await boardWebAuthnGetAssertion());
+      } catch (e) {
+        if (!e.needsEnrollment) throw e;
+        boardPasskeyState.registered = false;
+      }
     }
     await boardEnrollPasskey(sessionToken, assertion);
     return true;
@@ -369,6 +376,7 @@ async function withBoardWebAuthn(fetchFn, actionLabel) {
     ({ sessionToken, assertion } = await boardWebAuthnGetAssertion());
   } catch (e) {
     if (!e.needsEnrollment) throw e;
+    boardPasskeyState.registered = false;
     const doEnroll = confirm(
       'Board actions require a registered passkey.\n\nClick OK to enroll a passkey now, or Cancel to abort.');
     if (!doEnroll || !(await enrollBoardPasskey())) return null;
@@ -4358,7 +4366,7 @@ async function refreshSettingsPasskeys() {
     creds.length ? `${creds.length} passkey${creds.length === 1 ? '' : 's'} enrolled` : 'No passkeys enrolled'));
   enrollLbl.appendChild(el('div', 'settings-row-sub', creds.length
     ? 'Adding another passkey asks for an existing one first.'
-    : 'Board actions are locked until a passkey is enrolled. You will need the pairing code from the macOS notification.'));
+    : 'Board actions are locked until a passkey is enrolled. You will need the pairing code shown in the StayPoint Board dialog.'));
   enrollRow.appendChild(enrollLbl);
   const enrollBtn = el('button', 'btn btn-primary settings-enroll-passkey-btn', 'Enroll passkey');
   enrollBtn.type = 'button';
