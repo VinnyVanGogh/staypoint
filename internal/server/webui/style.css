@@ -23,6 +23,7 @@
   --shadow:    0 4px 16px rgba(0,0,0,.4);
   --sidebar-w: 220px;
   --header-h:  49px;
+  --passkey-banner-h: 0px;
 }
 
 html, body {
@@ -56,9 +57,22 @@ html, body {
 /* ── App Layout ─────────────────────────────────────────── */
 .app-layout {
   display: flex;
-  height: calc(100vh - var(--header-h));
+  height: calc(100vh - var(--header-h) - var(--passkey-banner-h));
   overflow: hidden;
 }
+
+/* "No passkey enrolled" banner (STA-694): shown under the header for a Board
+   session with zero passkeys; --passkey-banner-h keeps the layout one screen. */
+body.has-passkey-banner { --passkey-banner-h: 40px; }
+.board-passkey-banner {
+  display: flex; align-items: center; justify-content: center; gap: 12px;
+  height: var(--passkey-banner-h); padding: 0 20px; flex-shrink: 0;
+  background: rgba(245, 158, 11, 0.14); border-bottom: 1px solid rgba(245, 158, 11, 0.4);
+  color: var(--amber); font-size: 13px; font-weight: 600;
+  position: sticky; top: var(--header-h); z-index: 199;
+}
+.board-passkey-banner[hidden] { display: none; }
+.board-passkey-banner-btn { padding: 4px 12px; font-size: 12px; }
 
 /* ── Sidebar ────────────────────────────────────────────── */
 .sidebar {
@@ -719,7 +733,7 @@ html, body {
   position: fixed;
   left: var(--sidebar-w);
   right: 0;
-  top: var(--header-h);
+  top: calc(var(--header-h) + var(--passkey-banner-h));
   bottom: 0;
   width: auto;
   max-width: none;
