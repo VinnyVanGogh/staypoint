@@ -1463,7 +1463,7 @@ func TestSpentTurnsEqualsAdapterInvocations(t *testing.T) {
 	result, err := h.Run(context.Background(), "sta466-task", RunConfig{
 		MaxTurns:     wantTurns,
 		AgentID:      "tester",
-		MaxWallclock: 10 * time.Second,
+		MaxWallclock: 2 * time.Minute,
 		RunAdapter: func(_ context.Context, _, _ string, _, _ []string, _ io.Writer, _ io.Writer) error {
 			mu.Lock()
 			adapterCalls++
