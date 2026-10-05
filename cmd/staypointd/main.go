@@ -235,12 +235,8 @@ func runDaemon(ctx context.Context) error {
 		hub := httpServer.Hub()
 		repoChecker.Publish = func(eventType string, data any) { hub.Publish(eventType, data) }
 	}
-	go repoChecker.Run(ctx, 10*time.Minute, func() []repoaccess.Target {
-		targets, err := repoaccess.RepoTargets(dbStore.DB(), cfg.HarnessRepoRoot)
-		if err != nil {
-			slog.Warn("repo access check: listing repo paths failed", slog.Any("error", err))
-		}
-		return targets
+	go repoChecker.Run(ctx, 10*time.Minute, func() ([]repoaccess.Target, error) {
+		return repoaccess.RepoTargets(dbStore.DB(), cfg.HarnessRepoRoot)
 	})
 
 	// 5. Wire GlobalDispatcher.OnWake to launch harness runs.

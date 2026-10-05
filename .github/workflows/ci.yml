@@ -107,6 +107,12 @@ jobs:
       - name: Run Tests (with race detector)
         run: go test -v -race ./...
 
+      # repoaccess builds for Windows, tests included (STA-697). The rest of the
+      # module does not cross-build yet, so this is scoped to the package.
+      - name: Vet repoaccess for Windows
+        if: matrix.os == 'ubuntu-latest'
+        run: GOOS=windows go vet ./internal/repoaccess/...
+
       - name: Run govulncheck
         uses: golang/govulncheck-action@v1
         if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25'
