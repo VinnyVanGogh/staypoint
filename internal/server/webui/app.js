@@ -619,8 +619,8 @@ function handleEvent(evt) {
     const d = evt.data;
     const tid = d.task_id;
     if (tid && state.openDetailTaskId === tid) {
-      // Reload the task page so the ship review card updates.
-      const slot = document.querySelector('#task-page-content .task-page-review-card-slot');
+      // Reload the ship review card in the task page or the drawer.
+      const slot = document.querySelector('#task-page-content .task-page-review-card-slot, #panel-content .task-page-review-card-slot');
       if (slot) {
         const existing = document.getElementById(`ship-review-${tid}`);
         if (existing) existing.remove();
@@ -6444,13 +6444,11 @@ async function refreshChatMessages(taskId) {
     const comments = cr.comments || (Array.isArray(cr) ? cr : []);
     state.taskComments[taskId] = comments;
     if (state.tasks[taskId]) state.tasks[taskId].comments = comments;
-    const messagesDiv = document.getElementById('panel-chat-messages') || document.getElementById('page-chat-messages');
-    const titleEl = document.querySelector('#panel-chat-section .panel-section-title') || document.querySelector('#page-chat-section .panel-section-title');
+    const messagesDiv = document.getElementById('page-chat-messages');
     if (!messagesDiv) return;
     const atBottom = messagesDiv.scrollHeight - messagesDiv.scrollTop <= messagesDiv.clientHeight + 30;
     renderChatMessages(messagesDiv, comments);
     if (atBottom) messagesDiv.scrollTop = messagesDiv.scrollHeight;
-    if (titleEl) titleEl.textContent = `Chat (${comments.length})`;
     const pageToggle = document.getElementById('page-chat-toggle');
     if (pageToggle) pageToggle.textContent = chatToggleLabel(comments.length);
   } catch { /* silent */ }
@@ -6481,57 +6479,6 @@ function renderChatMessages(container, comments) {
     msg.appendChild(bubble);
     container.appendChild(msg);
   }
-}
-
-function buildChatSection(container, taskId, comments) {
-  const section = el('div', 'chat-section');
-  section.id = 'panel-chat-section';
-  section.appendChild(el('div', 'panel-section-title', `Chat (${comments.length})`));
-
-  const messagesDiv = el('div', 'chat-messages');
-  messagesDiv.id = 'panel-chat-messages';
-  renderChatMessages(messagesDiv, comments);
-  section.appendChild(messagesDiv);
-
-  const compose = el('div', 'chat-compose');
-  const textarea = document.createElement('textarea');
-  textarea.className = 'chat-textarea';
-  textarea.placeholder = 'Message the agent… (⌘↵ to send)';
-  textarea.rows = 2;
-  const autoResizeChat = () => {
-    textarea.style.height = 'auto';
-    textarea.style.height = Math.max(38, Math.min(220, textarea.scrollHeight)) + 'px';
-  };
-  textarea.addEventListener('input', autoResizeChat);
-  const sendBtn = el('button', 'chat-send-btn', 'Send');
-  sendBtn.type = 'button';
-
-  const doSend = async () => {
-    const body = textarea.value.trim();
-    if (!body) return;
-    textarea.value = '';
-    textarea.style.height = '';
-    sendBtn.disabled = true;
-    try {
-      await sendComment(taskId, body);
-      await refreshChatMessages(taskId);
-    } catch { /* ignore send error visually */ } finally {
-      sendBtn.disabled = false;
-      textarea.focus();
-    }
-  };
-
-  sendBtn.addEventListener('click', doSend);
-  textarea.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); doSend(); }
-  });
-
-  compose.appendChild(textarea);
-  compose.appendChild(sendBtn);
-  section.appendChild(compose);
-  container.appendChild(section);
-
-  messagesDiv.scrollTop = messagesDiv.scrollHeight;
 }
 
 async function sendComment(taskId, body) {
@@ -6570,110 +6517,11 @@ function addPanelField(content, label, value) {
   content.appendChild(field);
 }
 
-function renderDetailContent(content, task) {
-  content.innerHTML = '';
-
-  // Title
-  const title = task.title || task.name || '(untitled)';
-  content.appendChild(el('h2', 'panel-title', title));
-
-  // Meta row: explicitly labeled fields for Status, Identifier, Priority, Org, Stage
-  const metaRow = el('div', 'panel-meta-row');
-
-  const ident = task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : null);
-  if (ident) {
-    const idWrap = el('div', 'panel-meta-item');
-    idWrap.innerHTML = `<span class="panel-meta-tag-label">Identifier</span><span class="card-id panel-meta-value">${escapeHtml(ident)}</span>`;
-    metaRow.appendChild(idWrap);
-  }
-
-  const statusWrap = el('div', 'panel-meta-item');
-  statusWrap.innerHTML = `<span class="panel-meta-tag-label">Status</span>`;
-  statusWrap.appendChild(statusPill(task.status || 'unknown'));
-  metaRow.appendChild(statusWrap);
-
-  if (task.priority) {
-    const prioWrap = el('div', 'panel-meta-item');
-    prioWrap.innerHTML = `<span class="panel-meta-tag-label">Priority</span>`;
-    prioWrap.appendChild(statusPill(task.priority));
-    metaRow.appendChild(prioWrap);
-  }
-
-  if (task.organization) {
-    const orgWrap = el('div', 'panel-meta-item');
-    orgWrap.innerHTML = `<span class="panel-meta-tag-label">Org</span>`;
-    orgWrap.appendChild(el('span', 'pill', task.organization));
-    metaRow.appendChild(orgWrap);
-  }
-
-  const stage = task.execution_stage || task.status;
-  if (stage) {
-    const stageWrap = el('div', 'panel-meta-item');
-    stageWrap.innerHTML = `<span class="panel-meta-tag-label">Stage</span><span class="pill stage-pill">${escapeHtml(stage)}</span>`;
-    metaRow.appendChild(stageWrap);
-  }
-
-  content.appendChild(metaRow);
-
-  // Description (with fallback to first comment)
-  let desc = (task.description || '').trim();
-  if (!desc && task.comments && task.comments.length) {
-    for (const c of task.comments) {
-      const commentBody = (c.body || c.message || c.content || '').trim();
-      if (commentBody) {
-        desc = commentBody;
-        break;
-      }
-    }
-  }
-  const descField = el('div', 'panel-field');
-  descField.appendChild(el('div', 'panel-field-label', 'Description'));
-  if (desc) {
-    descField.appendChild(mdEl(desc));
-  } else {
-    descField.appendChild(el('div', 'panel-field-muted', 'No description provided.'));
-  }
-  content.appendChild(descField);
-
-  // Properties grid with explicit typography labels
-  if (ident)                         addPanelField(content, 'Identifier', ident);
-  if (task.priority)                 addPanelField(content, 'Priority',   task.priority);
-  if (task.organization)             addPanelField(content, 'Org',        task.organization);
-  addPanelField(content, 'Stage',    task.execution_stage || task.status);
-  addPanelField(content, 'Assignee',     task.assignee_name || task.checkout_agent_id || null);
-  addPanelField(content, 'Kind of work', workKindLabel(task.work_kind));
-  addPanelField(content, 'Project',      task.project || null);
-  addPanelField(content, 'Goal',     task.goal_title || task.goal_id ? (task.goal_title || task.goal_id?.slice(0, 12)) : null);
-  addPanelField(content, 'Repo',     task.repo_path ? `${task.repo_path} (${task.git_branch || 'main'})` : null);
-
-  // Labels rendering as colorful badges
-  let labels = task.labels;
-  if (typeof labels === 'string') {
-    try { labels = JSON.parse(labels); } catch { labels = labels ? [labels] : []; }
-  }
-  if (Array.isArray(labels) && labels.length) {
-    const lblWrap = el('div', 'panel-field');
-    lblWrap.appendChild(el('div', 'panel-field-label', 'Labels'));
-    const badgeContainer = el('div', 'panel-labels-container');
-    badgeContainer.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;';
-    for (const l of labels) {
-      const name = typeof l === 'object' ? l.name : l;
-      const color = typeof l === 'object' && l.color ? l.color : '#38bdf8';
-      const badge = el('span', 'task-label-badge', name);
-      badge.style.cssText = `font-size:0.75rem;padding:2px 8px;border-radius:12px;font-weight:600;background:${color}22;border:1px solid ${color};color:${color};`;
-      badgeContainer.appendChild(badge);
-    }
-    lblWrap.appendChild(badgeContainer);
-    content.appendChild(lblWrap);
-  }
-
-  // Spend (always displayed so user sees tracking status)
-  addPanelField(content, 'Spend',
-    `${fmtCurrency(task.spent_usd || 0)} · ${fmtCompactNum(task.spent_tokens || 0)} tokens`);
-
-  // Budget
-  addPanelField(content, 'Budget', `${fmtCurrency(task.max_budget_usd || 0)} · ${task.max_turns || 50} runs max`);
-
+// Governance, blockers, dependency tree, parent and timestamps for the task
+// page Details section. These lived only in the old one-column drawer; the
+// drawer now renders the task page layout (STA-700), so both views show them.
+// openTask opens a linked task in the same view the user is in.
+function appendTaskRelations(target, task, openTask) {
   // Governance Section: Reviewers, Approvers, Quality Gates
   const gov = task.governance;
   if (gov || task.reviewers?.length || task.approvers?.length) {
@@ -6743,7 +6591,7 @@ function renderDetailContent(content, task) {
     gateInfo.appendChild(el('div', 'panel-field-value', `Review: ${reqReview} · Approval Threshold: ${thresh}`));
     govSection.appendChild(gateInfo);
 
-    content.appendChild(govSection);
+    target.appendChild(govSection);
   }
 
   // Blocker Status & Upstream Dependencies
@@ -6771,7 +6619,7 @@ function renderDetailContent(content, task) {
 
     const tag = el('span', 'panel-blocker-tag', blockerSummary);
     blockerWrap.appendChild(tag);
-    content.appendChild(blockerWrap);
+    target.appendChild(blockerWrap);
   }
 
   // Clickable Upstream Blockers ("Blocked By")
@@ -6787,7 +6635,7 @@ function renderDetailContent(content, task) {
       card.style.cssText = 'padding:8px 10px;background:rgba(255,255,255,0.04);border:1px solid rgba(248,81,73,0.3);border-radius:6px;cursor:pointer;transition:all 0.15s ease;display:flex;flex-direction:column;gap:3px;';
       card.addEventListener('mouseenter', () => { card.style.background = 'rgba(248,81,73,0.1)'; card.style.borderColor = 'var(--red)'; });
       card.addEventListener('mouseleave', () => { card.style.background = 'rgba(255,255,255,0.04)'; card.style.borderColor = 'rgba(248,81,73,0.3)'; });
-      card.addEventListener('click', () => openDetail(bb.id));
+      card.addEventListener('click', () => openTask(bb.id));
 
       const headerRow = el('div', null);
       headerRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:0.8rem;';
@@ -6820,7 +6668,7 @@ function renderDetailContent(content, task) {
       bbList.appendChild(card);
     }
     bbSection.appendChild(bbList);
-    content.appendChild(bbSection);
+    target.appendChild(bbSection);
   }
 
   // Clickable Downstream Tasks ("Blocks")
@@ -6836,7 +6684,7 @@ function renderDetailContent(content, task) {
       card.style.cssText = 'padding:8px 10px;background:rgba(255,255,255,0.04);border:1px solid rgba(56,189,248,0.3);border-radius:6px;cursor:pointer;transition:all 0.15s ease;display:flex;flex-direction:column;gap:3px;';
       card.addEventListener('mouseenter', () => { card.style.background = 'rgba(56,189,248,0.1)'; card.style.borderColor = 'var(--accent, #38bdf8)'; });
       card.addEventListener('mouseleave', () => { card.style.background = 'rgba(255,255,255,0.04)'; card.style.borderColor = 'rgba(56,189,248,0.3)'; });
-      card.addEventListener('click', () => openDetail(b.id));
+      card.addEventListener('click', () => openTask(b.id));
 
       const headerRow = el('div', null);
       headerRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:0.8rem;';
@@ -6869,7 +6717,7 @@ function renderDetailContent(content, task) {
       blocksList.appendChild(card);
     }
     blocksSection.appendChild(blocksList);
-    content.appendChild(blocksSection);
+    target.appendChild(blocksSection);
   }
 
   // Dependency Hierarchy Visualization Section
@@ -6888,7 +6736,7 @@ function renderDetailContent(content, task) {
       const pLine = el('div', null);
       pLine.style.cssText = 'color:var(--muted);margin-bottom:4px;cursor:pointer;';
       pLine.innerHTML = `◆ Parent: <span style="color:var(--accent,#38bdf8);text-decoration:underline;">#${p.identifier || p.id?.slice(0, 10)}</span> ${escapeHtml(p.title || p.name || '')}`;
-      pLine.addEventListener('click', () => openDetail(p.id));
+      pLine.addEventListener('click', () => openTask(p.id));
       treeBox.appendChild(pLine);
     }
 
@@ -6904,7 +6752,7 @@ function renderDetailContent(content, task) {
         const row = el('div', null);
         row.style.cssText = 'cursor:pointer;padding:2px 0;transition:color 0.15s;';
         row.innerHTML = `${prefix}<span style="color:var(--accent,#38bdf8);text-decoration:underline;font-weight:600;">#${bb.identifier || bb.id?.slice(0, 10)}</span> <span style="color:var(--fg);">${escapeHtml(bb.title || bb.name || '')}</span> <span style="font-size:0.7rem;padding:0 4px;border-radius:3px;background:rgba(255,255,255,0.08);">${bb.execution_stage || bb.status || 'todo'}</span>`;
-        row.addEventListener('click', () => openDetail(bb.id));
+        row.addEventListener('click', () => openTask(bb.id));
         treeBox.appendChild(row);
 
         if (bb.rationale) {
@@ -6935,7 +6783,7 @@ function renderDetailContent(content, task) {
         const row = el('div', null);
         row.style.cssText = 'cursor:pointer;padding:2px 0;transition:color 0.15s;';
         row.innerHTML = `${prefix}<span style="color:var(--accent,#38bdf8);text-decoration:underline;font-weight:600;">#${b.identifier || b.id?.slice(0, 10)}</span> <span style="color:var(--fg);">${escapeHtml(b.title || b.name || '')}</span> <span style="font-size:0.7rem;padding:0 4px;border-radius:3px;background:rgba(255,255,255,0.08);">${b.execution_stage || b.status || 'todo'}</span>`;
-        row.addEventListener('click', () => openDetail(b.id));
+        row.addEventListener('click', () => openTask(b.id));
         treeBox.appendChild(row);
 
         if (b.rationale) {
@@ -6960,18 +6808,18 @@ function renderDetailContent(content, task) {
         const row = el('div', null);
         row.style.cssText = 'cursor:pointer;padding:2px 0;';
         row.innerHTML = `${prefix}<span style="color:var(--accent,#38bdf8);text-decoration:underline;">#${st.identifier || st.id?.slice(0, 10)}</span> ${escapeHtml(st.title || st.name || '')}`;
-        row.addEventListener('click', () => openDetail(st.id));
+        row.addEventListener('click', () => openTask(st.id));
         treeBox.appendChild(row);
       });
     }
 
     depSection.appendChild(treeBox);
-    content.appendChild(depSection);
+    target.appendChild(depSection);
   }
 
   // Parent task
   if (task.parent_id || task.parent_identifier) {
-    addPanelField(content, 'Parent Task',
+    addPanelField(target, 'Parent Task',
       task.parent_identifier || `#${task.parent_id?.slice(0, 12)}`);
   }
 
@@ -6985,14 +6833,9 @@ function renderDetailContent(content, task) {
     if (task.updated_at) parts.push(`Updated: ${fmtRelTime(task.updated_at)}`);
     tsVal.textContent = parts.join('  ·  ');
     tsField.appendChild(tsVal);
-    content.appendChild(tsField);
+    target.appendChild(tsField);
   }
 
-  // Raw ID
-  const idField = el('div', 'panel-field');
-  idField.appendChild(el('div', 'panel-field-label', 'Internal ID'));
-  idField.appendChild(el('div', 'panel-field-muted', task.id || '—'));
-  content.appendChild(idField);
 }
 
 function isFleetTaskId(id) {
@@ -7004,14 +6847,93 @@ function isFleetTaskId(id) {
 }
 
 let lastDetailOpenTime = 0;
+// The click that opened the drawer. It bubbles on to the document
+// click-outside handler, which must never close what it just opened: the
+// 150ms clock check alone fails when the open stalls the main thread (STA-700).
+let detailOpenEvent = null;
 
+// Bumped by every openDetail / openTaskPage call. Their fetches can resolve out
+// of order (a second click, or ↗ while the drawer is still loading). Only the
+// newest call renders, so a stale response neither paints over it nor leaves a
+// second copy of the task layout's element ids in the DOM (STA-700).
+let taskViewSeq = 0;
+
+// Fetches everything the task layout renders, for the full page and the drawer.
+async function fetchTaskViewData(resolvedId) {
+  const isFleet = isFleetTaskId(resolvedId);
+  const apiBase = isFleet ? '/api/fleet/tasks' : '/api/tasks';
+  const [taskResp, commentsResp, stepsResp, interactionsResp, diffResp, checkpointsResp, runErrorsResp, shipCardResp] = await Promise.all([
+    apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}`),
+    apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}/comments`).catch(() => ({ comments: [] })),
+    (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/run-steps`).catch(() => ({ steps: [] })) : Promise.resolve({ steps: [] })),
+    (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/interactions`).catch(() => ({ interactions: [] })) : Promise.resolve({ interactions: [] })),
+    (!isFleet ? fetchTaskDiff(resolvedId, '') : Promise.resolve({ diff: '', files: [], checkpoint_id: '' })),
+    (!isFleet ? fetchTaskCheckpoints(resolvedId) : Promise.resolve([])),
+    (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/run-errors?limit=20`).catch(() => ({ errors: [] })) : Promise.resolve({ errors: [] })),
+    (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/ship-review`).catch(() => null) : Promise.resolve(null)),
+  ]);
+  const task = taskResp.task || taskResp;
+  if (taskResp.dependencies) task.dependencies = taskResp.dependencies;
+  const comments = (taskResp.comments && taskResp.comments.length)
+    ? taskResp.comments
+    : (commentsResp?.comments || (Array.isArray(commentsResp) ? commentsResp : []));
+  task.comments = comments;
+  task.runSteps = stepsResp?.steps || [];
+  task.runErrors = runErrorsResp?.errors || [];
+  task._diffData = diffResp;
+  task._checkpoints = checkpointsResp;
+  const interactions = interactionsResp?.interactions || [];
+  const shipCard = (shipCardResp && !shipCardResp.error) ? shipCardResp : null;
+
+  try {
+    const govResp = await apiFetch(`/api/tasks/${encodeURIComponent(task.id || resolvedId)}/governance`);
+    if (govResp && !govResp.error) task.governance = govResp;
+  } catch { /* governance optional */ }
+
+  return { task, comments, interactions, shipCard };
+}
+
+function cacheTaskView(task, comments, fallbackId) {
+  const key = task.id || fallbackId;
+  state.tasks[key] = { ...(state.tasks[key] || {}), ...task };
+  if (task.description) state.taskDescriptions[key] = task.description;
+  state.taskComments[key] = comments;
+  return key;
+}
+
+// Renders a cached copy of the task when the daemon can't be reached, with
+// every action disabled.
+function renderCachedTaskView(container, cached, opts) {
+  renderTaskPage(container, cached, cached.comments || [], [], cached._diffData || null, cached._checkpoints || [], undefined, undefined, opts);
+  const banner = document.createElement('div');
+  banner.style.cssText = 'background:var(--red,#c0392b);color:#fff;padding:.5rem 1rem;font-size:.85rem;font-weight:600;';
+  banner.textContent = 'Daemon unreachable — showing cached copy. Actions are disabled.';
+  container.prepend(banner);
+  container.querySelectorAll('button,input,textarea').forEach(el => { el.disabled = true; });
+}
+
+function isTaskPageShowing() {
+  return Boolean(document.getElementById('view-task-page')?.classList.contains('active'));
+}
+
+// The drawer ("peek") renders the task page layout (STA-700), stacked to fit
+// its width; see .task-page-drawer in style.css.
 async function openDetail(target, pushHistory = true, orgHint = null, projectHint = null, fromRouteMiss = false) {
+  // One copy of the layout at a time: its element ids are global. On the full
+  // page a task link therefore opens that task's page instead of a drawer.
+  if (isTaskPageShowing()) {
+    const t = (typeof target === 'object' && target !== null) ? target : { id: target, org: orgHint, project: projectHint };
+    return openTaskPage(t, pushHistory);
+  }
+
   const panel   = document.getElementById('detail-panel');
   const content = document.getElementById('panel-content');
+  const seq = ++taskViewSeq;
 
   stopChatPoll();
   stopElapsedTicker();
   lastDetailOpenTime = Date.now();
+  detailOpenEvent = window.event || null;
   if (panel) {
     panel.classList.remove('hidden');
     panel.classList.toggle('full-page', Boolean(state.taskDetailFullPage));
@@ -7025,7 +6947,13 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
     expandBtn.innerHTML = state.taskDetailFullPage ? '🗗' : '&#x26F6;';
     expandBtn.setAttribute('aria-pressed', String(Boolean(state.taskDetailFullPage)));
   }
-  if (content) content.innerHTML = '<p style="color:var(--muted)">Loading…</p>';
+  // The full page isn't showing (checked above): drop its stale copy.
+  const pageContent = document.getElementById('task-page-content');
+  if (pageContent) pageContent.innerHTML = '';
+  if (content) {
+    content.classList.add('task-page-drawer');
+    content.innerHTML = '<p style="color:var(--muted);padding:20px">Loading…</p>';
+  }
 
   let targetId = target;
   if (typeof target === 'object' && target !== null) {
@@ -7050,22 +6978,9 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
     history.replaceState({ taskId: resolvedId, canonicalPath, taskPage: false }, '', canonicalPath);
   }
 
-  const isFleet = isFleetTaskId(resolvedId);
-  const apiBase = isFleet ? '/api/fleet/tasks' : '/api/tasks';
-
   try {
-    const [taskResp, commentsResp] = await Promise.all([
-      apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}`),
-      apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}/comments`).catch(() => ({ comments: [] }))
-    ]);
-    const task = taskResp.task || taskResp;
-    if (taskResp.dependencies) {
-      task.dependencies = taskResp.dependencies;
-    }
-    const comments = (taskResp.comments && taskResp.comments.length)
-      ? taskResp.comments
-      : (commentsResp?.comments || (Array.isArray(commentsResp) ? commentsResp : []));
-    task.comments = comments;
+    const { task, comments, interactions, shipCard } = await fetchTaskViewData(resolvedId);
+    if (seq !== taskViewSeq) return;
 
     // Use robust UUID for internal state
     if (task.id) {
@@ -7078,38 +6993,25 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
       history.replaceState({ taskId: task.id, canonicalPath: finalCanonicalPath, taskPage: false }, '', finalCanonicalPath);
     }
 
-    // Also fetch native StayPoint governance snapshot if available
-    try {
-      const govResp = await apiFetch(`/api/tasks/${encodeURIComponent(task.id || resolvedId)}/governance`);
-      if (govResp && !govResp.error) {
-        task.governance = govResp;
-      }
-    } catch { /* governance optional */ }
-
-    renderDetailContent(content, task);
-    const detailKey = task.id || resolvedId;
-    if (task.description) state.taskDescriptions[detailKey] = task.description;
-    state.taskComments[detailKey] = comments;
-    state.tasks[detailKey] = { ...(state.tasks[detailKey] || {}), ...task };
-
-    buildChatSection(content, task.id || resolvedId, comments);
-    startChatPoll(task.id || resolvedId);
+    const detailKey = cacheTaskView(task, comments, resolvedId);
+    renderTaskPage(content, task, comments, interactions, task._diffData, task._checkpoints, task.runErrors, shipCard, { drawer: true });
+    startChatPoll(detailKey);
   } catch (err) {
+    if (seq !== taskViewSeq) return;
     if (!fromRouteMiss && err && /^404\b/.test(err.message)) {
       const fallbackId = await resolveTaskRouteMiss(targetId, orgHint, projectHint);
+      if (seq !== taskViewSeq) return;
       if (fallbackId && fallbackId !== resolvedId) {
         return openDetail(fallbackId, false, orgHint, projectHint, true);
       }
     }
     const cached = matchedTask || state.tasks[resolvedId] || state.tasks[targetId];
-    if (cached) {
+    if (cached && content) {
       if (cached.id) state.openDetailTaskId = cached.id;
-      renderDetailContent(content, cached);
-      buildChatSection(content, cached.id || resolvedId, cached.comments || []);
-      startChatPoll(cached.id || resolvedId);
+      renderCachedTaskView(content, cached, { drawer: true });
     } else {
       const p = el('p', null, 'Task not found or failed to load.');
-      p.style.color = 'var(--red)';
+      p.style.cssText = 'color:var(--red);padding:20px;';
       if (content) {
         content.innerHTML = '';
         content.appendChild(p);
@@ -7367,10 +7269,18 @@ function openFileDiffModal(task, filePath, checkpointId) {
 
   // Dismiss on backdrop click
   overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
-  // Dismiss on Escape
-  const escHandler = e => { if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', escHandler); } };
-  document.addEventListener('keydown', escHandler);
-  overlay.addEventListener('remove', () => document.removeEventListener('keydown', escHandler));
+  // Dismiss on Escape. Capture phase + stopPropagation: Escape closes only the
+  // diff, not the drawer behind it (STA-700). A modal already closed another
+  // way just unhooks the listener on the next Escape.
+  const escHandler = e => {
+    if (e.key !== 'Escape') return;
+    document.removeEventListener('keydown', escHandler, true);
+    if (!overlay.isConnected) return;
+    e.preventDefault();
+    e.stopPropagation();
+    overlay.remove();
+  };
+  document.addEventListener('keydown', escHandler, true);
 
   // Fetch and render
   fetchFileDiff(task.id, filePath, checkpointId).then(data => {
@@ -7982,11 +7892,18 @@ function appendRunStepToTimeline(taskId, step) {
 // fromRouteMiss: this call re-opens a task found by resolveTaskRouteMiss, so
 // the URL that missed is replaced with the canonical one.
 async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
-  // Close sidebar if open
+  // Close sidebar if open, and drop its copy of the task layout: the two
+  // share element ids (STA-700).
   const panel = document.getElementById('detail-panel');
   if (panel) panel.classList.add('hidden');
+  const panelContent = document.getElementById('panel-content');
+  if (panelContent) {
+    panelContent.innerHTML = '';
+    panelContent.classList.remove('task-page-drawer');
+  }
   stopChatPoll();
   stopElapsedTicker();
+  const seq = ++taskViewSeq;
 
   let targetId = target;
   let orgHint = null;
@@ -8014,31 +7931,9 @@ async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
   const pageContent = document.getElementById('task-page-content');
   if (pageContent) pageContent.innerHTML = '<p style="color:var(--muted);padding:2rem">Loading…</p>';
 
-  const isFleet = isFleetTaskId(resolvedId);
-  const apiBase = isFleet ? '/api/fleet/tasks' : '/api/tasks';
-
   try {
-    const [taskResp, commentsResp, stepsResp, interactionsResp, diffResp, checkpointsResp, runErrorsResp, shipCardResp] = await Promise.all([
-      apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}`),
-      apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}/comments`).catch(() => ({ comments: [] })),
-      (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/run-steps`).catch(() => ({ steps: [] })) : Promise.resolve({ steps: [] })),
-      (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/interactions`).catch(() => ({ interactions: [] })) : Promise.resolve({ interactions: [] })),
-      (!isFleet ? fetchTaskDiff(resolvedId, '') : Promise.resolve({ diff: '', files: [], checkpoint_id: '' })),
-      (!isFleet ? fetchTaskCheckpoints(resolvedId) : Promise.resolve([])),
-      (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/run-errors?limit=20`).catch(() => ({ errors: [] })) : Promise.resolve({ errors: [] })),
-      (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/ship-review`).catch(() => null) : Promise.resolve(null)),
-    ]);
-    const task = taskResp.task || taskResp;
-    const comments = (taskResp.comments && taskResp.comments.length)
-      ? taskResp.comments
-      : (commentsResp?.comments || (Array.isArray(commentsResp) ? commentsResp : []));
-    task.comments = comments;
-    task.runSteps = stepsResp?.steps || [];
-    task.runErrors = runErrorsResp?.errors || [];
-    const interactions = interactionsResp?.interactions || [];
-    task._diffData = diffResp;
-    task._checkpoints = checkpointsResp;
-    const shipCard = (shipCardResp && !shipCardResp.error) ? shipCardResp : null;
+    const { task, comments, interactions, shipCard } = await fetchTaskViewData(resolvedId);
+    if (seq !== taskViewSeq) return;
 
     if (task.id) state.openDetailTaskId = task.id;
 
@@ -8047,22 +7942,15 @@ async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
       history.replaceState({ taskId: task.id, canonicalPath: finalPath, taskPage: true }, '', finalPath);
     }
 
-    try {
-      const govResp = await apiFetch(`/api/tasks/${encodeURIComponent(task.id || resolvedId)}/governance`);
-      if (govResp && !govResp.error) task.governance = govResp;
-    } catch { /* governance optional */ }
-
-    const activeId = task.id || resolvedId;
-    state.tasks[activeId] = { ...(state.tasks[activeId] || {}), ...task };
-    if (task.description) state.taskDescriptions[activeId] = task.description;
-    state.taskComments[activeId] = comments;
-
+    const activeId = cacheTaskView(task, comments, resolvedId);
     renderTaskPage(pageContent, task, comments, interactions, task._diffData, task._checkpoints, task.runErrors, shipCard);
     startChatPoll(activeId);
   } catch (err) {
+    if (seq !== taskViewSeq) return;
     const is404 = err && /^404\b/.test(err.message);
     if (is404 && !fromRouteMiss) {
       const fallbackId = await resolveTaskRouteMiss(targetId, orgHint, projectHint);
+      if (seq !== taskViewSeq) return;
       if (fallbackId && fallbackId !== resolvedId) {
         return openTaskPage({ id: fallbackId, org: orgHint, project: projectHint }, false, true);
       }
@@ -8073,12 +7961,7 @@ async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
         pageContent.innerHTML = '<p style="color:var(--red);padding:2rem">Task not found.</p>';
       }
     } else if (cached && pageContent) {
-      renderTaskPage(pageContent, cached, cached.comments || [], [], cached._diffData || null, cached._checkpoints || []);
-      const banner = document.createElement('div');
-      banner.style.cssText = 'background:var(--red,#c0392b);color:#fff;padding:.5rem 1rem;font-size:.85rem;font-weight:600;';
-      banner.textContent = 'Daemon unreachable — showing cached copy. Actions are disabled.';
-      pageContent.prepend(banner);
-      pageContent.querySelectorAll('button,input,textarea').forEach(el => { el.disabled = true; });
+      renderCachedTaskView(pageContent, cached);
     } else if (pageContent) {
       pageContent.innerHTML = '<p style="color:var(--red);padding:2rem">Failed to load — daemon may be unreachable.</p>';
     }
@@ -8621,7 +8504,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
 
   // For SSE-driven re-renders the buttons may already be in the DOM.
   // Hide them so they don't sit alongside the card's own action buttons.
-  const page = container.closest('#task-page-content') || container;
+  const page = container.closest('#task-page-content, #panel-content') || container;
   for (const btn of page.querySelectorAll('.run-now-btn, .mark-done-btn, .mark-done-error, .ship-review-see-card-link')) {
     btn.style.display = 'none';
   }
@@ -9211,8 +9094,15 @@ function buildTaskPagePanel(taskId, defaultKey) {
   return { side, panels, select, setCount };
 }
 
-function renderTaskPage(container, task, comments, interactions, diffData, checkpoints, runErrors, shipCard) {
+// Renders the task layout into the full page (#task-page-content) or, with
+// opts.drawer, into the drawer (#panel-content, STA-700). The drawer has no
+// Back button (it has its own close / expand / open controls) and actions
+// that reload the task reload it in the drawer.
+function renderTaskPage(container, task, comments, interactions, diffData, checkpoints, runErrors, shipCard, opts = {}) {
   container.innerHTML = '';
+  const drawer = Boolean(opts.drawer);
+  const reopen = () => (drawer ? openDetail(task.id, false) : openTaskPage(task.id));
+  const openTask = (id) => (drawer ? openDetail(id) : openTaskPage(id));
 
   const ident = task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : '');
 
@@ -9222,14 +9112,16 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   // buttons (mounted by renderShipReviewCardFromData into the review slot).
   const header = el('div', 'task-page-header');
   const headerRow = el('div', 'task-page-header-row');
-  const backBtn = el('button', 'task-page-back-btn', '← Back');
-  backBtn.addEventListener('click', () => {
-    stopChatPoll();
-    stopElapsedTicker();
-    state.openDetailTaskId = null;
-    history.back();
-  });
-  headerRow.appendChild(backBtn);
+  if (!drawer) {
+    const backBtn = el('button', 'task-page-back-btn', '← Back');
+    backBtn.addEventListener('click', () => {
+      stopChatPoll();
+      stopElapsedTicker();
+      state.openDetailTaskId = null;
+      history.back();
+    });
+    headerRow.appendChild(backBtn);
+  }
 
   const headerMain = el('div', 'task-page-header-main');
   const metaLine = taskPageHeaderMeta(task, ident);
@@ -9571,6 +9463,9 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   addMetaField('Project', projectSlug(task) !== 'default' ? projectSlug(task) : null);
   addMetaField('Org', task.organization || null);
   addMetaField('Stage', task.execution_stage || null);
+  addMetaField('Kind of work', workKindLabel(task.work_kind));
+  addMetaField('Goal', task.goal_title || (task.goal_id ? task.goal_id.slice(0, 12) : null));
+  addMetaField('Repo', task.repo_path ? `${task.repo_path} (${task.git_branch || 'main'})` : null);
   addMetaField('Spend',
     (task.spent_usd || task.spent_tokens)
       ? `${fmtCurrency(task.spent_usd || 0)} · ${fmtCompactNum(task.spent_tokens || 0)} tokens`
@@ -9602,6 +9497,8 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     meta.appendChild(lblWrap);
   }
 
+  appendTaskRelations(meta, task, openTask);
+
   // A ship review card in pending/sent_back/approved/rejected state blocks
   // Run Now and Mark done — starting a new run on finished work or closing
   // without merging both confuse the review flow.
@@ -9624,7 +9521,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
         });
         if (!res.ok) throw new Error(`${res.status}`);
         runBtn.textContent = '✓ Started';
-        setTimeout(() => openTaskPage(task.id), 800);
+        setTimeout(reopen, 800);
       } catch (err) {
         runBtn.disabled = false;
         runBtn.textContent = '▶ Run Now';
@@ -9670,7 +9567,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
           return;
         }
         doneBtn.textContent = '✓ Done';
-        setTimeout(() => openTaskPage(task.id), 800);
+        setTimeout(reopen, 800);
       } catch (err) {
         doneError.textContent = err.message || 'Request failed';
         doneError.style.display = 'block';
@@ -9693,9 +9590,12 @@ document.addEventListener('click', (e) => {
   const panel = document.getElementById('detail-panel');
   if (!panel || panel.classList.contains('hidden')) return;
   // If detail was just opened/switched in this click event, do not close
-  if (Date.now() - lastDetailOpenTime < 150) return;
+  if (e === detailOpenEvent || Date.now() - lastDetailOpenTime < 150) return;
   // If clicked inside the detail panel, do not close
   if (panel.contains(e.target)) return;
+  // Nor for clicks in a dialog the drawer opened (body-level overlays), or on
+  // a control that removed itself, such as a dialog's close button.
+  if (!e.target.isConnected || e.target.closest('.content-modal, .file-diff-modal')) return;
   // If clicked on close, expand, or open button, ignore
   if (e.target.closest('#panel-close') || e.target.closest('#panel-expand') || e.target.closest('#panel-open')) return;
   closeDetailPanel();

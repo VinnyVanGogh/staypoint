@@ -177,10 +177,14 @@ export async function gotoTaskPage(page: Page, task: Task) {
  * Selects a tab of the task page's right panel (STA-641). Only one tab shows
  * at a time: Review (ship review card, Details), Diff, Migrations, Brief
  * (description, notes). It opens on Review while a ship review is pending,
- * else on Diff.
+ * else on Diff. Pass scope '#panel-content' for the drawer (STA-700).
  */
-export async function openTaskPanelTab(page: Page, name: 'Review' | 'Diff' | 'Migrations' | 'Brief') {
-  const tab = page.locator('#task-page-content .task-page-panel').getByRole('tab', { name: new RegExp(`^\\W*${name}\\b`) });
+export async function openTaskPanelTab(
+  page: Page,
+  name: 'Review' | 'Diff' | 'Migrations' | 'Brief',
+  scope = '#task-page-content',
+) {
+  const tab = page.locator(`${scope} .task-page-panel`).getByRole('tab', { name: new RegExp(`^\\W*${name}\\b`) });
   await tab.click();
   await expect(tab).toHaveAttribute('aria-selected', 'true');
 }
