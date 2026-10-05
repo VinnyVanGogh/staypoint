@@ -1098,6 +1098,9 @@ func applyMigrations(dbPath string, conn *sql.DB) error {
 }
 
 func Open(dbPath string) (*Store, error) {
+	if err := refuseLiveDBUnderTest(dbPath); err != nil {
+		return nil, err
+	}
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create db dir: %w", err)

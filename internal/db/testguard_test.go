@@ -40,6 +40,16 @@ func TestOpenRefusesLiveDBUnderTest(t *testing.T) {
 			t.Errorf("Open(%q) refused but still created the file (stat err %v)", p, statErr)
 		}
 	}
+
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(live, alias); err != nil {
+		t.Fatal(err)
+	}
+	if store, err := Open(filepath.Join(alias, ".staypoint", "staypoint.db")); err == nil {
+		store.Close()
+		t.Errorf("Open via symlinked home = nil error, want refusal")
+	}
+
 	if _, err := os.Stat(filepath.Join(live, ".staypoint")); !os.IsNotExist(err) {
 		t.Errorf("refused Open still created the live data dir (stat err %v)", err)
 	}
