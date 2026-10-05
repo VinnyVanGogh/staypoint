@@ -170,3 +170,47 @@ func addMigrationOnTaskBranch(t *testing.T) (database *sql.DB, baseURL, token, b
 	gitOut(t, repoDir, "checkout", "main")
 	return database, baseURL, token, boardToken, taskID, repoDir
 }
+
+// STA-719: POST /api/tasks stores repo_path as sent, so it can be a
+// subdirectory of the repo. <subdir>/.git does not exist there, and the gate
+// used to read that as "not a git repo" and let any git failure through.
+func repoSubdirTask(t *testing.T) (baseURL, token, boardToken, taskID string) {
+	t.Helper()
+	database, baseURL, token, boardToken, taskID, repoDir, _ := shipApproveServer(t)
+	sub := filepath.Join(repoDir, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE tasks SET repo_path = ? WHERE id = ?`, sub, taskID); err != nil {
+		t.Fatal(err)
+	}
+	return baseURL, token, boardToken, taskID
+}
+
+func TestGitDenied_RepoSubdirFailsClosedAtGate(t *testing.T) {
+	baseURL, token, boardToken, taskID := repoSubdirTask(t)
+	deniedGit(t)
+
+	resp, body, _ := timedReq(t, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", boardToken, "", "mock-assertion")
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("Approve succeeded while git was refused the repo: %s", body)
+	}
+	if !strings.Contains(string(body), "could not check migration verification status") {
+		t.Errorf("Approve body %s: want the migration gate to refuse", body)
+	}
+
+	card := getCardMap(t, baseURL, token, taskID)
+	if msg, _ := card["repo_error"].(string); !strings.Contains(msg, "Operation not permitted") {
+		t.Errorf("repo_error = %q, want git's EPERM error", msg)
+	}
+}
+
+// A readable repo subdirectory with no checkpoint yet is still nothing to check.
+func TestMigrationGate_RepoSubdirNoCheckpointIsNotAnError(t *testing.T) {
+	baseURL, token, _, taskID := repoSubdirTask(t)
+
+	card := getCardMap(t, baseURL, token, taskID)
+	if v, ok := card["repo_error"]; ok {
+		t.Errorf("repo_error = %v, want none when the repo has no checkpoint", v)
+	}
+}
