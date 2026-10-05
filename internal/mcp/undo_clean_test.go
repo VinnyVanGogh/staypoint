@@ -38,12 +38,12 @@ func TestUndoCleanIgnoredOutlivesDefaultGitTimeout(t *testing.T) {
 	// Every git call goes to real git, except the forced clean, which takes
 	// longer than the default git timeout.
 	bin := t.TempDir()
-	script := "#!/bin/sh\nif [ \"$1\" = clean ] && [ \"$2\" = -f ]; then sleep 1.5; fi\nexec " + realGit + " \"$@\"\n"
+	script := "#!/bin/sh\nif [ \"$1\" = clean ] && [ \"$2\" = -f ]; then sleep 3; fi\nexec " + realGit + " \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv(gitexec.TimeoutEnv, "500ms")
+	t.Setenv(gitexec.TimeoutEnv, "2s")
 
 	callTool(t, s, "staypoint_undo", map[string]any{"keep_untracked": true, "clean_ignored": true})
 
