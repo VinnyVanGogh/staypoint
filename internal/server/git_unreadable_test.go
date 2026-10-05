@@ -160,17 +160,93 @@ func addMigrationOnTaskBranch(t *testing.T) (database *sql.DB, baseURL, token, b
 	t.Helper()
 	database, baseURL, token, boardToken, taskID, repoDir, _ = shipApproveServer(t)
 	gitOut(t, repoDir, "update-ref", "refs/staypoint/checkpoints/latest", "main")
+	commitMigrationOnTaskBranch(t, repoDir, taskID, "migrations/001_add.sql")
+	return database, baseURL, token, boardToken, taskID, repoDir
+}
+
+// commitMigrationOnTaskBranch commits a migration file at relPath on the task
+// branch and leaves the repo on main.
+func commitMigrationOnTaskBranch(t *testing.T, repoDir, taskID, relPath string) {
+	t.Helper()
 	gitOut(t, repoDir, "checkout", "staypoint/"+taskID)
-	if err := os.MkdirAll(filepath.Join(repoDir, "migrations"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(repoDir, filepath.Dir(relPath)), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(repoDir, "migrations", "001_add.sql"), []byte("ALTER TABLE t ADD COLUMN c TEXT;\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(repoDir, relPath), []byte("ALTER TABLE t ADD COLUMN c TEXT;\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitOut(t, repoDir, "add", ".")
 	gitOut(t, repoDir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "task: add migration")
 	gitOut(t, repoDir, "checkout", "main")
-	return database, baseURL, token, boardToken, taskID, repoDir
+}
+
+// STA-718: with no checkpoint ref the gate used to see nothing to diff and
+// report no migrations. It must compare the task branch against where it
+// left main instead, so a migration committed on the branch still blocks.
+func TestMigrationGate_NoCheckpointDetectsMigrationAgainstMergeBase(t *testing.T) {
+	_, baseURL, token, boardToken, taskID, repoDir, _ := shipApproveServer(t)
+	commitMigrationOnTaskBranch(t, repoDir, taskID, "migrations/001_x.sql")
+
+	card := getCardMap(t, baseURL, token, taskID)
+	if v, ok := card["repo_error"]; ok {
+		t.Fatalf("repo_error = %v, want none", v)
+	}
+	got, _ := card["unverified_migrations"].([]any)
+	if len(got) != 1 || got[0] != "migrations/001_x.sql" {
+		t.Errorf("unverified_migrations = %v, want [migrations/001_x.sql]", card["unverified_migrations"])
+	}
+
+	resp, body, _ := timedReq(t, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "unverified_migrations") {
+		t.Errorf("Approve: %d %s, want 409 unverified_migrations", resp.StatusCode, body)
+	}
+}
+
+const mergeBaseFailMsg = "fatal: merge-base exploded"
+
+// mergeBaseFailingGit puts a `git` first on PATH that runs the real git for
+// everything except merge-base, which fails as an unreadable repo does.
+func mergeBaseFailingGit(t *testing.T) {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	script := "#!/bin/sh\nif [ \"$1\" = merge-base ]; then echo \"" + mergeBaseFailMsg + "\" >&2; exit 128; fi\nexec \"" + realGit + "\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// When there is no checkpoint and git cannot find the merge-base for a reason
+// other than a missing ref, the gate cannot tell what the branch changed, so
+// it fails closed rather than reporting no migrations.
+func TestMigrationGate_NoCheckpointMergeBaseErrorFailsClosed(t *testing.T) {
+	database, baseURL, token, boardToken, taskID, repoDir, _ := shipApproveServer(t)
+	commitMigrationOnTaskBranch(t, repoDir, taskID, "migrations/001_x.sql")
+	mergeBaseFailingGit(t)
+
+	card := getCardMap(t, baseURL, token, taskID)
+	if msg, _ := card["repo_error"].(string); !strings.Contains(msg, mergeBaseFailMsg) {
+		t.Errorf("repo_error = %q, want git's merge-base error", msg)
+	}
+
+	resp, body, _ := timedReq(t, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", boardToken, "", "mock-assertion")
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("Approve succeeded while merge-base failed: %s", body)
+	}
+	if !strings.Contains(string(body), "could not check migration verification status") {
+		t.Errorf("Approve body %s: want the migration gate to refuse", body)
+	}
+	card2, err := shipreview.GetCard(database, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if card2.Status != shipreview.StatusPending {
+		t.Errorf("card status = %s, want pending", card2.Status)
+	}
 }
 
 // STA-719: POST /api/tasks stores repo_path as sent, so it can be a
