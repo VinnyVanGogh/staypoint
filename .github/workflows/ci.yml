@@ -10,6 +10,14 @@ on:
 permissions:
   contents: write
 
+# PRs: a newer push to the same PR cancels the older run, so its runners free
+# up at once (STA-777). main and tags: each commit gets its own group. A shared
+# group would let a newer push replace an older run still waiting for a runner,
+# and that commit would never be tested.
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   js-test:
     name: JS Unit Tests
@@ -84,9 +92,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # PRs run Go 1.25 only, on both OSes: macOS stays because the daemon is
+      # macOS-first (launchd, TCC). Pushes to main and tags run the full 2x2.
+      # The full matrix on every PR used more runners than the free tier has,
+      # and jobs were cancelled while queued (STA-777).
       matrix:
         os: [ ubuntu-latest, macos-latest ]
-        go-version: [ '1.24', '1.25' ]
+        go-version: ${{ fromJSON(github.event_name == 'pull_request' && '["1.25"]' || '["1.24", "1.25"]') }}
 
     steps:
       - name: Checkout Code
