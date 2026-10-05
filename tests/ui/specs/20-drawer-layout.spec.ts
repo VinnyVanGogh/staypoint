@@ -7,9 +7,9 @@
  * and the Review / Diff / Migrations / Brief tabs, stacked to fit the drawer
  * and back in two columns once #panel-expand makes it wide.
  *
- * Also covered: Escape in a drawer dialog closes only the dialog, live run
- * steps reach the drawer's timeline, and a slow drawer load can't render a
- * second copy of the layout after ↗ opened the full page.
+ * Also covered: Escape in a drawer dialog (content or file diff) closes only
+ * the dialog, live run steps reach the drawer's timeline, and a slow drawer
+ * load can't render a second copy of the layout after ↗ opened the full page.
  */
 
 import type { Locator, Page } from '@playwright/test';
@@ -181,7 +181,33 @@ test.describe('drawer behaviour', () => {
     await expect(panel).toHaveClass(/\bhidden\b/);
   });
 
-  test('a live run step lands in the drawer timeline and stats', async ({ page, api }) => {
+  test('Escape or a backdrop click in the file diff closes only the diff', async ({ page, api }) => {
+    const task = await api.createTask('Drawer diff escape');
+    const panel = await openDrawer(page, task);
+    const modal = page.locator('.file-diff-modal');
+    const openDiff = () => page.evaluate(
+      (id) => (window as unknown as { openFileDiffModal: (t: unknown, f: string, c: string) => void })
+        .openFileDiffModal({ id }, 'README.md', ''),
+      task.id,
+    );
+
+    await openDiff();
+    await expect(modal).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(modal).toHaveCount(0);
+    await expect(panel).not.toHaveClass(/\bhidden\b/);
+
+    await openDiff();
+    await expect(modal).toBeVisible();
+    await modal.click({ position: { x: 5, y: 5 } });
+    await expect(modal).toHaveCount(0);
+    await expect(panel).not.toHaveClass(/\bhidden\b/);
+
+    await page.keyboard.press('Escape');
+    await expect(panel).toHaveClass(/\bhidden\b/);
+  });
+
+  test('a live run step lands in the drawer timeline', async ({ page, api }) => {
     const task = await api.createTask('Drawer live step');
     const panel = await openDrawer(page, task);
     const timeline = panel.locator(`#timeline-steps-${task.id}`);
