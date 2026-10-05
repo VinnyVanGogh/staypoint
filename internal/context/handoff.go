@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 )
 
 // HandoffOptions holds configuration for generating a handoff prompt.
@@ -113,7 +115,7 @@ func GatherGitContext(dir string) GitContext {
 func execGit(dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := gitexec.Command(ctx, args...)
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	return string(out), err

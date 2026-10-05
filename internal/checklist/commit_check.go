@@ -5,11 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 )
 
 var (
@@ -151,7 +152,7 @@ func GetMainCommitSHA(repoRoot string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	for _, ref := range []string{"main", "origin/main", "HEAD"} {
-		cmd := exec.CommandContext(ctx, "git", "rev-parse", "--short", ref)
+		cmd := gitexec.Command(ctx, "rev-parse", "--short", ref)
 		cmd.Dir = repoRoot
 		out, err := cmd.Output()
 		if err == nil {
@@ -264,7 +265,7 @@ func VerifyCommits(ctx context.Context, repoRoot string, binaryCommit string, it
 func probeRepo(ctx context.Context, repoRoot string) error {
 	probeCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	defer cancel()
-	cmd := exec.CommandContext(probeCtx, "git", "rev-parse", "--git-dir")
+	cmd := gitexec.Command(probeCtx, "rev-parse", "--git-dir")
 	cmd.Dir = repoRoot
 	if err := cmd.Run(); err != nil {
 		if probeCtx.Err() != nil {
@@ -285,7 +286,7 @@ func checkCommit(ctx context.Context, repoRoot, commitSHA, binaryCommit string) 
 	defer cancel()
 
 	// 1. Resolve commit object in git
-	cmdRev := exec.CommandContext(gitCtx, "git", "rev-parse", "--verify", commitSHA+"^{commit}")
+	cmdRev := gitexec.Command(gitCtx, "rev-parse", "--verify", commitSHA+"^{commit}")
 	cmdRev.Dir = repoRoot
 	outRev, err := cmdRev.CombinedOutput()
 	if err != nil {
@@ -299,7 +300,7 @@ func checkCommit(ctx context.Context, repoRoot, commitSHA, binaryCommit string) 
 	// 2. Check if commit is ancestor of / in main
 	inMain := false
 	for _, mainRef := range []string{"main", "origin/main", "HEAD"} {
-		cmdMain := exec.CommandContext(gitCtx, "git", "merge-base", "--is-ancestor", commitSHA, mainRef)
+		cmdMain := gitexec.Command(gitCtx, "merge-base", "--is-ancestor", commitSHA, mainRef)
 		cmdMain.Dir = repoRoot
 		if err := cmdMain.Run(); err == nil {
 			inMain = true
@@ -322,7 +323,7 @@ func checkCommit(ctx context.Context, repoRoot, commitSHA, binaryCommit string) 
 			status.Reason += fmt.Sprintf("; also running staypointd binary has unverified commit %q", cleanBinary)
 		}
 	} else {
-		cmdBinary := exec.CommandContext(gitCtx, "git", "merge-base", "--is-ancestor", commitSHA, cleanBinary)
+		cmdBinary := gitexec.Command(gitCtx, "merge-base", "--is-ancestor", commitSHA, cleanBinary)
 		cmdBinary.Dir = repoRoot
 		if err := cmdBinary.Run(); err != nil {
 			status.MissingFromBinary = true

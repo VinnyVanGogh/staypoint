@@ -5,10 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 )
 
@@ -136,7 +136,7 @@ func gitCurrentBranch(ctx context.Context, wtPath string) string {
 	if wtPath == "" {
 		return ""
 	}
-	cmd := exec.CommandContext(ctx, "git", "branch", "--show-current")
+	cmd := gitexec.Command(ctx, "branch", "--show-current")
 	cmd.Dir = wtPath
 	cmd.Env = security.ChildEnv()
 	out, err := cmd.Output()
@@ -151,7 +151,7 @@ func gitHeadSHA(ctx context.Context, wtPath string) string {
 	if wtPath == "" {
 		return ""
 	}
-	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--short", "HEAD")
+	cmd := gitexec.Command(ctx, "rev-parse", "--short", "HEAD")
 	cmd.Dir = wtPath
 	cmd.Env = security.ChildEnv()
 	out, err := cmd.Output()

@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -17,7 +17,7 @@ import (
 )
 
 func runGit(ctx context.Context, dir string, env []string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := gitexec.Command(ctx, args...)
 	cmd.Dir = dir
 	cmd.Env = append(security.ChildEnv(), env...)
 	var stdout, stderr bytes.Buffer

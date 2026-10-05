@@ -13,6 +13,7 @@ import (
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/context"
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/migration"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
@@ -709,7 +710,13 @@ func (h *TasksHandler) GetTaskCheckpoints(w http.ResponseWriter, r *http.Request
 			limit = v
 		}
 	}
-	checkpoints, err := checkpoint.ListCheckpoints(r.Context(), task.RepoPath, limit)
+	ctx, cancel := gitRequestContext(r)
+	defer cancel()
+	checkpoints, err := checkpoint.ListCheckpoints(ctx, task.RepoPath, limit)
+	if gitexec.IsTimeout(err) {
+		writeError(w, http.StatusGatewayTimeout, err.Error())
+		return
+	}
 	if err != nil {
 		// not a git repo or no checkpoints yet — return empty list
 		checkpoints = []checkpoint.Checkpoint{}
@@ -749,12 +756,14 @@ func (h *TasksHandler) GetTaskDiff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cpID := r.URL.Query().Get("checkpoint")
+	ctx, cancel := gitRequestContext(r)
+	defer cancel()
 
 	// "Whole run" (empty checkpoint) should diff against the task's pre-run
 	// baseline, not refs/staypoint/checkpoints/latest (which is the newest
 	// turn checkpoint and shows "No changes" after a run completes).
 	if cpID == "" {
-		if preRunID, _ := checkpoint.FindPreRunCheckpoint(r.Context(), task.RepoPath, task.ID); preRunID != "" {
+		if preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID); preRunID != "" {
 			cpID = preRunID
 		}
 	}
@@ -762,26 +771,28 @@ func (h *TasksHandler) GetTaskDiff(w http.ResponseWriter, r *http.Request) {
 	workDir, hasWorktree := taskCheckpointWorkDir(task)
 	var stat string
 	var fileStats []checkpoint.FileDiffStat
+	var statErr, filesErr error
 	if hasWorktree {
-		stat, err = checkpoint.DiffCheckpoint(r.Context(), workDir, cpID)
-		if err != nil {
-			stat = ""
-		}
-		fileStats, err = checkpoint.DiffCheckpointFiles(r.Context(), workDir, cpID)
-		if err != nil {
-			fileStats = []checkpoint.FileDiffStat{}
-		}
+		stat, statErr = checkpoint.DiffCheckpoint(ctx, workDir, cpID)
+		fileStats, filesErr = checkpoint.DiffCheckpointFiles(ctx, workDir, cpID)
 	} else {
 		// Worktree pruned — compare checkpoint against the task branch tip.
 		branch := "staypoint/" + task.ID
-		stat, err = checkpoint.DiffCheckpointAgainstRef(r.Context(), task.RepoPath, cpID, branch)
-		if err != nil {
-			stat = ""
+		stat, statErr = checkpoint.DiffCheckpointAgainstRef(ctx, task.RepoPath, cpID, branch)
+		fileStats, filesErr = checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, cpID, branch)
+	}
+	// A timeout is not "no changes": say so instead of showing an empty diff.
+	for _, e := range []error{statErr, filesErr} {
+		if gitexec.IsTimeout(e) {
+			writeError(w, http.StatusGatewayTimeout, e.Error())
+			return
 		}
-		fileStats, err = checkpoint.DiffCheckpointFilesAgainstRef(r.Context(), task.RepoPath, cpID, branch)
-		if err != nil {
-			fileStats = []checkpoint.FileDiffStat{}
-		}
+	}
+	if statErr != nil {
+		stat = ""
+	}
+	if filesErr != nil {
+		fileStats = []checkpoint.FileDiffStat{}
 	}
 
 	// Build plain file list for backwards compatibility.
@@ -820,8 +831,10 @@ func (h *TasksHandler) GetTaskFileDiff(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cpID := r.URL.Query().Get("checkpoint")
+	ctx, cancel := gitRequestContext(r)
+	defer cancel()
 	if cpID == "" {
-		if preRunID, _ := checkpoint.FindPreRunCheckpoint(r.Context(), task.RepoPath, task.ID); preRunID != "" {
+		if preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID); preRunID != "" {
 			cpID = preRunID
 		}
 	}
@@ -829,10 +842,14 @@ func (h *TasksHandler) GetTaskFileDiff(w http.ResponseWriter, r *http.Request) {
 	workDir, hasWorktree := taskCheckpointWorkDir(task)
 	var content string
 	if hasWorktree {
-		content, err = checkpoint.DiffFileContent(r.Context(), workDir, cpID, filePath)
+		content, err = checkpoint.DiffFileContent(ctx, workDir, cpID, filePath)
 	} else {
 		branch := "staypoint/" + task.ID
-		content, err = checkpoint.DiffFileContentAgainstRef(r.Context(), task.RepoPath, cpID, branch, filePath)
+		content, err = checkpoint.DiffFileContentAgainstRef(ctx, task.RepoPath, cpID, branch, filePath)
+	}
+	if gitexec.IsTimeout(err) {
+		writeError(w, http.StatusGatewayTimeout, err.Error())
+		return
 	}
 	if err != nil {
 		content = ""
@@ -1046,17 +1063,26 @@ func (h *TasksHandler) GetTaskMigrations(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Get the full diff file list.
+	ctx, cancel := gitRequestContext(r)
+	defer cancel()
 	cpID := ""
-	if preRunID, _ := checkpoint.FindPreRunCheckpoint(r.Context(), task.RepoPath, task.ID); preRunID != "" {
+	if preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID); preRunID != "" {
 		cpID = preRunID
 	}
 	workDir, hasWorktree := taskCheckpointWorkDir(task)
 	var fileStats []checkpoint.FileDiffStat
+	var diffErr error
 	if hasWorktree {
-		fileStats, _ = checkpoint.DiffCheckpointFiles(r.Context(), workDir, cpID)
+		fileStats, diffErr = checkpoint.DiffCheckpointFiles(ctx, workDir, cpID)
 	} else {
 		branch := "staypoint/" + task.ID
-		fileStats, _ = checkpoint.DiffCheckpointFilesAgainstRef(r.Context(), task.RepoPath, cpID, branch)
+		fileStats, diffErr = checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, cpID, branch)
+	}
+	// Other errors keep the old "no migrations" answer; a timeout means the
+	// diff was never read, which must not look like an empty list.
+	if gitexec.IsTimeout(diffErr) {
+		writeError(w, http.StatusGatewayTimeout, diffErr.Error())
+		return
 	}
 
 	filePaths := make([]string, len(fileStats))
@@ -1090,7 +1116,7 @@ func (h *TasksHandler) GetTaskMigrations(w http.ResponseWriter, r *http.Request)
 			// The worktree is gone (or lacks the file): read it from the task
 			// branch. The repo checkout is usually on main, where the file
 			// doesn't exist yet.
-			sqlContent, readErr = migration.ReadContentAtRef(r.Context(), task.RepoPath, branch, p)
+			sqlContent, readErr = migration.ReadContentAtRef(ctx, task.RepoPath, branch, p)
 		}
 		f := migration.File{Path: p, SQL: sqlContent, RiskStatements: []string{}}
 		var checks []migration.Check

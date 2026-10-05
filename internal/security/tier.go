@@ -1,11 +1,13 @@
 package security
 
 import (
+	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 )
 
 // boardEndpointRe matches board-only API endpoint path segments that agents must not call.
@@ -510,7 +512,7 @@ func barePushTargetsMain(dir string, rest []string) bool {
 		return true
 	}
 	// symbolic-ref works on unborn branches; rev-parse --abbrev-ref fails there.
-	out, err := exec.Command("git", "-C", dir, "symbolic-ref", "--short", "HEAD").Output()
+	out, err := gitexec.Command(context.Background(), "-C", dir, "symbolic-ref", "--short", "HEAD").Output()
 	if err != nil {
 		return true
 	}
