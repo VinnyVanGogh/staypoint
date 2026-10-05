@@ -300,10 +300,10 @@ func unverifiedMigrations(ctx gocontext.Context, db *sql.DB, task *context.Task)
 // repo git was refused (EPERM) or timed out on is never mistaken for one with
 // nothing in it.
 func nothingToDiff(ctx gocontext.Context, dir string, refs ...string) bool {
-	if _, err := os.Stat(filepath.Join(dir, ".git")); errors.Is(err, fs.ErrNotExist) {
-		return true
-	} else if err != nil {
+	if inRepo, err := insideGitRepo(dir); err != nil {
 		return false
+	} else if !inRepo {
+		return true
 	}
 	for _, ref := range refs {
 		// --verify --quiet exits 1 when the ref does not exist and 128 when git
@@ -321,6 +321,31 @@ func nothingToDiff(ctx gocontext.Context, dir string, refs ...string) bool {
 		}
 	}
 	return false
+}
+
+// insideGitRepo reports whether dir or any of its ancestors holds a .git, the
+// way git itself discovers a repo, since a task's repo_path can be a
+// subdirectory of the repo. Any stat error other than "does not exist" (EPERM
+// from a refused folder) is returned so the caller fails closed.
+func insideGitRepo(dir string) (bool, error) {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return false, err
+	}
+	for {
+		_, err := os.Stat(filepath.Join(dir, ".git"))
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return false, err
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return false, nil
+		}
+		dir = parent
+	}
 }
 
 // Approve handles POST /api/tasks/{id}/ship-review/approve (Board action)
