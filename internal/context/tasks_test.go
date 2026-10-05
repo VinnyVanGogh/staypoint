@@ -450,3 +450,29 @@ func TestRecordTaskSpend_ZeroTurnsDoesNotInflateSpentTurns(t *testing.T) {
 	}
 }
 
+
+// STA-693: GET /api/tasks/{id} builds the task page URL from organization and
+// project, so GetTask must return them like ListTasks does.
+func TestGetTaskReturnsOrganizationAndProject(t *testing.T) {
+	database := setupTestDB(t)
+
+	created, err := CreateTaskWithOptions(database, TaskCreateOptions{
+		Name:         "About page block",
+		RepoPath:     "/repo",
+		GitBranch:    "main",
+		AccountRole:  "personal",
+		Organization: "Rhizome",
+		Project:      "rhizome-site",
+	})
+	if err != nil {
+		t.Fatalf("CreateTaskWithOptions: %v", err)
+	}
+
+	got, err := GetTask(database, created.ID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.Organization != "Rhizome" || got.Project != "rhizome-site" {
+		t.Fatalf("GetTask org/project = %q/%q, want Rhizome/rhizome-site", got.Organization, got.Project)
+	}
+}

@@ -709,9 +709,18 @@ function projectSlug(task) {
   return p.urlKey || p.slug || p.name || p.id || 'default';
 }
 
+// Local daemon tasks ("task-…") only resolve by id. Any identifier they carry is
+// the fleet aggregator's display label (issue prefix + first 6 chars of the id,
+// e.g. "RHI-task-e"), which no endpoint can look up (STA-693).
+function taskRouteIdent(task) {
+  const id = task.id || '';
+  if (id.startsWith('task-')) return id;
+  return task.identifier || id;
+}
+
 function taskToPath(task) {
   if (!task) return '/';
-  const ident = task.identifier || task.id || '';
+  const ident = taskRouteIdent(task);
   let org = '';
   if (ident && ident.includes('-') && !ident.startsWith('task-')) {
     org = ident.split('-')[0];
@@ -759,7 +768,7 @@ function findTask(target, orgHint = null, projectHint = null) {
 
   for (const t of allTasks) {
     const id = (t.id || '').toLowerCase();
-    const ident = (t.identifier || '').toLowerCase();
+    const ident = taskRouteIdent(t).toLowerCase();
 
     if (id === cleanTarget || (ident && ident === cleanTarget) || (ident && ident === targetLower)) {
       exactMatches.push(t);
@@ -792,6 +801,45 @@ function findTask(target, orgHint = null, projectHint = null) {
   }
 
   return null;
+}
+
+// Second chance for a /tasks/:org/:project/:ident URL whose ident the daemon
+// 404'd: links minted before STA-693 carry the fleet display label
+// ("RHI-task-e") instead of the task id. Look the id part up against the
+// daemon's task list and return a task id only when exactly one task matches,
+// narrowing by the URL's project and org; an ambiguous prefix stays a miss.
+async function resolveTaskRouteMiss(ident, orgHint, projectHint) {
+  const raw = String(ident || '').trim();
+  const labelled = /^([A-Za-z]+)-(task-.+)$/.exec(raw);
+  const idPart = (labelled ? labelled[2] : raw).toLowerCase();
+  if (!idPart.startsWith('task-')) return null;
+
+  let tasks;
+  try {
+    tasks = (await apiFetch('/api/tasks?status=all&limit=1000')).tasks || [];
+  } catch {
+    return null;
+  }
+  let pool = tasks.filter(t => (t.id || '').toLowerCase().startsWith(idPart));
+
+  const narrow = (pred) => {
+    const kept = pool.filter(pred);
+    if (kept.length) pool = kept;
+  };
+  if (pool.length > 1 && projectHint) {
+    const proj = projectHint.toLowerCase();
+    narrow(t => (t.project || 'default').toLowerCase() === proj);
+  }
+  const orgKeys = [orgHint, labelled && labelled[1]].filter(Boolean).map(s => s.toLowerCase());
+  if (pool.length > 1 && orgKeys.length) {
+    const orgs = state.fleet?.organizations || [];
+    narrow(t => {
+      const name = (t.organization || '').toLowerCase();
+      const prefix = (orgs.find(o => o.name?.toLowerCase() === name)?.issue_prefix || '').toLowerCase();
+      return orgKeys.includes(name) || (prefix && orgKeys.includes(prefix));
+    });
+  }
+  return pool.length === 1 ? pool[0].id : null;
 }
 
 function pathToRoute(pathname) {
@@ -6780,7 +6828,7 @@ function isFleetTaskId(id) {
 
 let lastDetailOpenTime = 0;
 
-async function openDetail(target, pushHistory = true, orgHint = null, projectHint = null) {
+async function openDetail(target, pushHistory = true, orgHint = null, projectHint = null, fromRouteMiss = false) {
   const panel   = document.getElementById('detail-panel');
   const content = document.getElementById('panel-content');
 
@@ -6870,6 +6918,12 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
     buildChatSection(content, task.id || resolvedId, comments);
     startChatPoll(task.id || resolvedId);
   } catch (err) {
+    if (!fromRouteMiss && err && /^404\b/.test(err.message)) {
+      const fallbackId = await resolveTaskRouteMiss(targetId, orgHint, projectHint);
+      if (fallbackId && fallbackId !== resolvedId) {
+        return openDetail(fallbackId, false, orgHint, projectHint, true);
+      }
+    }
     const cached = matchedTask || state.tasks[resolvedId] || state.tasks[targetId];
     if (cached) {
       if (cached.id) state.openDetailTaskId = cached.id;
@@ -7748,7 +7802,9 @@ function appendRunStepToTimeline(taskId, step) {
 
 // ── Full-page task view ────────────────────────────────────
 
-async function openTaskPage(target, pushHistory = true) {
+// fromRouteMiss: this call re-opens a task found by resolveTaskRouteMiss, so
+// the URL that missed is replaced with the canonical one.
+async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
   // Close sidebar if open
   const panel = document.getElementById('detail-panel');
   if (panel) panel.classList.add('hidden');
@@ -7810,7 +7866,7 @@ async function openTaskPage(target, pushHistory = true) {
     if (task.id) state.openDetailTaskId = task.id;
 
     const finalPath = taskToPath(task);
-    if (pushHistory && window.location.pathname !== finalPath) {
+    if ((pushHistory || fromRouteMiss) && window.location.pathname !== finalPath) {
       history.replaceState({ taskId: task.id, canonicalPath: finalPath, taskPage: true }, '', finalPath);
     }
 
@@ -7828,6 +7884,12 @@ async function openTaskPage(target, pushHistory = true) {
     startChatPoll(activeId);
   } catch (err) {
     const is404 = err && /^404\b/.test(err.message);
+    if (is404 && !fromRouteMiss) {
+      const fallbackId = await resolveTaskRouteMiss(targetId, orgHint, projectHint);
+      if (fallbackId && fallbackId !== resolvedId) {
+        return openTaskPage({ id: fallbackId, org: orgHint, project: projectHint }, false, true);
+      }
+    }
     const cached = matchedTask || state.tasks[resolvedId] || state.tasks[targetId];
     if (is404) {
       if (pageContent) {
