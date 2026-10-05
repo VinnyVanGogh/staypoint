@@ -28,7 +28,12 @@ GOCACHE="$(go env GOCACHE)"
 GOPATH="$(go env GOPATH)"
 export GOMODCACHE GOCACHE GOPATH
 
-TEST_HOME="$(mktemp -d "${TMPDIR:-/tmp}/staypoint-test-home.XXXXXX")"
+# macOS runners set TMPDIR with a trailing slash. os.UserHomeDir returns HOME
+# verbatim, so a "T//staypoint-test-home" HOME never matches the cleaned
+# filepath.Join paths tests compare against.
+TMP_BASE="${TMPDIR:-/tmp}"
+TMP_BASE="${TMP_BASE%/}"
+TEST_HOME="$(mktemp -d "${TMP_BASE:-/tmp}/staypoint-test-home.XXXXXX")"
 trap 'rm -rf "$TEST_HOME"' EXIT
 
 (cd "$REPO" && HOME="$TEST_HOME" go test "$@")
