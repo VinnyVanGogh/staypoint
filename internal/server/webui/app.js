@@ -602,9 +602,9 @@ function handleEvent(evt) {
         const createdAtMs = task.created_at ? new Date(task.created_at).getTime() : null;
         const lastStepAt = runSteps.length ? new Date(runSteps[runSteps.length - 1].created_at).getTime() : null;
         const elapsedMs = lastStepAt && createdAtMs ? lastStepAt - createdAtMs : (createdAtMs ? Date.now() - createdAtMs : null);
-        const isStuck = runSteps.length > 0 && (Date.now() - (lastStepAt || 0)) > 5 * 60 * 1000 && task.status !== 'done';
+        const stuck = isStuck(runSteps, Date.now(), task.status);
         statsBar.innerHTML = '';
-        statsBar.appendChild(buildTimelineStats(task, runSteps, elapsedMs, isStuck));
+        statsBar.appendChild(buildTimelineStats(task, runSteps, elapsedMs, stuck));
       }
     }
     return;
@@ -8605,8 +8605,11 @@ function taskPageHeaderMeta(task, ident) {
   const parts = [];
   if (ident) parts.push(ident);
   const assignee = task.assignee_name || task.checkout_agent_id || '';
-  const route = [...(task.runSteps || [])].reverse().find(s => s && s.kind === 'route' && s.title);
-  const model = route ? route.title.replace(/^Routed to\s+/i, '') : '';
+  // Latest route step that names a model; fallback reasons are not a model.
+  let model = '';
+  for (const s of [...(task.runSteps || [])].reverse()) {
+    if (s && s.kind === 'route' && (model = routeModel(s.title))) break;
+  }
   if (assignee) parts.push(`assigned to ${assignee}${model ? ` (${model})` : ''}`);
   else if (model) parts.push(model);
   return parts.join(' · ');

@@ -58,13 +58,30 @@
 
   // Extracted isStuck predicate used by both refreshTaskStatsBar and renderTaskPage.
   // Caller passes (steps, Date.now(), task.status).
+  // Statuses with no run in flight: a quiet timeline there is expected.
+  const NOT_RUNNING = new Set(['in_review', 'done', 'cancelled', 'blocked']);
+
   function isStuck(allSteps, nowMs, taskStatus) {
+    if (NOT_RUNNING.has(taskStatus)) return false;
     const latest     = latestRunSteps(allSteps);
+    // A terminal state step means the run finished, however long ago.
+    if (latest.some(s => s.kind === 'state')) return false;
     const lastStepAt = latest.length ? new Date(latest[latest.length - 1].created_at).getTime() : null;
-    return lastStepAt !== null && (nowMs - lastStepAt) > 5 * 60 * 1000 && taskStatus !== 'done';
+    return lastStepAt !== null && (nowMs - lastStepAt) > 5 * 60 * 1000;
   }
 
-  const api = { groupStepsByRun, isRealRunGroup, latestRunSteps, currentRunSteps, runElapsedMs, isStuck };
+  // Model named by a route step title, for the task page header. Only titles
+  // that name the model count: "Routed to X", "Ran on X", or "Fell back to X:
+  // <reason>". Anything else ("All providers locked", ...) is not a model.
+  function routeModel(title) {
+    const t = String(title || '').trim();
+    let m = t.match(/^(?:Routed to|Ran on)\s+(.+)$/i);
+    if (m) return m[1].trim();
+    m = t.match(/^Fell back to\s+([^:]+):/i);
+    return m ? m[1].trim() : '';
+  }
+
+  const api = { groupStepsByRun, isRealRunGroup, latestRunSteps, currentRunSteps, runElapsedMs, isStuck, routeModel };
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;
