@@ -336,41 +336,7 @@ document.addEventListener('click', () => {
   document.querySelectorAll('.report-dl-menu').forEach(m => { m.hidden = true; });
 });
 
-// ── Simple markdown renderer ──────────────────────────────
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-function renderMarkdown(text) {
-  if (!text) return '';
-  let s = escapeHtml(text);
-  s = s.replace(/```[\w]*\n?([\s\S]*?)```/g, (_, code) =>
-    `<pre><code>${code.trimEnd()}</code></pre>`);
-  s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
-  s = s.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-  s = s.replace(/^## (.+)$/gm, '<h2>$1</h2>');
-  s = s.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-  s = s.replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>');
-  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
-  s = s.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
-  s = s.replace(/^[-*] (.+)$/gm, '<li>$1</li>');
-  s = s.replace(/(<li>[\s\S]*?<\/li>)(\n<li>[\s\S]*?<\/li>)*/g, m => `<ul>${m}</ul>`);
-  s = s.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
-  s = s.replace(/^---+$/gm, '<hr>');
-  const lines = s.split(/\n\n+/);
-  const wrapped = lines.map(chunk => {
-    chunk = chunk.trim();
-    if (!chunk) return '';
-    if (/^<(h[1-6]|ul|ol|pre|blockquote|hr)/.test(chunk)) return chunk;
-    return `<p>${chunk.replace(/\n/g, '<br>')}</p>`;
-  });
-  return wrapped.join('\n');
-}
+// escapeHtml and renderMarkdown live in lib/markdown.js.
 
 function mdEl(text) {
   const div = el('div', 'md-body');
