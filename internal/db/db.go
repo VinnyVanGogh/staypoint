@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -1071,18 +1072,34 @@ func applyMigrations(dbPath string, conn *sql.DB) error {
 		return fmt.Errorf("failed to create schema_versions: %w", err)
 	}
 
-	var currentVersion int
-	err := conn.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_versions;`).Scan(&currentVersion)
+	// Apply every migration not yet recorded, not just those above MAX(version):
+	// branch builds of parallel PRs migrate the live DB, so it can already hold
+	// a higher version while a lower one from another branch never ran (STA-716).
+	rows, err := conn.Query(`SELECT version FROM schema_versions;`)
 	if err != nil {
-		return fmt.Errorf("failed to get current version: %w", err)
+		return fmt.Errorf("failed to read applied versions: %w", err)
+	}
+	applied := map[int]bool{}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to read applied versions: %w", err)
+		}
+		applied[v] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read applied versions: %w", err)
 	}
 
 	var pending []Migration
 	for _, m := range Migrations {
-		if m.Version > currentVersion {
+		if !applied[m.Version] {
 			pending = append(pending, m)
 		}
 	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].Version < pending[j].Version })
 
 	if len(pending) == 0 {
 		return nil
