@@ -232,6 +232,9 @@ func gitEnvFrom(ctx context.Context) []string {
 var (
 	ghTimeout     = 60 * time.Second
 	gitNetTimeout = 120 * time.Second
+	// prHeadSyncWait bounds the wait for GitHub to show a pushed head on the PR.
+	prHeadSyncWait = 15 * time.Second
+	prHeadSyncPoll = time.Second
 )
 
 // IsWorkRepo decides whether a repo is a work (Managed Solution) repo. The
@@ -460,6 +463,13 @@ func OpenOrUpdatePR(ctx context.Context, a GHAuth, card *Card, force bool) (*PRI
 		n, _ := strconv.Atoi(m[1])
 		if pr, err = a.ViewPR(ctx, n); err != nil {
 			return nil, fmt.Errorf("read created PR #%d: %w", n, err)
+		}
+	}
+	// GitHub can take a moment to move the PR head after a push.
+	for deadline := time.Now().Add(prHeadSyncWait); pr.HeadRefOid != card.HeadSHA && time.Now().Before(deadline); {
+		time.Sleep(prHeadSyncPoll)
+		if next, err := a.ViewPR(ctx, pr.Number); err == nil {
+			pr = next
 		}
 	}
 	if pr.IsCrossRepository || pr.HeadRefName != card.Branch || pr.HeadRefOid != card.HeadSHA {
