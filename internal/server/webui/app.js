@@ -304,29 +304,84 @@ async function boardEnrollPasskey(existingSessionToken, existingAssertion) {
   }
 }
 
+// boardPasskeyState mirrors GET /api/board/webauthn/status for this page.
+// boardSession is false when the page has no Board session (the route is
+// Board-session gated); registered is whether any passkey is stored.
+const boardPasskeyState = { boardSession: false, registered: false };
+
+// refreshBoardPasskeyStatus re-reads the passkey status and shows the
+// "No passkey enrolled" banner only for a Board session with zero passkeys.
+async function refreshBoardPasskeyStatus() {
+  let data = null;
+  try {
+    const r = await fetch('/api/board/webauthn/status', { headers: authHeader() });
+    if (r.ok) data = await r.json();
+  } catch { /* daemon unreachable: leave the banner as it was */ return boardPasskeyState; }
+  boardPasskeyState.boardSession = !!data;
+  boardPasskeyState.registered = !!(data && data.registered);
+  const showBanner = boardPasskeyState.boardSession && !boardPasskeyState.registered;
+  const banner = document.getElementById('board-passkey-banner');
+  if (banner) banner.hidden = !showBanner;
+  document.body.classList.toggle('has-passkey-banner', showBanner);
+  return boardPasskeyState;
+}
+
+// enrollBoardPasskey runs boardEnrollPasskey for an explicit "Enroll passkey"
+// click. A second passkey needs an assertion from an existing one, so that is
+// collected first when one is believed enrolled; if the server says none is
+// (the cached state was stale), it enrolls as the first passkey instead.
+// Returns true on success; failures, including the daemon's "Couldn't show
+// the pairing code: …" (STA-696), are reported with an alert.
+let boardEnrollInFlight = false;
+async function enrollBoardPasskey() {
+  if (boardEnrollInFlight) return false;
+  boardEnrollInFlight = true;
+  try {
+    let sessionToken, assertion;
+    if (boardPasskeyState.registered) {
+      try {
+        ({ sessionToken, assertion } = await boardWebAuthnGetAssertion());
+      } catch (e) {
+        if (!e.needsEnrollment) throw e;
+        boardPasskeyState.registered = false;
+      }
+    }
+    await boardEnrollPasskey(sessionToken, assertion);
+    return true;
+  } catch (e) {
+    alert('Enrollment failed: ' + (e.message || e));
+    return false;
+  } finally {
+    boardEnrollInFlight = false;
+    await refreshBoardPasskeyUI();
+  }
+}
+
+// refreshBoardPasskeyUI updates the banner and, when Settings is open, the
+// passkey list (which re-reads the status itself).
+function refreshBoardPasskeyUI() {
+  return document.querySelector('#settings-security .settings-passkeys-body')
+    ? refreshSettingsPasskeys()
+    : refreshBoardPasskeyStatus();
+}
+
 // withBoardWebAuthn wraps a Board action fetch. It calls boardWebAuthnGetAssertion()
-// first and attaches the session/assertion headers. On 403 board_passkey_enrollment_required
-// it shows the enrollment prompt and does NOT perform the action.
-// Returns null if enrollment is required (caller should abort), or the fetch Response.
-async function withBoardWebAuthn(fetchFn) {
+// first and attaches the session/assertion headers. With no passkey enrolled it
+// offers enrollment and, once enrolled, asks "Continue with <actionLabel>?" so
+// the Board does not have to start the action again.
+// Returns null if the action was not performed (caller should abort), or the fetch Response.
+async function withBoardWebAuthn(fetchFn, actionLabel) {
   let sessionToken, assertion;
   try {
     ({ sessionToken, assertion } = await boardWebAuthnGetAssertion());
   } catch (e) {
-    if (e.needsEnrollment) {
-      const doEnroll = confirm(
-        'Board actions require a registered passkey.\n\nClick OK to enroll a passkey now, or Cancel to abort.');
-      if (doEnroll) {
-        try {
-          await boardEnrollPasskey();
-          alert('Passkey enrolled! Please try your action again.');
-        } catch (ee) {
-          alert('Enrollment failed: ' + (ee.message || ee));
-        }
-      }
-      return null;
-    }
-    throw e;
+    if (!e.needsEnrollment) throw e;
+    boardPasskeyState.registered = false;
+    const doEnroll = confirm(
+      'Board actions require a registered passkey.\n\nClick OK to enroll a passkey now, or Cancel to abort.');
+    if (!doEnroll || !(await enrollBoardPasskey())) return null;
+    if (!confirm(`Passkey enrolled. Continue with ${actionLabel || 'this action'}?`)) return null;
+    ({ sessionToken, assertion } = await boardWebAuthnGetAssertion());
   }
   return fetchFn(sessionToken, assertion);
 }
@@ -551,6 +606,10 @@ function handleEvent(evt) {
     if (tid && state.openDetailTaskId === tid) {
       refreshTaskStatsBar(tid);
     }
+    return;
+  }
+  if (type === 'board_passkey_registered' || type === 'board_passkey_deleted') {
+    refreshBoardPasskeyUI();
     return;
   }
   if (type === 'security_gate_request' && evt.data) {
@@ -4274,6 +4333,90 @@ function renderTopTasksSpendCard(f, grid) {
 
 
 // ── Settings Page ─────────────────────────────────────────
+// refreshSettingsPasskeys fills Settings → Security with the enrolled passkeys,
+// an Enroll passkey button and a Delete action per passkey. A no-op when the
+// Settings page is not rendered.
+let settingsPasskeysSeq = 0;
+async function refreshSettingsPasskeys() {
+  if (!document.querySelector('#settings-security .settings-passkeys-body')) return;
+  const seq = ++settingsPasskeysSeq;
+  const status = await refreshBoardPasskeyStatus();
+  let creds = [];
+  if (status.boardSession) {
+    try {
+      const r = await fetch('/api/board/webauthn/credentials', { headers: authHeader() });
+      if (r.ok) creds = (await r.json()).credentials || [];
+    } catch { /* render what we have */ }
+  }
+  // A newer refresh (or a re-render of Settings) superseded this one.
+  const body = document.querySelector('#settings-security .settings-passkeys-body');
+  if (!body || seq !== settingsPasskeysSeq) return;
+  body.innerHTML = '';
+
+  if (!status.boardSession) {
+    const row = el('div', 'settings-row');
+    row.appendChild(el('div', 'settings-row-sub', 'Open the Board link from `staypoint board url` to manage passkeys.'));
+    body.appendChild(row);
+    return;
+  }
+
+  const enrollRow = el('div', 'settings-row');
+  const enrollLbl = el('div', 'settings-row-label-wrap');
+  enrollLbl.appendChild(el('div', 'settings-row-label',
+    creds.length ? `${creds.length} passkey${creds.length === 1 ? '' : 's'} enrolled` : 'No passkeys enrolled'));
+  enrollLbl.appendChild(el('div', 'settings-row-sub', creds.length
+    ? 'Adding another passkey asks for an existing one first.'
+    : 'Board actions are locked until a passkey is enrolled. You will need the pairing code shown in the StayPoint Board dialog.'));
+  enrollRow.appendChild(enrollLbl);
+  const enrollBtn = el('button', 'btn btn-primary settings-enroll-passkey-btn', 'Enroll passkey');
+  enrollBtn.type = 'button';
+  enrollBtn.addEventListener('click', async () => {
+    enrollBtn.disabled = true;
+    try { await enrollBoardPasskey(); } finally { enrollBtn.disabled = false; }
+  });
+  enrollRow.appendChild(enrollBtn);
+  body.appendChild(enrollRow);
+
+  for (const c of creds) {
+    const row = el('div', 'settings-row passkey-row');
+    const lbl = el('div', 'settings-row-label-wrap');
+    lbl.appendChild(el('div', 'settings-row-label', `Passkey ${String(c.credential_id || c.id).slice(0, 10)}`));
+    const sub = el('div', 'settings-row-sub');
+    sub.appendChild(document.createTextNode('Enrolled '));
+    sub.appendChild(el('span', 'passkey-created', c.created_at ? fmtDateTime(c.created_at) : 'unknown'));
+    lbl.appendChild(sub);
+    row.appendChild(lbl);
+    const del = el('button', 'btn btn-secondary passkey-delete-btn', 'Delete');
+    del.type = 'button';
+    del.addEventListener('click', async () => {
+      const last = creds.length === 1;
+      if (!confirm(last
+        ? 'Delete the only enrolled passkey? Board actions stay locked until you enroll another.'
+        : 'Delete this passkey?')) return;
+      del.disabled = true;
+      try {
+        const r = await withBoardWebAuthn((sessionToken, assertion) =>
+          fetch(`/api/board/webauthn/credentials/${encodeURIComponent(c.id)}`, {
+            method: 'DELETE',
+            headers: { ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+          }), 'deleting the passkey',
+        );
+        if (r && !r.ok) {
+          const e = await r.json().catch(() => ({}));
+          alert('Delete failed: ' + (e.message || r.status));
+        }
+      } catch (e) {
+        alert('Delete failed: ' + (e.message || e));
+      } finally {
+        del.disabled = false;
+        refreshBoardPasskeyUI();
+      }
+    });
+    row.appendChild(del);
+    body.appendChild(row);
+  }
+}
+
 function renderSettings() {
   const container = document.getElementById('settings-container');
   if (!container) return;
@@ -4535,6 +4678,17 @@ function renderSettings() {
   }
   container.appendChild(fleetSec);
 
+  // Security section: Board passkeys (STA-694)
+  const pkSec = el('div', 'settings-section');
+  pkSec.id = 'settings-security';
+  const pkHdr = el('div', 'settings-section-header');
+  pkHdr.appendChild(el('div', 'settings-section-title', 'Security'));
+  pkHdr.appendChild(el('div', 'settings-section-desc', 'Board passkeys (Touch ID). Every Board action needs one.'));
+  pkSec.appendChild(pkHdr);
+  pkSec.appendChild(el('div', 'settings-passkeys-body'));
+  container.appendChild(pkSec);
+  refreshSettingsPasskeys();
+
   // Security Gates section
   const gateSec = el('div', 'settings-section');
   const gateHdr = el('div', 'settings-section-header');
@@ -4579,7 +4733,7 @@ function renderSettings() {
         method: 'POST',
         headers: Object.assign({ 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion }, authHeader()),
         body: JSON.stringify({ main_merge_approval: checked }),
-      })
+      }), 'changing "Require my approval to merge to main"',
     ).then(r => {
       if (r === null) { gateToggle.disabled = false; gateToggle.checked = !checked; return null; }
       return r.ok ? r.json() : null;
@@ -4623,7 +4777,7 @@ function renderSettings() {
         method: 'POST',
         headers: Object.assign({ 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion }, authHeader()),
         body: JSON.stringify({ ship_review: checked }),
-      })
+      }), 'changing "Ship review before merge"',
     ).then(r => {
       if (r === null) { srToggle.disabled = false; srToggle.checked = !checked; return null; }
       return r.ok ? r.json() : null;
@@ -4709,7 +4863,7 @@ function renderSettings() {
         method: 'PUT',
         headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
         body: JSON.stringify(payload),
-      })
+      }), 'saving the dev environment config',
     );
     saveBtn.disabled = false;
     if (r === null) { saveStatus.textContent = 'Passkey required — enroll first.'; return; }
@@ -7905,7 +8059,7 @@ function renderBranchDeleteWarning(taskId, headSHA, mainSHA, cleanup) {
         fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/delete-branch`, {
           method: 'POST',
           headers: { ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-        })
+        }), 'deleting the branch',
       );
       if (r === null) { retry.disabled = false; return; }
       const body = await r.json().catch(() => ({}));
@@ -8170,7 +8324,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
             method: 'POST',
             headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
             body: JSON.stringify({ comment: 'HEAD moved — please re-pin to the current branch HEAD.' }),
-          })
+          }), 'asking the agent to re-pin',
         );
         if (r === null) { repin.disabled = false; return; }
         if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -8212,7 +8366,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
             method: 'POST',
             headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
             body: JSON.stringify({ comment }),
-          })
+          }), 'sending the review back',
         );
         if (r === null) { sbSubmit.disabled = false; return; }
         if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -8264,7 +8418,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
             method: 'POST',
             headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
             body: JSON.stringify({ comment, delete_branch: delBranch }),
-          })
+          }), 'rejecting the review',
         );
         if (r === null) { rjSubmit.disabled = false; return; }
         if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -8301,7 +8455,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
           fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/approve`, {
             method: 'POST',
             headers: { ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-          })
+          }), 'merging to main',
         );
         if (r === null) { acMerge.disabled = false; return; }
         if (r.status === 409) {
@@ -10863,6 +11017,12 @@ document.getElementById('projects-org-filter')?.addEventListener('change', (e) =
   }
 
   connectSSE();
+  refreshBoardPasskeyStatus();
+  const bannerEnrollBtn = document.getElementById('board-passkey-banner-enroll');
+  bannerEnrollBtn?.addEventListener('click', async () => {
+    bannerEnrollBtn.disabled = true;
+    try { await enrollBoardPasskey(); } finally { bannerEnrollBtn.disabled = false; }
+  });
   updateDevTourToggleUI();
   if (isWalkthroughActive()) {
     renderWalkthroughHUD();
@@ -11243,7 +11403,7 @@ async function decideGate(id, decision) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
         body: JSON.stringify({ decision }),
-      })
+      }), `${decision === 'approve' ? 'approving' : 'denying'} the gate request`,
     );
     if (r === null) return; // enrollment required — user was prompted
     if (r.status === 403) {
