@@ -31,6 +31,9 @@ async function createCardTask(request: APIRequestContext, label: string, files: 
   const run = (args: string[]) => execFileSync('git', args, { cwd: work, env, stdio: 'pipe' });
   fs.mkdirSync(work, { recursive: true });
   execFileSync('git', ['init', '-b', 'main', work], { env, stdio: 'pipe' });
+  // The server's merge commit needs an identity of its own.
+  run(['config', 'user.email', 't@t.com']);
+  run(['config', 'user.name', 'test']);
   fs.writeFileSync(path.join(work, 'README.md'), 'init\n');
   run(['add', '.']);
   run(['commit', '-m', 'init']);
@@ -89,6 +92,8 @@ async function fakeTestCoverage(page: Page, taskId: string, body: unknown) {
 const TEST_TASK = { id: 'task-gap0001', name: 'Add tests for calc/calc.go (merged untested at `abc1234`)', url: '/tasks/STA/ui-e2e/task-gap0001', created: true };
 
 test.describe('ship review merge test gate (STA-734)', () => {
+  // Each spec builds a real repo and task first; slow on a loaded host.
+  test.describe.configure({ timeout: 90_000 });
 
   test('no CI and no tests: both warnings block Approve; the no-coverage note says so', async ({ page, request }) => {
     const { task, headSHA, cleanup } = await createCardTask(request, 'Gate no CI');
@@ -268,6 +273,7 @@ test.describe('ship review merge test gate (STA-734)', () => {
   });
 
   test('real server: source change with no tests merges via bypass and files one backlog task', async ({ boardPage: page, request }) => {
+    test.setTimeout(120_000);
     const { task, headSHA, cleanup } = await createCardTask(request, 'Gate real bypass', {
       'calc/calc.go': 'package calc\n\nfunc Add(a, b int) int { return a + b }\n',
     });
