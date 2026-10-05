@@ -3,7 +3,11 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { test, expect, gotoTaskPage } from '../fixtures';
-import type { APIRequestContext } from '@playwright/test';
+import type { APIRequestContext, Page } from '@playwright/test';
+
+// The Approve & Merge / Send Back / Reject buttons and their inline forms live
+// in the task page's sticky header, not inside .ship-review-card (STA-640).
+const reviewActions = (page: Page) => page.locator('#task-page-content .task-page-header');
 
 // STA-535 regression coverage for ship-review UI bugs:
 //   Bug 1 — dev_url missing from GET after UpsertCard auto-start
@@ -140,13 +144,13 @@ test.describe('ship review card', () => {
       throw new Error(`Unexpected browser dialog (${d.type()}): ${d.message()}`);
     });
 
-    await card.getByRole('button', { name: /Approve/i }).click();
+    await reviewActions(page).getByRole('button', { name: /Approve/i }).click();
     // Inline confirm form must appear; click Merge to main to proceed.
-    await expect(card.locator('.ship-review-approve-confirm')).toBeVisible({ timeout: 3_000 });
-    await card.getByRole('button', { name: /Merge to main/i }).click();
+    await expect(reviewActions(page).locator('.ship-review-approve-confirm')).toBeVisible({ timeout: 3_000 });
+    await reviewActions(page).getByRole('button', { name: /Merge to main/i }).click();
 
     // The inline head-moved banner must appear with the new SHA and a re-pin button.
-    const banner = card.locator('.ship-review-head-moved-banner');
+    const banner = reviewActions(page).locator('.ship-review-head-moved-banner');
     await expect(banner).toBeVisible({ timeout: 5_000 });
     await expect(banner).toContainText(fakeNewHead.slice(0, 12));
     await expect(banner).toContainText(/re-pin/i);
@@ -187,7 +191,7 @@ test.describe('ship review card', () => {
     });
 
     // Approve shows inline confirm form — click Approve then Merge to main.
-    await page.locator('.ship-review-card .ship-review-approve-btn').click();
+    await reviewActions(page).locator('.ship-review-approve-btn').click();
     await expect(page.locator('.ship-review-approve-confirm')).toBeVisible({ timeout: 3_000 });
     await page.locator('.ship-review-approve-confirm').getByRole('button', { name: /Merge to main/i }).click();
 
@@ -236,10 +240,10 @@ test.describe('ship review card', () => {
     const rejectComment = 'Tests failed on mobile';
 
     // Click Reject to open the inline form.
-    await page.locator('.ship-review-card .ship-review-reject-btn').click();
+    await reviewActions(page).locator('.ship-review-reject-btn').click();
 
     // The inline form must be visible.
-    const rejectForm = section.locator('.ship-review-inline-form:not(.ship-review-approve-confirm)').last();
+    const rejectForm = reviewActions(page).locator('.ship-review-inline-form:not(.ship-review-approve-confirm)').last();
     await expect(rejectForm).toBeVisible({ timeout: 3_000 });
 
     // Fill in reason.
@@ -282,8 +286,8 @@ test.describe('ship review card', () => {
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 'ok' }) });
     });
 
-    await page.locator('.ship-review-card .ship-review-reject-btn').click();
-    const rejectForm = section.locator('.ship-review-inline-form:not(.ship-review-approve-confirm)').last();
+    await reviewActions(page).locator('.ship-review-reject-btn').click();
+    const rejectForm = reviewActions(page).locator('.ship-review-inline-form:not(.ship-review-approve-confirm)').last();
     await expect(rejectForm).toBeVisible({ timeout: 3_000 });
 
     await rejectForm.locator('.ship-review-del-branch-chk').check();
@@ -315,9 +319,9 @@ test.describe('ship review card', () => {
     });
 
     // Click Send Back to open the inline form.
-    await page.locator('.ship-review-card .ship-review-sendback-btn').click();
+    await reviewActions(page).locator('.ship-review-sendback-btn').click();
 
-    const sendBackForm = section.locator('.ship-review-inline-form').first();
+    const sendBackForm = reviewActions(page).locator('.ship-review-inline-form').first();
     await expect(sendBackForm).toBeVisible({ timeout: 3_000 });
 
     // Submit with feedback.
@@ -335,6 +339,7 @@ test.describe('ship review card', () => {
 
     // No action buttons should be present in the working state.
     await expect(workingCard.locator('.ship-review-approve-btn')).toHaveCount(0);
+    await expect(reviewActions(page).locator('.ship-review-approve-btn')).toHaveCount(0);
     cleanup();
   });
 
@@ -402,8 +407,8 @@ test.describe('ship review card', () => {
       });
     });
 
-    await card.getByRole('button', { name: /Approve/i }).click();
-    await card.getByRole('button', { name: /Merge to main/i }).click();
+    await reviewActions(page).getByRole('button', { name: /Approve/i }).click();
+    await reviewActions(page).getByRole('button', { name: /Merge to main/i }).click();
 
     // Merge stands: final approved card, plus the non-blocking warning.
     const finalCard = page.locator('.ship-review-card--final');
@@ -468,10 +473,10 @@ test.describe('ship review card', () => {
     });
 
     const challenge = page.waitForResponse((r) => r.url().includes('/api/board/webauthn/challenge'));
-    await card.getByRole('button', { name: /Approve/i }).click();
+    await reviewActions(page).getByRole('button', { name: /Approve/i }).click();
     // Inline confirm form must appear; click Merge to main to trigger withBoardWebAuthn.
-    await expect(card.locator('.ship-review-approve-confirm')).toBeVisible({ timeout: 3_000 });
-    await card.getByRole('button', { name: /Merge to main/i }).click();
+    await expect(reviewActions(page).locator('.ship-review-approve-confirm')).toBeVisible({ timeout: 3_000 });
+    await reviewActions(page).getByRole('button', { name: /Merge to main/i }).click();
 
     // The real server, not a route, must report zero passkeys.
     const challengeRes = await challenge;
@@ -492,7 +497,7 @@ test.describe('ship review card', () => {
     const after = await (await request.get(cardURL, { headers: { Authorization: `Bearer ${TOKEN}` } })).json();
     expect(after.status).toBe(before.status);
     expect(after.head_sha).toBe(before.head_sha);
-    await expect(card.locator('.ship-review-approve-btn')).toBeEnabled();
+    await expect(reviewActions(page).locator('.ship-review-approve-btn')).toBeEnabled();
     expect(approveWasCalled).toBe(false);
     cleanup();
   });
@@ -525,8 +530,8 @@ test.describe('ship review card', () => {
     });
 
     // Click Approve → inline confirm form must appear.
-    await card.getByRole('button', { name: /Approve/i }).click();
-    const confirmForm = card.locator('.ship-review-approve-confirm');
+    await reviewActions(page).getByRole('button', { name: /Approve/i }).click();
+    const confirmForm = reviewActions(page).locator('.ship-review-approve-confirm');
     await expect(confirmForm).toBeVisible({ timeout: 3_000 });
 
     // Form must mention the target branch.
@@ -541,7 +546,7 @@ test.describe('ship review card', () => {
     expect(approveCallCount).toBe(0);
 
     // Click Approve again → Merge to main → final card appears.
-    await card.getByRole('button', { name: /Approve/i }).click();
+    await reviewActions(page).getByRole('button', { name: /Approve/i }).click();
     await expect(confirmForm).toBeVisible({ timeout: 3_000 });
     await confirmForm.getByRole('button', { name: /Merge to main/i }).click();
     await expect(page.locator('.ship-review-card--final')).toBeVisible({ timeout: 5_000 });
@@ -566,8 +571,8 @@ test.describe('ship review card', () => {
     const card = page.locator('.ship-review-card');
     await expect(card).toBeVisible({ timeout: 10_000 });
 
-    await card.getByRole('button', { name: /Approve/i }).click();
-    await card.getByRole('button', { name: /Merge to main/i }).click();
+    await reviewActions(page).getByRole('button', { name: /Approve/i }).click();
+    await reviewActions(page).getByRole('button', { name: /Merge to main/i }).click();
 
     const finalCard = page.locator('.ship-review-card--final');
     await expect(finalCard.locator('.ship-review-status-badge')).toContainText(/Approved/i, { timeout: 15_000 });

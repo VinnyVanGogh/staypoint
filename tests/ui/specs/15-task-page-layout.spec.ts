@@ -296,7 +296,6 @@ test('seeded heavy task renders and is captured at 1512x900', async ({ page, api
 });
 
 test('step 2: one screen at 1512x900 with sticky header actions, stats strip and pinned composer', async ({ page, api }) => {
-  knownBug('STA-638-2');
   test.setTimeout(90_000);
   const { task, ident } = await openHeavyTask(page, api);
 
