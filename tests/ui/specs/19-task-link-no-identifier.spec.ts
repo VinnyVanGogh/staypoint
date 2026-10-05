@@ -100,10 +100,49 @@ test.describe('task link without identifier (STA-693)', () => {
   test('legacy URL with the fleet label in the ident slot resolves by id', async ({ page, api }) => {
     const project = `rhizome-site-${Date.now().toString(36)}`;
     const task = await api.createTask('LegacyLabel', { organization: ORG, project });
+    // The label was minted by the fleet overview, which maps Rhizome to RHI. The
+    // e2e daemon's overview leaves local orgs out, so seed it as production has it.
+    await seedFleetLabel(page, task, project);
 
     await page.goto(`/tasks/${PREFIX}/${project}/${fleetLabel(task)}`);
     await expect(page.locator('#task-page-content .task-page-title')).toHaveText(task.name, { timeout: 20_000 });
     // The URL is rewritten to the resolvable task id.
     await expect(page).toHaveURL(new RegExp(`/${task.id}$`));
+  });
+
+  // STA-722: the label prefix is the task's own org, so a legacy RHI label must
+  // not open a task from another org just because it is the only id match (the
+  // RHI task may be deleted or past the task list cap). The full id stands in
+  // for the 6-char id part so the match is unique however many tasks the run has.
+  test('legacy label URL does not resolve to a task in another org', async ({ page, api }) => {
+    const task = await api.createTask('OtherOrg'); // STA / ui-e2e
+    const path = `/tasks/${PREFIX}/rhizome-gone/${PREFIX}-${task.id}`;
+
+    await page.goto(path);
+    await expect(page.locator('#task-page-content')).toContainText('Task not found', { timeout: 20_000 });
+    await expect(page.locator('#task-page-content .task-page-title')).toHaveCount(0);
+    expect(new URL(page.url()).pathname).toBe(path);
+  });
+
+  test('legacy label URL resolves without the overview when the org name is the prefix', async ({ page, api }) => {
+    const task = await api.createTask('NamedByPrefix', { organization: PREFIX, project: 'rhizome-site' });
+    await page.route('**/api/fleet/overview', (route) => route.abort());
+
+    await page.goto(`/tasks/${PREFIX}/default/${fleetLabel(task)}`);
+    await expect(page.locator('#task-page-content .task-page-title')).toHaveText(task.name, { timeout: 20_000 });
+    await expect(page).toHaveURL(new RegExp(`/${task.id}$`));
+  });
+
+  test('legacy label URL stays a miss when the org prefix cannot be loaded', async ({ page, api }) => {
+    const project = `rhizome-site-${Date.now().toString(36)}`;
+    const task = await api.createTask('NoFleet', { organization: ORG, project });
+    // Without the overview nothing maps "Rhizome" to RHI; resolving anyway would
+    // be a guess, and that guess is what lets another org's task through.
+    await page.route('**/api/fleet/overview', (route) => route.abort());
+    const path = `/tasks/${PREFIX}/${project}/${fleetLabel(task)}`;
+
+    await page.goto(path);
+    await expect(page.locator('#task-page-content')).toContainText('Task not found', { timeout: 20_000 });
+    expect(new URL(page.url()).pathname).toBe(path);
   });
 });

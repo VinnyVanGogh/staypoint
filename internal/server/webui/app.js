@@ -833,6 +833,9 @@ function findTask(target, orgHint = null, projectHint = null) {
 // ("RHI-task-e") instead of the task id. Look the id part up against the
 // daemon's task list and return a task id only when exactly one task matches,
 // narrowing by the URL's project and org; an ambiguous prefix stays a miss.
+// The label's prefix is the task's own org issue_prefix, so a labelled ident
+// only ever resolves to a task in that org (STA-722): the intended task may be
+// gone or past the list cap, and another org's task-8… is not it.
 async function resolveTaskRouteMiss(ident, orgHint, projectHint) {
   const raw = String(ident || '').trim();
   const labelled = /^([A-Za-z]+)-(task-.+)$/.exec(raw);
@@ -847,24 +850,55 @@ async function resolveTaskRouteMiss(ident, orgHint, projectHint) {
   }
   let pool = tasks.filter(t => (t.id || '').toLowerCase().startsWith(idPart));
 
+  if (labelled && pool.length) {
+    pool = await filterByLabelOrg(pool, labelled[1].toLowerCase());
+  }
+
   const narrow = (pred) => {
     const kept = pool.filter(pred);
     if (kept.length) pool = kept;
   };
+  // Soft: links minted before STA-693 carried "default" for every project.
   if (pool.length > 1 && projectHint) {
     const proj = projectHint.toLowerCase();
     narrow(t => (t.project || 'default').toLowerCase() === proj);
   }
-  const orgKeys = [orgHint, labelled && labelled[1]].filter(Boolean).map(s => s.toLowerCase());
-  if (pool.length > 1 && orgKeys.length) {
-    const orgs = state.fleet?.organizations || [];
+  if (pool.length > 1 && orgHint && !labelled) {
+    const orgKey = orgHint.toLowerCase();
+    const prefixOf = orgPrefixMap(state.fleet?.organizations);
     narrow(t => {
-      const name = (t.organization || '').toLowerCase();
-      const prefix = (orgs.find(o => o.name?.toLowerCase() === name)?.issue_prefix || '').toLowerCase();
-      return orgKeys.includes(name) || (prefix && orgKeys.includes(prefix));
+      const name = taskOrgName(t);
+      return name === orgKey || prefixOf.get(name) === orgKey;
     });
   }
   return pool.length === 1 ? pool[0].id : null;
+}
+
+// The fleet aggregator files a task with no organization under "StayPoint".
+function taskOrgName(t) {
+  return (t.organization || 'StayPoint').toLowerCase();
+}
+
+function orgPrefixMap(orgs) {
+  const m = new Map();
+  for (const o of orgs || []) {
+    if (o.name && o.issue_prefix) m.set(o.name.toLowerCase(), o.issue_prefix.toLowerCase());
+  }
+  return m;
+}
+
+// Keeps the tasks whose org is the label prefix, by name or by the org's fleet
+// issue_prefix. At boot state.fleet may not be loaded yet, so when a candidate's
+// org has no known prefix the overview is fetched here; if that fails the
+// candidate stays unmatched and the URL stays a miss rather than guessing.
+async function filterByLabelOrg(pool, prefix) {
+  let prefixOf = orgPrefixMap(state.fleet?.organizations);
+  if (pool.some(t => taskOrgName(t) !== prefix && !prefixOf.has(taskOrgName(t)))) {
+    try {
+      prefixOf = orgPrefixMap((await apiFetch('/api/fleet/overview'))?.organizations);
+    } catch { /* unknown orgs stay unmatched */ }
+  }
+  return pool.filter(t => taskOrgName(t) === prefix || prefixOf.get(taskOrgName(t)) === prefix);
 }
 
 function pathToRoute(pathname) {

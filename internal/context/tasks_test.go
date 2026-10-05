@@ -450,7 +450,6 @@ func TestRecordTaskSpend_ZeroTurnsDoesNotInflateSpentTurns(t *testing.T) {
 	}
 }
 
-
 // STA-693: GET /api/tasks/{id} builds the task page URL from organization and
 // project, so GetTask must return them like ListTasks does.
 func TestGetTaskReturnsOrganizationAndProject(t *testing.T) {
