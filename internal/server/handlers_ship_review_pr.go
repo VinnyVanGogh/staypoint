@@ -5,31 +5,60 @@ package server
 // head, and the Board merges through GitHub from the card.
 
 import (
+	gocontext "context"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/VinnyVanGogh/staypoint/internal/bridge"
 	"github.com/VinnyVanGogh/staypoint/internal/context"
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 )
 
-func init() {
-	// A repo counts as work if either detector says so: the path rules, or
-	// the router's git-remote and scan-repos checks. Erring towards "work"
-	// only ever means stricter credentials and an Open PR default.
-	shipreview.IsWorkRepo = func(path string) bool {
-		if path == "" {
-			return false
-		}
-		if bridge.IsWorkRepo(path) {
-			return true
-		}
-		isWork, _, _ := router.IsWorkRepo(path)
-		return isWork
+func init() { shipreview.IsWorkRepo = shipReviewIsWorkRepo }
+
+// shipReviewIsWorkRepo decides the Open PR default: the bridge path rules,
+// or the router's path, remote and scan-repos checks. The router counts all
+// of ~/Documents/dev/worktrees as work (right for account routing, wrong
+// here: personal repos have worktrees there too), so under that dir only the
+// git remote decides.
+func shipReviewIsWorkRepo(path string) bool {
+	if path == "" {
+		return false
 	}
+	if bridge.IsWorkRepo(path) {
+		return true
+	}
+	isWork, src, _ := router.IsWorkRepo(path)
+	if !isWork {
+		return false
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(src, "prefix: ~/Documents/dev/work") {
+		wt := filepath.Join(home, "Documents", "dev", "worktrees")
+		if p := filepath.Clean(path); p == wt || strings.HasPrefix(p, wt+string(filepath.Separator)) {
+			return remoteIsWork(path)
+		}
+	}
+	return true
+}
+
+// remoteIsWork reports whether the repo's origin points at a Managed Solution
+// GitHub org.
+func remoteIsWork(path string) bool {
+	cmd := gitexec.Command(gocontext.Background(), "config", "--get", "remote.origin.url")
+	cmd.Dir = path
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	u := strings.ToLower(string(out))
+	return strings.Contains(u, "managedsolution") || strings.Contains(u, "managed-solution") || strings.Contains(u, "mansol")
 }
 
 func writeJSONStatus(w http.ResponseWriter, code int, body any) {
@@ -38,15 +67,15 @@ func writeJSONStatus(w http.ResponseWriter, code int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// requireGHAuth resolves the repo's gh identity, answering 409 when a work
-// repo has none of its own.
+// requireGHAuth resolves the repo's gh identity, answering 409 when the
+// project's gh_config_dir override is unusable.
 func (h *ShipReviewHandler) requireGHAuth(w http.ResponseWriter, task *context.Task) (shipreview.GHAuth, bool) {
 	cfg, err := shipreview.GetProjectDevConfig(h.db, task.RepoPath)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
 		return shipreview.GHAuth{}, false
 	}
-	auth, err := shipreview.ResolveGHAuth(cfg, task.RepoPath, shipreview.IsWorkRepo(task.RepoPath))
+	auth, err := shipreview.ResolveGHAuth(cfg, task.RepoPath)
 	if err != nil {
 		writeJSONStatus(w, http.StatusConflict, map[string]any{"error": "gh_auth", "message": err.Error()})
 		return auth, false
@@ -57,8 +86,8 @@ func (h *ShipReviewHandler) requireGHAuth(w http.ResponseWriter, task *context.T
 // approvePR is Approve for the PR modes: push the pinned head, open or reuse
 // the PR. open_pr closes the card there; pr_merge leaves it pending with
 // checks running.
-func (h *ShipReviewHandler) approvePR(w http.ResponseWriter, r *http.Request, card *shipreview.Card, task *context.Task, cfg *shipreview.ProjectDevConfig, mode string, isWork bool) {
-	auth, err := shipreview.ResolveGHAuth(cfg, task.RepoPath, isWork)
+func (h *ShipReviewHandler) approvePR(w http.ResponseWriter, r *http.Request, card *shipreview.Card, task *context.Task, cfg *shipreview.ProjectDevConfig, mode string) {
+	auth, err := shipreview.ResolveGHAuth(cfg, task.RepoPath)
 	if err != nil {
 		writeJSONStatus(w, http.StatusConflict, map[string]any{"error": "gh_auth", "message": err.Error()})
 		return
@@ -198,11 +227,25 @@ func (h *ShipReviewHandler) MergePR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
+		// HeadSHA is the head the Board was shown. The agent can replace the
+		// card (and re-push the PR) while the Board looks at it, so the merge
+		// is pinned to what the Board saw, not to the latest card.
+		HeadSHA                 string `json:"head_sha"`
 		Override                bool   `json:"override"`
 		OverrideReason          string `json:"override_reason"`
 		MigrationOverrideReason string `json:"migration_override_reason"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.HeadSHA == "" {
+		writeError(w, http.StatusBadRequest, "head_sha (the head shown on the card) is required")
+		return
+	}
+	if req.HeadSHA != card.HeadSHA {
+		writeJSONStatus(w, http.StatusConflict, map[string]any{"error": "head_moved",
+			"message":      "the card was re-pinned to a new head since you opened it; review the new head before merging",
+			"new_head_sha": card.HeadSHA})
+		return
+	}
 
 	// The head being merged may be a re-push the Board has not Approved (the
 	// fix after "Send failures to agent"), so the migration gate Approve

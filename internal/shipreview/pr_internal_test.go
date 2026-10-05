@@ -1,7 +1,6 @@
 package shipreview
 
 import (
-	"errors"
 	"strings"
 	"testing"
 )
@@ -74,38 +73,38 @@ func TestFailingLines(t *testing.T) {
 	}
 }
 
-func TestResolveGHAuth_WorkRepoNeverUsesDefaultLogin(t *testing.T) {
-	def := t.TempDir()
-	prev := defaultGHConfigDir
-	defaultGHConfigDir = func() string { return def }
-	t.Cleanup(func() { defaultGHConfigDir = prev })
+func TestResolveGHAuth(t *testing.T) {
+	t.Setenv("GH_TOKEN", "daemon-token")
+	t.Setenv("GITHUB_TOKEN", "daemon-token")
 
-	if _, err := ResolveGHAuth(&ProjectDevConfig{}, "/r", true); !errors.Is(err, ErrWorkRepoGHAuth) {
-		t.Errorf("work repo, no gh_config_dir: err = %v", err)
-	}
-	if _, err := ResolveGHAuth(&ProjectDevConfig{GHConfigDir: def}, "/r", true); !errors.Is(err, ErrWorkRepoGHAuth) {
-		t.Errorf("work repo on the default gh dir: err = %v", err)
-	}
-	if _, err := ResolveGHAuth(&ProjectDevConfig{GHConfigDir: "rel"}, "/r", false); err == nil {
-		t.Error("relative gh_config_dir accepted")
-	}
-	work := t.TempDir()
-	a, err := ResolveGHAuth(&ProjectDevConfig{GHConfigDir: work}, "/r", true)
-	if err != nil {
-		t.Fatalf("work repo with its own dir: %v", err)
-	}
-	t.Setenv("GH_TOKEN", "personal")
-	t.Setenv("GITHUB_TOKEN", "personal")
-	env := strings.Join(a.env(), "\n")
-	if strings.Contains(env, "GH_TOKEN=personal") || strings.Contains(env, "GITHUB_TOKEN=personal") || !strings.Contains(env, "GH_CONFIG_DIR="+work) {
-		t.Errorf("work env leaks the daemon's token or misses the work dir:\n%s", env)
-	}
-	// Personal repos keep the daemon's own gh setup.
-	p, err := ResolveGHAuth(&ProjectDevConfig{}, "/r", false)
+	// No override: the repo's normal gh auth, environment untouched (Board,
+	// 2026-10-05: no separate work credential).
+	a, err := ResolveGHAuth(&ProjectDevConfig{}, "/r")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(p.env(), "\n"), "GH_TOKEN=personal") {
-		t.Error("personal repo lost GH_TOKEN")
+	if env := strings.Join(a.env(), "\n"); !strings.Contains(env, "GH_TOKEN=daemon-token") || !strings.Contains(env, "GITHUB_TOKEN=daemon-token") {
+		t.Errorf("default auth changed the environment:\n%s", env)
+	}
+	if _, err := ResolveGHAuth(nil, "/r"); err != nil {
+		t.Errorf("nil config: %v", err)
+	}
+
+	// An override wins over tokens in the daemon's environment.
+	dir := t.TempDir()
+	o, err := ResolveGHAuth(&ProjectDevConfig{GHConfigDir: dir}, "/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := strings.Join(o.env(), "\n")
+	if strings.Contains(env, "GH_TOKEN=daemon-token") || strings.Contains(env, "GITHUB_TOKEN=daemon-token") || !strings.Contains(env, "GH_CONFIG_DIR="+dir) {
+		t.Errorf("override env:\n%s", env)
+	}
+
+	if _, err := ResolveGHAuth(&ProjectDevConfig{GHConfigDir: "rel"}, "/r"); err == nil {
+		t.Error("relative gh_config_dir accepted")
+	}
+	if _, err := ResolveGHAuth(&ProjectDevConfig{GHConfigDir: dir + "/missing"}, "/r"); err == nil {
+		t.Error("missing gh_config_dir accepted")
 	}
 }

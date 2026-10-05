@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -154,12 +155,20 @@ func prApprove(t *testing.T, client *http.Client, baseURL, token, boardToken, ta
 	return resp.StatusCode, rb
 }
 
+// prMerge posts Merge with the card's current head as the head the Board saw,
+// unless body sets head_sha itself.
 func prMerge(t *testing.T, client *http.Client, baseURL, token, boardToken, taskID string, body string) (int, []byte) {
 	t.Helper()
-	var b []byte
+	req := map[string]any{}
 	if body != "" {
-		b = []byte(body)
+		if err := json.Unmarshal([]byte(body), &req); err != nil {
+			t.Fatal(err)
+		}
 	}
+	if _, ok := req["head_sha"]; !ok {
+		req["head_sha"] = getPRCard(t, client, baseURL, token, taskID).HeadSHA
+	}
+	b, _ := json.Marshal(req)
 	resp, rb := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/merge", b, boardToken, "", "mock-assertion")
 	return resp.StatusCode, rb
 }
@@ -458,12 +467,13 @@ func TestShipReviewPR_GitHubRefusalShownVerbatim(t *testing.T) {
 	}
 }
 
-// Work repos default to Open PR and never fall back to the default gh login.
-func TestShipReviewPR_WorkRepoNeedsOwnGHAuth(t *testing.T) {
+// Work repos default to Open PR and use the repo's normal gh auth (Board,
+// 2026-10-05); gh_config_dir is an optional override that wins over tokens.
+func TestShipReviewPR_WorkRepoAuth(t *testing.T) {
 	state := installFakeGH(t)
-	personal := t.TempDir()
-	t.Setenv("GH_CONFIG_DIR", personal) // the daemon's own (personal) gh login
-	t.Setenv("GH_TOKEN", "personal-token")
+	daemonDir := t.TempDir()
+	t.Setenv("GH_CONFIG_DIR", daemonDir)
+	t.Setenv("GH_TOKEN", "daemon-token")
 	prev := shipreview.IsWorkRepo
 	shipreview.IsWorkRepo = func(string) bool { return true }
 	t.Cleanup(func() { shipreview.IsWorkRepo = prev })
@@ -472,30 +482,113 @@ func TestShipReviewPR_WorkRepoNeedsOwnGHAuth(t *testing.T) {
 	if c := getPRCard(t, client, baseURL, token, taskID); c.EffectiveMode != "open_pr" {
 		t.Fatalf("work repo default mode = %q, want open_pr", c.EffectiveMode)
 	}
-
-	// No gh_config_dir: refused before gh or git push runs.
-	code, rb := prApprove(t, client, baseURL, token, boardToken, taskID)
-	if code != http.StatusConflict || !strings.Contains(string(rb), `"gh_auth"`) {
-		t.Fatalf("Approve without work gh auth: %d %s", code, rb)
-	}
-	// gh_config_dir pointing at the default login is refused too.
-	setMergeMode(t, database, repoDir, "", personal)
-	if code, rb := prApprove(t, client, baseURL, token, boardToken, taskID); code != http.StatusConflict {
-		t.Fatalf("Approve with the default gh dir: %d %s", code, rb)
-	}
-	if calls := ghCalls(t, state); len(calls) != 0 {
-		t.Fatalf("gh ran without a work identity: %v", calls)
-	}
-
-	work := t.TempDir()
-	setMergeMode(t, database, repoDir, "", work)
 	if code, rb := prApprove(t, client, baseURL, token, boardToken, taskID); code != http.StatusOK {
-		t.Fatalf("Approve with work gh auth: %d %s", code, rb)
+		t.Fatalf("Approve with the normal gh auth: %d %s", code, rb)
 	}
 	for _, c := range ghCalls(t, state) {
-		if !strings.HasSuffix(c, "|GH_CONFIG_DIR="+work+"|GH_TOKEN=") {
-			t.Errorf("gh call not isolated to the work login: %q", c)
+		if !strings.HasSuffix(c, "|GH_CONFIG_DIR="+daemonDir+"|GH_TOKEN=daemon-token") {
+			t.Errorf("gh call did not use the normal gh auth: %q", c)
 		}
+	}
+
+	// With an override the dir wins and the daemon's token is dropped.
+	_ = os.Remove(filepath.Join(state, "calls"))
+	_ = os.Remove(filepath.Join(state, "pr"))
+	_, _ = database.Exec(`UPDATE ship_review_cards SET status = 'pending' WHERE task_id = ?`, taskID)
+	override := t.TempDir()
+	setMergeMode(t, database, repoDir, "", override)
+	if code, rb := prApprove(t, client, baseURL, token, boardToken, taskID); code != http.StatusOK {
+		t.Fatalf("Approve with gh_config_dir: %d %s", code, rb)
+	}
+	calls := ghCalls(t, state)
+	if len(calls) == 0 {
+		t.Fatal("no gh calls")
+	}
+	for _, c := range calls {
+		if !strings.HasSuffix(c, "|GH_CONFIG_DIR="+override+"|GH_TOKEN=") {
+			t.Errorf("gh call not under the override: %q", c)
+		}
+	}
+}
+
+// Merge is pinned to the head the Board saw: if the agent re-pins the card
+// (and re-pushes the PR) between render and click, Merge is refused.
+func TestShipReviewPR_MergePinnedToHeadBoardSaw(t *testing.T) {
+	notWork(t)
+	state := installFakeGH(t)
+	database, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	setMergeMode(t, database, repoDir, shipreview.MergeModePRMerge, "")
+	if code, rb := prApprove(t, client, baseURL, token, boardToken, taskID); code != http.StatusOK {
+		t.Fatalf("Approve: %d %s", code, rb)
+	}
+	seen := getPRCard(t, client, baseURL, token, taskID).HeadSHA
+
+	// Send failures, then the agent resubmits B, which is re-pushed to the PR.
+	sb, _ := json.Marshal(map[string]any{"comment": "CI red", "ci_failures": true})
+	if resp, rb := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/send-back", sb, boardToken, "", "mock-assertion"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("send-back: %d %s", resp.StatusCode, rb)
+	}
+	branch := "staypoint/" + taskID
+	gitOut(t, repoDir, "checkout", branch)
+	if err := os.WriteFile(filepath.Join(repoDir, "b.txt"), []byte("b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repoDir, "add", ".")
+	gitOut(t, repoDir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "B")
+	headB := gitOut(t, repoDir, "rev-parse", "HEAD")
+	gitOut(t, repoDir, "checkout", "main")
+	up, _ := json.Marshal(map[string]any{"test_steps": []string{"1. ok"}})
+	if resp, rb := shipDoReq(t, client, token, "PUT", baseURL+"/api/tasks/"+taskID+"/ship-review", up); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("resubmit: %d %s", resp.StatusCode, rb)
+	}
+	writeState(t, state, "checks.json", greenChecks)
+
+	// The Board, still looking at the old head, clicks Merge anyway.
+	code, rb := prMerge(t, client, baseURL, token, boardToken, taskID, `{"head_sha":"`+seen+`","override":true}`)
+	if code != http.StatusConflict || !strings.Contains(string(rb), `"head_moved"`) || !strings.Contains(string(rb), headB) {
+		t.Fatalf("Merge on a stale view: %d %s", code, rb)
+	}
+	if hasCall(ghCalls(t, state), "pr merge") {
+		t.Fatal("gh pr merge ran for a head the Board never saw")
+	}
+	// Without head_sha the request is refused outright.
+	resp, rb := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/merge", []byte(`{}`), boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("Merge without head_sha: %d %s", resp.StatusCode, rb)
+	}
+}
+
+// A PR merged on GitHub outside StayPoint (by hand, auto-merge, merge queue)
+// is recorded by Merge instead of leaving the card stuck pending.
+func TestShipReviewPR_MergedOutsideIsFinalized(t *testing.T) {
+	notWork(t)
+	state := installFakeGH(t)
+	database, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	setMergeMode(t, database, repoDir, shipreview.MergeModePRMerge, "")
+	head := gitOut(t, repoDir, "rev-parse", "staypoint/"+taskID)
+	if code, rb := prApprove(t, client, baseURL, token, boardToken, taskID); code != http.StatusOK {
+		t.Fatalf("Approve: %d %s", code, rb)
+	}
+	writeState(t, state, "checks.json", redChecks)
+
+	// Someone merges the PR on GitHub.
+	gh := exec.Command(filepath.Join(filepath.SplitList(os.Getenv("PATH"))[0], "gh"), "pr", "merge", "7", "--merge", "--match-head-commit", head)
+	gh.Dir = repoDir
+	if out, err := gh.CombinedOutput(); err != nil {
+		t.Fatalf("outside merge: %v %s", err, out)
+	}
+	mergeSHA := strings.TrimSpace(readFile(t, filepath.Join(state, "merge_sha")))
+
+	code, rb := prMerge(t, client, baseURL, token, boardToken, taskID, "")
+	if code != http.StatusOK {
+		t.Fatalf("Merge after an outside merge: %d %s", code, rb)
+	}
+	if n := strings.Count(strings.Join(ghCalls(t, state), "\n"), "pr merge"); n != 1 {
+		t.Errorf("pr merge ran %d times, want only the outside one", n)
+	}
+	c := getPRCard(t, client, baseURL, token, taskID)
+	if c.Status != "approved" || c.MainSHA != mergeSHA {
+		t.Errorf("card after outside merge = %+v, want approved at %s", c, mergeSHA)
 	}
 }
 

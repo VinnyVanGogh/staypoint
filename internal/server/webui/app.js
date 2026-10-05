@@ -4931,7 +4931,7 @@ function renderSettings() {
   const ghDirInput = el('input');
   ghDirInput.type = 'text';
   ghDirInput.className = 'settings-dev-config-input settings-dev-config-gh-dir';
-  ghDirInput.placeholder = 'gh config dir for this repo (GH_CONFIG_DIR; required for work repos in PR modes)';
+  ghDirInput.placeholder = 'Optional GH_CONFIG_DIR override (blank: the repo\'s normal gh login)';
   const saveBtn = el('button', 'settings-dev-config-save', 'Save config');
   const saveStatus = el('span', 'settings-dev-config-status', '');
   devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Repo path'));
@@ -8783,8 +8783,9 @@ function renderShipReviewCardFromData(container, taskId, card) {
         const r = await withBoardWebAuthn((sessionToken, assertion) =>
           fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/approve`, {
             method: 'POST',
-            headers: { ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-          }), 'merging to main',
+            headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+            body: JSON.stringify({ head_sha: card.head_sha }),
+          }), approveMode === 'direct' ? 'merging to main' : 'opening the PR',
         );
         if (r === null) { acMerge.disabled = false; return; }
         if (r.status === 409) {
@@ -8853,8 +8854,11 @@ function renderShipReviewCardFromData(container, taskId, card) {
         fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/merge`, {
           method: 'POST',
           headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-          body: JSON.stringify(override ? { override: true, override_reason: reason || '' } : {}),
-        })
+          // head_sha pins the merge to the head on screen (STA-717).
+          body: JSON.stringify(override
+            ? { head_sha: card.head_sha, override: true, override_reason: reason || '' }
+            : { head_sha: card.head_sha }),
+        }), override ? 'merging the PR anyway' : 'merging the PR',
       );
       if (r === null) { btn.disabled = false; return; }
       const body = await r.json().catch(() => ({}));

@@ -100,6 +100,7 @@ type Card struct {
 	// CIFixRequested is set when the Board sent CI failures back to the agent;
 	// the agent's resubmitted card then re-pushes the PR and re-runs checks.
 	CIFixRequested bool `json:"ci_fix_requested,omitempty"`
+
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -910,7 +911,7 @@ func BuildAndStartCard(ctx context.Context, db *sql.DB, taskID, repoPath string,
 	// Fast-forward only; anything else waits for the Board's Approve.
 	if prev.ciFixReq && prev.mode == MergeModePRMerge && prev.number > 0 {
 		cfg, _ := GetProjectDevConfig(db, repoPath)
-		if auth, aErr := ResolveGHAuth(cfg, repoPath, IsWorkRepo(repoPath)); aErr != nil {
+		if auth, aErr := ResolveGHAuth(cfg, repoPath); aErr != nil {
 			_ = SetPRMergeError(db, card.ID, "re-push to PR failed: "+aErr.Error())
 		} else if pr, pErr := OpenOrUpdatePR(ctx, auth, card, false); pErr != nil {
 			_ = SetPRMergeError(db, card.ID, "re-push to PR failed: "+pErr.Error())

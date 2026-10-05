@@ -368,8 +368,20 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 	// Parse optional override reason from request body.
 	var req struct {
 		MigrationOverrideReason string `json:"migration_override_reason"`
+		// HeadSHA, when sent, is the head the Board was shown (STA-717).
+		HeadSHA string `json:"head_sha"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.HeadSHA != "" && req.HeadSHA != card.HeadSHA {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":        "head_moved",
+			"message":      "the card was re-pinned to a new head since you opened it",
+			"new_head_sha": card.HeadSHA,
+		})
+		return
+	}
 
 	// Block if any migration has not been verified, unless override supplied.
 	// Fail-closed: if we can't determine unverified migrations, block approval.
@@ -405,9 +417,8 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
 		return
 	}
-	isWork := shipreview.IsWorkRepo(task.RepoPath)
-	if mode := shipreview.EffectiveMergeMode(cfg, isWork); mode != shipreview.MergeModeDirect {
-		h.approvePR(w, r, card, task, cfg, mode, isWork)
+	if mode := shipreview.EffectiveMergeMode(cfg, shipreview.IsWorkRepo(task.RepoPath)); mode != shipreview.MergeModeDirect {
+		h.approvePR(w, r, card, task, cfg, mode)
 		return
 	}
 
@@ -784,6 +795,7 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 		"new_dev_command": cfg.DevCommand,
 		"old_setup_steps": old.SetupSteps,
 		"new_setup_steps": cfg.SetupSteps,
+
 		"old_merge_mode":    old.MergeMode,
 		"new_merge_mode":    cfg.MergeMode,
 		"old_gh_config_dir": old.GHConfigDir,

@@ -151,7 +151,7 @@ test.describe('ship review PR merge mode card (STA-717)', () => {
     await expect(final).toBeVisible({ timeout: 10_000 });
     await expect(final).toContainText(mainSHA.slice(0, 12));
     await expect(final.locator('.ship-review-pr-link')).toHaveAttribute('href', PR_URL);
-    expect(mergeBody).toEqual({});
+    expect(mergeBody).toEqual({ head_sha: headSHA });
     cleanup();
   });
 
@@ -184,7 +184,7 @@ test.describe('ship review PR merge mode card (STA-717)', () => {
     await confirm.locator('.ship-review-override-reason').fill('known flaky e2e');
     await confirm.getByRole('button', { name: 'Merge anyway' }).click();
     await expect(page.locator('.ship-review-card--final')).toBeVisible({ timeout: 10_000 });
-    expect(mergeBody).toEqual({ override: true, override_reason: 'known flaky e2e' });
+    expect(mergeBody).toEqual({ head_sha: headSHA, override: true, override_reason: 'known flaky e2e' });
     cleanup();
   });
 

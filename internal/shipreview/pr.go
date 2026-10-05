@@ -42,9 +42,6 @@ const (
 var (
 	// ErrInvalidMergeMode is returned for a merge_mode outside the known set.
 	ErrInvalidMergeMode = errors.New("merge_mode must be one of direct, open_pr, pr_merge")
-	// ErrWorkRepoGHAuth is returned when a work repo has no gh identity of its
-	// own: the personal gh login must never act on a work repo.
-	ErrWorkRepoGHAuth = errors.New("work repo needs its own gh_config_dir (the work GitHub account's GH_CONFIG_DIR); refusing to use the default gh login")
 	// ErrChecksNotGreen is returned by MergePR when CI is failing or still
 	// running and the Board did not choose Merge anyway.
 	ErrChecksNotGreen = errors.New("checks are not all green")
@@ -126,36 +123,23 @@ func NotGreen(checks []PRCheck) []PRCheck {
 
 // ── gh runner ───────────────────────────────────────────────────────────────
 
-// GHAuth is how gh and git push authenticate for one repo.
+// GHAuth is how gh and git push authenticate for one repo: the repo's
+// normal gh login, unless the project names a config dir to use instead.
 type GHAuth struct {
 	RepoDir string
-	// ConfigDir is exported as GH_CONFIG_DIR when set; "" uses gh's default.
+	// ConfigDir, when set, is exported as GH_CONFIG_DIR and wins over any
+	// token in the daemon's environment. "" keeps gh's normal auth.
 	ConfigDir string
-	// Work repos never inherit GH_TOKEN-style variables from the daemon: those
-	// would override ConfigDir with whatever account the daemon runs as.
-	Work bool
 }
 
-// ghTokenVars override gh's stored login and git's gh credential helper.
-var ghTokenVars = []string{"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_CONFIG_DIR", "GH_HOST"}
+// ghTokenVars would override the login in ConfigDir.
+var ghTokenVars = []string{"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_CONFIG_DIR"}
 
-// defaultGHConfigDir is where gh keeps its login when GH_CONFIG_DIR is unset.
-// Variable so tests can point it at a temp dir.
-var defaultGHConfigDir = func() string {
-	if d := os.Getenv("GH_CONFIG_DIR"); d != "" {
-		return d
-	}
-	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
-		return filepath.Join(x, "gh")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "gh")
-}
-
-// ResolveGHAuth picks the gh identity for repoDir. A work repo must name its
-// own config dir, and it may not be the default (personal) one.
-func ResolveGHAuth(cfg *ProjectDevConfig, repoDir string, isWork bool) (GHAuth, error) {
-	auth := GHAuth{RepoDir: repoDir, Work: isWork}
+// ResolveGHAuth picks the gh identity for repoDir: the project's
+// gh_config_dir override if set, otherwise gh's normal auth (Board,
+// 2026-10-05: the Board's work GitHub account is the same login).
+func ResolveGHAuth(cfg *ProjectDevConfig, repoDir string) (GHAuth, error) {
+	auth := GHAuth{RepoDir: repoDir}
 	if cfg != nil {
 		auth.ConfigDir = strings.TrimSpace(cfg.GHConfigDir)
 	}
@@ -167,23 +151,7 @@ func ResolveGHAuth(cfg *ProjectDevConfig, repoDir string, isWork bool) (GHAuth, 
 			return auth, fmt.Errorf("gh_config_dir %q is not a directory", auth.ConfigDir)
 		}
 	}
-	if isWork {
-		if auth.ConfigDir == "" || sameDir(auth.ConfigDir, defaultGHConfigDir()) {
-			return auth, ErrWorkRepoGHAuth
-		}
-	}
 	return auth, nil
-}
-
-func sameDir(a, b string) bool {
-	ca, cb := filepath.Clean(a), filepath.Clean(b)
-	if ra, err := filepath.EvalSymlinks(ca); err == nil {
-		ca = ra
-	}
-	if rb, err := filepath.EvalSymlinks(cb); err == nil {
-		cb = rb
-	}
-	return ca == cb
 }
 
 // env returns the environment for gh and git push under this auth.
@@ -195,11 +163,11 @@ func (a GHAuth) env() []string {
 			name = kv[:i]
 		}
 		drop := false
-		for _, v := range ghTokenVars {
-			// GH_CONFIG_DIR is always replaced below; the token vars only
-			// for work repos, where they would be the wrong account.
-			if name == v && (a.Work || v == "GH_CONFIG_DIR") {
-				drop = true
+		if a.ConfigDir != "" {
+			for _, v := range ghTokenVars {
+				if name == v {
+					drop = true
+				}
 			}
 		}
 		if !drop {
@@ -208,8 +176,6 @@ func (a GHAuth) env() []string {
 	}
 	if a.ConfigDir != "" {
 		out = append(out, "GH_CONFIG_DIR="+a.ConfigDir)
-	} else if d := os.Getenv("GH_CONFIG_DIR"); d != "" && !a.Work {
-		out = append(out, "GH_CONFIG_DIR="+d)
 	}
 	return append(out, "GH_PROMPT_DISABLED=1", "GH_NO_UPDATE_NOTIFIER=1", "NO_COLOR=1", "GIT_TERMINAL_PROMPT=0")
 }
@@ -670,6 +636,13 @@ func MergePR(ctx context.Context, db *sql.DB, a GHAuth, card *Card, override boo
 	if pr.HeadRefOid != card.HeadSHA {
 		return nil, ErrHeadMoved
 	}
+	// Merged on GitHub already (by hand, auto-merge or a merge queue): record it.
+	if res, done, err := finalizeIfMerged(db, card, pr); done {
+		return res, err
+	}
+	if pr.State != "OPEN" {
+		return nil, fmt.Errorf("PR #%d is %s", card.PRNumber, strings.ToLower(pr.State))
+	}
 	checks, err := a.PRChecks(ctx, card.PRNumber, time.Now().UTC())
 	if err != nil {
 		return nil, fmt.Errorf("read checks: %w", err)
@@ -690,22 +663,39 @@ func MergePR(ctx context.Context, db *sql.DB, a GHAuth, card *Card, override boo
 			}
 		}
 	}
-	if _, err := a.gh(ctx, "pr", "merge", strconv.Itoa(card.PRNumber), "--merge", "--match-head-commit", card.HeadSHA); err != nil {
-		msg := err.Error()
+	_, mergeErr := a.gh(ctx, "pr", "merge", strconv.Itoa(card.PRNumber), "--merge", "--match-head-commit", card.HeadSHA)
+	// Whatever gh said, GitHub's PR state is the truth: a refusal can race a
+	// merge that landed, and a merge queue may not report the commit at once.
+	merged, viewErr := a.ViewPR(ctx, card.PRNumber)
+	if viewErr == nil {
+		if fin, done, err := finalizeIfMerged(db, card, merged); done {
+			if fin != nil {
+				fin.Checks, fin.Overridden = res.Checks, res.Overridden
+			}
+			return fin, err
+		}
+	}
+	if mergeErr != nil {
+		msg := mergeErr.Error()
 		_ = SetPRMergeError(db, card.ID, msg)
 		return res, fmt.Errorf("%w: %s", ErrGitHubRefused, msg)
 	}
-	merged, err := a.ViewPR(ctx, card.PRNumber)
-	if err != nil || merged.MergeCommit == nil || merged.MergeCommit.Oid == "" {
-		return res, fmt.Errorf("merged, but could not read the merge commit: %v", err)
+	return res, fmt.Errorf("gh pr merge succeeded but PR #%d is not merged yet (queued?); merge again once GitHub shows it merged: %v", card.PRNumber, viewErr)
+}
+
+// finalizeIfMerged closes the card when GitHub shows the PR merged at the
+// pinned head. done is false when the PR is not (yet) merged.
+func finalizeIfMerged(db *sql.DB, card *Card, pr *PRInfo) (*MergeResult, bool, error) {
+	if pr.State != "MERGED" || pr.HeadRefOid != card.HeadSHA || pr.MergeCommit == nil || pr.MergeCommit.Oid == "" {
+		return nil, false, nil
 	}
-	res.MainSHA = merged.MergeCommit.Oid
-	_, err = db.Exec(`
+	res := &MergeResult{MainSHA: pr.MergeCommit.Oid, Checks: card.PRChecks}
+	_, err := db.Exec(`
 		UPDATE ship_review_cards
 		SET status = 'approved', approved_sha = ?, main_sha = ?, pr_merge_error = '',
 		    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 		WHERE id = ?`, card.HeadSHA, res.MainSHA, card.ID)
-	return res, err
+	return res, true, err
 }
 
 // FetchOrigin brings origin's refs (and the merge commit) into the repo so the
