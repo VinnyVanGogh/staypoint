@@ -2,12 +2,20 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/VinnyVanGogh/staypoint/internal/repoaccess"
 )
+
+// RepoAccessReporter supplies the latest repo access check (repoaccess.Checker).
+type RepoAccessReporter interface {
+	Snapshot() repoaccess.Snapshot
+}
 
 // Server is the StayPoint local HTTP and SSE daemon server.
 type Server struct {
@@ -98,8 +106,23 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// Health check (within security wrapper)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","version":"1.0","git_commit":%q,"commit":%q}`, s.opts.GitCommit, s.opts.GitCommit)
+		snap := s.repoAccessSnapshot()
+		writeJSONUnescaped(w, struct {
+			Status     string           `json:"status"`
+			Version    string           `json:"version"`
+			GitCommit  string           `json:"git_commit"`
+			Commit     string           `json:"commit"`
+			RepoAccess healthRepoAccess `json:"repo_access"`
+		}{
+			Status: "ok", Version: "1.0", GitCommit: s.opts.GitCommit, Commit: s.opts.GitCommit,
+			RepoAccess: healthRepoAccess{snap.Checked, snap.CheckedAt, snap.Failing()},
+		})
+	})
+
+	// Per-repo check results (STA-687): every configured repo, with the step
+	// that failed, the raw error and the daemon's uid and executable.
+	mux.HandleFunc("GET /api/health/repos", func(w http.ResponseWriter, r *http.Request) {
+		writeJSONUnescaped(w, s.repoAccessSnapshot())
 	})
 
 	// Tasks REST API
@@ -350,4 +373,34 @@ func (s *Server) SetPairingNotifier(fn func(code string) error) {
 	if s.webAuthnH != nil {
 		s.webAuthnH.SetPairingNotifier(fn)
 	}
+}
+
+// healthRepoAccess is the repo check summary in /api/health: only the repos
+// that failed. /api/health/repos has all of them.
+type healthRepoAccess struct {
+	Checked      bool                `json:"checked"`
+	CheckedAt    *time.Time          `json:"checked_at,omitempty"`
+	Inaccessible []repoaccess.Result `json:"inaccessible"`
+}
+
+// repoAccessSnapshot returns the latest repo check, or an unchecked snapshot
+// when no checker is wired.
+func (s *Server) repoAccessSnapshot() repoaccess.Snapshot {
+	if s.opts.RepoAccess == nil {
+		return repoaccess.Snapshot{Repos: []repoaccess.Result{}}
+	}
+	snap := s.opts.RepoAccess.Snapshot()
+	if snap.Repos == nil {
+		snap.Repos = []repoaccess.Result{}
+	}
+	return snap
+}
+
+// writeJSONUnescaped writes v as JSON without HTML escaping, so paths and
+// messages stay readable from curl and shell scripts.
+func writeJSONUnescaped(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(v)
 }

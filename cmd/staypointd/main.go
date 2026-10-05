@@ -22,6 +22,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/logging"
 	"github.com/VinnyVanGogh/staypoint/internal/mcp"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
+	"github.com/VinnyVanGogh/staypoint/internal/repoaccess"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/server"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
@@ -43,6 +44,9 @@ func init() {
 }
 
 func main() {
+	// A repo access probe child (STA-687) exits here, before any daemon setup.
+	repoaccess.RunProbeChild()
+
 	// Subcommands dispatch before flag.Parse so they own their own flag sets.
 	if len(os.Args) > 1 && os.Args[1] == "eval-contracts" {
 		if err := runEvalContracts(os.Args[2:]); err != nil {
@@ -186,6 +190,10 @@ func runDaemon(ctx context.Context) error {
 	}
 
 	// 4. Start HTTP & SSE Local Daemon Server (127.0.0.1 only)
+	repoChecker := &repoaccess.Checker{
+		Options: repoaccess.Options{Timeout: repoaccess.DefaultTimeout},
+		Notify:  telemetry.SendNotification,
+	}
 	var httpServer *server.Server
 	tokenPath := filepath.Join(cfg.DataDir, "auth_token")
 	boardTokenPath := filepath.Join(cfg.DataDir, "board_token")
@@ -197,6 +205,7 @@ func runDaemon(ctx context.Context) error {
 		DB:             dbStore.DB(),
 		GitCommit:      GitCommit,
 		CORSAllowAll:   cfg.CORSAllowAll,
+		RepoAccess:     repoChecker,
 	}); err != nil {
 		slog.Warn("Failed to initialize HTTP server", slog.Any("error", err))
 	} else if err := s.Start(); err != nil {
@@ -217,6 +226,22 @@ func runDaemon(ctx context.Context) error {
 			fmt.Printf("  Board URL:  %s\n", boardURL)
 		}
 	}
+
+	// 4b. Repo self-check (STA-687). After a redeploy, git children in a repo
+	// have hung in open() with no error (2026-10-04). Probe every repo now and
+	// every 10 minutes, step by step, and tell the Board which step failed and
+	// the raw error, instead of letting requests hang.
+	if httpServer != nil {
+		hub := httpServer.Hub()
+		repoChecker.Publish = func(eventType string, data any) { hub.Publish(eventType, data) }
+	}
+	go repoChecker.Run(ctx, 10*time.Minute, func() []repoaccess.Target {
+		targets, err := repoaccess.RepoTargets(dbStore.DB(), cfg.HarnessRepoRoot)
+		if err != nil {
+			slog.Warn("repo access check: listing repo paths failed", slog.Any("error", err))
+		}
+		return targets
+	})
 
 	// 5. Wire GlobalDispatcher.OnWake to launch harness runs.
 	// HarnessRepoRoot comes from STAYPOINT_REPO_ROOT env or harness_repo_root config key.

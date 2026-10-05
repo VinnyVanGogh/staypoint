@@ -248,6 +248,55 @@ else
 fi
 
 TOKEN=$(cat "$HOME/.staypoint/auth_token" 2>/dev/null || echo "")
+
+# Repo self-check (STA-687). After a redeploy, git children in a repo have
+# hung with no error. The daemon probes every repo at startup (stat, open,
+# git rev-parse, git status) and reports the first failing step and its raw
+# error in /api/health. Wait for that check and print each failing repo's
+# message as the daemon wrote it.
+REPO_CHECK_TIMEOUT="${STAYPOINT_REPO_CHECK_TIMEOUT:-30}"
+REPOS_URL="http://127.0.0.1:41421/api/health/repos"
+HEALTH_BODY=""
+deadline=$((SECONDS + REPO_CHECK_TIMEOUT))
+while [ -n "$TOKEN" ] && [ "$SECONDS" -lt "$deadline" ]; do
+    HEALTH_BODY="$(curl -s -m 2 -H "Authorization: Bearer $TOKEN" "$HEALTH_URL" 2>/dev/null || true)"
+    case "$HEALTH_BODY" in *'"repo_access":{"checked":true'*) break ;; esac
+    HEALTH_BODY=""
+    sleep 1
+done
+if [ -z "$TOKEN" ]; then
+    echo "  ! No auth token at ~/.staypoint/auth_token; skipped the repo check. See $REPOS_URL."
+elif [ -z "$HEALTH_BODY" ]; then
+    echo "  ! Repo check did not finish within ${REPO_CHECK_TIMEOUT}s; see $REPOS_URL."
+elif ! command -v plutil >/dev/null 2>&1; then
+    echo "  ! plutil not found; can't summarise the repo check. See $REPOS_URL."
+else
+    PROBLEMS=""
+    MISSING=""
+    i=0
+    while CAUSE="$(printf '%s' "$HEALTH_BODY" | plutil -extract "repo_access.inaccessible.$i.cause" raw -o - - 2>/dev/null)"; do
+        MSG="$(printf '%s' "$HEALTH_BODY" | plutil -extract "repo_access.inaccessible.$i.message" raw -o - - 2>/dev/null || true)"
+        case "$CAUSE" in
+            missing) MISSING="$MISSING      - $MSG
+" ;;
+            *) PROBLEMS="$PROBLEMS      ✗ $MSG
+" ;;
+        esac
+        i=$((i + 1))
+    done
+    if [ -n "$PROBLEMS" ]; then
+        echo "!!! staypointd's repo check failed for these repos (first failing step and raw error):"
+        printf '%s' "$PROBLEMS"
+        echo "    The daemon rechecks every 10 minutes. Full detail: $REPOS_URL"
+    else
+        echo "✓ Repo check: every existing repo is readable and git works in it."
+    fi
+    if [ -n "$MISSING" ]; then
+        echo "  These checked repo paths no longer exist (from dev configs, active tasks or the harness root):"
+        printf '%s' "$MISSING"
+    fi
+fi
+
 if [ -n "$TOKEN" ]; then
     PORT=$(grep "HTTP and SSE server active" /tmp/staypointd.err 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | tail -1 | cut -d: -f2 || echo "41421")
     echo ""
