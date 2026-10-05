@@ -45,25 +45,25 @@ func TestIsTestFile(t *testing.T) {
 
 func TestIsExemptDefaults(t *testing.T) {
 	cases := map[string]bool{
-		"README.md":                   true,
-		"docs/guide/setup.md":         true,
-		"docs/diagram.png":            true,
-		"internal/server/webui/a.css": true,
-		"web/theme.scss":              true,
-		".github/workflows/ci.yml":    true,
-		"config.toml":                 true,
-		".golangci.yml":               true,
-		"package.json":                true,
-		"go.mod":                      true,
-		"go.sum":                      true,
-		"pnpm-lock.yaml":              true,
-		"LICENSE":                     true,
-		".gitignore":                  true,
-		"main.go":                     false,
+		"README.md":                    true,
+		"docs/guide/setup.md":          true,
+		"docs/diagram.png":             true,
+		"internal/server/webui/a.css":  true,
+		"web/theme.scss":               true,
+		".github/workflows/ci.yml":     true,
+		"config.toml":                  true,
+		".golangci.yml":                true,
+		"package.json":                 true,
+		"go.mod":                       true,
+		"go.sum":                       true,
+		"pnpm-lock.yaml":               true,
+		"LICENSE":                      true,
+		".gitignore":                   true,
+		"main.go":                      false,
 		"internal/server/webui/app.js": false,
-		"scripts/deploy.sh":           false,
-		"db/migrations/001_init.sql":  false,
-		"Makefile":                    false,
+		"scripts/deploy.sh":            false,
+		"db/migrations/001_init.sql":   false,
+		"Makefile":                     false,
 	}
 	for path, want := range cases {
 		if got := IsExempt(path, nil); got != want {
@@ -75,14 +75,14 @@ func TestIsExemptDefaults(t *testing.T) {
 func TestIsExemptProjectGlobs(t *testing.T) {
 	extra := []string{"scripts/**", "*.sql", "Makefile", "  ", "internal/gen/*.go"}
 	cases := map[string]bool{
-		"scripts/deploy.sh":           true,
-		"scripts/sub/dir/x.py":        true,
-		"db/migrations/001_init.sql":  true,
-		"Makefile":                    true,
-		"internal/gen/models.go":      true,
-		"internal/gen/sub/models.go":  false,
-		"internal/server/server.go":   false,
-		"scriptsx/deploy.sh":          false,
+		"scripts/deploy.sh":          true,
+		"scripts/sub/dir/x.py":       true,
+		"db/migrations/001_init.sql": true,
+		"Makefile":                   true,
+		"internal/gen/models.go":     true,
+		"internal/gen/sub/models.go": false,
+		"internal/server/server.go":  false,
+		"scriptsx/deploy.sh":         false,
 	}
 	for path, want := range cases {
 		if got := IsExempt(path, extra); got != want {
