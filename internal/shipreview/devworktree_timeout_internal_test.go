@@ -39,12 +39,21 @@ func TestEnsureDevWorktree_GitHangFailsFast(t *testing.T) {
 // STA-710: after STA-685, recreating a dev worktree ran `git worktree remove
 // --force` under the quick git timeout, and deleting a worktree that holds
 // node_modules took longer than that. The recreate must delete the old tree
-// outside git's quick timeout and still finish well inside the slow one.
+// outside git's quick timeout.
+//
+// A real tree's delete time depends on disk and machine load, so a shim makes
+// `git worktree remove` take longer than the quick timeout and passes every
+// other call to the real git. The quick timeout is generous enough that
+// `worktree prune` fits even on a loaded machine.
 func TestEnsureDevWorktree_RecreatesBigTreeWithinTimeout(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
 	repo := t.TempDir()
 	git := func(args ...string) string {
 		t.Helper()
-		cmd := exec.Command("git", args...)
+		cmd := exec.Command(realGit, args...)
 		cmd.Dir = repo
 		cmd.Env = append(os.Environ(),
 			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=t@t.com",
@@ -69,9 +78,8 @@ func TestEnsureDevWorktree_RecreatesBigTreeWithinTimeout(t *testing.T) {
 		t.Fatalf("first create: %v", err)
 	}
 
-	// A node_modules-like tree: thousands of small files in nested packages.
-	// Deleting it takes well over the quick timeout set below.
-	for p := 0; p < 150; p++ {
+	// A node_modules-like tree: many small files in nested packages.
+	for p := 0; p < 50; p++ {
 		dir := filepath.Join(wt, "node_modules", fmt.Sprintf("pkg-%d", p), "lib")
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
@@ -83,14 +91,19 @@ func TestEnsureDevWorktree_RecreatesBigTreeWithinTimeout(t *testing.T) {
 		}
 	}
 
-	t.Setenv(gitexec.TimeoutEnv, "500ms")
-	t.Setenv(gitexec.SlowTimeoutEnv, "60s")
+	shim := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = worktree ] && [ \"$2\" = remove ]; then sleep 5; fi\n" +
+		"exec '" + realGit + "' \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(shim, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(gitexec.TimeoutEnv, "3s")
+
 	start := time.Now()
 	if err := ensureDevWorktree(context.Background(), repo, wt, sha); err != nil {
 		t.Fatalf("recreate after %s: %v", time.Since(start), err)
-	}
-	if took := time.Since(start); took > 60*time.Second {
-		t.Fatalf("recreate took %s", took)
 	}
 
 	if _, err := os.Stat(filepath.Join(wt, "node_modules")); !os.IsNotExist(err) {

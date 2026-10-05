@@ -716,10 +716,10 @@ func startDevServerSync(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath 
 		if ctx.Err() == nil {
 			return false
 		}
-		// A killed `worktree add` can leave a directory git never
-		// registered, which `worktree remove` alone would keep.
+		// removeDevWorktree also deletes a directory git never registered,
+		// e.g. one left by a killed `worktree add`. No extra RemoveAll here:
+		// it would run unbounded on a folder git just timed out reading.
 		removeDevWorktree(repoPath, wtPath)
-		_ = os.RemoveAll(wtPath)
 		return true
 	}
 	if canceled() {
