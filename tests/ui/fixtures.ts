@@ -245,7 +245,41 @@ export function knownBug(id: KnownBug) {
   base.fail(true, `${id}: ${KNOWN_BUGS[id]}`);
 }
 
-type Fixtures = { api: StayPointAPI; page: Page; boardPage: Page };
+type Fixtures = { api: StayPointAPI; page: Page; boardPage: Page; boardSessionPage: Page };
+
+/**
+ * Gives the page a Board session cookie (fresh nonce, then the ?board_nonce=
+ * bootstrap) and a CDP virtual authenticator (transport: internal, user
+ * verification on) that answers navigator.credentials.create/get() so tests
+ * never need Touch ID. Enrolls nothing.
+ */
+async function openBoardSession(page: Page, baseURL: string, request: APIRequestContext) {
+  const bt = BOARD_TOKEN;
+  if (!bt) throw new Error('STAYPOINT_BOARD_TOKEN is not set: run via scripts/ui-e2e.sh');
+
+  const nonceRes = await request.post(`${baseURL}/api/board/fresh-nonce`, {
+    headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Board-Token': bt },
+  });
+  if (!nonceRes.ok()) {
+    throw new Error(`POST /api/board/fresh-nonce -> ${nonceRes.status()}: ${await nonceRes.text()}`);
+  }
+  const { nonce } = await nonceRes.json();
+
+  await page.goto(`${baseURL}/?token=${encodeURIComponent(TOKEN)}&board_nonce=${encodeURIComponent(nonce)}`);
+  await expect(page).toHaveURL(`${baseURL}/`);
+
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('WebAuthn.enable', { enableUI: false });
+  await cdp.send('WebAuthn.addVirtualAuthenticator', {
+    options: {
+      protocol: 'ctap2',
+      transport: 'internal',
+      hasResidentKey: false,
+      hasUserVerification: true,
+      isUserVerified: true,
+    },
+  });
+}
 
 export const test = base.extend<Fixtures>({
   api: async ({ request }, use) => {
@@ -263,37 +297,9 @@ export const test = base.extend<Fixtures>({
   // scripts/ui-e2e.sh) and a TestMode server (staypoint-apitest-server) so
   // that GET /api/board/webauthn/test/last-pairing-code is available.
   boardPage: async ({ page, baseURL, request }, use) => {
-    const bt = BOARD_TOKEN;
-    if (!bt) throw new Error('STAYPOINT_BOARD_TOKEN is not set: run via scripts/ui-e2e.sh');
+    await openBoardSession(page, baseURL || '', request);
 
-    // 1. Mint a fresh nonce.
-    const nonceRes = await request.post(`${baseURL}/api/board/fresh-nonce`, {
-      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Board-Token': bt },
-    });
-    if (!nonceRes.ok()) {
-      throw new Error(`POST /api/board/fresh-nonce -> ${nonceRes.status()}: ${await nonceRes.text()}`);
-    }
-    const { nonce } = await nonceRes.json();
-
-    // 2. Bootstrap board session — sets staypoint_board cookie.
-    await page.goto(`${baseURL}/?token=${encodeURIComponent(TOKEN)}&board_nonce=${encodeURIComponent(nonce)}`);
-    await expect(page).toHaveURL(`${baseURL}/`);
-
-    // 3. Set up CDP virtual authenticator (transport: internal, userVerification on).
-    //    This intercepts navigator.credentials.create/get() so tests never need Touch ID.
-    const cdp = await page.context().newCDPSession(page);
-    await cdp.send('WebAuthn.enable', { enableUI: false });
-    await cdp.send('WebAuthn.addVirtualAuthenticator', {
-      options: {
-        protocol: 'ctap2',
-        transport: 'internal',
-        hasResidentKey: false,
-        hasUserVerification: true,
-        isUserVerified: true,
-      },
-    });
-
-    // 4. Enroll a passkey from the browser context (has session + board cookies).
+    // Enroll a passkey from the browser context (has session + board cookies).
     //    Uses the TestMode-only endpoint to retrieve the pairing code without a
     //    macOS notification (the server is started with TestMode: true for e2e).
     await page.evaluate(async (token: string) => {
@@ -371,6 +377,19 @@ export const test = base.extend<Fixtures>({
       }
     }, TOKEN);
 
+    await use(page);
+  },
+  // boardSessionPage has the Board session cookie and a CDP virtual
+  // authenticator, but no passkey is enrolled: every stored credential is
+  // wiped through the TestMode-only clear-credentials endpoint (STA-694).
+  boardSessionPage: async ({ page, baseURL, request }, use) => {
+    await openBoardSession(page, baseURL || '', request);
+    const clear = await page.request.delete('/api/board/webauthn/test/clear-credentials', {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    if (!clear.ok()) {
+      throw new Error(`clear-credentials -> ${clear.status()}: ${await clear.text()}`);
+    }
     await use(page);
   },
 });
