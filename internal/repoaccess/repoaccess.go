@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,7 +55,7 @@ const (
 	CauseOK               Cause = "ok"
 	CauseMissing          Cause = "missing"           // ENOENT: path missing or moved
 	CauseNotDirectory     Cause = "not_directory"     // ENOTDIR, or not a directory
-	CausePrivacy          Cause = "macos_privacy"     // EPERM: a macOS privacy (TCC) setting
+	CausePrivacy          Cause = "macos_privacy"     // EPERM on macOS: a privacy (TCC) setting
 	CauseUnixPermissions  Cause = "unix_permissions"  // EACCES: owner/mode vs the daemon's uid
 	CauseBlocked          Cause = "blocked"           // the step never returned
 	CauseNotGitRepo       Cause = "not_git_repo"      // git: not a git repository
@@ -381,6 +382,12 @@ func runGit(ctx context.Context, t Target, o Options, step Step, args []string) 
 // FSFailure classifies a failed filesystem step from its error. owner, when
 // known, is reported for EACCES.
 func FSFailure(t Target, step Step, err error, owner *Owner) Result {
+	return fsFailure(runtime.GOOS, t, step, err, owner)
+}
+
+// fsFailure is FSFailure as classified on goos. EPERM means a privacy (TCC)
+// denial only on macOS; elsewhere it is shown raw.
+func fsFailure(goos string, t Target, step Step, err error, owner *Owner) Result {
 	r := Result{Path: t.Path, Label: t.Label, Step: step, RawError: err.Error()}
 	var errno syscall.Errno
 	if !errors.As(err, &errno) {
@@ -395,6 +402,10 @@ func FSFailure(t Target, step Step, err error, owner *Owner) Result {
 	case syscall.ENOTDIR:
 		r.Cause, r.explanation = CauseNotDirectory, "the configured repo path is not a directory"
 	case syscall.EPERM:
+		if goos != "darwin" {
+			r.Cause = CauseFSError
+			break
+		}
 		r.Cause, r.explanation = CausePrivacy, "macOS privacy setting is blocking staypointd"
 	case syscall.EACCES:
 		r.Cause = CauseUnixPermissions
@@ -640,11 +651,17 @@ func (c *Checker) Snapshot() Snapshot {
 
 // Run checks once immediately, then every interval until ctx is done.
 // targets is re-read before each check so new tasks and dev configs are covered.
-func (c *Checker) Run(ctx context.Context, interval time.Duration, targets func() []Target) {
+// When listing fails the check is skipped: an empty list would replace every
+// verdict, and the next good listing would re-alert every failing repo.
+func (c *Checker) Run(ctx context.Context, interval time.Duration, targets func() ([]Target, error)) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		c.Check(ctx, targets())
+		if ts, err := targets(); err != nil {
+			slog.Warn("repo check: listing repo paths failed; keeping the previous results", slog.Any("error", err))
+		} else {
+			c.Check(ctx, ts)
+		}
 		select {
 		case <-ctx.Done():
 			return
