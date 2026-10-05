@@ -7,9 +7,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 )
 
 // Result is returned by every gate function.
@@ -43,7 +44,7 @@ func (r *Result) addInfo(msg string) {
 func git(ctx context.Context, dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := gitexec.Command(ctx, args...)
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -210,7 +211,7 @@ func isAncestor(ctx context.Context, repo, sha string) bool {
 	// git merge-base --is-ancestor exits 0 if ancestor, 1 if not
 	ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx2, "git", "merge-base", "--is-ancestor", sha, "origin/main")
+	cmd := gitexec.Command(ctx2, "merge-base", "--is-ancestor", sha, "origin/main")
 	cmd.Dir = repo
 	return cmd.Run() == nil
 }

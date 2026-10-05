@@ -10,6 +10,7 @@ import (
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/context"
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/migration"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
@@ -55,12 +56,19 @@ func (h *ShipReviewHandler) GetCard(w http.ResponseWriter, r *http.Request) {
 	// Merge into a flat map so existing clients that read card fields directly continue to work.
 	task, taskErr := context.GetTask(h.db, taskID)
 	if taskErr == nil {
-		unverified, _ := unverifiedMigrations(r.Context(), h.db, task)
+		ctx, cancel := gitRequestContext(r)
+		unverified, gitErr := unverifiedMigrations(ctx, h.db, task)
+		cancel()
 		cardBytes, _ := json.Marshal(card)
 		var merged map[string]any
 		if jsonErr := json.Unmarshal(cardBytes, &merged); jsonErr == nil {
 			merged["unverified_migrations"] = unverified
 			merged["repo_name"] = filepath.Base(task.RepoPath)
+			if gitErr != nil {
+				// The card itself is DB-only; return it and say why the
+				// migration check is missing rather than hanging or erroring.
+				merged["repo_error"] = gitErr.Error()
+			}
 			writeJSON(w, merged)
 			return
 		}
@@ -217,11 +225,18 @@ func unverifiedMigrations(ctx gocontext.Context, db *sql.DB, task *context.Task)
 	workDir, hasWorktree := taskCheckpointWorkDir(task)
 	cpID := ""
 	var fileStats []checkpoint.FileDiffStat
+	var diffErr error
 	if hasWorktree {
-		fileStats, _ = checkpoint.DiffCheckpointFiles(ctx, workDir, cpID)
+		fileStats, diffErr = checkpoint.DiffCheckpointFiles(ctx, workDir, cpID)
 	} else {
 		branch := "staypoint/" + task.ID
-		fileStats, _ = checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, cpID, branch)
+		fileStats, diffErr = checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, cpID, branch)
+	}
+	// Other diff errors (no branch, not a repo) still mean "no migrations", as
+	// before. A timeout means we never looked, so the Approve gate must not
+	// read it as "nothing to verify".
+	if gitexec.IsTimeout(diffErr) {
+		return nil, diffErr
 	}
 	filePaths := make([]string, len(fileStats))
 	for i, s := range fileStats {
@@ -280,9 +295,11 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 	// Block if any migration has not been verified, unless override supplied.
 	// Fail-closed: if we can't determine unverified migrations, block approval.
 	if req.MigrationOverrideReason == "" {
-		unverified, unverifiedErr := unverifiedMigrations(r.Context(), h.db, task)
+		ctx, cancel := gitRequestContext(r)
+		unverified, unverifiedErr := unverifiedMigrations(ctx, h.db, task)
+		cancel()
 		if unverifiedErr != nil {
-			writeError(w, http.StatusInternalServerError, "could not check migration verification status: "+unverifiedErr.Error())
+			writeError(w, gitErrorStatus(unverifiedErr), "could not check migration verification status: "+unverifiedErr.Error())
 			return
 		}
 		if len(unverified) > 0 {

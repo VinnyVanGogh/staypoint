@@ -5,11 +5,12 @@ package migration
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 )
 
 // DefaultGlobs are the migration file patterns used when no project config overrides them.
@@ -273,7 +274,7 @@ func ReadContent(workDir, relPath string) (string, error) {
 // ReadContentAtRef reads relPath as committed on ref (e.g. the task branch)
 // without needing a checkout, so it works after the task worktree is pruned.
 func ReadContentAtRef(ctx context.Context, repoPath, ref, relPath string) (string, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoPath, "show", ref+":"+filepath.ToSlash(relPath)).Output()
+	out, err := gitexec.Command(ctx, "-C", repoPath, "show", ref+":"+filepath.ToSlash(relPath)).Output()
 	if err != nil {
 		return "", err
 	}

@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/condenser"
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
@@ -335,13 +335,13 @@ func (s *Server) handleUndo(ctx context.Context, rawArgs json.RawMessage) *ToolC
 
 	if args.CleanIgnored {
 		if args.DryRun {
-			cmd := exec.CommandContext(ctx, "git", "clean", "-n", "-X", "-d")
+			cmd := gitexec.Command(ctx, "clean", "-n", "-X", "-d")
 			cmd.Dir = s.getWorkDir()
 			if out, cleanErr := cmd.Output(); cleanErr == nil && len(out) > 0 {
 				res.DiffStat += "\nIgnored files to clean:\n" + string(out)
 			}
 		} else {
-			cmd := exec.CommandContext(ctx, "git", "clean", "-f", "-X", "-d")
+			cmd := gitexec.Command(ctx, "clean", "-f", "-X", "-d")
 			cmd.Dir = s.getWorkDir()
 			_ = cmd.Run()
 		}

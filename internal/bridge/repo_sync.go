@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 )
 
 // RepoInfo encapsulates git metadata for a local directory.
@@ -25,7 +27,7 @@ func GetRepoInfo(dir string) RepoInfo {
 	}
 
 	// Check if inside git work tree
-	checkCmd := exec.Command("git", "-C", dir, "rev-parse", "--is-inside-work-tree")
+	checkCmd := gitexec.Command(context.Background(), "-C", dir, "rev-parse", "--is-inside-work-tree")
 	if out, err := checkCmd.Output(); err != nil || strings.TrimSpace(string(out)) != "true" {
 		return RepoInfo{}
 	}
@@ -33,19 +35,19 @@ func GetRepoInfo(dir string) RepoInfo {
 	info := RepoInfo{IsRepo: true}
 
 	// Top level directory
-	if rootOut, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output(); err == nil {
+	if rootOut, err := gitexec.Command(context.Background(), "-C", dir, "rev-parse", "--show-toplevel").Output(); err == nil {
 		info.RepoRoot = strings.TrimSpace(string(rootOut))
 	} else {
 		info.RepoRoot = dir
 	}
 
 	// Remote origin URL
-	if remOut, err := exec.Command("git", "-C", dir, "remote", "get-url", "origin").Output(); err == nil {
+	if remOut, err := gitexec.Command(context.Background(), "-C", dir, "remote", "get-url", "origin").Output(); err == nil {
 		info.RemoteURL = strings.TrimSpace(string(remOut))
 	}
 
 	// Current branch
-	if brOut, err := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD").Output(); err == nil {
+	if brOut, err := gitexec.Command(context.Background(), "-C", dir, "rev-parse", "--abbrev-ref", "HEAD").Output(); err == nil {
 		info.Branch = strings.TrimSpace(string(brOut))
 	}
 

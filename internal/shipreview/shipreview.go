@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 )
 
@@ -664,9 +665,18 @@ func ensureDevWorktree(ctx context.Context, repoPath, wtPath, headSHA string) er
 
 	// Clear any stale git registration for this exact path.
 	// --force succeeds even when the directory is missing (post-daemon-restart).
-	_, _ = gitOutput(ctx, repoPath, "worktree", "remove", "--force", wtPath)
+	// These are quick local calls, so they get the short git timeout rather than
+	// gitOutput's 60s. Their other errors are expected, but a timeout means git
+	// can't reach the repo at all: stop there instead of trying the add.
+	quick, cancel := context.WithTimeout(ctx, gitexec.Timeout())
+	defer cancel()
+	if _, err := gitOutput(quick, repoPath, "worktree", "remove", "--force", wtPath); gitexec.IsTimeout(err) {
+		return err
+	}
 	// Prune any other orphaned registrations in this repo.
-	_, _ = gitOutput(ctx, repoPath, "worktree", "prune")
+	if _, err := gitOutput(quick, repoPath, "worktree", "prune"); gitexec.IsTimeout(err) {
+		return err
+	}
 	// Remove directory remnants if any.
 	_ = os.RemoveAll(wtPath)
 
@@ -1188,7 +1198,7 @@ func verifyAncestor(ctx context.Context, repoDir, sha, ref string) error {
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec
+	cmd := gitexec.Command(ctx, args...) //nolint:gosec
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

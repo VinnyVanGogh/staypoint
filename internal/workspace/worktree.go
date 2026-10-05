@@ -5,10 +5,11 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 )
 
@@ -23,8 +24,14 @@ func NewWorktreeManager(repoRoot string, db *sql.DB) *WorktreeManager {
 	return &WorktreeManager{RepoRoot: repoRoot, DB: db}
 }
 
+// worktreeGitTimeout is longer than gitexec's default because `worktree add`
+// checks out the whole tree, which can take a while in a large repo.
+const worktreeGitTimeout = 2 * time.Minute
+
 func runGit(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	ctx, cancel := context.WithTimeout(ctx, worktreeGitTimeout)
+	defer cancel()
+	cmd := gitexec.Command(ctx, args...)
 	cmd.Dir = dir
 	cmd.Env = security.ChildEnv()
 	out, err := cmd.CombinedOutput()

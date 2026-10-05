@@ -5,10 +5,10 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
-	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/paperclip"
 )
 
@@ -79,7 +79,7 @@ func GetGitCommitSHA(dir string) string {
 	if dir == "" {
 		dir = "."
 	}
-	cmd := exec.Command("git", "rev-parse", "--short", "HEAD")
+	cmd := gitexec.Command(context.Background(), "rev-parse", "--short", "HEAD")
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {

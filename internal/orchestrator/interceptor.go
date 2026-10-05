@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 )
@@ -123,7 +123,7 @@ func (ic *Interceptor) checkGitSync(ctx context.Context, _, wtPath, _ string) (s
 	}
 
 	run := func(args ...string) (string, error) {
-		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd := gitexec.Command(ctx, args...)
 		cmd.Dir = wtPath
 		cmd.Env = security.ChildEnv()
 		out, err := cmd.CombinedOutput()
@@ -207,7 +207,7 @@ func (ic *Interceptor) checkShipReviewCard(_ context.Context, taskID, wtPath, _ 
 		if _, err := os.Stat(wtPath); err == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			cmd := exec.CommandContext(ctx, "git", "rev-list", "--count", "main..HEAD")
+			cmd := gitexec.Command(ctx, "rev-list", "--count", "main..HEAD")
 			cmd.Dir = wtPath
 			cmd.Env = security.ChildEnv()
 			if out, err := cmd.Output(); err == nil {
@@ -235,7 +235,7 @@ func (ic *Interceptor) checkShipReviewCard(_ context.Context, taskID, wtPath, _ 
 		if _, err := os.Stat(wtPath); err == nil {
 			ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel2()
-			cmd := exec.CommandContext(ctx2, "git", "rev-parse", "HEAD")
+			cmd := gitexec.Command(ctx2, "rev-parse", "HEAD")
 			cmd.Dir = wtPath
 			cmd.Env = security.ChildEnv()
 			if out, err := cmd.Output(); err == nil {
