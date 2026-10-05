@@ -328,13 +328,11 @@ func (m *procManager) paths(taskID string) (repoPath, wtPath string) {
 	return m.repoPaths[taskID], m.worktrees[taskID]
 }
 
-// removeDevWorktree removes a temporary dev-server worktree.
-// Uses `git worktree remove --force` when a repoPath is available, else os.RemoveAll.
+// removeDevWorktree removes a temporary dev-server worktree, and its git
+// registration when a repoPath is available.
 func removeDevWorktree(repoPath, wtPath string) {
 	if repoPath != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		_, _ = gitOutput(ctx, repoPath, "worktree", "remove", "--force", wtPath)
+		_ = deleteDevWorktree(context.Background(), repoPath, wtPath)
 		return
 	}
 	_ = os.RemoveAll(wtPath)
@@ -652,36 +650,45 @@ func StartDevServer(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath stri
 	return url, nil
 }
 
-// ensureDevWorktree creates or reuses a detached worktree at wtPath for headSHA.
-// Before calling git worktree add it clears any stale registration for wtPath
-// (e.g. directory deleted by daemon restart while git still had it registered).
-// If a registered worktree already exists at wtPath with the correct SHA it is
-// reused without recreation. Only paths whose base name starts with "devserver-"
-// are managed; anything else is rejected.
+// ensureDevWorktree creates a fresh detached worktree at wtPath for headSHA,
+// first deleting whatever tree or stale git registration is already there
+// (e.g. a directory left by a daemon restart while git still had it
+// registered). Only paths whose base name starts with "devserver-" are
+// managed; anything else is rejected.
 func ensureDevWorktree(ctx context.Context, repoPath, wtPath, headSHA string) error {
-	if !strings.HasPrefix(filepath.Base(wtPath), "devserver-") {
-		return fmt.Errorf("ensureDevWorktree: refusing non-devserver path %q", wtPath)
-	}
-
-	// Clear any stale git registration for this exact path.
-	// --force succeeds even when the directory is missing (post-daemon-restart).
-	// These are quick local calls, so they get the short git timeout rather than
-	// gitOutput's 60s. Their other errors are expected, but a timeout means git
-	// can't reach the repo at all: stop there instead of trying the add.
-	quick, cancel := context.WithTimeout(ctx, gitexec.Timeout())
-	defer cancel()
-	if _, err := gitOutput(quick, repoPath, "worktree", "remove", "--force", wtPath); gitexec.IsTimeout(err) {
+	if err := deleteDevWorktree(ctx, repoPath, wtPath); err != nil {
 		return err
 	}
-	// Prune any other orphaned registrations in this repo.
-	if _, err := gitOutput(quick, repoPath, "worktree", "prune"); gitexec.IsTimeout(err) {
-		return err
-	}
-	// Remove directory remnants if any.
-	_ = os.RemoveAll(wtPath)
-
 	_, err := gitOutput(ctx, repoPath, "worktree", "add", "--detach", wtPath, headSHA)
 	return err
+}
+
+// deleteDevWorktree deletes the devserver worktree at wtPath and its git
+// registration.
+//
+// The tree is deleted with os.RemoveAll, not `git worktree remove`: a dev
+// worktree holding node_modules can take longer to delete than git's quick
+// timeout (STA-710), and the directory is StayPoint's own. Git then only has
+// to prune the registration, which is quick.
+func deleteDevWorktree(ctx context.Context, repoPath, wtPath string) error {
+	if !strings.HasPrefix(filepath.Base(wtPath), "devserver-") {
+		return fmt.Errorf("deleteDevWorktree: refusing non-devserver path %q", wtPath)
+	}
+	// Prune before touching the directory. It is a quick git call, so a repo
+	// git cannot read (STA-685) fails here within the quick timeout instead of
+	// blocking the unbounded RemoveAll below on the same folder. Its other
+	// errors are not fatal: the add reports anything that still matters.
+	if _, err := gitOutput(ctx, repoPath, "worktree", "prune"); gitexec.IsTimeout(err) {
+		return err
+	}
+	if err := os.RemoveAll(wtPath); err != nil {
+		return fmt.Errorf("remove dev worktree %s: %w", wtPath, err)
+	}
+	// Drop the registration of the tree just deleted, and any other orphan.
+	if _, err := gitOutput(ctx, repoPath, "worktree", "prune"); gitexec.IsTimeout(err) {
+		return err
+	}
+	return nil
 }
 
 // startDevServerSync performs the full setup sequence: worktree, Supabase env,
@@ -1194,9 +1201,11 @@ func verifyAncestor(ctx context.Context, repoDir, sha, ref string) error {
 	return err
 }
 
-// gitOutput runs git in dir with a 60s timeout and returns trimmed stdout.
+// gitOutput runs git in dir and returns trimmed stdout. Each call is bounded by
+// gitexec.TimeoutFor: quick for reads, longer for fetch, push, merge and
+// worktree add/remove (STA-710).
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, gitexec.TimeoutFor(args...))
 	defer cancel()
 	cmd := gitexec.Command(ctx, args...) //nolint:gosec
 	cmd.Dir = dir

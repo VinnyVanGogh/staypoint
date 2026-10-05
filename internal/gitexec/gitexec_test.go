@@ -129,3 +129,67 @@ func TestTimeoutEnv_InvalidFallsBackToDefault(t *testing.T) {
 		t.Errorf("Timeout() = %s, want 2s", got)
 	}
 }
+
+// STA-710: one short timeout for every git call made `worktree remove` of a
+// node_modules-sized tree time out. Reads stay quick; calls that hit the
+// network or a whole tree get the slow timeout.
+func TestTimeoutFor_PerOperation(t *testing.T) {
+	t.Setenv(gitexec.TimeoutEnv, "")
+	t.Setenv(gitexec.SlowTimeoutEnv, "")
+	fast, slow := gitexec.DefaultTimeout, gitexec.DefaultSlowTimeout
+	for _, tc := range []struct {
+		args []string
+		want time.Duration
+	}{
+		{[]string{"rev-parse", "HEAD"}, fast},
+		{[]string{"-C", "/repo", "rev-parse", "--show-toplevel"}, fast},
+		{[]string{"worktree", "prune"}, fast},
+		{[]string{"worktree", "list", "--porcelain"}, fast},
+		{[]string{"merge-base", "--is-ancestor", "a", "b"}, fast},
+		{[]string{"worktree", "add", "--detach", "/wt", "abc"}, slow},
+		{[]string{"worktree", "remove", "--force", "/wt"}, slow},
+		{[]string{"-C", "/repo", "worktree", "add", "/wt"}, slow},
+		{[]string{"fetch", "--all", "--prune"}, slow},
+		{[]string{"push", "origin", "main"}, slow},
+		{[]string{"-c", "user.name=x", "merge", "--no-ff", "b"}, slow},
+		{[]string{"ls-remote", "--heads", "origin"}, slow},
+		{nil, fast},
+	} {
+		if got := gitexec.TimeoutFor(tc.args...); got != tc.want {
+			t.Errorf("TimeoutFor(%q) = %s, want %s", tc.args, got, tc.want)
+		}
+	}
+	if slow <= fast {
+		t.Fatalf("DefaultSlowTimeout %s should exceed DefaultTimeout %s", slow, fast)
+	}
+}
+
+func TestSlowTimeoutEnv(t *testing.T) {
+	t.Setenv(gitexec.SlowTimeoutEnv, "banana")
+	if got := gitexec.SlowTimeout(); got != gitexec.DefaultSlowTimeout {
+		t.Errorf("SlowTimeout() = %s, want %s", got, gitexec.DefaultSlowTimeout)
+	}
+	t.Setenv(gitexec.SlowTimeoutEnv, "3s")
+	t.Setenv(gitexec.TimeoutEnv, "1s")
+	if got := gitexec.TimeoutFor("push"); got != 3*time.Second {
+		t.Errorf("TimeoutFor(push) = %s, want 3s", got)
+	}
+	if got := gitexec.TimeoutFor("status"); got != time.Second {
+		t.Errorf("TimeoutFor(status) = %s, want 1s", got)
+	}
+}
+
+func TestCommand_SlowOperationGetsSlowTimeout(t *testing.T) {
+	// The fake git outlives the quick timeout but finishes well inside the
+	// slow one, so only a per-operation deadline lets it succeed.
+	fakeGit(t, "exec sleep 0.5")
+	t.Setenv(gitexec.TimeoutEnv, "100ms")
+	t.Setenv(gitexec.SlowTimeoutEnv, "10s")
+
+	if err := gitexec.Command(context.Background(), "worktree", "add", "/wt", "HEAD").Run(); err != nil {
+		t.Errorf("worktree add: %v, want success under the slow timeout", err)
+	}
+	if err := gitexec.Command(context.Background(), "rev-parse", "HEAD").Run(); !gitexec.IsTimeout(err) {
+		t.Errorf("rev-parse: err = %v, want ErrTimeout under the quick timeout", err)
+	}
+}

@@ -32,6 +32,7 @@ func hangGit(t *testing.T) {
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(gitexec.TimeoutEnv, "300ms")
+	t.Setenv(gitexec.SlowTimeoutEnv, "300ms")
 }
 
 // timedReq runs shipDoReq on a client with a hard deadline, so a hang fails
