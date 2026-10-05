@@ -19,21 +19,29 @@
 
   function renderMarkdown(text) {
     if (!text) return '';
-    let s = escapeHtml(text);
-    s = s.replace(/```[\w]*\n?([\s\S]*?)```/g, (_, code) =>
-      `<pre><code>${code.trimEnd()}</code></pre>`);
-    s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+    // NUL delimits code placeholders below, so it must not survive from the input.
+    let s = escapeHtml(text).replace(/\u0000/g, '');
+    // Code is rendered first and parked behind placeholders so the inline and
+    // block rules below never touch its contents.
+    const code = [];
+    const park = html => `\u0000${code.push(html) - 1}\u0000`;
+    s = s.replace(/```[\w]*\n?([\s\S]*?)```/g, (_, c) =>
+      park(`<pre><code>${c.trimEnd()}</code></pre>`));
+    s = s.replace(/`([^`\n]+)`/g, (_, c) => park(`<code>${c}</code>`));
     s = s.replace(/^### (.+)$/gm, '<h3>$1</h3>');
     s = s.replace(/^## (.+)$/gm, '<h2>$1</h2>');
     s = s.replace(/^# (.+)$/gm, '<h1>$1</h1>');
     s = s.replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>');
     s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+    s = s.replace(/\*(?=\S)([^*\n]*?\S)\*/g, '<em>$1</em>');
+    // _x_ only at word boundaries, so snake_case names stay literal.
+    s = s.replace(/(^|\W)_(?=\S)([^\n]*?\S)_(?!\w)/gm, '$1<em>$2</em>');
     s = s.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
     s = s.replace(/^[-*] (.+)$/gm, '<li>$1</li>');
     s = s.replace(/(<li>[\s\S]*?<\/li>)(\n<li>[\s\S]*?<\/li>)*/g, m => `<ul>${m}</ul>`);
     s = s.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
     s = s.replace(/^---+$/gm, '<hr>');
+    s = s.replace(/\u0000(\d+)\u0000/g, (_, i) => code[i]);
     const lines = s.split(/\n\n+/);
     const wrapped = lines.map(chunk => {
       chunk = chunk.trim();
