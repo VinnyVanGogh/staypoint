@@ -165,8 +165,8 @@ func (c *Cmd) wrap(err error) error {
 		dir, _ = os.Getwd()
 	}
 	if errors.Is(ctxErr, context.DeadlineExceeded) {
-		return fmt.Errorf("%w: git %s in %s after %s (if staypointd cannot read this folder, macOS may be waiting on a privacy permission for it): %v",
-			ErrTimeout, strings.Join(c.args, " "), dir, time.Since(c.start).Round(time.Millisecond), err)
+		return fmt.Errorf("%w: git %s blocked for %s in %s (possible causes: macOS privacy prompt pending, file provider, network mount): %v",
+			ErrTimeout, strings.Join(c.args, " "), time.Since(c.start).Round(time.Millisecond), dir, err)
 	}
 	return fmt.Errorf("git %s in %s: %w", strings.Join(c.args, " "), dir, ctxErr)
 }

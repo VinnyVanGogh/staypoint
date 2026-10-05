@@ -312,6 +312,9 @@ func (s *Server) handleCheckpoint(ctx context.Context, rawArgs json.RawMessage) 
 	return toolSuccess(string(data))
 }
 
+// undoCleanTimeout bounds staypoint_undo's removal of ignored files.
+const undoCleanTimeout = 5 * time.Minute
+
 func (s *Server) handleUndo(ctx context.Context, rawArgs json.RawMessage) *ToolCallResult {
 	var args struct {
 		CheckpointID  string `json:"checkpoint_id"`
@@ -341,9 +344,14 @@ func (s *Server) handleUndo(ctx context.Context, rawArgs json.RawMessage) *ToolC
 				res.DiffStat += "\nIgnored files to clean:\n" + string(out)
 			}
 		} else {
-			cmd := gitexec.Command(ctx, "clean", "-f", "-X", "-d")
+			// Deleting a large ignored tree (node_modules, build output) can
+			// take far longer than gitexec's default, and a clean cut off
+			// partway leaves the tree half-removed.
+			cleanCtx, cancel := context.WithTimeout(ctx, undoCleanTimeout)
+			cmd := gitexec.Command(cleanCtx, "clean", "-f", "-X", "-d")
 			cmd.Dir = s.getWorkDir()
 			_ = cmd.Run()
+			cancel()
 		}
 	}
 

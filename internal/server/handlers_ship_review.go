@@ -5,7 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io/fs"
 	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
@@ -13,6 +17,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/migration"
+	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 	"github.com/google/uuid"
 )
@@ -67,7 +72,11 @@ func (h *ShipReviewHandler) GetCard(w http.ResponseWriter, r *http.Request) {
 			if gitErr != nil {
 				// The card itself is DB-only; return it and say why the
 				// migration check is missing rather than hanging or erroring.
-				merged["repo_error"] = gitErr.Error()
+				if errors.Is(gitErr, errRepoUnreadable) {
+					merged["repo_error"] = gitErr.Error()
+				} else {
+					merged["migration_check_error"] = gitErr.Error()
+				}
 			}
 			writeJSON(w, merged)
 			return
@@ -218,25 +227,35 @@ func (h *ShipReviewHandler) StopDev(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
+// errRepoUnreadable marks a migration check that failed because git could not
+// read the task repo, as opposed to a database error.
+var errRepoUnreadable = errors.New("cannot read task repo")
+
 // unverifiedMigrations returns migration file paths that appear in the task diff
 // but have not been marked applied (with successful verification) in the activity log.
+//
+// It fails closed: a diff error is returned (wrapping errRepoUnreadable) unless
+// nothingToDiff confirms there was nothing to compare, so a repo git cannot
+// read is never taken to have no migrations.
 func unverifiedMigrations(ctx gocontext.Context, db *sql.DB, task *context.Task) ([]string, error) {
 	// Detect migration files in the task diff.
 	workDir, hasWorktree := taskCheckpointWorkDir(task)
 	cpID := ""
+	refs := []string{checkpoint.LatestRef}
 	var fileStats []checkpoint.FileDiffStat
 	var diffErr error
 	if hasWorktree {
 		fileStats, diffErr = checkpoint.DiffCheckpointFiles(ctx, workDir, cpID)
 	} else {
 		branch := "staypoint/" + task.ID
+		refs = append(refs, branch)
 		fileStats, diffErr = checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, cpID, branch)
 	}
-	// Other diff errors (no branch, not a repo) still mean "no migrations", as
-	// before. A timeout means we never looked, so the Approve gate must not
-	// read it as "nothing to verify".
-	if gitexec.IsTimeout(diffErr) {
-		return nil, diffErr
+	if diffErr != nil {
+		if gitexec.IsTimeout(diffErr) || !nothingToDiff(ctx, workDir, refs...) {
+			return nil, fmt.Errorf("%w: %w", errRepoUnreadable, diffErr)
+		}
+		return nil, nil
 	}
 	filePaths := make([]string, len(fileStats))
 	for i, s := range fileStats {
@@ -272,6 +291,36 @@ func unverifiedMigrations(ctx gocontext.Context, db *sql.DB, task *context.Task)
 		}
 	}
 	return unverified, nil
+}
+
+// nothingToDiff reports whether a failed migration diff failed only because
+// there was nothing to compare: dir is not a git repo, or one of refs (the
+// checkpoint baseline, the task branch) does not exist yet. It decides from the
+// filesystem and git's exit status, never from the text of git's error, so a
+// repo git was refused (EPERM) or timed out on is never mistaken for one with
+// nothing in it.
+func nothingToDiff(ctx gocontext.Context, dir string, refs ...string) bool {
+	if _, err := os.Stat(filepath.Join(dir, ".git")); errors.Is(err, fs.ErrNotExist) {
+		return true
+	} else if err != nil {
+		return false
+	}
+	for _, ref := range refs {
+		// --verify --quiet exits 1 when the ref does not exist and 128 when git
+		// cannot read the repo.
+		cmd := gitexec.Command(ctx, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+		cmd.Dir = dir
+		cmd.Env = security.ChildEnv()
+		err := cmd.Run()
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return true
+		}
+		if err != nil {
+			return false
+		}
+	}
+	return false
 }
 
 // Approve handles POST /api/tasks/{id}/ship-review/approve (Board action)
