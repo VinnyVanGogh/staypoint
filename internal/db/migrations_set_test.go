@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -278,5 +279,51 @@ func TestOpen_BackfillsDBMigratedByOldRunner(t *testing.T) {
 	}
 	if _, ok := got[27]; !ok {
 		t.Errorf("version 27 missing from schema_migrations: %v", got)
+	}
+}
+
+// STA-754: the daemon and a CLI/hook can open a pre-ledger DB at the same
+// moment after an upgrade. Both see the same rows missing from
+// schema_migrations; the backfill must not fail the slower one.
+func TestOpen_ConcurrentFirstOpenAfterUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	template := filepath.Join(dir, "template.db")
+	store, err := Open(template)
+	if err != nil {
+		t.Fatalf("seed Open: %v", err)
+	}
+	if _, err := store.DB().Exec(`DROP TABLE schema_migrations; PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
+		t.Fatalf("drop ledger: %v", err)
+	}
+	store.Close()
+
+	const iterations, openers = 20, 4
+	for i := 0; i < iterations; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("legacy-%d.db", i))
+		if err := copyFile(template, path); err != nil {
+			t.Fatalf("copy template: %v", err)
+		}
+		var wg sync.WaitGroup
+		errs := make(chan error, openers)
+		start := make(chan struct{})
+		for g := 0; g < openers; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				s, err := Open(path)
+				if err != nil {
+					errs <- err
+					return
+				}
+				s.Close()
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Errorf("iteration %d: concurrent Open failed: %v", i, err)
+		}
 	}
 }
