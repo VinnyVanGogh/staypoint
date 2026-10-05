@@ -343,6 +343,38 @@ test.describe('ship review card', () => {
     cleanup();
   });
 
+  // ── STA-657: SSE re-render whose card fetch fails clears header actions ───
+  // The ship_review_* handler removes the card before refetching it. If that
+  // GET fails, no card is rendered, so the header must not keep Approve /
+  // Send Back / Reject wired to the removed card.
+  test('ship_review SSE with failed card fetch clears header review buttons', async ({ boardPage: page, request }) => {
+    const { task, cleanup } = await createShipReviewTask(request, 'Ship review SSE fetch fail');
+    const upsert = await upsertShipReview(request, task.id);
+    expect(upsert.ok(), `upsert failed: ${await upsert.text()}`).toBeTruthy();
+
+    await gotoTaskPage(page, task);
+    await expect(page.locator('.ship-review-card')).toBeVisible({ timeout: 10_000 });
+    await expect(reviewActions(page).locator('.ship-review-approve-btn')).toHaveCount(1);
+
+    let failedGets = 0;
+    await page.route(`**/api/tasks/${encodeURIComponent(task.id)}/ship-review`, async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      failedGets++;
+      await route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'boom' }) });
+    });
+
+    await page.evaluate((tid) => {
+      (window as unknown as { handleEvent: (e: unknown) => void })
+        .handleEvent({ type: 'ship_review_updated', data: { task_id: tid } });
+    }, task.id);
+
+    await expect.poll(() => failedGets, { timeout: 5_000 }).toBeGreaterThan(0);
+    await expect(page.locator('.ship-review-card')).toHaveCount(0);
+    await expect(reviewActions(page).locator('.ship-review-approve-btn')).toHaveCount(0);
+    await expect(reviewActions(page).locator('.ship-review-sendback-btn')).toHaveCount(0);
+    cleanup();
+  });
+
   // ── STA-586 Bug 4: no duplicate messages in "Send to Agent" section ───────
   test('Send to Agent section has no duplicate comments above composer', async ({ page, api: _api, request }) => {
     const { task, cleanup } = await createShipReviewTask(request, 'Ship review no duplicate');
