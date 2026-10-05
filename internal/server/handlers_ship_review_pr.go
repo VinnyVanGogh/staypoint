@@ -86,7 +86,7 @@ func (h *ShipReviewHandler) requireGHAuth(w http.ResponseWriter, task *context.T
 // approvePR is Approve for the PR modes: push the pinned head, open or reuse
 // the PR. open_pr closes the card there; pr_merge leaves it pending with
 // checks running.
-func (h *ShipReviewHandler) approvePR(w http.ResponseWriter, r *http.Request, card *shipreview.Card, task *context.Task, cfg *shipreview.ProjectDevConfig, mode string) {
+func (h *ShipReviewHandler) approvePR(w http.ResponseWriter, r *http.Request, card *shipreview.Card, task *context.Task, cfg *shipreview.ProjectDevConfig, mode string, gate *gateOutcome) {
 	auth, err := shipreview.ResolveGHAuth(cfg, task.RepoPath)
 	if err != nil {
 		writeJSONStatus(w, http.StatusConflict, map[string]any{"error": "gh_auth", "message": err.Error()})
@@ -136,7 +136,10 @@ func (h *ShipReviewHandler) approvePR(w http.ResponseWriter, r *http.Request, ca
 	})
 
 	refreshed, _ := shipreview.GetCard(h.db, task.ID)
-	writeJSON(w, map[string]any{"card": refreshed, "merge_mode": mode, "pr_number": pr.Number, "pr_url": pr.URL})
+	resp := map[string]any{"card": refreshed, "merge_mode": mode, "pr_number": pr.Number, "pr_url": pr.URL}
+	// open_pr hands the PR to GitHub here; a bypass files its task now.
+	h.addGateResult(resp, card, task, gate, pr.Number, pr.URL, "")
+	writeJSON(w, resp)
 }
 
 // Checks handles GET /api/tasks/{id}/ship-review/checks: polls the card's PR
@@ -234,6 +237,7 @@ func (h *ShipReviewHandler) MergePR(w http.ResponseWriter, r *http.Request) {
 		Override                bool   `json:"override"`
 		OverrideReason          string `json:"override_reason"`
 		MigrationOverrideReason string `json:"migration_override_reason"`
+		testGateBypass
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.HeadSHA == "" {
@@ -272,6 +276,12 @@ func (h *ShipReviewHandler) MergePR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auth, ok := h.requireGHAuth(w, task)
+	if !ok {
+		return
+	}
+
+	// STA-734: the test gate, after the head and CI facts above are settled.
+	gate, ok := h.enforceTestGate(w, r, card, task, "merge_pr", req.HeadSHA, req.testGateBypass)
 	if !ok {
 		return
 	}
@@ -347,6 +357,7 @@ func (h *ShipReviewHandler) MergePR(w http.ResponseWriter, r *http.Request) {
 
 	refreshed, _ := shipreview.GetCard(h.db, taskID)
 	resp := map[string]any{"card": refreshed, "main_sha": res.MainSHA, "branch_deleted": deleteErr == "", "pr_url": card.PRURL}
+	h.addGateResult(resp, card, task, gate, card.PRNumber, card.PRURL, res.MainSHA)
 	if deleteErr != "" {
 		resp["branch_delete_error"] = deleteErr
 		resp["warning"] = "merged; branch delete failed: " + deleteErr

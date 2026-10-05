@@ -20,6 +20,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/migration"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
+	"github.com/VinnyVanGogh/staypoint/internal/testgate"
 	"github.com/google/uuid"
 )
 
@@ -517,6 +518,7 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 		MigrationOverrideReason string `json:"migration_override_reason"`
 		// HeadSHA, when sent, is the head the Board was shown (STA-717).
 		HeadSHA string `json:"head_sha"`
+		testGateBypass
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.HeadSHA != "" && req.HeadSHA != card.HeadSHA {
@@ -564,8 +566,18 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
 		return
 	}
-	if mode := shipreview.EffectiveMergeMode(cfg, shipreview.IsWorkRepo(task.RepoPath)); mode != shipreview.MergeModeDirect {
-		h.approvePR(w, r, card, task, cfg, mode)
+	mode := shipreview.EffectiveMergeMode(cfg, shipreview.IsWorkRepo(task.RepoPath))
+
+	// STA-734: direct and open_pr Approve hand the change to main, so the
+	// test gate runs here; pr_merge only opens the PR and is gated at Merge.
+	var gate *gateOutcome
+	if mode != shipreview.MergeModePRMerge {
+		if gate, ok = h.enforceTestGate(w, r, card, task, "approve", req.HeadSHA, req.testGateBypass); !ok {
+			return
+		}
+	}
+	if mode != shipreview.MergeModeDirect {
+		h.approvePR(w, r, card, task, cfg, mode, gate)
 		return
 	}
 
@@ -613,6 +625,7 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 
 	refreshed, _ := shipreview.GetCard(h.db, taskID)
 	resp := map[string]any{"card": refreshed, "main_sha": mainSHA, "branch_deleted": deleteErr == ""}
+	h.addGateResult(resp, card, task, gate, 0, "", mainSHA)
 	if deleteErr != "" {
 		resp["branch_delete_error"] = deleteErr
 		resp["warning"] = "merged; branch delete failed: " + deleteErr
@@ -829,11 +842,16 @@ func (h *ShipReviewHandler) ListProjectDevConfigs(w http.ResponseWriter, r *http
 		*shipreview.ProjectDevConfig
 		IsWorkRepo         bool   `json:"is_work_repo"`
 		EffectiveMergeMode string `json:"effective_merge_mode"`
+		// TestExemptGlobs are the project's own test-gate exempt paths;
+		// DefaultTestExemptGlobs always apply on top (STA-734).
+		TestExemptGlobs        []string `json:"test_exempt_globs"`
+		DefaultTestExemptGlobs []string `json:"default_test_exempt_globs"`
 	}
 	views := make([]configView, 0, len(cfgs))
 	for _, c := range cfgs {
 		isWork := shipreview.IsWorkRepo(c.RepoPath)
-		views = append(views, configView{c, isWork, shipreview.EffectiveMergeMode(c, isWork)})
+		exempt, _ := shipreview.GetTestExemptGlobs(h.db, c.RepoPath)
+		views = append(views, configView{c, isWork, shipreview.EffectiveMergeMode(c, isWork), exempt, testgate.DefaultExemptGlobs})
 	}
 	writeJSON(w, map[string]any{"configs": views})
 }
@@ -853,6 +871,8 @@ type devConfigUpdateReq struct {
 	MergeMode       *string   `json:"merge_mode"`
 	GHConfigDir     *string   `json:"gh_config_dir"`
 	LiveCredentials *bool     `json:"live_credentials"`
+	// TestExemptGlobs are the project's own test-gate exempt paths (STA-734).
+	TestExemptGlobs *[]string `json:"test_exempt_globs"`
 }
 
 // UpsertProjectDevConfig handles PUT /api/project-dev-configs.
@@ -927,6 +947,13 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 		cfg.LiveCredentials = *req.LiveCredentials
 	}
 
+	// Read before the transaction: SQLite may have only the one connection.
+	oldExempt, err := shipreview.GetTestExemptGlobs(h.db, req.RepoPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load test exempt globs: "+err.Error())
+		return
+	}
+
 	// Audit failure must roll back the config write; both go in one transaction.
 	tx, txErr := h.db.Begin()
 	if txErr != nil {
@@ -938,6 +965,14 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 	if err := shipreview.UpsertProjectDevConfigTx(tx, &cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	newExempt := oldExempt
+	if req.TestExemptGlobs != nil {
+		if err := shipreview.SetTestExemptGlobsTx(tx, req.RepoPath, *req.TestExemptGlobs); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		newExempt = *req.TestExemptGlobs
 	}
 
 	if err := governance.LogBoardEventTx(tx, "board", "dev_config_change", map[string]any{
@@ -953,8 +988,10 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 		"new_gh_config_dir": cfg.GHConfigDir,
 		// STA-727: the live flag is only ever changed here, so this row is
 		// its full history.
-		"old_live_credentials": old.LiveCredentials,
-		"new_live_credentials": cfg.LiveCredentials,
+		"old_live_credentials":  old.LiveCredentials,
+		"new_live_credentials":  cfg.LiveCredentials,
+		"old_test_exempt_globs": oldExempt,
+		"new_test_exempt_globs": newExempt,
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "audit log write failed: "+err.Error())
 		return

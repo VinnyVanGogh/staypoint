@@ -148,14 +148,14 @@ func TestTaskTitleAndDescription(t *testing.T) {
 		}}})
 	g := GapTask{PRNumber: 12, PRURL: "https://github.com/o/r/pull/12", HeadSHA: "0123456789abcdef",
 		MainSHA: "fedcba", Branch: "staypoint/task-1", SourceTaskID: "task-1", SourceTaskName: "Calc",
-		CardURL: "http://127.0.0.1:7777/#/tasks/task-1", Reason: "hotfix"}
+		CardURL: "/tasks/STA/core/task-1", Reason: "hotfix"}
 	if got, want := TaskTitle(r, g), "Add tests for internal/calc/calc.go (Div) (merged untested in PR #12 `0123456`)"; got != want {
 		t.Errorf("title = %q, want %q", got, want)
 	}
 	d := TaskDescription(r, g)
 	for _, want := range []string{
 		"PR: #12 https://github.com/o/r/pull/12", "`0123456789abcdef`", "Merge commit: `fedcba`",
-		"task `task-1` Calc (http://127.0.0.1:7777/#/tasks/task-1)", "Board's reason: hotfix",
+		"task `task-1` Calc ([open card](/tasks/STA/core/task-1))", "Board's reason: hotfix",
 		NoCIMessage, "- `web/app.js`", "internal/calc/calc.go: functions Div; lines 10-11",
 	} {
 		if !strings.Contains(d, want) {

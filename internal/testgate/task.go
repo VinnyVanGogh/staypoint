@@ -79,7 +79,7 @@ func TaskDescription(r *Report, g GapTask) string {
 	if g.SourceTaskID != "" {
 		fmt.Fprintf(&b, "- Ship review card: task `%s` %s", g.SourceTaskID, g.SourceTaskName)
 		if g.CardURL != "" {
-			fmt.Fprintf(&b, " (%s)", g.CardURL)
+			fmt.Fprintf(&b, " ([open card](%s))", g.CardURL)
 		}
 		b.WriteString("\n")
 	}
