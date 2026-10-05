@@ -180,18 +180,18 @@ func validateDevURL(rawURL string) error {
 
 // devServerManager tracks running dev-server subprocesses by task ID.
 var devServerManager = &procManager{
-	procs:      make(map[string]*os.Process),
-	repoPaths:  make(map[string]string),
-	worktrees:  make(map[string]string),
-	setups:     make(map[string]*devSetup),
+	procs:     make(map[string]*os.Process),
+	repoPaths: make(map[string]string),
+	worktrees: make(map[string]string),
+	setups:    make(map[string]*devSetup),
 }
 
 type procManager struct {
-	mu         sync.Mutex
-	procs      map[string]*os.Process
-	repoPaths  map[string]string // taskID -> repoPath (for worktree cleanup)
-	worktrees  map[string]string // taskID -> temp worktree path
-	setups     map[string]*devSetup // taskID -> dev-server setup still in flight
+	mu        sync.Mutex
+	procs     map[string]*os.Process
+	repoPaths map[string]string    // taskID -> repoPath (for worktree cleanup)
+	worktrees map[string]string    // taskID -> temp worktree path
+	setups    map[string]*devSetup // taskID -> dev-server setup still in flight
 }
 
 // devSetup is one in-flight run of startDevServerSync. cancel is only ever
@@ -205,13 +205,27 @@ type devSetup struct {
 
 // beginSetup registers a new dev-server setup for taskID, cancelling and
 // waiting for any earlier one so two setups never share the worktree path.
+//
+// The swap and the cancel happen in one critical section: the new setup is
+// visible to cancelSetup the moment the old one is superseded, so two
+// overlapping restarts can never leave a live setup outside the map that
+// CleanupMergedBranch could not reach.
 func (m *procManager) beginSetup(taskID string) *devSetup {
-	m.cancelSetup(taskID, devSetupWait)
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &devSetup{ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	m.mu.Lock()
+	prev := m.setups[taskID]
 	m.setups[taskID] = s
+	if prev != nil {
+		prev.cancel()
+	}
 	m.mu.Unlock()
+	if prev != nil {
+		select {
+		case <-prev.done:
+		case <-time.After(devSetupWait):
+		}
+	}
 	return s
 }
 
@@ -711,6 +725,9 @@ func startDevServerSync(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath 
 		if err := StartSupabaseDevEnv(repoPath, wtPath, cfg.DevCommand, func(p SupabaseProgress) {
 			emit(p.Step, p.Message, p.OK)
 		}); err != nil {
+			if canceled() {
+				return ErrDevSetupCanceled
+			}
 			removeDevWorktree(repoPath, wtPath)
 			return fmt.Errorf("supabase dev env: %w", err)
 		}
@@ -1000,10 +1017,13 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 	// ── Checks: nothing below this block is destructive until all pass. ──
 
 	if _, err := os.Stat(agentWT); err == nil {
-		if head, err := gitOutput(ctx, agentWT, "rev-parse", "--verify", "-q", "HEAD"); err == nil && head != "" {
-			if verifyAncestor(ctx, repoDir, head, mainSHA) != nil {
-				return fmt.Errorf("agent worktree %s is at %s, which is not in main; nothing deleted", agentWT, head)
-			}
+		// Fail closed: a worktree whose HEAD cannot be read may hold anything.
+		head, err := gitOutput(ctx, agentWT, "rev-parse", "--verify", "-q", "HEAD")
+		if err != nil || head == "" {
+			return fmt.Errorf("agent worktree %s: cannot read HEAD (%v); nothing deleted", agentWT, err)
+		}
+		if verifyAncestor(ctx, repoDir, head, mainSHA) != nil {
+			return fmt.Errorf("agent worktree %s is at %s, which is not in main; nothing deleted", agentWT, head)
 		}
 	}
 
@@ -1049,9 +1069,19 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 	var errs []error
 
 	if localTip != "" {
-		// Like the remote lease: only delete the tip that was checked.
-		if _, err := gitOutput(ctx, repoDir, "update-ref", "-d", "refs/heads/"+branch, localTip); err != nil {
+		// update-ref skips branch -D's "checked out in a worktree" refusal,
+		// so check that ourselves: the task's own worktrees are gone by now,
+		// any other checkout of the branch must keep it.
+		if wt, err := worktreeWithBranch(ctx, repoDir, branch); err != nil {
 			errs = append(errs, fmt.Errorf("delete local branch: %w", err))
+		} else if wt != "" {
+			errs = append(errs, fmt.Errorf("local branch %s is checked out in %s; not deleted", branch, wt))
+		} else if _, err := gitOutput(ctx, repoDir, "update-ref", "-d", "refs/heads/"+branch, localTip); err != nil {
+			// Like the remote lease: only delete the tip that was checked.
+			errs = append(errs, fmt.Errorf("delete local branch: %w", err))
+		} else {
+			// branch -D would have dropped the branch's config too.
+			_, _ = gitOutput(ctx, repoDir, "config", "--remove-section", "branch."+branch)
 		}
 	}
 
@@ -1062,6 +1092,24 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 	}
 
 	return errors.Join(errs...)
+}
+
+// worktreeWithBranch returns the path of a worktree that has branch checked
+// out, or "" when none does.
+func worktreeWithBranch(ctx context.Context, repoDir, branch string) (string, error) {
+	out, err := gitOutput(ctx, repoDir, "worktree", "list", "--porcelain")
+	if err != nil {
+		return "", err
+	}
+	wt := ""
+	for _, line := range strings.Split(out, "\n") {
+		if p, ok := strings.CutPrefix(line, "worktree "); ok {
+			wt = p
+		} else if line == "branch refs/heads/"+branch {
+			return wt, nil
+		}
+	}
+	return "", nil
 }
 
 // deleteRemoteBranchLeased deletes refs/heads/<branch> on origin only while

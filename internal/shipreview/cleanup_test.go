@@ -324,6 +324,25 @@ func TestCleanupMergedBranchCancelsInFlightDevSetup(t *testing.T) {
 	}
 }
 
+// STA-649 review: the leased local delete keeps branch -D's refusal to delete
+// a branch checked out in some other worktree.
+func TestCleanupMergedBranchKeepsBranchCheckedOutElsewhere(t *testing.T) {
+	repoDir, card, mainSHA := mergedCard(t, "t-elsewhere")
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	gitIn(t, repoDir, "worktree", "add", elsewhere, card.Branch)
+
+	err := shipreview.CleanupMergedBranch(context.Background(), repoDir, card, mainSHA)
+	if err == nil || !strings.Contains(err.Error(), "checked out in") {
+		t.Fatalf("want checked-out refusal, got %v", err)
+	}
+	if !localHasBranch(repoDir, card.Branch) {
+		t.Error("local branch deleted while checked out in another worktree")
+	}
+	if got := gitIn(t, elsewhere, "symbolic-ref", "HEAD"); got != "refs/heads/"+card.Branch {
+		t.Errorf("other worktree HEAD = %q", got)
+	}
+}
+
 func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
