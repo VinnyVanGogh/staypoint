@@ -3191,6 +3191,84 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   .task-page-tabpanel { padding: 12px 16px; }
   .task-page-dock { position: sticky; bottom: 0; z-index: 10; padding: 6px 16px 10px; }
 }
+/* Drawer (peek) view (STA-700): the task page layout in #detail-panel, stacked
+   like the narrow page above but sized by the drawer, not the viewport. The
+   drawer content scrolls under a sticky header and composer; the panel's
+   close / expand / open buttons stay put in its top-right corner. Wide enough
+   (#panel-expand), the body goes back to two columns. */
+.detail-panel:has(> #panel-content.task-page-drawer) {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+/* Above the sticky header, which comes later in the panel. */
+.detail-panel:has(> #panel-content.task-page-drawer) > .panel-header-actions { z-index: 20; }
+.detail-panel #panel-content.task-page-drawer {
+  flex: 1;
+  min-height: 0;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  container: task-drawer / inline-size;
+}
+.task-page-drawer > .task-page-header { padding: 10px 16px; }
+/* Clears the panel's ↗ / ⛶ / × buttons. */
+.task-page-drawer .task-page-header-main { padding-right: 104px; }
+.task-page-drawer .task-page-header-row { row-gap: 8px; }
+.task-page-drawer .task-page-actions { margin-left: 0; }
+.task-page-drawer .task-page-stats .timeline-stat { padding: 6px 12px; }
+.task-page-drawer .task-page-stats .timeline-stat-val { font-size: 15px; }
+.task-page-drawer > .task-page-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+}
+.task-page-drawer .task-page-layout > .task-page-timeline {
+  min-height: 0;
+  max-height: 50vh;
+  overflow-y: auto;
+  padding: 12px 16px;
+}
+.task-page-drawer .task-page-layout > .task-page-side {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: visible;
+  border-left: 0;
+  border-top: 1px solid var(--border);
+}
+.task-page-drawer .task-page-tabs {
+  gap: 2px;
+  margin: 12px 16px 0;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface2);
+  overflow-x: visible;
+}
+.task-page-drawer .task-page-tab {
+  flex: 1 1 0;
+  min-width: 0;
+  justify-content: center;
+  margin: 0;
+  padding: 6px 8px;
+  border-bottom: 0;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.task-page-drawer .task-page-tab[aria-selected="true"] { background: var(--surface); box-shadow: inset 0 0 0 1px var(--accent); }
+.task-page-drawer .task-page-tabpanel { overflow: visible; padding: 12px 16px; }
+.task-page-drawer > .task-page-dock { position: sticky; bottom: 0; z-index: 10; padding: 6px 16px 10px; }
+@container task-drawer (min-width: 900px) {
+  .task-page-drawer > .task-page-layout { grid-template-columns: minmax(0, 1fr) 440px; align-items: start; }
+  .task-page-drawer .task-page-layout > .task-page-timeline { max-height: none; overflow-y: visible; padding: 16px 20px; }
+  .task-page-drawer .task-page-layout > .task-page-side { border-top: 0; border-left: 1px solid var(--border); }
+}
 .task-page-back-btn {
   background: none;
   border: 1px solid var(--border);
