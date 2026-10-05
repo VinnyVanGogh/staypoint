@@ -450,7 +450,6 @@ test('step 4: timeline scrolls in its column, grouped run -> subtask -> step, ro
 });
 
 test('step 5: full brief, dev-server log, agent summary and migration SQL open in a modal', async ({ page, api }) => {
-  knownBug('STA-638-5');
   test.setTimeout(90_000);
   await openHeavyTask(page, api);
 

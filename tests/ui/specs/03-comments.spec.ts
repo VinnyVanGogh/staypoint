@@ -6,6 +6,8 @@ test('a comment typed on the task page shows in the thread and is stored', async
 
   await gotoTaskPage(page, task);
   const content = page.locator('#task-page-content');
+  // The thread sits behind the "Messages (n)" toggle in the composer row (STA-643).
+  await content.locator('#page-chat-toggle').click();
   await expect(content.getByText('seeded comment from the API').first()).toBeVisible();
 
   const body = `typed in the browser ${Date.now()}`;
