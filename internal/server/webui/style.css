@@ -4617,3 +4617,95 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .task-pending-gates-title { font-weight: 600; font-size: 13px; color: var(--amber, #f59e0b); margin-bottom: 8px; }
 .task-pending-gate-row { font-size: 12px; display: flex; align-items: flex-start; gap: 10px; margin-bottom: 6px; }
 .task-pending-gate-cmd { font-family: 'JetBrains Mono', ui-monospace, monospace; word-break: break-all; flex: 1; }
+
+/* ── Ship review PR modes: PR link, CI checks, merge warning (STA-717) ───── */
+.ship-review-pr-section { margin-bottom: 14px; display: flex; flex-direction: column; gap: 6px; }
+.ship-review-pr-link { font-weight: 600; color: var(--accent, #58a6ff); }
+.ship-review-pr-note { font-size: 12px; color: var(--text-muted, #8b949e); }
+.ship-review-pr-summary { margin-left: 8px; text-transform: none; letter-spacing: 0; font-weight: 600; }
+.ship-review-pr-checks { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+.ship-review-pr-check {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border, #30363d);
+  min-width: 0;
+}
+.ship-review-pr-check:last-child { border-bottom: none; }
+.ship-review-pr-check-icon { width: 14px; flex: none; text-align: center; font-weight: 700; }
+.ship-review-pr-check-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.ship-review-pr-check-state, .ship-review-pr-check-duration { color: var(--text-muted, #8b949e); white-space: nowrap; }
+.ship-review-pr-check-link { white-space: nowrap; color: var(--accent, #58a6ff); }
+.ship-review-pr-check--pass .ship-review-pr-check-icon { color: var(--green, #3fb950); }
+.ship-review-pr-check--fail .ship-review-pr-check-icon,
+.ship-review-pr-check--cancel .ship-review-pr-check-icon { color: var(--red, #f85149); }
+.ship-review-pr-check--pending .ship-review-pr-check-icon { color: #f8c436; }
+.ship-review-pr-check--empty { color: var(--text-muted, #8b949e); }
+.ship-review-pr-warning {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: rgba(248,196,54,.1);
+  border: 1px solid rgba(248,196,54,.35);
+  color: #f8c436;
+  font-size: 12px;
+}
+.ship-review-pr-warning-title { font-weight: 600; }
+.ship-review-pr-warning-list { margin: 0 0 0 16px; padding: 0; overflow-wrap: anywhere; }
+.ship-review-github-refusal {
+  padding: 7px 12px;
+  border-radius: 6px;
+  background: rgba(248,81,73,.12);
+  border: 1px solid rgba(248,81,73,.4);
+  color: var(--red, #f85149);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.ship-review-github-refusal-label { font-weight: 600; }
+.ship-review-github-refusal-text { font-family: var(--mono, ui-monospace, monospace); }
+.ship-review-merge-btn {
+  padding: 7px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  background: rgba(40,167,69,.15);
+  border: 1.5px solid rgba(40,167,69,.5);
+  color: #28a745;
+}
+.ship-review-merge-btn:hover:not(:disabled) { background: rgba(40,167,69,.25); }
+.ship-review-merge-btn:disabled { opacity: .45; cursor: not-allowed; }
+.ship-review-merge-anyway-btn, .ship-review-send-failures-btn {
+  padding: 5px 12px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ship-review-merge-anyway-btn {
+  background: rgba(248,81,73,.1);
+  border: 1px solid rgba(248,81,73,.45);
+  color: var(--red, #f85149);
+}
+.ship-review-send-failures-btn {
+  background: rgba(248,196,54,.15);
+  border: 1px solid rgba(248,196,54,.45);
+  color: #f8c436;
+}
+.ship-review-merge-anyway-btn:disabled, .ship-review-send-failures-btn:disabled { opacity: .5; cursor: default; }
+.ship-review-form-input {
+  border-radius: 5px;
+  border: 1px solid var(--border, #30363d);
+  background: var(--bg, #0d1117);
+  color: var(--text, #cdd6f4);
+  font-size: 13px;
+  padding: 6px 8px;
+}
+.ship-review-status-badge.status-checks-running,
+.ship-review-status-badge.status-checks-none { background: rgba(248,196,54,.15); color: #f8c436; }
+.ship-review-status-badge.status-checks-passed { background: rgba(40,167,69,.15); color: #28a745; }
+.ship-review-status-badge.status-checks-failed { background: rgba(248,81,73,.12); color: var(--red, #f85149); }

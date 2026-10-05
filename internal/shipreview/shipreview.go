@@ -503,7 +503,11 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 		c.PRChecks = []PRCheck{}
 	}
 	if c.PRNumber > 0 && c.PRChecksSHA != "" {
-		c.PRChecksSummary = SummarizeChecks(c.PRChecks)
+		// Pushed but not polled yet: CI is starting.
+		c.PRChecksSummary = ChecksRunning
+		if c.PRChecksAt != "" {
+			c.PRChecksSummary = SummarizeChecks(c.PRChecks)
+		}
 	}
 	c.ApprovedSHA = approvedSHA.String
 	c.MainSHA = mainSHA.String
