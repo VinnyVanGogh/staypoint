@@ -641,5 +641,40 @@ test.describe('ship review card', () => {
     cleanup();
   });
 
+  // ── STA-716: refused Board action names the server's error code ───────────
+  // The boardPage passkey is backup eligible (BE=1, BS=1) like an iCloud
+  // Keychain one; the STA-637 test above proves the real server accepts it.
+  // Here the assertion is replaced in flight so the real WrapBoardAction gate
+  // refuses it, and the card must say why instead of a bare "403 Forbidden".
+  test('Board action refused by the server shows its error code (STA-716)', async ({ boardPage: page, request }) => {
+    const { task, cleanup } = await createShipReviewTask(request, 'Approve refused code');
+    const upsert = await upsertShipReview(request, task.id);
+    expect(upsert.ok(), `upsert failed: ${await upsert.text()}`).toBeTruthy();
+
+    await gotoTaskPage(page, task);
+    await expect(page.locator('.ship-review-card')).toBeVisible({ timeout: 10_000 });
+
+    let flags = -1;
+    await page.route('**/ship-review/approve', async (route) => {
+      const headers = route.request().headers();
+      const assertion = JSON.parse(headers['x-webauthn-assertion']);
+      const authData = Buffer.from(assertion.response.authenticatorData, 'base64url');
+      flags = authData[32];
+      await route.continue({ headers: { ...headers, 'x-webauthn-assertion': '{}' } });
+    });
+
+    await reviewActions(page).getByRole('button', { name: /Approve/i }).click();
+    await reviewActions(page).getByRole('button', { name: /Merge to main/i }).click();
+
+    const err = page.locator('.ship-review-err-banner');
+    await expect(err).toBeVisible({ timeout: 10_000 });
+    await expect(err).toContainText('403');
+    await expect(err).toContainText('board_passkey_assertion_invalid');
+    expect(flags & 0x08, 'virtual authenticator must assert BE=1').toBe(0x08);
+    expect(flags & 0x10, 'virtual authenticator must assert BS=1').toBe(0x10);
+    await expect(page.locator('.ship-review-card--final')).toHaveCount(0);
+    cleanup();
+  });
+
 });
 

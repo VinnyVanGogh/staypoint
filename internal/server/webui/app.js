@@ -386,6 +386,21 @@ async function withBoardWebAuthn(fetchFn, actionLabel) {
   return fetchFn(sessionToken, assertion);
 }
 
+// boardActionErrorText describes a failed Board-action response with the
+// server's error code, e.g. "403 Forbidden: board_passkey_assertion_invalid".
+// A bare "403 Forbidden" hid why the passkey was refused (STA-716).
+function boardActionErrorText(r, body) {
+  let text = `${r.status} ${r.statusText}`;
+  if (body && body.error) text += `: ${body.error}`;
+  if (body && body.message && body.message !== body.error) text += ` (${body.message})`;
+  return text;
+}
+
+async function boardActionError(r) {
+  const body = await r.json().catch(() => ({}));
+  return new Error(boardActionErrorText(r, body));
+}
+
 // Close any open .report-dl-menu when clicking outside its wrapper.
 document.addEventListener('click', () => {
   document.querySelectorAll('.report-dl-menu').forEach(m => { m.hidden = true; });
@@ -4784,11 +4799,15 @@ function renderSettings() {
       }), 'changing "Require my approval to merge to main"',
     ).then(r => {
       if (r === null) { gateToggle.disabled = false; gateToggle.checked = !checked; return null; }
-      return r.ok ? r.json() : null;
+      return r.ok ? r.json() : boardActionError(r).then(e => { throw e; });
     }).then(data => {
       gateToggle.disabled = false;
       if (data) gateToggle.checked = data.main_merge_approval !== false;
-    }).catch(() => { gateToggle.disabled = false; });
+    }).catch(e => {
+      gateToggle.disabled = false;
+      gateToggle.checked = !checked;
+      showToast('Security gate not saved: ' + (e.message || e), 'error');
+    });
   });
 
   // Ship Review toggle row (inside Security Gates section)
@@ -4828,11 +4847,15 @@ function renderSettings() {
       }), 'changing "Ship review before merge"',
     ).then(r => {
       if (r === null) { srToggle.disabled = false; srToggle.checked = !checked; return null; }
-      return r.ok ? r.json() : null;
+      return r.ok ? r.json() : boardActionError(r).then(e => { throw e; });
     }).then(data => {
       srToggle.disabled = false;
       if (data) srToggle.checked = data.ship_review !== false;
-    }).catch(() => { srToggle.disabled = false; });
+    }).catch(e => {
+      srToggle.disabled = false;
+      srToggle.checked = !checked;
+      showToast('Ship review setting not saved: ' + (e.message || e), 'error');
+    });
   });
 
   // ── Dev Environment Config section (STA-520) ──────────────────────────────
@@ -8125,7 +8148,7 @@ function renderBranchDeleteWarning(taskId, headSHA, mainSHA, cleanup) {
       );
       if (r === null) { retry.disabled = false; return; }
       const body = await r.json().catch(() => ({}));
-      if (!r.ok && !body.card) throw new Error(body.message || body.error || `${r.status} ${r.statusText}`);
+      if (!r.ok && !body.card) throw new Error(boardActionErrorText(r, body));
       const next = {
         branch: cleanup.branch,
         branch_deleted: !!body.branch_deleted,
@@ -8389,7 +8412,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
           }), 'asking the agent to re-pin',
         );
         if (r === null) { repin.disabled = false; return; }
-        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        if (!r.ok) throw await boardActionError(r);
         showWorkingState(section, taskId, card.run_number || 1);
       } catch (e) {
         repin.disabled = false;
@@ -8431,7 +8454,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
           }), 'sending the review back',
         );
         if (r === null) { sbSubmit.disabled = false; return; }
-        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        if (!r.ok) throw await boardActionError(r);
         showWorkingState(section, taskId, card.run_number || 1);
       } catch (e) {
         sbSubmit.disabled = false;
@@ -8483,7 +8506,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
           }), 'rejecting the review',
         );
         if (r === null) { rjSubmit.disabled = false; return; }
-        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        if (!r.ok) throw await boardActionError(r);
         clearShipReviewHeaderActions(taskId);
         section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'rejected', '', comment));
       } catch (e) {
@@ -8531,9 +8554,9 @@ function renderShipReviewCardFromData(container, taskId, card) {
             acMerge.disabled = false;
             return;
           }
-          throw new Error(`${r.status} ${r.statusText}`);
+          throw new Error(boardActionErrorText(r, body));
         }
-        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        if (!r.ok) throw await boardActionError(r);
         const result = await r.json();
         const mainSHA = result.main_sha || (result.card && result.card.main_sha) || '';
         clearShipReviewHeaderActions(taskId);

@@ -26,6 +26,27 @@ import (
 // boardWebAuthnUser implements webauthn.User for the single Board principal.
 type boardWebAuthnUser struct {
 	credentials []webauthn.Credential
+	// flagsUnknown holds the IDs (as strings) of credentials enrolled before
+	// their authenticator flags were stored (STA-716).
+	flagsUnknown map[string]bool
+}
+
+// adoptLegacyFlags gives a credential with unknown flags the flags of the
+// assertion presented for it, so go-webauthn's BackupEligible consistency check
+// compares the assertion with itself on first use. The signature is still
+// verified; the caller persists the flags only if it is. Reports whether
+// anything was adopted.
+func (u *boardWebAuthnUser) adoptLegacyFlags(credID []byte, flags protocol.AuthenticatorFlags) bool {
+	if !u.flagsUnknown[string(credID)] {
+		return false
+	}
+	for i := range u.credentials {
+		if bytes.Equal(u.credentials[i].ID, credID) {
+			u.credentials[i].Flags = webauthn.NewCredentialFlags(flags)
+			return true
+		}
+	}
+	return false
 }
 
 func (u *boardWebAuthnUser) WebAuthnID() []byte                         { return []byte("staypoint-board") }
@@ -196,28 +217,63 @@ func (h *WebAuthnHandler) initWebAuthn() (*webauthn.WebAuthn, error) {
 // loadUser returns a boardWebAuthnUser populated with all stored credentials.
 func (h *WebAuthnHandler) loadUser() *boardWebAuthnUser {
 	rows, err := h.db.Query(
-		`SELECT credential_id, public_key, sign_count FROM board_webauthn_credentials`,
+		`SELECT credential_id, public_key, sign_count,
+			flags_user_present, flags_user_verified, flags_backup_eligible, flags_backup_state,
+			attestation_type, transports
+		FROM board_webauthn_credentials`,
 	)
 	if err != nil {
+		slog.Warn("load board passkeys", slog.String("error", err.Error()))
 		return &boardWebAuthnUser{}
 	}
 	defer rows.Close()
-	var user boardWebAuthnUser
+	user := boardWebAuthnUser{flagsUnknown: map[string]bool{}}
 	for rows.Next() {
 		var credID, pubKey []byte
 		var signCount uint32
-		if err := rows.Scan(&credID, &pubKey, &signCount); err != nil {
+		var up, uv, be, bs sql.NullBool
+		var attType, transportsJSON string
+		if err := rows.Scan(&credID, &pubKey, &signCount, &up, &uv, &be, &bs, &attType, &transportsJSON); err != nil {
+			slog.Warn("load board passkey row", slog.String("error", err.Error()))
 			continue
 		}
-		user.credentials = append(user.credentials, webauthn.Credential{
-			ID:        credID,
-			PublicKey: pubKey,
+		var transports []protocol.AuthenticatorTransport
+		_ = json.Unmarshal([]byte(transportsJSON), &transports)
+		cred := webauthn.Credential{
+			ID:              credID,
+			PublicKey:       pubKey,
+			AttestationType: attType,
+			Transport:       transports,
 			Authenticator: webauthn.Authenticator{
 				SignCount: signCount,
 			},
-		})
+		}
+		if be.Valid {
+			cred.Flags = webauthn.NewCredentialFlags(authenticatorFlags(up.Bool, uv.Bool, be.Bool, bs.Bool))
+		} else {
+			user.flagsUnknown[string(credID)] = true
+		}
+		user.credentials = append(user.credentials, cred)
 	}
 	return &user
+}
+
+// authenticatorFlags packs stored flag columns back into the protocol octet.
+func authenticatorFlags(up, uv, be, bs bool) protocol.AuthenticatorFlags {
+	var f protocol.AuthenticatorFlags
+	if up {
+		f |= protocol.FlagUserPresent
+	}
+	if uv {
+		f |= protocol.FlagUserVerified
+	}
+	if be {
+		f |= protocol.FlagBackupEligible
+	}
+	if bs {
+		f |= protocol.FlagBackupState
+	}
+	return f
 }
 
 // evictSessions removes expired sessions (caller may hold sessionMu or not; this is
@@ -383,10 +439,19 @@ func (h *WebAuthnHandler) RegisterFinish(w http.ResponseWriter, r *http.Request)
 	}
 
 	credIDHex := fmt.Sprintf("%x", cred.ID)
+	transports, _ := json.Marshal(cred.Transport)
+	if cred.Transport == nil {
+		transports = []byte("[]")
+	}
 	if _, err := h.db.Exec(
-		`INSERT INTO board_webauthn_credentials (id, credential_id, public_key, sign_count, aaguid) VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO board_webauthn_credentials (id, credential_id, public_key, sign_count, aaguid,
+			flags_user_present, flags_user_verified, flags_backup_eligible, flags_backup_state,
+			attestation_type, transports)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		uuid.New().String(), cred.ID, cred.PublicKey, cred.Authenticator.SignCount,
 		fmt.Sprintf("%x", cred.Authenticator.AAGUID),
+		cred.Flags.UserPresent, cred.Flags.UserVerified, cred.Flags.BackupEligible, cred.Flags.BackupState,
+		cred.AttestationType, string(transports),
 	); err != nil {
 		writeError(w, http.StatusInternalServerError, "store credential: "+err.Error())
 		return
@@ -458,20 +523,35 @@ func (h *WebAuthnHandler) VerifyAssertion(r *http.Request, assertion string) err
 		return fmt.Errorf("no credentials registered")
 	}
 
-	// FinishLogin reads from r.Body; forward the assertion JSON there.
-	syntheticReq := r.Clone(r.Context())
-	syntheticReq.Body = io.NopCloser(bytes.NewReader([]byte(assertion)))
+	parsed, err := protocol.ParseCredentialRequestResponseBytes([]byte(assertion))
+	if err != nil {
+		return fmt.Errorf("assertion parse failed: %w", err)
+	}
+	adopted := user.adoptLegacyFlags(parsed.RawID, parsed.Response.AuthenticatorData.Flags)
 
-	cred, err := wa.FinishLogin(user, *sessionData, syntheticReq)
+	cred, err := wa.ValidateLogin(user, *sessionData, parsed)
 	if err != nil {
 		return fmt.Errorf("assertion verification failed: %w", err)
 	}
 
-	// Update signCount to defend against cloned authenticators.
-	_, _ = h.db.Exec(
-		`UPDATE board_webauthn_credentials SET sign_count = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE credential_id = ?`,
-		cred.Authenticator.SignCount, cred.ID,
-	)
+	// Persist signCount (cloned-authenticator defence) and the flags as of this
+	// assertion: backup state can change, and a legacy row gets its first flags.
+	if _, err := h.db.Exec(
+		`UPDATE board_webauthn_credentials SET sign_count = ?,
+			flags_user_present = ?, flags_user_verified = ?, flags_backup_eligible = ?, flags_backup_state = ?,
+			updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE credential_id = ?`,
+		cred.Authenticator.SignCount,
+		cred.Flags.UserPresent, cred.Flags.UserVerified, cred.Flags.BackupEligible, cred.Flags.BackupState,
+		cred.ID,
+	); err != nil {
+		slog.Warn("persist board passkey state", slog.String("credential_id", fmt.Sprintf("%x", cred.ID)), slog.String("error", err.Error()))
+	} else if adopted {
+		slog.Info("board passkey flags recorded on first use",
+			slog.String("credential_id", fmt.Sprintf("%x", cred.ID)),
+			slog.Bool("backup_eligible", cred.Flags.BackupEligible),
+			slog.Bool("backup_state", cred.Flags.BackupState))
+	}
 	return nil
 }
 

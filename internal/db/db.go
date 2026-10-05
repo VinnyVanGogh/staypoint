@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -1028,6 +1029,29 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version: 27,
+		Name:    "board_webauthn_credential_flags",
+		Up: func(conn *sql.DB) error {
+			// 27, not 26: PR #192 (board_alerts) claims 26 and already ran on the live DB.
+			// STA-716: go-webauthn checks the stored BackupEligible flag on every
+			// login, so it has to be persisted. The flag columns stay NULL on rows
+			// enrolled before this migration; the first valid assertion fills them.
+			for _, stmt := range []string{
+				`ALTER TABLE board_webauthn_credentials ADD COLUMN flags_user_present    INTEGER;`,
+				`ALTER TABLE board_webauthn_credentials ADD COLUMN flags_user_verified   INTEGER;`,
+				`ALTER TABLE board_webauthn_credentials ADD COLUMN flags_backup_eligible INTEGER;`,
+				`ALTER TABLE board_webauthn_credentials ADD COLUMN flags_backup_state    INTEGER;`,
+				`ALTER TABLE board_webauthn_credentials ADD COLUMN attestation_type      TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE board_webauthn_credentials ADD COLUMN transports            TEXT NOT NULL DEFAULT '[]';`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {
@@ -1048,18 +1072,34 @@ func applyMigrations(dbPath string, conn *sql.DB) error {
 		return fmt.Errorf("failed to create schema_versions: %w", err)
 	}
 
-	var currentVersion int
-	err := conn.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_versions;`).Scan(&currentVersion)
+	// Apply every migration not yet recorded, not just those above MAX(version):
+	// branch builds of parallel PRs migrate the live DB, so it can already hold
+	// a higher version while a lower one from another branch never ran (STA-716).
+	rows, err := conn.Query(`SELECT version FROM schema_versions;`)
 	if err != nil {
-		return fmt.Errorf("failed to get current version: %w", err)
+		return fmt.Errorf("failed to read applied versions: %w", err)
+	}
+	applied := map[int]bool{}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to read applied versions: %w", err)
+		}
+		applied[v] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read applied versions: %w", err)
 	}
 
 	var pending []Migration
 	for _, m := range Migrations {
-		if m.Version > currentVersion {
+		if !applied[m.Version] {
 			pending = append(pending, m)
 		}
 	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].Version < pending[j].Version })
 
 	if len(pending) == 0 {
 		return nil
