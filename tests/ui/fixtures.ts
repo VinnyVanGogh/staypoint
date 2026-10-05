@@ -235,9 +235,6 @@ export async function saveArtifactScreenshot(page: Page, name: string): Promise<
  */
 export const KNOWN_BUGS = {
   'STA-378': 'StepRecorder inserts run_steps.status and expects an integer id, but the run_steps table has no status column and a TEXT id: every step insert fails',
-  // STA-638 task page re-layout, one entry per step subtask. Each step's PR
-  // removes its own entry and knownBug() call (specs/15-task-page-layout).
-  'STA-638-6': 'task page has no narrow-screen layout: no stacking, no segmented tabs (STA-644)',
 } as const;
 
 export type KnownBug = keyof typeof KNOWN_BUGS;
