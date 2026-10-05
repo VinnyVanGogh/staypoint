@@ -523,13 +523,15 @@ func TestTestGate_BypassPinnedToReviewedHead(t *testing.T) {
 	bare := gitOut(t, repoDir, "remote", "get-url", "origin")
 	mainBefore := gitOut(t, bare, "rev-parse", "main")
 
-	for name, body := range map[string]string{
-		"no head":    `{"merge_without_tests":true}`,
-		"stale head": `{"merge_without_tests":true,"head_sha":"` + old + `"}`,
+	// No head: the gate refuses the bypass. A stale head: Approve's own
+	// head pin (STA-717) refuses it before the gate runs.
+	for name, tc := range map[string]struct{ body, wantErr string }{
+		"no head":    {`{"merge_without_tests":true}`, "bypass_head_mismatch"},
+		"stale head": {`{"merge_without_tests":true,"head_sha":"` + old + `"}`, "head_moved"},
 	} {
-		code, g := approveBody(t, client, baseURL, token, boardToken, taskID, body)
-		if code != http.StatusConflict || g.Error != "bypass_head_mismatch" {
-			t.Errorf("%s: %d %+v, want 409 bypass_head_mismatch", name, code, g)
+		code, g := approveBody(t, client, baseURL, token, boardToken, taskID, tc.body)
+		if code != http.StatusConflict || g.Error != tc.wantErr {
+			t.Errorf("%s: %d %+v, want 409 %s", name, code, g, tc.wantErr)
 		}
 	}
 	if got := gitOut(t, bare, "rev-parse", "main"); got != mainBefore {
