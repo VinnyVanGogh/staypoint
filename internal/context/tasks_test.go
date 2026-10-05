@@ -109,6 +109,8 @@ func TestTaskCRUD(t *testing.T) {
 }
 
 func TestHandoffGeneration(t *testing.T) {
+	// GenerateHandoff writes ~/.staypoint/handoff.json and a manifest (STA-741).
+	t.Setenv("HOME", t.TempDir())
 	database := setupTestDB(t)
 
 	_, err := CreateTask(database, "Test Handoff Flow", ".", "main", "personal")

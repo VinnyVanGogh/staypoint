@@ -32,6 +32,8 @@ func TestQuoteForAppleScript(t *testing.T) {
 
 func TestFindRecentDesktopScreenshot(t *testing.T) {
 	tmpDir := t.TempDir()
+	// The test creates ~/Desktop, so keep it out of the real home (STA-741).
+	t.Setenv("HOME", t.TempDir())
 	home := getHomeDir()
 	desktopDir := filepath.Join(home, "Desktop")
 	_ = os.MkdirAll(desktopDir, 0755)

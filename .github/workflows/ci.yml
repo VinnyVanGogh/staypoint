@@ -104,8 +104,10 @@ jobs:
       - name: Go Vet
         run: go vet ./...
 
+      # Runs under a throwaway HOME and fails if a test leaves
+      # ~/.staypoint/handoff* or ~/Desktop behind (STA-741).
       - name: Run Tests (with race detector)
-        run: go test -v -race ./...
+        run: scripts/check-test-home.sh -v -race ./...
 
       # repoaccess builds for Windows, tests included (STA-697). The rest of the
       # module does not cross-build yet, so this is scoped to the package.
