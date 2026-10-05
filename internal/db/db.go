@@ -1093,10 +1093,11 @@ var Migrations = []Migration{
 		},
 	},
 	{
-		Version: 30,
+		Version: 31,
 		Name:    "ship_review_test_gate",
 		Up: func(conn *sql.DB) error {
-			// 30: 26-29 belong to open PRs (#192, #193, STA-727, #195).
+			// 31: the Board fixed 26-30 for the open PRs (#193 26/27,
+			// #196 28, #195 29, #192 30).
 			// STA-734: the card's last "Test coverage" report, the project's
 			// own test-exempt globs, and one "Add tests" backlog task per PR
 			// merged without tests.
