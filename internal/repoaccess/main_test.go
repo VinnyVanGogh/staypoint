@@ -9,9 +9,14 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/repoaccess"
 )
 
-// TestMain lets this test binary act as the probe child DefaultCommand starts.
+// TestMain lets this test binary act as the probe child DefaultCommand starts,
+// and keeps git away from the machine's global and system config. CI runners
+// set safe.directory=* globally, which disables git's ownership check and
+// hides the dubious-ownership failure the tests need to see.
 func TestMain(m *testing.M) {
 	repoaccess.RunProbeChild()
+	os.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	os.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	os.Exit(m.Run())
 }
 
