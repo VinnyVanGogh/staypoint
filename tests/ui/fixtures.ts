@@ -174,6 +174,18 @@ export async function gotoTaskPage(page: Page, task: Task) {
 }
 
 /**
+ * Selects a tab of the task page's right panel (STA-641). Only one tab shows
+ * at a time: Review (ship review card, Details), Diff, Migrations, Brief
+ * (description, notes). It opens on Review while a ship review is pending,
+ * else on Diff.
+ */
+export async function openTaskPanelTab(page: Page, name: 'Review' | 'Diff' | 'Migrations' | 'Brief') {
+  const tab = page.locator('#task-page-content .task-page-panel').getByRole('tab', { name: new RegExp(`^\\W*${name}\\b`) });
+  await tab.click();
+  await expect(tab).toHaveAttribute('aria-selected', 'true');
+}
+
+/**
  * Runs tests/ui/stepsim against the throwaway DB: the real StepRecorder
  * writing a short run for the task. Returns how many steps it persisted.
  */
@@ -225,7 +237,6 @@ export const KNOWN_BUGS = {
   'STA-378': 'StepRecorder inserts run_steps.status and expects an integer id, but the run_steps table has no status column and a TEXT id: every step insert fails',
   // STA-638 task page re-layout, one entry per step subtask. Each step's PR
   // removes its own entry and knownBug() call (specs/15-task-page-layout).
-  'STA-638-3': 'task page has no tabbed right panel (Review / Diff / Migrations / Brief) yet (STA-641)',
   'STA-638-4': 'task page timeline is a flat list in the page flow, not grouped run -> subtask -> step and not scrolling inside its column (STA-642)',
   'STA-638-5': 'full brief, dev-server log, agent summary and migration SQL render inline at full height instead of opening in a modal (STA-643)',
   'STA-638-6': 'task page has no narrow-screen layout: no stacking, no segmented tabs (STA-644)',

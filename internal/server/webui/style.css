@@ -3049,12 +3049,65 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   padding: 16px 20px;
 }
 .task-page-layout > .task-page-side {
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   min-width: 0;
-  overflow-y: auto;
-  padding: 16px;
+  overflow: hidden;
   border-left: 1px solid var(--border);
 }
+/* Tabbed right panel (STA-638): tab strip fixed, active tabpanel scrolls. */
+.task-page-tabs {
+  display: flex;
+  flex-shrink: 0;
+  gap: 2px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+.task-page-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  padding: 10px 10px 8px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.task-page-tab:hover { color: var(--text); }
+.task-page-tab[aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+.task-page-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.task-page-tab-count {
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--border);
+  border-radius: 8px;
+  padding: 0 6px;
+}
+.task-page-tab-count:empty { display: none; }
+.task-page-tabpanels {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.task-page-tabpanel {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
+}
+.task-page-tabpanel[hidden] { display: none; }
+.task-page-review-card-slot:empty { display: none; }
 .task-page-side .task-page-diff,
 .task-page-side .task-page-meta {
   border-left: 0;
@@ -3088,7 +3141,8 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   .task-page-content:has(> .task-page-header) { overflow: visible; }
   .task-page-content > .task-page-layout { grid-template-columns: 1fr; }
   .task-page-layout > .task-page-timeline,
-  .task-page-layout > .task-page-side { overflow: visible; }
+  .task-page-layout > .task-page-side,
+  .task-page-side .task-page-tabpanel { overflow: visible; }
   .task-page-layout > .task-page-side { border-left: 0; border-top: 1px solid var(--border); }
 }
 .task-page-back-btn {

@@ -578,14 +578,14 @@ function handleEvent(evt) {
     const tid = d.task_id;
     if (tid && state.openDetailTaskId === tid) {
       // Reload the task page so the ship review card updates.
-      const side = document.querySelector('#task-page-content .task-page-side');
-      if (side) {
+      const slot = document.querySelector('#task-page-content .task-page-review-card-slot');
+      if (slot) {
         const existing = document.getElementById(`ship-review-${tid}`);
         if (existing) existing.remove();
         // Clear the header buttons too: if the refetch fails no card renders,
         // and they would stay wired to the removed card (STA-657).
         clearShipReviewHeaderActions(tid);
-        renderShipReviewCard(side, tid);
+        renderShipReviewCard(slot, tid);
       }
     }
     return;
@@ -606,9 +606,9 @@ function handleEvent(evt) {
         const createdAtMs = task.created_at ? new Date(task.created_at).getTime() : null;
         const lastStepAt = runSteps.length ? new Date(runSteps[runSteps.length - 1].created_at).getTime() : null;
         const elapsedMs = lastStepAt && createdAtMs ? lastStepAt - createdAtMs : (createdAtMs ? Date.now() - createdAtMs : null);
-        const isStuck = runSteps.length > 0 && (Date.now() - (lastStepAt || 0)) > 5 * 60 * 1000 && task.status !== 'done';
+        const stuck = isStuck(runSteps, Date.now(), task.status);
         statsBar.innerHTML = '';
-        statsBar.appendChild(buildTimelineStats(task, runSteps, elapsedMs, isStuck));
+        statsBar.appendChild(buildTimelineStats(task, runSteps, elapsedMs, stuck));
       }
     }
     return;
@@ -8645,11 +8645,99 @@ function taskPageHeaderMeta(task, ident) {
   const parts = [];
   if (ident) parts.push(ident);
   const assignee = task.assignee_name || task.checkout_agent_id || '';
-  const route = [...(task.runSteps || [])].reverse().find(s => s && s.kind === 'route' && s.title);
-  const model = route ? route.title.replace(/^Routed to\s+/i, '') : '';
+  // Latest route step that names a model; fallback reasons are not a model.
+  let model = '';
+  for (const s of [...(task.runSteps || [])].reverse()) {
+    if (s && s.kind === 'route' && (model = routeModel(s.title))) break;
+  }
   if (assignee) parts.push(`assigned to ${assignee}${model ? ` (${model})` : ''}`);
   else if (model) parts.push(model);
   return parts.join(' · ');
+}
+
+// Last tab picked on the task page, so a re-render of the same task (SSE,
+// Run Now, Mark done) keeps it instead of jumping back to the default.
+let taskPagePanelTab = { taskId: null, key: null };
+
+const TASK_PAGE_TABS = [
+  { key: 'review', label: 'Review' },
+  { key: 'diff', label: 'Diff' },
+  { key: 'migrations', label: 'Migrations' },
+  { key: 'brief', label: 'Brief' },
+];
+
+// Right column of the task page (STA-638): one tablist over Review / Diff /
+// Migrations / Brief. Returns the column, the tabpanel per key (callers fill
+// them with the existing renderers), and setters for the tab badges.
+function buildTaskPagePanel(taskId, defaultKey) {
+  const side = el('div', 'task-page-side task-page-panel');
+  const tablist = el('div', 'task-page-tabs');
+  tablist.setAttribute('role', 'tablist');
+  tablist.setAttribute('aria-label', 'Task details');
+  const body = el('div', 'task-page-tabpanels');
+
+  const tabs = {};
+  const panels = {};
+  const counts = {};
+  for (const { key, label } of TASK_PAGE_TABS) {
+    const tab = el('button', 'task-page-tab');
+    tab.type = 'button';
+    tab.id = `task-page-tab-${key}`;
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-controls', `task-page-tabpanel-${key}`);
+    tab.dataset.tab = key;
+    tab.appendChild(el('span', 'task-page-tab-label', label));
+    counts[key] = el('span', 'task-page-tab-count');
+    tab.appendChild(counts[key]);
+    tablist.appendChild(tab);
+    tabs[key] = tab;
+
+    const panel = el('div', `task-page-tabpanel task-page-tabpanel-${key}`);
+    panel.id = `task-page-tabpanel-${key}`;
+    panel.setAttribute('role', 'tabpanel');
+    panel.setAttribute('aria-labelledby', tab.id);
+    body.appendChild(panel);
+    panels[key] = panel;
+  }
+
+  const select = (key, focus = false) => {
+    for (const { key: k } of TASK_PAGE_TABS) {
+      const on = k === key;
+      tabs[k].setAttribute('aria-selected', on ? 'true' : 'false');
+      tabs[k].tabIndex = on ? 0 : -1;
+      tabs[k].classList.toggle('active', on);
+      panels[k].hidden = !on;
+    }
+    if (focus) tabs[key].focus();
+    taskPagePanelTab = { taskId, key };
+  };
+
+  tablist.addEventListener('click', (e) => {
+    const tab = e.target.closest('[role="tab"]');
+    if (tab) select(tab.dataset.tab);
+  });
+  // Arrow keys move between tabs (WAI-ARIA tabs pattern).
+  tablist.addEventListener('keydown', (e) => {
+    const keys = TASK_PAGE_TABS.map(t => t.key);
+    const i = keys.indexOf(e.target.dataset && e.target.dataset.tab);
+    if (i < 0) return;
+    let next = null;
+    if (e.key === 'ArrowRight') next = keys[(i + 1) % keys.length];
+    else if (e.key === 'ArrowLeft') next = keys[(i - 1 + keys.length) % keys.length];
+    else if (e.key === 'Home') next = keys[0];
+    else if (e.key === 'End') next = keys[keys.length - 1];
+    if (!next) return;
+    e.preventDefault();
+    select(next, true);
+  });
+
+  const remembered = taskPagePanelTab.taskId === taskId ? taskPagePanelTab.key : null;
+  select(remembered && panels[remembered] ? remembered : defaultKey);
+
+  side.appendChild(tablist);
+  side.appendChild(body);
+  const setCount = (key, n) => { counts[key].textContent = n ? String(n) : ''; };
+  return { side, panels, select, setCount };
 }
 
 function renderTaskPage(container, task, comments, interactions, diffData, checkpoints, runErrors, shipCard) {
@@ -8718,8 +8806,14 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   // ── Left column: timeline ──
   const main = el('div', 'task-page-main task-page-timeline');
 
-  // ── Right column: review, migrations, diff, brief, details ──
-  const side = el('div', 'task-page-side');
+  // ── Right column: tabs over review, diff, migrations, brief ──
+  // Open on Review while the Board has a ship review to act on, else Diff.
+  const reviewPending = !!(shipCard && shipCard.status === 'pending');
+  const { side, panels: tabPanels, select: selectPanelTab, setCount: setTabCount } =
+    buildTaskPagePanel(task.id || '', reviewPending ? 'review' : 'diff');
+  // The ship review card mounts here; SSE updates re-render into the same slot.
+  const reviewCardSlot = el('div', 'task-page-review-card-slot');
+  tabPanels.review.appendChild(reviewCardSlot);
 
   // Description (editable)
   const descSection = el('div', 'task-page-section');
@@ -8895,11 +8989,21 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   // Ship Review card (when agent has created one for Board approval).
   // Rendered synchronously from the pre-fetched shipCard so it appears
   // immediately with no extra round-trip; its action buttons go to the header.
-  renderShipReviewCardFromData(side, task.id || '', shipCard || null);
+  renderShipReviewCardFromData(reviewCardSlot, task.id || '', shipCard || null);
 
   // Migrations panel — lazy-loads migration files from the task's diff
+  const migPanel = tabPanels.migrations;
+  const showNoMigrations = () => {
+    if (migPanel.querySelector('.migrations-section')) return;
+    migPanel.appendChild(el('p', 'panel-field-muted task-page-tab-empty', 'No migration files in this task\'s diff.'));
+  };
   if (task.id && !isFleetTaskId(task.id || '')) {
-    renderMigrationsPanel(side, task.id);
+    renderMigrationsPanel(migPanel, task.id).then(() => {
+      setTabCount('migrations', migPanel.querySelectorAll('.migration-file-card').length);
+      showNoMigrations();
+    }, showNoMigrations);
+  } else {
+    showNoMigrations();
   }
 
   // Agent interaction (chat): recent messages above a composer pinned to the
@@ -8952,12 +9056,16 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   const diffPane = el('div', 'task-page-diff');
   if (!isFleetTaskId(task.id || '')) {
     renderDiffPane(diffPane, task, checkpoints || [], diffData || { diff: '', files: [], checkpoint_id: '' });
+    const d = diffData || {};
+    setTabCount('diff', (d.file_stats && d.file_stats.length) || (d.files && d.files.length) || 0);
+  } else {
+    diffPane.appendChild(el('p', 'panel-field-muted task-page-tab-empty', 'Fleet tasks have no diff.'));
   }
-  side.appendChild(diffPane);
+  tabPanels.diff.appendChild(diffPane);
 
   // ── Brief ──
-  side.appendChild(descSection);
-  if (notesSection) side.appendChild(notesSection);
+  tabPanels.brief.appendChild(descSection);
+  if (notesSection) tabPanels.brief.appendChild(notesSection);
 
   // ── Details ──
   const meta = el('div', 'task-page-meta');
@@ -9048,6 +9156,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     reviewLink.style.cssText = 'display:block;margin-top:8px;font-size:0.85rem;';
     reviewLink.addEventListener('click', (e) => {
       e.preventDefault();
+      selectPanelTab('review');
       document.getElementById(`ship-review-${task.id}`)?.scrollIntoView({ behavior: 'smooth' });
     });
     meta.appendChild(reviewLink);
@@ -9092,7 +9201,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     actionTray.appendChild(doneError);
   }
 
-  side.appendChild(meta);
+  tabPanels.review.appendChild(meta);
   layout.appendChild(side);
   container.appendChild(layout);
   container.appendChild(chatSection);
