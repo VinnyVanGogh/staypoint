@@ -448,11 +448,11 @@ func validCheckpointID(s string) bool {
 	return true
 }
 
-// resolveCheckpointRef converts a short checkpoint ID to a git ref or SHA.
-// Returns an error when checkpointID contains unsafe characters.
 // LatestRef is the checkpoint a diff compares against when given no checkpoint ID.
 const LatestRef = "refs/staypoint/checkpoints/latest"
 
+// resolveCheckpointRef converts a short checkpoint ID to a git ref or SHA.
+// Returns an error when checkpointID contains unsafe characters.
 func resolveCheckpointRef(checkpointID string) (string, error) {
 	if !validCheckpointID(checkpointID) {
 		return "", fmt.Errorf("invalid checkpoint id")

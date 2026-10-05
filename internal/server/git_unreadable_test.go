@@ -82,8 +82,9 @@ func TestGitDenied_GetCardReportsRepoError(t *testing.T) {
 	}
 }
 
-// The shipApproveServer repo has a task branch but no checkpoint ref: there is
-// no baseline to diff against, so there is nothing to check.
+// The shipApproveServer repo has a task branch but no checkpoint ref. The gate
+// falls back to the merge-base with main, and a branch with no migrations is
+// not an error.
 func TestMigrationGate_NoCheckpointIsNotAnError(t *testing.T) {
 	_, baseURL, token, _, taskID, _, _ := shipApproveServer(t)
 
