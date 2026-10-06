@@ -1092,6 +1092,36 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version: 31,
+		Name:    "ship_review_test_gate",
+		Up: func(conn *sql.DB) error {
+			// 31: the Board fixed 26-30 for the open PRs (#193 26/27,
+			// #196 28, #195 29, #192 30).
+			// STA-734: the card's last "Test coverage" report, the project's
+			// own test-exempt globs, and one "Add tests" backlog task per PR
+			// merged without tests.
+			for _, stmt := range []string{
+				`ALTER TABLE ship_review_cards ADD COLUMN test_gate_json TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE project_dev_configs ADD COLUMN test_exempt_globs_json TEXT NOT NULL DEFAULT '[]';`,
+				`CREATE TABLE IF NOT EXISTS ship_review_test_tasks (
+					dedupe_key     TEXT PRIMARY KEY,
+					task_id        TEXT NOT NULL DEFAULT '',
+					source_task_id TEXT NOT NULL,
+					card_id        TEXT NOT NULL,
+					pr_number      INTEGER NOT NULL DEFAULT 0,
+					head_sha       TEXT NOT NULL DEFAULT '',
+					created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+				);`,
+				`CREATE INDEX IF NOT EXISTS idx_ship_review_test_tasks_source ON ship_review_test_tasks (source_task_id);`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {
