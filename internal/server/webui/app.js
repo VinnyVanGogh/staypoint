@@ -8327,7 +8327,7 @@ function renderPRStatusSection(taskId, card) {
 // head. A blocking warning keeps Merge disabled until the Board picks
 // "Merge without tests", which also files a backlog "Add tests" task.
 
-const TEST_GATE_ICONS = { no_ci: '⚠', no_tests: '⚠', uncovered: '⚠', untested_sources: 'ℹ', no_coverage_data: 'ℹ' };
+const TEST_GATE_ICONS = { no_ci: '⚠', no_tests: '⚠', uncovered: '⚠', untested_sources: 'ℹ', no_coverage_data: 'ℹ', coverage_ambiguous: 'ℹ' };
 
 // renderTestTaskRow links the backlog task a bypassed merge filed.
 function renderTestTaskRow(tt) {
@@ -8354,7 +8354,10 @@ async function fetchTestCoverage(taskId) {
 // renderTestCoverageSection returns the section and a handle. onState fires
 // with { loaded, blocking, missing, report, error } whenever the verdict
 // changes; apply(report) lets a 409 "untested" response update it in place.
-function renderTestCoverageSection(taskId, onState) {
+// opts.enforcedAt names a later step that enforces the gate (a pr_merge card
+// before its PR exists: Approve only opens the PR). The section then shows
+// the verdict without a bypass, which would do nothing at this step.
+function renderTestCoverageSection(taskId, onState, opts = {}) {
   const sec = el('div', 'ship-review-test-coverage');
   sec.dataset.state = 'loading';
   const title = el('div', 'ship-review-section-title', 'Test coverage');
@@ -8369,6 +8372,14 @@ function renderTestCoverageSection(taskId, onState) {
   actions.appendChild(bypassBtn);
   actions.style.display = 'none';
   sec.appendChild(actions);
+  const enforcedNote = el('div', 'ship-review-test-coverage-note ship-review-test-coverage-enforced',
+    `Not enforced yet: ${opts.enforcedAt || ''} waits for this check, and Merge without tests is offered there.`);
+  enforcedNote.style.display = 'none';
+  sec.appendChild(enforcedNote);
+  const showActions = (blocking) => {
+    actions.style.display = blocking && !opts.enforcedAt ? '' : 'none';
+    enforcedNote.style.display = blocking && opts.enforcedAt ? '' : 'none';
+  };
   const state = { loaded: false, blocking: true, missing: [], report: null, error: '' };
   const emit = () => onState && onState(state);
 
@@ -8399,13 +8410,13 @@ function renderTestCoverageSection(taskId, onState) {
       }
       nodes.push(box);
     }
-    if (report && report.coverage && report.coverage.available && !warnings.some((w) => w.kind === 'uncovered')) {
+    if (report && report.coverage && report.coverage.available && !warnings.some((w) => w.kind === 'uncovered' || w.kind === 'coverage_ambiguous')) {
       nodes.push(el('div', 'ship-review-test-coverage-note', `Coverage from ${report.coverage.source}: every changed line runs under a test.`));
     }
     body.replaceChildren(...nodes);
     status.textContent = state.blocking ? `not tested: ${state.missing.join(', ')}` : 'ok';
     sec.dataset.state = state.blocking ? 'blocking' : 'ok';
-    actions.style.display = state.blocking ? '' : 'none';
+    showActions(state.blocking);
     emit();
   };
 
@@ -8421,7 +8432,7 @@ function renderTestCoverageSection(taskId, onState) {
     body.replaceChildren(err);
     status.textContent = 'unknown';
     sec.dataset.state = 'error';
-    actions.style.display = '';
+    showActions(true);
     emit();
   };
 
@@ -8661,7 +8672,11 @@ function renderShipReviewCardFromData(container, taskId, card) {
   // Test coverage (STA-734): Merge waits for this verdict.
   let testGate = null;
   if (card.status === 'pending') {
-    testGate = renderTestCoverageSection(taskId, () => section.dispatchEvent(new CustomEvent('test-gate')));
+    // A pr_merge card before its PR exists: Approve only opens the PR, and
+    // the server enforces the gate at Merge PR, so no bypass here.
+    const enforcedAt = approveMode !== 'pr_merge' || prActive ? ''
+      : card.pr_number > 0 ? `Merge PR #${card.pr_number}` : 'Merge PR, once the PR is open,';
+    testGate = renderTestCoverageSection(taskId, () => section.dispatchEvent(new CustomEvent('test-gate')), { enforcedAt });
     section.appendChild(testGate.el);
   }
 

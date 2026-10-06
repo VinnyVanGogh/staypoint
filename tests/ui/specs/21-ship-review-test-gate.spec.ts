@@ -272,6 +272,43 @@ test.describe('ship review merge test gate (STA-734)', () => {
     cleanup();
   });
 
+  // STA-766 review: before the PR exists, pr_merge Approve only opens the PR
+  // and the server doesn't gate it, so a bypass there would audit nothing and
+  // file no task. The section shows the verdict and says Merge PR enforces it.
+  test('pr_merge before the PR exists: no bypass, Approve opens the PR, the gate waits for Merge PR', async ({ boardPage: page, request }) => {
+    const { task, headSHA, cleanup } = await createCardTask(request, 'Gate pr_merge no PR');
+    await page.route(`**/api/tasks/${encodeURIComponent(task.id)}/ship-review`, async (route: Route) => {
+      if (route.request().method() !== 'GET') return route.continue();
+      const resp = await route.fetch();
+      await route.fulfill({ response: resp, json: { ...(await resp.json()), merge_mode: 'pr_merge', effective_merge_mode: 'pr_merge', pr_number: 0 } });
+    });
+    const AMBIGUOUS: Warning = { kind: 'coverage_ambiguous', blocking: false, message: 'Coverage unknown: CI artifact lcov lists more than one file that could be each of these, so it can\'t tell which one is this file:', items: ['src/index.ts'] };
+    await fakeTestCoverage(page, task.id, { head_sha: headSHA, report: report(headSHA, [NO_TESTS, AMBIGUOUS], { coverage: { available: true, source: 'CI artifact lcov', ambiguous: ['src/index.ts'] } }) });
+    let approveBody: Record<string, unknown> | null = null;
+    await page.route('**/ship-review/approve', async (route) => {
+      approveBody = JSON.parse(route.request().postData() || '{}');
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ merge_mode: 'pr_merge', pr_number: 9, pr_url: 'https://github.com/o/r/pull/9' }) });
+    });
+    await gotoTaskPage(page, task);
+
+    const sec = page.locator('.ship-review-test-coverage');
+    await expect(sec).toHaveAttribute('data-state', 'blocking', { timeout: 10_000 });
+    await expect(sec.locator('.ship-review-test-warning[data-kind="coverage_ambiguous"]')).toContainText('src/index.ts');
+    await expect(sec).not.toContainText('every changed line runs under a test');
+    await expect(sec.getByRole('button', { name: 'Merge without tests' })).toBeHidden();
+    await expect(sec.locator('.ship-review-test-coverage-enforced')).toHaveText(
+      'Not enforced yet: Merge PR, once the PR is open, waits for this check, and Merge without tests is offered there.');
+
+    const approve = reviewActions(page).locator('.ship-review-approve-btn');
+    await expect(approve).toHaveText('✓ Approve & open PR');
+    await expect(approve).toBeEnabled();
+    await approve.click();
+    await reviewActions(page).locator('.ship-review-approve-confirm').getByRole('button', { name: 'Push & run checks' }).click();
+    await expect.poll(() => approveBody, { timeout: 10_000 }).not.toBeNull();
+    expect(approveBody).toEqual({ head_sha: headSHA });
+    cleanup();
+  });
+
   test('real server: source change with no tests merges via bypass and files one backlog task', async ({ boardPage: page, request }) => {
     test.setTimeout(120_000);
     const { task, headSHA, cleanup } = await createCardTask(request, 'Gate real bypass', {
