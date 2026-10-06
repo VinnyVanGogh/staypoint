@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	gocontext "context"
 	"database/sql"
 	"encoding/json"
@@ -315,32 +316,48 @@ var errRepoUnreadable = errors.New("cannot read task repo")
 // unverifiedMigrations returns migration file paths that appear in the task diff
 // but have not been marked applied (with successful verification) in the activity log.
 //
+// The diff compares against the latest checkpoint or, when the repo has none,
+// the commit where the task left main (see migrationBaseline).
+//
 // It fails closed: a diff error is returned (wrapping errRepoUnreadable) unless
 // nothingToDiff confirms there was nothing to compare, so a repo git cannot
 // read is never taken to have no migrations.
 func unverifiedMigrations(ctx gocontext.Context, db *sql.DB, task *context.Task) ([]string, error) {
 	// Detect migration files in the task diff.
 	workDir, hasWorktree := taskCheckpointWorkDir(task)
-	cpID := ""
 	branch := "staypoint/" + task.ID
-	refs := []string{checkpoint.LatestRef, branch}
-	fileStats, diffErr := checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, cpID, branch)
-	if diffErr != nil {
-		if gitexec.IsTimeout(diffErr) || !nothingToDiff(ctx, task.RepoPath, refs...) {
-			return nil, fmt.Errorf("%w: %w", errRepoUnreadable, diffErr)
+	var fileStats []checkpoint.FileDiffStat
+	base, err := migrationBaseline(ctx, task.RepoPath, branch)
+	if err != nil {
+		return nil, err
+	}
+	if base != "" {
+		stats, diffErr := checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, base, branch)
+		if diffErr != nil {
+			// base is not among the refs checked: it either exists or could not
+			// be looked up, and neither means there is nothing to compare.
+			if gitexec.IsTimeout(diffErr) || !nothingToDiff(ctx, task.RepoPath, branch) {
+				return nil, fmt.Errorf("%w: %w", errRepoUnreadable, diffErr)
+			}
 		}
-		if !hasWorktree {
-			return nil, nil
-		}
+		fileStats = stats
 	}
 	if hasWorktree {
-		wtStats, wtErr := checkpoint.DiffCheckpointFiles(ctx, workDir, cpID)
-		if wtErr != nil {
-			if gitexec.IsTimeout(wtErr) || !nothingToDiff(ctx, workDir, checkpoint.LatestRef) {
-				return nil, fmt.Errorf("%w: %w", errRepoUnreadable, wtErr)
+		// The worktree's HEAD can sit on a different commit than the branch,
+		// so it gets its own baseline.
+		wtBase, err := migrationBaseline(ctx, workDir, "HEAD")
+		if err != nil {
+			return nil, err
+		}
+		if wtBase != "" {
+			wtStats, wtErr := checkpoint.DiffCheckpointFiles(ctx, workDir, wtBase)
+			if wtErr != nil {
+				if gitexec.IsTimeout(wtErr) || !nothingToDiff(ctx, workDir) {
+					return nil, fmt.Errorf("%w: %w", errRepoUnreadable, wtErr)
+				}
+			} else {
+				fileStats = append(fileStats, wtStats...)
 			}
-		} else {
-			fileStats = append(fileStats, wtStats...)
 		}
 	}
 
@@ -445,12 +462,39 @@ func isRefMissing(ctx gocontext.Context, repoDir, ref string) bool {
 	return errors.As(err, &exitErr) && exitErr.ExitCode() == 1
 }
 
+// migrationBaseline returns the commit the migration diff compares head
+// against: the latest checkpoint or, when the repo has none, the merge-base of
+// main and head, so migrations committed on a task that never checkpointed are
+// still found (STA-718). It returns "" when there is nothing to compare
+// because main or head does not exist. Any other merge-base failure is
+// returned wrapping errRepoUnreadable.
+func migrationBaseline(ctx gocontext.Context, dir, head string) (string, error) {
+	found, err := refExists(ctx, dir, checkpoint.LatestRef)
+	if err != nil || found {
+		// When git cannot look the ref up, the diff fails the same way and
+		// reports git's error, so leave the verdict to it.
+		return checkpoint.LatestRef, nil
+	}
+	cmd := gitexec.Command(ctx, "merge-base", "main", head)
+	cmd.Dir = dir
+	cmd.Env = security.ChildEnv()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err == nil {
+		return strings.TrimSpace(string(out)), nil
+	}
+	if !gitexec.IsTimeout(err) && nothingToDiff(ctx, dir, "main", head) {
+		return "", nil
+	}
+	return "", fmt.Errorf("%w: git merge-base main %s failed: %w (stderr: %s)", errRepoUnreadable, head, err, strings.TrimSpace(stderr.String()))
+}
+
 // nothingToDiff reports whether a failed migration diff failed only because
 // there was nothing to compare: dir is not a git repo, or one of refs (the
-// checkpoint baseline, the task branch) does not exist yet. It decides from the
-// filesystem and git's exit status, never from the text of git's error, so a
-// repo git was refused (EPERM) or timed out on is never mistaken for one with
-// nothing in it.
+// task branch, main) does not exist yet. It decides from the filesystem and
+// git's exit status, never from the text of git's error, so a repo git was
+// refused (EPERM) or timed out on is never mistaken for one with nothing in it.
 func nothingToDiff(ctx gocontext.Context, dir string, refs ...string) bool {
 	if inRepo, err := insideGitRepo(dir); err != nil {
 		return false
@@ -458,18 +502,12 @@ func nothingToDiff(ctx gocontext.Context, dir string, refs ...string) bool {
 		return true
 	}
 	for _, ref := range refs {
-		// --verify --quiet exits 1 when the ref does not exist and 128 when git
-		// cannot read the repo.
-		cmd := gitexec.Command(ctx, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
-		cmd.Dir = dir
-		cmd.Env = security.ChildEnv()
-		err := cmd.Run()
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			return true
-		}
+		found, err := refExists(ctx, dir, ref)
 		if err != nil {
 			return false
+		}
+		if !found {
+			return true
 		}
 	}
 	return false
@@ -498,6 +536,22 @@ func insideGitRepo(dir string) (bool, error) {
 		}
 		dir = parent
 	}
+}
+
+// refExists reports whether ref names a commit in dir. A ref git cannot look
+// up, as opposed to one that does not exist, is an error.
+func refExists(ctx gocontext.Context, dir, ref string) (bool, error) {
+	// --verify --quiet exits 1 when the ref does not exist and 128 when git
+	// cannot read the repo.
+	cmd := gitexec.Command(ctx, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+	cmd.Dir = dir
+	cmd.Env = security.ChildEnv()
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // Approve handles POST /api/tasks/{id}/ship-review/approve (Board action)
