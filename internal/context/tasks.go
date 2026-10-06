@@ -420,7 +420,12 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 			}
 		}
 
-		dRows, err := db.Query(`SELECT task_id, content FROM task_documents WHERE doc_key = 'description' ORDER BY version DESC`)
+		dRows, err := db.Query(`
+			SELECT task_id, content 
+			FROM task_documents 
+			WHERE doc_key IN ('description', 'brief') 
+			ORDER BY id DESC
+		`)
 		if err == nil {
 			defer dRows.Close()
 			for dRows.Next() {
@@ -530,7 +535,12 @@ func GetTask(db *sql.DB, id string) (*Task, error) {
 		}
 	}
 	var content string
-	if err := db.QueryRow(`SELECT content FROM task_documents WHERE task_id = ? AND doc_key = 'description' ORDER BY version DESC LIMIT 1`, t.ID).Scan(&content); err == nil {
+	if err := db.QueryRow(`
+		SELECT content 
+		FROM task_documents 
+		WHERE task_id = ? AND doc_key IN ('description', 'brief') 
+		ORDER BY id DESC LIMIT 1
+	`, t.ID).Scan(&content); err == nil {
 		t.Description = content
 	}
 	return &t, nil

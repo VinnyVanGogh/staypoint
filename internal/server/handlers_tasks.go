@@ -13,6 +13,7 @@ import (
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/context"
+	"github.com/VinnyVanGogh/staypoint/internal/decision"
 	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/migration"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
@@ -563,6 +564,13 @@ func (h *TasksHandler) CreateInteraction(w http.ResponseWriter, r *http.Request)
 	}
 
 	if h.hub != nil {
+	t, _ := context.GetTask(h.db, created.TaskID)
+	taskCtx := ""
+	if t != nil {
+		taskCtx = "Task Goal: " + t.Name + "\n" + t.Description
+	}
+	decision.GenerateInteractionSuggestion(h.db, created.ID, created.TaskID, created.InteractionKind, created.Payload, taskCtx)
+
 		h.hub.Publish("task_interaction_created", map[string]any{
 			"task_id":        id,
 			"interaction_id": created.ID,
@@ -1368,6 +1376,48 @@ func (h *TasksHandler) MarkMigrationApplied(w http.ResponseWriter, r *http.Reque
 		"applied_by": body.AppliedBy,
 		"mode":       mode,
 		"checks":     results,
+	})
+}
+
+// GetTaskWorkspaceFile handles GET /api/tasks/{id}/workspace/file
+func (h *TasksHandler) GetTaskWorkspaceFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "task id is required")
+		return
+	}
+	task, err := context.GetTask(h.db, id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		writeError(w, http.StatusBadRequest, "path is required")
+		return
+	}
+
+	workDir, hasWorktree := taskCheckpointWorkDir(task)
+	var content []byte
+	if hasWorktree {
+		content, err = os.ReadFile(filepath.Join(workDir, filePath))
+	} else {
+		ctx, cancel := gitRequestContext(r)
+		defer cancel()
+		cmd := gitexec.Command(ctx, "show", "staypoint/"+task.ID+":"+filePath)
+		cmd.Dir = task.RepoPath
+		content, err = cmd.Output()
+	}
+	
+	if err != nil {
+		writeError(w, http.StatusNotFound, "file not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"content": string(content),
 	})
 }
 

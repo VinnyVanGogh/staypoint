@@ -11,6 +11,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/condenser"
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
+	"github.com/VinnyVanGogh/staypoint/internal/decision"
 	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
@@ -589,6 +590,13 @@ func (s *Server) handleCreateInteraction(ctx context.Context, rawArgs json.RawMe
 	if err != nil {
 		return toolError(fmt.Sprintf("create interaction error: %v", err))
 	}
+
+	t, _ := meshContext.GetTask(dbConn, created.TaskID)
+	taskCtx := ""
+	if t != nil {
+		taskCtx = "Task Goal: " + t.Name + "\n" + t.Description
+	}
+	decision.GenerateInteractionSuggestion(dbConn, created.ID, created.TaskID, created.InteractionKind, created.Payload, taskCtx)
 
 	data, err := json.MarshalIndent(created, "", "  ")
 	if err != nil {

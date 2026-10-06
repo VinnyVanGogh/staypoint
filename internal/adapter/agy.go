@@ -149,9 +149,9 @@ func buildAgyArgs(opts ParsedOptions) []string {
 	if effort != "" && model != "" {
 		args = append(args, "--effort", effort)
 	}
-	// Do NOT pass ConversationID for cross-provider fallback (Claude session IDs are invalid for agy).
-	// When running native Gemini sessions, pass --conversation.
-	if opts.ConversationID != "" && !isClaudeModel {
+	// When running native Gemini sessions or Claude fallbacks, pass --conversation
+	// so the tailer can follow the generated ID from StayPoint.
+	if opts.ConversationID != "" {
 		args = append(args, "--conversation", opts.ConversationID)
 	}
 	for _, dir := range opts.AddDirs {

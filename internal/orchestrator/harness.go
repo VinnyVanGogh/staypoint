@@ -363,10 +363,18 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			gfSummary += "ok (" + strings.Join(gfResult.Details, " | ") + ")"
 		}
 		runLog.Info("git preflight", slog.String("result", gfSummary))
-		_, _ = h.DB.ExecContext(ctx,
-			`INSERT INTO task_comments (task_id, author, message) VALUES (?, 'harness', ?)`,
-			taskID, gfSummary,
-		)
+		if sr != nil {
+			status := "done"
+			if gfErr != nil || (gfResult != nil && !gfResult.OK) {
+				status = "error"
+			}
+			sr.EmitCommand("Git preflight", "git fetch && git status", gfSummary, status)
+		} else {
+			_, _ = h.DB.ExecContext(ctx,
+				`INSERT INTO task_comments (task_id, author, message) VALUES (?, 'harness', ?)`,
+				taskID, gfSummary,
+			)
+		}
 		if gfErr != nil || (gfResult != nil && !gfResult.OK) {
 			result.Disposition = "in_progress"
 			result.DiagnosticMsg = gfSummary

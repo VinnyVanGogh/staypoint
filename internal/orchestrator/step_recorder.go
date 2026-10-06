@@ -228,6 +228,29 @@ func (r *StepRecorder) EmitCheckpoint(sha, msg string) {
 	r.publish("run.step", step)
 }
 
+// EmitCommand emits a verbatim command step.
+func (r *StepRecorder) EmitCommand(title, command, body, status string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.drainAllLocked()
+	r.seq++
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	step := RunStep{
+		RunID:     r.runID,
+		TaskID:    r.taskID,
+		Seq:       r.seq,
+		Kind:      StepRun,
+		Title:     title,
+		Command:   command,
+		Body:      body,
+		Status:    status,
+		StartedAt: now,
+		EndedAt:   &now,
+	}
+	r.persist(step)
+	r.publish("run.step", step)
+}
+
 // EmitRunState broadcasts a run.state SSE event without persisting a step row.
 // Use for transient states like "paused" / "in_progress" that don't mark the run terminal.
 func (r *StepRecorder) EmitRunState(disposition string) {

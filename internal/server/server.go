@@ -152,6 +152,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("GET /api/tasks/{id}/checkpoints", tasksH.GetTaskCheckpoints)
 		mux.HandleFunc("GET /api/tasks/{id}/diff", tasksH.GetTaskDiff)
 		mux.HandleFunc("GET /api/tasks/{id}/diff/file", tasksH.GetTaskFileDiff)
+		mux.HandleFunc("GET /api/tasks/{id}/workspace/file", tasksH.GetTaskWorkspaceFile)
 		mux.HandleFunc("GET /api/tasks/{id}/migrations", tasksH.GetTaskMigrations)
 		mux.HandleFunc("POST /api/tasks/{id}/migrations/mark-applied", tasksH.MarkMigrationApplied)
 		mux.HandleFunc("POST /api/tasks/{id}/checkpoint-undo", tasksH.UndoTaskCheckpoint)
@@ -232,6 +233,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		// Board-only: these three actions merge / reject / revise the branch — agents cannot call them.
 		mux.Handle("POST /api/tasks/{id}/ship-review/approve", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.Approve)))
 		mux.Handle("POST /api/tasks/{id}/ship-review/send-back", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.SendBack)))
+		mux.Handle("POST /api/tasks/{id}/ship-review/ai-review", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.AIReview)))
 		mux.Handle("POST /api/tasks/{id}/ship-review/reject", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.Reject)))
 		mux.Handle("POST /api/tasks/{id}/ship-review/delete-branch", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.DeleteMergedBranch)))
 		// STA-717: PR-mode checks are read-only polls; merging the PR is a Board action.

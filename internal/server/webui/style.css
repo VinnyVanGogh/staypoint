@@ -3106,9 +3106,20 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   background: var(--surface);
   padding: 6px 20px 10px;
 }
+.task-page-dock.expanded {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
 .task-page-dock .chat-messages {
   max-height: 14vh;
   padding: 4px 0;
+}
+.task-page-dock.expanded .chat-messages {
+  max-height: none;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 .task-page-dock .chat-messages:empty,
 .task-page-dock .chat-messages[hidden] { display: none; }
@@ -3459,13 +3470,12 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .diff-file-row:hover .diff-file-name { color: var(--accent, #38bdf8); }
 .diff-file-row.expanded { background: var(--surface2); border-radius: 4px; }
 
-/* ── Long content: bounded preview + shared dialog (STA-643) ── */
+/* ── Long content: shared dialog (STA-643) ── */
 .task-page-panel .desc-view,
 .task-page-panel .ship-review-summary-body,
 .task-page-panel .ship-review-devenv-log,
 .task-page-panel .migration-sql-block {
-  max-height: 14rem;
-  overflow: auto;
+  /* Removed max-height constraint since they live in their own tabs now */
 }
 /* The agent summary is a preview, not a scroller (Board, STA-644): clip it and
    fade the cut edge; "Open" shows the rest. The fade is a sticky ::after after
@@ -4460,6 +4470,8 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   padding: 10px 0 4px;
   border-top: 1px solid var(--border, #30363d);
   margin-top: 4px;
+  cursor: pointer;
+  user-select: none;
 }
 .timeline-run:first-child > .timeline-run-header { border-top: none; margin-top: 0; padding-top: 2px; }
 

@@ -20,7 +20,10 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/migration"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
+	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/google/uuid"
+
+
 )
 
 // ShipReviewHandler handles Ship Review card lifecycle endpoints.
@@ -657,6 +660,8 @@ func (h *ShipReviewHandler) SendBack(w http.ResponseWriter, r *http.Request) {
 	_ = governance.LogEvent(h.db, taskID, "board", governance.AuditBoardAction, nil, nil,
 		map[string]any{"action": "send_back", "ci_failures": ciFix, "ip": r.RemoteAddr, "user_agent": r.UserAgent()})
 
+	h.hub.Publish("task_comment_added", map[string]string{"task_id": taskID, "author": "board", "message": req.Comment})
+
 	h.hub.Publish("ship_review_sent_back", map[string]any{
 		"task_id": taskID,
 		"comment": req.Comment,
@@ -959,3 +964,46 @@ func (h *ShipReviewHandler) SeedCard(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, card)
 }
 
+
+// AIReview handles POST /api/tasks/{id}/ship-review/ai-review (Board action)
+// It resets the task's cap by extending turns, marks the card sent_back with a
+// review request comment, and wakes the agent.
+func (h *ShipReviewHandler) AIReview(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	card, _, ok := h.requireCard(w, taskID)
+	if !ok {
+		return
+	}
+
+	comment := "DO NOT review this yourself. You must invoke a dedicated subagent to act as the PR Reviewer. Use the `invoke_subagent` tool to spawn a subagent with the Role 'PR Reviewer' and the TypeName 'pr_reviewer'. Instruct it to review the diff on this branch against the original goal of this task. Wait for its feedback. Do NOT fix the code. Simply relay the reviewer's feedback and thoughts to the user so they can get an external opinion."
+
+	// Extend task budget to allow it to run again
+	_, err := h.db.Exec(`UPDATE tasks SET max_turns = max_turns + 50, execution_stage = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, taskID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to extend task limits: "+err.Error())
+		return
+	}
+
+	// Send back card
+	if err := shipreview.SendBack(h.db, card, comment); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	shipreview.StopDevServer(h.db, card)
+	_ = context.AddTaskComment(h.db, taskID, "board", comment)
+	_ = governance.LogEvent(h.db, taskID, "board", governance.AuditBoardAction, nil, nil,
+		map[string]any{"action": "ai_review", "ip": r.RemoteAddr, "user_agent": r.UserAgent()})
+
+	h.hub.Publish("task_comment_added", map[string]string{"task_id": taskID, "author": "board", "message": comment})
+
+	h.hub.Publish("ship_review_sent_back", map[string]any{
+		"task_id": taskID,
+		"comment": comment,
+	})
+	
+	// Wake the dispatcher
+	orchestrator.GlobalDispatcher.Wake(taskID, "run_now", "run_now:"+taskID+":"+uuid.New().String()[:8])
+
+	writeJSON(w, map[string]string{"status": "ok"})
+}

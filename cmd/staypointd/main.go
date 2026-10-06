@@ -342,6 +342,7 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 				if len(extraEnv) > 0 {
 					runCtx = adapter.WithExtraEnv(runCtx, extraEnv)
 				}
+				rawArgs = append(rawArgs, "--conversation", sessID)
 				return adapter.RunAdapter(runCtx, cwd, nil, prov, rawArgs, nil, stdout, stderr)
 			}
 		}
@@ -365,6 +366,15 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 		// Wake and route steps are now emitted from inside harness.Run() after
 		// Claim() succeeds, so refused runs (ErrConcurrencyCap) never write steps.
 
+		runCtx, runCancel := context.WithCancel(context.Background())
+		defer runCancel()
+
+		// Start the tailer immediately, relying on the known StayPoint session ID.
+		transcriptPath := filepath.Join(os.Getenv("HOME"), ".gemini", "antigravity-cli", "brain", sessID, ".system_generated", "logs", "transcript.jsonl")
+		go orchestrator.TailTranscript(runCtx, transcriptPath, repoRoot, func(d orchestrator.StepDelta) {
+			sr.Feed(d)
+		})
+
 		parseDelta := func(line []byte) ([]orchestrator.StepDelta, error) {
 			prov := resolvedProv
 			if prov == "" {
@@ -376,6 +386,12 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			}
 			out := make([]orchestrator.StepDelta, 0, len(raw))
 			for _, d := range raw {
+
+				// Skip sparse tool events from agy; the tailer provides detailed ones.
+				if prov == "agy" && (d.Kind == adapter.DeltaToolUse || d.Kind == adapter.DeltaToolResult) {
+					continue
+				}
+
 				sd := orchestrator.StepDelta{
 					Kind:      orchestrator.StepDeltaKind(d.Kind),
 					Text:      d.Text,
@@ -398,6 +414,8 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			return out, nil
 		}
 
+			// Use runCtx so we can cancel the tailer when Run returns.
+			// Actually h.Run expects context.Background() normally, let's pass context.Background() to h.Run but defer cancel for runCtx.
 		// Use context.Background() so daemon shutdown does not abruptly kill
 		// in-flight harness work; the dispatcher's Drain() provides the graceful
 		// drain window during shutdown.

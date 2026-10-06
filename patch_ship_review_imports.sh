@@ -1,0 +1,1 @@
+sed -i '' 's|"github.com/VinnyVanGogh/staypoint/internal/shipreview"|"github.com/VinnyVanGogh/staypoint/internal/shipreview"\n\t"github.com/VinnyVanGogh/staypoint/internal/orchestrator"\n\t"github.com/google/uuid"|' internal/server/handlers_ship_review.go

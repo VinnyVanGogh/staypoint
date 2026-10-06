@@ -169,6 +169,12 @@ func runTaskCreate(cmd *cobra.Command, args []string) error {
 	if companyID != "" {
 		compCtx, compCancel := context.WithTimeout(ctx, 15*time.Second)
 		comp, compErr := paperclipClient.GetCompany(compCtx, companyID)
+		if compErr != nil || comp == nil {
+			comp, compErr = paperclipClient.ResolveCompany(compCtx, companyID)
+			if compErr == nil && comp != nil {
+				companyID = comp.ID
+			}
+		}
 		compCancel()
 		if compErr == nil && comp != nil {
 			companyPrefix = comp.IssuePrefix

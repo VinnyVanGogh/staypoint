@@ -4,6 +4,9 @@ import (
 	gocontext "context"
 	"encoding/json"
 	"net/http"
+	
+
+	"github.com/google/uuid"
 	"strings"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 
 var validRunControlActions = map[string]bool{
 	"pause":   true,
+	"extend":  true,
 	"resume":  true,
 	"stop":    true,
 	"message": true,
@@ -57,7 +61,7 @@ func (h *TasksHandler) RunControl(w http.ResponseWriter, r *http.Request) {
 	if stage == "" {
 		stage = task.Status
 	}
-	if req.Action != "stop" {
+	if req.Action != "stop" && req.Action != "extend" {
 		switch stage {
 		case "in_progress", "paused":
 			// allowed
@@ -70,6 +74,14 @@ func (h *TasksHandler) RunControl(w http.ResponseWriter, r *http.Request) {
 	rc := orchestrator.GlobalRunControl
 
 	switch req.Action {
+	case "extend":
+		// Increment max_turns by 50, update status
+		_, err := h.db.Exec(`UPDATE tasks SET max_turns = max_turns + 50, execution_stage = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to extend task limits: "+err.Error())
+			return
+		}
+		orchestrator.GlobalDispatcher.Wake(id, "run_now", "run_now:"+id+":"+uuid.New().String()[:8])
 	case "pause":
 		if err := rc.SetPause(id, true); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to set pause: "+err.Error())

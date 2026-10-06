@@ -219,3 +219,67 @@ func firstNonEmpty(vals ...string) string {
 	}
 	return ""
 }
+
+type AnswerRequest struct {
+	Context  string
+	Question string
+}
+
+func (c *TogetherDecisionClient) Answer(ctx context.Context, req AnswerRequest) (string, error) {
+	prompt := "You are a product manager answering a developer's question.\nContext:\n" + req.Context + "\n\nQuestion:\n" + req.Question
+	body := map[string]any{
+		"model": c.model,
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
+		"temperature": 0.2,
+		"max_tokens":  256,
+		"stream":      false,
+	}
+
+	b, err := json.Marshal(body)
+	if err != nil {
+		return "", fmt.Errorf("decision: marshal answer request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(b))
+	if err != nil {
+		return "", fmt.Errorf("decision: build answer request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("decision: answer http: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("decision: read answer response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("decision: answer server %d: %s", resp.StatusCode, raw)
+	}
+
+	var parsed struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "", fmt.Errorf("decision: parse answer response: %w", err)
+	}
+
+	if len(parsed.Choices) == 0 {
+		return "", fmt.Errorf("decision: no choices returned for answer")
+	}
+
+	return parsed.Choices[0].Message.Content, nil
+}

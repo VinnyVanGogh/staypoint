@@ -1,0 +1,1 @@
+sed -i '' 's/h.hub.Publish("ship_review_sent_back"/h.hub.Publish("task_comment_added", map[string]string{"task_id": taskID, "author": "board", "message": comment})\n\n\th.hub.Publish("ship_review_sent_back"/' internal/server/handlers_ship_review.go

@@ -132,11 +132,15 @@ function fmtCurrency(usd) {
 }
 
 function fmtTime(ts) {
+  if (!ts) return '';
+  if (isNaN(new Date(ts).getTime())) return '';
   try { return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
   catch { return ''; }
 }
 
 function fmtDateTime(ts) {
+  if (!ts) return '';
+  if (isNaN(new Date(ts).getTime())) return '';
   try { return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }); }
   catch { return ''; }
 }
@@ -7497,7 +7501,7 @@ function fmtDuration(ms) {
 function buildRunControlBar(task) {
   const wrap = el('div', 'run-control-bar');
   const stage = task.execution_stage || task.status || '';
-  const isActive = stage === 'in_progress' || stage === 'paused';
+  const isActive = stage === 'in_progress' || stage === 'paused' || stage === 'capped';
   if (!isActive) wrap.classList.add('hidden');
   wrap.setAttribute('data-task-id', task.id || '');
   renderRunControlBarContent(wrap, task.id, stage);
@@ -7510,6 +7514,17 @@ function buildRunControlBar(task) {
 function renderRunControlBarContent(wrap, taskId, stage) {
   wrap.innerHTML = '';
   const isPaused = stage === 'paused';
+  const isCapped = stage === 'capped';
+
+  if (isCapped) {
+    const extendBtn = el('button', 'run-ctrl-btn run-ctrl-pause', '🚀 Resume Run (Extend Cap)');
+    extendBtn.title = 'Add 50 more turns and continue the run';
+    extendBtn.addEventListener('click', () => {
+      runControlAction(taskId, 'extend');
+    });
+    wrap.appendChild(extendBtn);
+    return;
+  }
 
   // Pause / Resume
   const pauseBtn = el('button', `run-ctrl-btn run-ctrl-pause${isPaused ? ' active' : ''}`,
@@ -7560,7 +7575,7 @@ function renderRunControlBarContent(wrap, taskId, stage) {
 function updateRunControlBar(taskId, disposition) {
   const bar = document.getElementById(`run-control-bar-${taskId}`);
   if (!bar) return;
-  const isActive = disposition === 'in_progress' || disposition === 'paused';
+  const isActive = disposition === 'in_progress' || disposition === 'paused' || disposition === 'capped';
   if (isActive) {
     bar.classList.remove('hidden');
     renderRunControlBarContent(bar, taskId, disposition);
@@ -7777,7 +7792,8 @@ function timelineStepRow(s) {
 }
 
 function buildTimelineRun(runId) {
-  const run = el('div', 'timeline-run');
+  const run = el('details', 'timeline-run');
+  run.open = true;
   run.setAttribute('data-run-id', runId || '');
   return run;
 }
@@ -7862,7 +7878,6 @@ function placeTimelineRow(runEl, row, s) {
 // "Run N" headers, only once the task has more than one real run.
 function syncTimelineRunHeaders(stepList, allSteps) {
   const groups = groupStepsByRun(allSteps || []);
-  const multi = groups.filter(isRealRunGroup).length > 1;
   let runNum = 0;
   for (const group of groups) {
     const real = isRealRunGroup(group);
@@ -7870,13 +7885,20 @@ function syncTimelineRunHeaders(stepList, allSteps) {
     const runEl = timelineRunEl(stepList, (group[0] && group[0].run_id) || '');
     if (!runEl) continue;
     let hdr = runEl.querySelector(':scope > .timeline-run-header');
-    if (!multi || !real) { if (hdr) hdr.remove(); continue; }
-    if (!hdr) { hdr = el('div', 'timeline-run-header'); runEl.prepend(hdr); }
+    
+    // Always create a summary element for the details container
+    if (!hdr) { hdr = el('summary', 'timeline-run-header'); runEl.prepend(hdr); }
+    
     const firstStep = group[0];
     const stateStep = [...group].reverse().find(s => s.kind === 'state');
     const startTime = firstStep ? fmtDateTime(firstStep.created_at) : '';
     const endTime = stateStep ? fmtDateTime(stateStep.created_at) : '';
-    hdr.textContent = `Run ${runNum}` + (startTime ? `  ·  started ${startTime}` : '') + (endTime ? `  ·  ended ${endTime}` : '');
+    
+    const actionCount = group.length;
+    const actionLabel = `${actionCount} action${actionCount === 1 ? '' : 's'}`;
+    const runTitle = real ? `Run ${runNum}` : 'Run (Overhead)';
+    
+    hdr.textContent = `${runTitle} (${actionLabel})` + (startTime ? `  ·  started ${startTime}` : '') + (endTime ? `  ·  ended ${endTime}` : '');
   }
 }
 
@@ -8872,6 +8894,27 @@ function renderShipReviewCardFromData(container, taskId, card) {
     approveBtn.addEventListener('click', () => showOnly(approveConfirmForm));
     actions.appendChild(approveBtn);
   }
+
+  const aiReviewBtn = el('button', 'ship-review-sendback-btn', '🤖 AI Review Diff');
+  aiReviewBtn.style.marginRight = '8px';
+  aiReviewBtn.addEventListener('click', async () => {
+    aiReviewBtn.disabled = true;
+    try {
+      const r = await withBoardWebAuthn((sessionToken, assertion) =>
+        fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/ai-review`, {
+          method: 'POST',
+          headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+        }), 'requesting AI review',
+      );
+      if (r === null) { aiReviewBtn.disabled = false; return; }
+      if (!r.ok) throw await boardActionError(r);
+      showWorkingState(section, taskId, card.run_number || 1);
+    } catch (e) {
+      aiReviewBtn.disabled = false;
+      showErr('AI Review failed: ' + (e.message || e));
+    }
+  });
+  actions.appendChild(aiReviewBtn);
 
   const sendBackBtn = el('button', 'ship-review-sendback-btn', '↩ Send Back');
   sendBackBtn.addEventListener('click', () => {
