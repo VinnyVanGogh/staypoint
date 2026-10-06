@@ -1,6 +1,7 @@
 package shipreview_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -91,5 +92,54 @@ func TestLiveGateConfig_UnstattablePathFailsClosed(t *testing.T) {
 	}
 	if _, gated, err := shipreview.LiveGateConfig(db, other); err != nil || gated {
 		t.Errorf("unrelated existing repo: gated=%v err=%v, want false, nil", gated, err)
+	}
+}
+
+// STA-798: a live row whose path fails to stat for a reason other than not
+// existing (here EACCES from a chmod 000 parent) could be the repo being
+// started, so LiveGateConfig gates every other repo too. A non-live row that
+// cannot be stat'ed, and a live row whose path no longer exists, cannot hide a
+// live repo and leave the gate open.
+func TestLiveGateConfig_UnstattableLiveRowFailsClosed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so stat never returns EACCES")
+	}
+	db := openTestDB(t)
+	base := t.TempDir()
+	other := filepath.Join(base, "other")
+	locked := filepath.Join(base, "locked")
+	for _, d := range []string{other, filepath.Join(locked, "nonlive"), filepath.Join(locked, "live")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustUpsert := func(cfg *shipreview.ProjectDevConfig) {
+		t.Helper()
+		if err := shipreview.UpsertProjectDevConfig(db, cfg); err != nil {
+			t.Fatalf("UpsertProjectDevConfig(%s): %v", cfg.RepoPath, err)
+		}
+	}
+	mustUpsert(&shipreview.ProjectDevConfig{RepoPath: filepath.Join(locked, "nonlive"), DevCommand: "exec sleep 60"})
+	mustUpsert(&shipreview.ProjectDevConfig{RepoPath: filepath.Join(base, "gone"), LiveCredentials: true})
+
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	if _, err := os.Stat(filepath.Join(locked, "live")); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("stat under chmod 000 dir: err = %v, want EACCES", err)
+	}
+
+	if _, gated, err := shipreview.LiveGateConfig(db, other); err != nil || gated {
+		t.Fatalf("non-live EACCES row + ENOENT live row: gated=%v err=%v, want false, nil", gated, err)
+	}
+
+	mustUpsert(&shipreview.ProjectDevConfig{RepoPath: filepath.Join(locked, "live"), LiveCredentials: true})
+	cfg, gated, err := shipreview.LiveGateConfig(db, other)
+	if err != nil || !gated {
+		t.Fatalf("live EACCES row: gated=%v err=%v, want true, nil", gated, err)
+	}
+	if cfg.LiveCredentials {
+		t.Errorf("unrelated repo loaded the unstattable live row; want defaults (gated only)")
 	}
 }
