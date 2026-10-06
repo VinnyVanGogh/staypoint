@@ -1427,6 +1427,13 @@ func scanDevConfig(rows *sql.Rows) (*ProjectDevConfig, error) {
 	return &c, nil
 }
 
+// statPath is os.Stat; tests swap it to simulate a path whose stat blocks.
+var statPath = os.Stat
+
+// devConfigStatTimeout bounds how long lookupDevConfig waits for the stats it
+// needs to compare repo paths.
+var devConfigStatTimeout = 2 * time.Second
+
 // lookupDevConfig returns the row for repoPath's directory (see
 // GetProjectDevConfig). unverified is true when that directory could not be
 // compared with every live row; LiveGateConfig gates on it.
@@ -1438,7 +1445,7 @@ func lookupDevConfig(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, unveri
 	defer rows.Close()
 
 	want := filepath.Clean(repoPath)
-	wantInfo, _ := os.Stat(repoPath)
+	wantInfo, _ := statPath(repoPath)
 
 	var exact, alias, live *ProjectDevConfig
 	for rows.Next() {
@@ -1453,7 +1460,7 @@ func lookupDevConfig(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, unveri
 			unverified = true
 		}
 		if !same && wantInfo != nil {
-			info, err := os.Stat(c.RepoPath)
+			info, err := statPath(c.RepoPath)
 			switch {
 			case err == nil:
 				same = os.SameFile(wantInfo, info)

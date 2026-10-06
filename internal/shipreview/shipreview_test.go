@@ -16,7 +16,7 @@ import (
 )
 
 // openTestDB creates an in-memory SQLite DB with the ship_review schema applied.
-func openTestDB(t *testing.T) *sql.DB {
+func openTestDB(t testing.TB) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
