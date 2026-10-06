@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/context"
@@ -246,25 +247,35 @@ func unverifiedMigrations(ctx gocontext.Context, db *sql.DB, task *context.Task)
 	// Detect migration files in the task diff.
 	workDir, hasWorktree := taskCheckpointWorkDir(task)
 	cpID := ""
-	refs := []string{checkpoint.LatestRef}
-	var fileStats []checkpoint.FileDiffStat
-	var diffErr error
-	if hasWorktree {
-		fileStats, diffErr = checkpoint.DiffCheckpointFiles(ctx, workDir, cpID)
-	} else {
-		branch := "staypoint/" + task.ID
-		refs = append(refs, branch)
-		fileStats, diffErr = checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, cpID, branch)
-	}
+	branch := "staypoint/" + task.ID
+	refs := []string{checkpoint.LatestRef, branch}
+	fileStats, diffErr := checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, cpID, branch)
 	if diffErr != nil {
-		if gitexec.IsTimeout(diffErr) || !nothingToDiff(ctx, workDir, refs...) {
+		if gitexec.IsTimeout(diffErr) || !nothingToDiff(ctx, task.RepoPath, refs...) {
 			return nil, fmt.Errorf("%w: %w", errRepoUnreadable, diffErr)
 		}
-		return nil, nil
+		if !hasWorktree {
+			return nil, nil
+		}
 	}
-	filePaths := make([]string, len(fileStats))
-	for i, s := range fileStats {
-		filePaths[i] = s.Path
+	if hasWorktree {
+		wtStats, wtErr := checkpoint.DiffCheckpointFiles(ctx, workDir, cpID)
+		if wtErr != nil {
+			if gitexec.IsTimeout(wtErr) || !nothingToDiff(ctx, workDir, checkpoint.LatestRef) {
+				return nil, fmt.Errorf("%w: %w", errRepoUnreadable, wtErr)
+			}
+		} else {
+			fileStats = append(fileStats, wtStats...)
+		}
+	}
+
+	seen := make(map[string]bool, len(fileStats))
+	var filePaths []string
+	for _, s := range fileStats {
+		if !seen[s.Path] {
+			seen[s.Path] = true
+			filePaths = append(filePaths, s.Path)
+		}
 	}
 	migPaths := migration.Detect(filePaths, migration.DefaultGlobs)
 	if len(migPaths) == 0 {
@@ -291,11 +302,72 @@ func unverifiedMigrations(ctx gocontext.Context, db *sql.DB, task *context.Task)
 
 	var unverified []string
 	for _, p := range migPaths {
-		if !appliedPaths[p] {
-			unverified = append(unverified, p)
+		if appliedPaths[p] {
+			continue
 		}
+		exists, existsErr := migrationFileExistsAtTask(ctx, task, workDir, hasWorktree, p)
+		if existsErr != nil {
+			return nil, fmt.Errorf("%w: %w", errRepoUnreadable, existsErr)
+		}
+		if !exists {
+			// Deleted migration files do not count as unverified migrations.
+			continue
+		}
+		unverified = append(unverified, p)
 	}
 	return unverified, nil
+}
+
+// migrationFileExistsAtTask checks whether the migration file exists at the task branch
+// tip or in the task's current working tree (if present). Deleted migrations
+// return false so they do not count as unverified migrations. If git or filesystem
+// inspection encounters an error (e.g. timeout, EPERM), it returns the error so the
+// caller fails closed.
+func migrationFileExistsAtTask(ctx gocontext.Context, task *context.Task, workDir string, hasWorktree bool, relPath string) (bool, error) {
+	// First check the task branch tip, which is what ApproveAndMerge ships.
+	// An uncommitted deletion in the worktree must not hide a migration that
+	// the branch still ships.
+	branch := "staypoint/" + task.ID
+	cmd := gitexec.Command(ctx, "ls-tree", "--full-tree", "-z", "--name-only", branch, "--", filepath.ToSlash(relPath))
+	cmd.Dir = task.RepoPath
+	cmd.Env = security.ChildEnv()
+	out, err := cmd.Output()
+	if err == nil {
+		if len(strings.TrimRight(string(out), "\x00")) > 0 {
+			return true, nil
+		}
+	} else {
+		// If the branch doesn't exist at all, and there is a worktree, we fall through
+		// only if we can verify the branch ref simply does not exist (rev-parse exit 1).
+		// Any timeout or git read error must fail closed.
+		if hasWorktree && isRefMissing(ctx, task.RepoPath, branch) {
+			// branch ref is missing; fall through to worktree check
+		} else {
+			return false, err
+		}
+	}
+
+	// If absent from the branch tip, check the worktree (if present) for uncommitted files.
+	if hasWorktree {
+		_, statErr := os.Lstat(filepath.Join(workDir, relPath))
+		if statErr == nil {
+			return true, nil
+		}
+		if !errors.Is(statErr, fs.ErrNotExist) {
+			return false, statErr
+		}
+	}
+
+	return false, nil
+}
+
+func isRefMissing(ctx gocontext.Context, repoDir, ref string) bool {
+	cmd := gitexec.Command(ctx, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+	cmd.Dir = repoDir
+	cmd.Env = security.ChildEnv()
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == 1
 }
 
 // nothingToDiff reports whether a failed migration diff failed only because

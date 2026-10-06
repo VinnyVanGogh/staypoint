@@ -12,9 +12,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 )
@@ -214,3 +216,248 @@ func TestMigrationGate_RepoSubdirNoCheckpointIsNotAnError(t *testing.T) {
 		t.Errorf("repo_error = %v, want none when the repo has no checkpoint", v)
 	}
 }
+
+// Renaming a migration must report the new real path in unverified_migrations,
+// not a mangled path like migrations/{026_x.sql. Regression for STA-755.
+func TestMigrationGate_RenamedMigration(t *testing.T) {
+	_, baseURL, token, boardToken, taskID, repoDir, _ := shipApproveServer(t)
+
+	// Commit migrations/026_alerts.sql on main first
+	if err := os.MkdirAll(filepath.Join(repoDir, "migrations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "migrations", "026_alerts.sql"), []byte("ALTER TABLE t ADD COLUMN c1 TEXT;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repoDir, "add", ".")
+	gitOut(t, repoDir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "main: 026_alerts.sql")
+
+	// Baseline checkpoint at main
+	gitOut(t, repoDir, "update-ref", "refs/staypoint/checkpoints/latest", "main")
+
+	// Branch task and rename 026_alerts.sql -> 027_alerts.sql
+	gitOut(t, repoDir, "checkout", "staypoint/"+taskID)
+	gitOut(t, repoDir, "reset", "--hard", "main")
+	gitOut(t, repoDir, "mv", filepath.Join("migrations", "026_alerts.sql"), filepath.Join("migrations", "027_alerts.sql"))
+	gitOut(t, repoDir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "task: rename migration")
+	gitOut(t, repoDir, "checkout", "main")
+
+	card := getCardMap(t, baseURL, token, taskID)
+	if v, ok := card["repo_error"]; ok {
+		t.Fatalf("repo_error = %v, want none", v)
+	}
+	got, _ := card["unverified_migrations"].([]any)
+	if len(got) != 1 || got[0] != "migrations/027_alerts.sql" {
+		t.Errorf("unverified_migrations = %v, want [migrations/027_alerts.sql]", card["unverified_migrations"])
+	}
+
+	// Approve must be blocked by the new migration
+	resp, body, _ := timedReq(t, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "unverified_migrations") {
+		t.Errorf("Approve: %d %s, want 409 unverified_migrations", resp.StatusCode, body)
+	}
+}
+
+// A migration file with spaces in its name must not be truncated by numstat parsing.
+// Regression for STA-755.
+func TestMigrationGate_MigrationPathWithSpaces(t *testing.T) {
+	_, baseURL, token, boardToken, taskID, repoDir, _ := shipApproveServer(t)
+
+	gitOut(t, repoDir, "update-ref", "refs/staypoint/checkpoints/latest", "main")
+	gitOut(t, repoDir, "checkout", "staypoint/"+taskID)
+	if err := os.MkdirAll(filepath.Join(repoDir, "migrations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	migPath := filepath.Join("migrations", "028 add new column.sql")
+	if err := os.WriteFile(filepath.Join(repoDir, migPath), []byte("ALTER TABLE t ADD COLUMN c2 TEXT;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repoDir, "add", migPath)
+	gitOut(t, repoDir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "task: migration with spaces")
+	gitOut(t, repoDir, "checkout", "main")
+
+	card := getCardMap(t, baseURL, token, taskID)
+	if v, ok := card["repo_error"]; ok {
+		t.Fatalf("repo_error = %v, want none", v)
+	}
+	got, _ := card["unverified_migrations"].([]any)
+	if len(got) != 1 || got[0] != "migrations/028 add new column.sql" {
+		t.Errorf("unverified_migrations = %v, want [migrations/028 add new column.sql]", card["unverified_migrations"])
+	}
+
+	resp, body, _ := timedReq(t, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "unverified_migrations") {
+		t.Errorf("Approve: %d %s, want 409 unverified_migrations", resp.StatusCode, body)
+	}
+}
+
+// Deleting a migration does not count as an unverified migration, so it does not
+// block approve or appear in unverified_migrations. Regression for STA-755.
+func TestMigrationGate_DeletedMigrationNotUnverified(t *testing.T) {
+	_, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+
+	// Commit migrations/005_to_delete.sql on main first
+	if err := os.MkdirAll(filepath.Join(repoDir, "migrations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	migPath := filepath.Join("migrations", "005_to_delete.sql")
+	if err := os.WriteFile(filepath.Join(repoDir, migPath), []byte("ALTER TABLE t ADD COLUMN c3 TEXT;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repoDir, "add", ".")
+	gitOut(t, repoDir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "main: 005_to_delete.sql")
+
+	// Baseline checkpoint at main
+	gitOut(t, repoDir, "update-ref", "refs/staypoint/checkpoints/latest", "main")
+
+	// Branch task and delete the migration file
+	gitOut(t, repoDir, "checkout", "staypoint/"+taskID)
+	gitOut(t, repoDir, "reset", "--hard", "main")
+	gitOut(t, repoDir, "rm", migPath)
+	gitOut(t, repoDir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "task: delete migration")
+	gitOut(t, repoDir, "checkout", "main")
+
+	// Re-render card so head_sha matches the task branch commit
+	upsertBody, _ := json.Marshal(map[string]any{"test_steps": []string{"1. Open /"}})
+	respCard, rb := shipDoReq(t, client, token, "PUT", baseURL+"/api/tasks/"+taskID+"/ship-review", upsertBody)
+	if respCard.StatusCode != http.StatusOK && respCard.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT ship-review: %d %s", respCard.StatusCode, rb)
+	}
+
+	card := getCardMap(t, baseURL, token, taskID)
+	if v, ok := card["repo_error"]; ok {
+		t.Fatalf("repo_error = %v, want none", v)
+	}
+	got, _ := card["unverified_migrations"].([]any)
+	if len(got) != 0 {
+		t.Errorf("unverified_migrations = %v, want empty for deleted migration", got)
+	}
+
+	// Approve must succeed (200 OK), not block with 409 unverified_migrations
+	resp, body, _ := timedReq(t, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Approve: %d %s, want 200 OK", resp.StatusCode, body)
+	}
+}
+
+// If the existence check for a migration times out or fails, Approve must fail closed
+// rather than assuming the migration is deleted and merging unverified. Regression for STA-755.
+func TestMigrationGate_ExistenceCheckTimeoutFailsClosed(t *testing.T) {
+	_, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	gitOut(t, repoDir, "update-ref", "refs/staypoint/checkpoints/latest", "main")
+	gitOut(t, repoDir, "checkout", "staypoint/"+taskID)
+	if err := os.MkdirAll(filepath.Join(repoDir, "migrations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mig := filepath.Join("migrations", "030_new.sql")
+	if err := os.WriteFile(filepath.Join(repoDir, mig), []byte("ALTER TABLE t ADD COLUMN c TEXT;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repoDir, "add", mig)
+	gitOut(t, repoDir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "task: new migration")
+	gitOut(t, repoDir, "checkout", "main")
+
+	ub, _ := json.Marshal(map[string]any{"test_steps": []string{"1. Open /"}})
+	if rc, rb := shipDoReq(t, client, token, "PUT", baseURL+"/api/tasks/"+taskID+"/ship-review", ub); rc.StatusCode != http.StatusOK && rc.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT: %d %s", rc.StatusCode, rb)
+	}
+
+	realGit, _ := exec.LookPath("git")
+	shim := t.TempDir()
+	// exec sleep: a plain `sleep` child keeps the stdout pipe open after the kill.
+	script := "#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = ls-tree ]; then exec sleep 30; fi; done\nexec " + realGit + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(shim, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("STAYPOINT_GIT_TIMEOUT", "3s")
+
+	resp, body := shipDoReq(t, &http.Client{Timeout: 90 * time.Second}, token, "POST",
+		baseURL+"/api/tasks/"+taskID+"/ship-review/approve", nil, boardToken, "", "mock-assertion")
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("approve merged an unverified migration whose existence check timed out: %s", body)
+	}
+}
+
+// An uncommitted removal of a migration in a task worktree must not hide a migration
+// that the task branch still ships. Regression for STA-755.
+func TestMigrationGate_UncommittedWorktreeRemovalDoesNotBypassGate(t *testing.T) {
+	_, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	gitOut(t, repoDir, "update-ref", "refs/staypoint/checkpoints/latest", "main")
+
+	// Create and commit a new migration on the task branch
+	gitOut(t, repoDir, "checkout", "staypoint/"+taskID)
+	if err := os.MkdirAll(filepath.Join(repoDir, "migrations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mig := filepath.Join("migrations", "031_committed.sql")
+	if err := os.WriteFile(filepath.Join(repoDir, mig), []byte("ALTER TABLE t ADD COLUMN c TEXT;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repoDir, "add", mig)
+	gitOut(t, repoDir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "task: migration to uncommit")
+	gitOut(t, repoDir, "checkout", "main")
+
+	// Set up the linked task worktree (.worktrees/<taskID>)
+	wtPath := filepath.Join(repoDir, ".worktrees", taskID)
+	if err := os.MkdirAll(filepath.Join(repoDir, ".worktrees"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repoDir, "worktree", "add", wtPath, "staypoint/"+taskID)
+
+	// Remove the migration file from the worktree without committing the deletion
+	if err := os.Remove(filepath.Join(wtPath, mig)); err != nil {
+		t.Fatal(err)
+	}
+
+	ub, _ := json.Marshal(map[string]any{"test_steps": []string{"1. Open /"}})
+	if rc, rb := shipDoReq(t, client, token, "PUT", baseURL+"/api/tasks/"+taskID+"/ship-review", ub); rc.StatusCode != http.StatusOK && rc.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT: %d %s", rc.StatusCode, rb)
+	}
+
+	card := getCardMap(t, baseURL, token, taskID)
+	if v, ok := card["repo_error"]; ok {
+		t.Fatalf("repo_error = %v, want none", v)
+	}
+	got, _ := card["unverified_migrations"].([]any)
+	if len(got) != 1 || got[0] != "migrations/031_committed.sql" {
+		t.Fatalf("unverified_migrations = %v, want [migrations/031_committed.sql]", card["unverified_migrations"])
+	}
+
+	// Approve must be blocked with 409 unverified_migrations
+	resp, body := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", nil, boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "unverified_migrations") {
+		t.Fatalf("Approve: %d %s, want 409 unverified_migrations", resp.StatusCode, body)
+	}
+}
+
+// STA-755: When repo_path is a subdirectory, migrationFileExistsAtTask must not fail open
+// by running ls-tree without --full-tree (which treats the root-relative migration path as deleted).
+func TestMigrationGate_RepoSubdirMigrationOnBranchBlocksApprove(t *testing.T) {
+	database, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	sub := filepath.Join(repoDir, "sub")
+	gitOut(t, repoDir, "update-ref", "refs/staypoint/checkpoints/latest", "main")
+	gitOut(t, repoDir, "checkout", "staypoint/"+taskID)
+	if err := os.MkdirAll(filepath.Join(repoDir, "migrations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "migrations", "001_add.sql"), []byte("ALTER TABLE t ADD COLUMN c TEXT;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repoDir, "add", ".")
+	gitOut(t, repoDir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "task: add migration")
+	gitOut(t, repoDir, "checkout", "main")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE tasks SET repo_path = ? WHERE id = ?`, sub, taskID); err != nil {
+		t.Fatal(err)
+	}
+	ub, _ := json.Marshal(map[string]any{"test_steps": []string{"1. Open /"}})
+	shipDoReq(t, client, token, "PUT", baseURL+"/api/tasks/"+taskID+"/ship-review", ub)
+	resp, body := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", nil, boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "unverified_migrations") {
+		t.Fatalf("Approve: %d %s, want 409 unverified_migrations", resp.StatusCode, body)
+	}
+}
+

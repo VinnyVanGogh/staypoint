@@ -230,6 +230,108 @@ func TestDiffCheckpointFilesBareID(t *testing.T) {
 	}
 }
 
+// TestDiffCheckpointFilesRenamedAndSpaces verifies that DiffCheckpointFiles and
+// DiffCheckpointFilesAgainstRef preserve full paths containing spaces and correctly
+// report real paths when files are renamed or deleted, rather than mangling them
+// into {old => new} or truncating on spaces. Regression for STA-755.
+func TestDiffCheckpointFilesRenamedAndSpaces(t *testing.T) {
+	dir := setupTestGitRepo(t)
+	ctx := context.Background()
+
+	// Create initial files and commit them
+	migDir := filepath.Join(dir, "migrations")
+	if err := os.MkdirAll(migDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	oldMig := filepath.Join(migDir, "026_alerts.sql")
+	if err := os.WriteFile(oldMig, []byte("-- old migration\nSELECT 1;\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	toDelete := filepath.Join(migDir, "005_to_delete.sql")
+	if err := os.WriteFile(toDelete, []byte("-- to delete\nSELECT 5;\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s failed: %v\nOutput: %s", strings.Join(args, " "), err, string(out))
+		}
+	}
+	run("add", ".")
+	run("commit", "-m", "commit migrations")
+
+	cp, err := CreateCheckpoint(ctx, CreateOptions{
+		WorkDir:   dir,
+		SessionID: "test-rename-spaces",
+		Message:   "checkpoint before rename",
+	})
+	if err != nil {
+		t.Fatalf("CreateCheckpoint failed: %v", err)
+	}
+
+	// 1. Rename 026_alerts.sql -> 027_alerts.sql
+	run("mv", filepath.Join("migrations", "026_alerts.sql"), filepath.Join("migrations", "027_alerts.sql"))
+
+	// 2. Add file with spaces
+	fileWithSpaces := filepath.Join(migDir, "028 add new column.sql")
+	if err := os.WriteFile(fileWithSpaces, []byte("-- spaces\nSELECT 28;\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", filepath.Join("migrations", "028 add new column.sql"))
+
+	// 3. Delete 005_to_delete.sql
+	run("rm", filepath.Join("migrations", "005_to_delete.sql"))
+
+	run("commit", "-m", "rename, spaces, and delete")
+
+	head, err := runGit(ctx, dir, nil, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+
+	checkStats := func(stats []FileDiffStat, label string) {
+		t.Helper()
+		byPath := make(map[string]FileDiffStat)
+		for _, s := range stats {
+			byPath[s.Path] = s
+		}
+
+		// Verify renamed file: path must be the real path "migrations/027_alerts.sql"
+		// and must not be mangled like "migrations/{026_alerts.sql"
+		if _, ok := byPath["migrations/027_alerts.sql"]; !ok {
+			t.Errorf("[%s] expected real renamed path migrations/027_alerts.sql, got stats: %+v", label, stats)
+		}
+		for p := range byPath {
+			if strings.Contains(p, "{") || strings.Contains(p, "=>") {
+				t.Errorf("[%s] path contains mangled rename syntax: %q", label, p)
+			}
+		}
+
+		// Verify file with spaces: must have full name "migrations/028 add new column.sql"
+		if _, ok := byPath["migrations/028 add new column.sql"]; !ok {
+			t.Errorf("[%s] expected full path with spaces 'migrations/028 add new column.sql', got stats: %+v", label, stats)
+		}
+
+		// Verify deleted file is present with its exact real path
+		if _, ok := byPath["migrations/005_to_delete.sql"]; !ok {
+			t.Errorf("[%s] expected deleted path migrations/005_to_delete.sql, got stats: %+v", label, stats)
+		}
+	}
+
+	stats, err := DiffCheckpointFiles(ctx, dir, cp.ID)
+	if err != nil {
+		t.Fatalf("DiffCheckpointFiles failed: %v", err)
+	}
+	checkStats(stats, "DiffCheckpointFiles")
+
+	statsRef, err := DiffCheckpointFilesAgainstRef(ctx, dir, cp.ID, head)
+	if err != nil {
+		t.Fatalf("DiffCheckpointFilesAgainstRef failed: %v", err)
+	}
+	checkStats(statsRef, "DiffCheckpointFilesAgainstRef")
+}
+
 // TestFindPreRunCheckpoint verifies FindPreRunCheckpoint returns the pre-run
 // checkpoint for a given task ID and ignores checkpoints from other tasks.
 // Regression for STA-500 bug 2.
