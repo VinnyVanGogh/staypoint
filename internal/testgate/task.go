@@ -110,12 +110,15 @@ func TaskDescription(r *Report, g GapTask) string {
 			note = "no coverage report from CI"
 		}
 		fmt.Fprintf(&b, "No coverage data (%s), so the uncovered lines are unknown.\n", note)
-	case len(r.Coverage.Uncovered) == 0:
+	case len(r.Coverage.Uncovered) == 0 && len(r.Coverage.Ambiguous) == 0:
 		fmt.Fprintf(&b, "None: every changed line in %s ran under a test.\n", r.Coverage.Source)
 	default:
 		fmt.Fprintf(&b, "From %s:\n", r.Coverage.Source)
 		for _, u := range r.Coverage.Uncovered {
 			fmt.Fprintf(&b, "- %s\n", u.Describe())
+		}
+		for _, p := range r.Coverage.Ambiguous {
+			fmt.Fprintf(&b, "- %s: coverage unknown (more than one report entry matches)\n", p)
 		}
 	}
 	return b.String()

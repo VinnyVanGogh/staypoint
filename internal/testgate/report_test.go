@@ -183,3 +183,37 @@ func TestDedupeKey(t *testing.T) {
 		t.Error("without a PR, each task gets its own key")
 	}
 }
+
+func TestEvaluateAmbiguousCoverageIsInfoOnly(t *testing.T) {
+	r := Evaluate(Input{Files: []string{"src/index.ts", "src/index.test.ts"},
+		CI: CIState{Workflows: testWorkflow},
+		Coverage: CoverageResult{Available: true, Source: "CI artifact lcov", Uncovered: []UncoveredFile{
+			{Path: "src/index.ts", Ambiguous: true},
+		}}})
+	if r.Blocking {
+		t.Fatalf("ambiguous coverage must not block: %+v", r.Warnings)
+	}
+	if want := []string{KindCoverageUnknown}; !reflect.DeepEqual(kinds(r), want) {
+		t.Fatalf("kinds = %v", kinds(r))
+	}
+	if !reflect.DeepEqual(r.Warnings[0].Items, []string{"src/index.ts"}) || len(r.Coverage.Uncovered) != 0 {
+		t.Errorf("items = %v, uncovered = %+v", r.Warnings[0].Items, r.Coverage.Uncovered)
+	}
+	if d := TaskDescription(r, GapTask{PRNumber: 1, HeadSHA: "abc"}); strings.Contains(d, "every changed line") || !strings.Contains(d, "src/index.ts: coverage unknown") {
+		t.Errorf("task description misreports ambiguous coverage:\n%s", d)
+	}
+}
+
+// STA-766 review nit: cached coverage is keyed by head, so a file the Board
+// has since exempted must stop blocking without a new head.
+func TestEvaluateDropsUncoveredFilesNowExempt(t *testing.T) {
+	r := Evaluate(Input{Files: []string{"internal/a/a.go", "internal/a/a_test.go", "tools/gen.go"},
+		ExtraExempt: []string{"tools/**"},
+		CI:          CIState{Workflows: testWorkflow},
+		Coverage: CoverageResult{Available: true, Source: "x", Uncovered: []UncoveredFile{
+			{Path: "tools/gen.go", NotInReport: true},
+		}}})
+	if r.Blocking || len(r.Coverage.Uncovered) != 0 {
+		t.Fatalf("exempted file still blocks: warnings=%+v uncovered=%+v", r.Warnings, r.Coverage.Uncovered)
+	}
+}

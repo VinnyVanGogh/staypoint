@@ -13,6 +13,7 @@ const (
 	KindUntestedSources = "untested_sources"
 	KindUncovered       = "uncovered"
 	KindNoCoverageData  = "no_coverage_data"
+	KindCoverageUnknown = "coverage_ambiguous"
 )
 
 // Warning is one finding shown in the card's "Test coverage" section. A
@@ -33,6 +34,9 @@ type CoverageResult struct {
 	// Note explains why there is no report (no CI run, no artifact, ...).
 	Note      string          `json:"note,omitempty"`
 	Uncovered []UncoveredFile `json:"uncovered,omitempty"`
+	// Ambiguous lists changed files several report entries could be, so
+	// their coverage is unknown. Evaluate fills it from Uncovered.
+	Ambiguous []string `json:"ambiguous,omitempty"`
 	// Final is set once nothing more can arrive for this head (a report was
 	// read, or every CI run for it has finished); until then it is re-checked.
 	Final bool `json:"final,omitempty"`
@@ -105,6 +109,23 @@ func Evaluate(in Input) *Report {
 		r.UntestedSources = []string{}
 		return r
 	}
+	// A cached coverage result is keyed by head only, so drop files that are
+	// no longer sources (e.g. just exempted via test_exempt_globs), and split
+	// out the ambiguous ones, which never block.
+	isSource := make(map[string]bool, len(r.Sources))
+	for _, s := range r.Sources {
+		isSource[s] = true
+	}
+	r.Coverage.Uncovered, r.Coverage.Ambiguous = nil, nil
+	for _, u := range in.Coverage.Uncovered {
+		switch {
+		case !isSource[u.Path]:
+		case u.Ambiguous:
+			r.Coverage.Ambiguous = append(r.Coverage.Ambiguous, u.Path)
+		default:
+			r.Coverage.Uncovered = append(r.Coverage.Uncovered, u)
+		}
+	}
 	r.UntestedSources = UnmatchedSources(r.Sources, r.Tests)
 	if r.UntestedSources == nil {
 		r.UntestedSources = []string{}
@@ -147,14 +168,21 @@ func Evaluate(in Input) *Report {
 		}
 		r.Warnings = append(r.Warnings, Warning{Kind: KindNoCoverageData,
 			Message: "No coverage data: " + note + ". Can't tell which changed lines run under tests."})
-	} else if len(in.Coverage.Uncovered) > 0 {
-		items := make([]string, 0, len(in.Coverage.Uncovered))
-		for _, u := range in.Coverage.Uncovered {
-			items = append(items, u.Describe())
+	} else {
+		if len(r.Coverage.Uncovered) > 0 {
+			items := make([]string, 0, len(r.Coverage.Uncovered))
+			for _, u := range r.Coverage.Uncovered {
+				items = append(items, u.Describe())
+			}
+			r.add(Warning{Kind: KindUncovered, Blocking: true,
+				Message: "Changed code no test runs (0% coverage in " + in.Coverage.Source + "):",
+				Items:   items}, "changed code with 0% coverage")
 		}
-		r.add(Warning{Kind: KindUncovered, Blocking: true,
-			Message: "Changed code no test runs (0% coverage in " + in.Coverage.Source + "):",
-			Items:   items}, "changed code with 0% coverage")
+		if len(r.Coverage.Ambiguous) > 0 {
+			r.Warnings = append(r.Warnings, Warning{Kind: KindCoverageUnknown,
+				Message: "Coverage unknown: " + in.Coverage.Source + " lists more than one file that could be each of these, so it can't tell which one is this file:",
+				Items:   r.Coverage.Ambiguous})
+		}
 	}
 	return r
 }

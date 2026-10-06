@@ -1,6 +1,7 @@
 package testgate
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -302,5 +303,56 @@ func TestMergeCoverage(t *testing.T) {
 	}
 	if !strings.Contains(m.Format, FormatGo) {
 		t.Errorf("Format = %q", m.Format)
+	}
+}
+
+// STA-766 review: a CI matrix uploads one LCOV per runner, so the same file
+// shows up under two absolute paths. That is one file, not an ambiguity.
+func TestLookupMergesSameFileFromMatrixReports(t *testing.T) {
+	ubuntu, _ := ParseCoverage("lcov.info", []byte("SF:/home/runner/work/app/app/src/util.ts\nFN:1,f\nFNDA:0,f\nDA:1,1\nDA:2,0\nend_of_record\n"))
+	macos, _ := ParseCoverage("lcov.info", []byte("SF:/Users/runner/work/app/app/src/util.ts\nFN:1,f\nFNDA:3,f\nDA:1,0\nDA:2,1\nend_of_record\n"))
+	cov := MergeCoverage(ubuntu, macos)
+	if got := FindUncovered(map[string][]int{"src/util.ts": {1, 2}}, cov, nil); len(got) != 0 {
+		t.Fatalf("a file covered across matrix jobs must not be uncovered, got %+v", got)
+	}
+	fc, ambiguous := cov.lookup("src/util.ts")
+	if ambiguous || fc == nil || fc.Lines[1] != 1 || fc.Lines[2] != 1 {
+		t.Fatalf("lookup = %+v ambiguous=%v, want merged lines hit", fc, ambiguous)
+	}
+	if len(fc.Funcs) != 1 || fc.Funcs[0].Hits != 3 {
+		t.Errorf("Funcs = %+v, want one f with the max hits", fc.Funcs)
+	}
+}
+
+// Two files in one report sharing a suffix (monorepo src/index.ts and
+// packages/web/src/index.ts) are different files: coverage is unknown, which
+// FindUncovered reports as Ambiguous, never as "not in the report".
+func TestFindUncoveredAmbiguousIsNotNotInReport(t *testing.T) {
+	one, _ := ParseCoverage("lcov.info", []byte("SF:/w/app/src/index.ts\nDA:1,1\nend_of_record\nSF:/w/app/packages/web/src/index.ts\nDA:1,0\nend_of_record\n"))
+	other, _ := ParseCoverage("lcov.info", []byte("SF:/x/app/src/index.ts\nDA:1,1\nend_of_record\n"))
+	for name, cov := range map[string]*Coverage{"single": one, "merged": MergeCoverage(one, other)} {
+		got := FindUncovered(map[string][]int{"src/index.ts": {1}}, cov, nil)
+		if want := []UncoveredFile{{Path: "src/index.ts", Ambiguous: true}}; !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: got %+v, want %+v", name, got, want)
+		}
+	}
+}
+
+func TestMergeCoverageCombinesFunctionsByNameAndStart(t *testing.T) {
+	a := &Coverage{Format: FormatLCOV, Files: map[string]*FileCoverage{"x.ts": {Lines: map[int]int{1: 0, 5: 0}, Funcs: []FuncCoverage{{Name: "f", Start: 1, End: 2}, {Name: "f", Start: 5, End: 6}}}}}
+	b := &Coverage{Format: FormatLCOV, Files: map[string]*FileCoverage{"x.ts": {Lines: map[int]int{1: 2}, Funcs: []FuncCoverage{{Name: "f", Start: 1, End: 2, Hits: 2}}}}}
+	got := MergeCoverage(a, b).Files["x.ts"].Funcs
+	want := []FuncCoverage{{Name: "f", Start: 1, End: 2, Hits: 2}, {Name: "f", Start: 5, End: 6}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Funcs = %+v, want %+v", got, want)
+	}
+}
+
+// STA-766 review: Clover XML (PHPUnit --coverage-clover coverage.xml) also has
+// a <coverage> root; it must not read as an empty, fully covered report.
+func TestParseCoverageRejectsCloverAsCobertura(t *testing.T) {
+	clover := `<?xml version="1.0"?><coverage generated="1"><project timestamp="1"><file name="/w/src/A.php"><line num="3" type="stmt" count="0"/></file></project></coverage>`
+	if cov, err := ParseCoverage("coverage.xml", []byte(clover)); !errors.Is(err, ErrNotCoverage) {
+		t.Fatalf("Clover: got cov=%+v err=%v, want ErrNotCoverage", cov, err)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"go/token"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -136,6 +137,17 @@ type FileCoverage struct {
 type Coverage struct {
 	Format string
 	Files  map[string]*FileCoverage
+	// from records which of the merged reports listed each path; nil for a
+	// single report. See lookup.
+	from map[string]map[int]bool
+}
+
+// reportsOf returns the indexes of the merged reports that list p.
+func (c *Coverage) reportsOf(p string) map[int]bool {
+	if r := c.from[p]; len(r) > 0 {
+		return r
+	}
+	return map[int]bool{0: true}
 }
 
 // ErrNotCoverage is returned for a file that is not a known report format.
@@ -232,6 +244,12 @@ func parseCobertura(data []byte) (*Coverage, error) {
 	var doc xmlCobertura
 	if err := xml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("parse Cobertura XML: %w", err)
+	}
+	// Clover (PHPUnit --coverage-clover) also has a <coverage> root but no
+	// packages>package>classes; reading it as an empty Cobertura report
+	// would claim every changed line is covered.
+	if len(doc.Classes) == 0 {
+		return nil, fmt.Errorf("Cobertura XML with no classes: %w", ErrNotCoverage)
 	}
 	cov := &Coverage{Format: FormatCobertura, Files: map[string]*FileCoverage{}}
 	for _, cl := range doc.Classes {
@@ -352,9 +370,9 @@ func parseLCOV(data []byte) (*Coverage, error) {
 // MergeCoverage combines reports (several CI jobs, several languages). A
 // line hit in any report counts as hit.
 func MergeCoverage(covs ...*Coverage) *Coverage {
-	out := &Coverage{Files: map[string]*FileCoverage{}}
+	out := &Coverage{Files: map[string]*FileCoverage{}, from: map[string]map[int]bool{}}
 	var formats []string
-	for _, c := range covs {
+	for i, c := range covs {
 		if c == nil {
 			continue
 		}
@@ -362,11 +380,11 @@ func MergeCoverage(covs ...*Coverage) *Coverage {
 			formats = append(formats, c.Format)
 		}
 		for p, fc := range c.Files {
-			dst := out.file(p)
-			for l, h := range fc.Lines {
-				setMax(dst.Lines, l, h)
+			if out.from[p] == nil {
+				out.from[p] = map[int]bool{}
 			}
-			dst.Funcs = append(dst.Funcs, fc.Funcs...)
+			out.from[p][i] = true
+			out.file(p).add(fc)
 		}
 	}
 	out.Format = strings.Join(formats, ",")
@@ -375,18 +393,32 @@ func MergeCoverage(covs ...*Coverage) *Coverage {
 
 // Lookup finds the report entry for a repo-relative path. Reports name files
 // by import path (Go), absolute runner path (LCOV) or source-relative path
-// (Cobertura), so the entry whose path shares the longest suffix wins; a tie
-// (e.g. two packages with util.go) is ambiguous and returns nil.
+// (Cobertura), so the entry whose path shares the longest suffix wins. It
+// returns nil when the report has no entry or the match is ambiguous; see
+// lookup.
 func (c *Coverage) Lookup(rel string) *FileCoverage {
+	fc, _ := c.lookup(rel)
+	return fc
+}
+
+// lookup is Lookup that also reports an ambiguous match. A tie on the
+// longest suffix is only ever between entries ending in "/"+rel. Entries of
+// one report are always different files (util.go in two packages, or
+// src/index.ts and packages/web/src/index.ts), so such a tie is ambiguous.
+// When each tied entry comes from a different report, it is the same file
+// uploaded by several CI jobs under different runner paths
+// (/home/runner/... and /Users/runner/...), and the entries are merged.
+func (c *Coverage) lookup(rel string) (fc *FileCoverage, ambiguous bool) {
 	if c == nil {
-		return nil
+		return nil, false
 	}
 	rel = path.Clean(strings.TrimPrefix(rel, "./"))
 	if fc, ok := c.Files[rel]; ok {
-		return fc
+		return fc, false
 	}
-	best, bestLen, tie := (*FileCoverage)(nil), 0, false
-	for p, fc := range c.Files {
+	var best []string
+	bestLen := 0
+	for p := range c.Files {
 		n := 0
 		switch {
 		case strings.HasSuffix(p, "/"+rel):
@@ -398,15 +430,51 @@ func (c *Coverage) Lookup(rel string) *FileCoverage {
 		}
 		switch {
 		case n > bestLen:
-			best, bestLen, tie = fc, n, false
+			best, bestLen = []string{p}, n
 		case n == bestLen:
-			tie = true
+			best = append(best, p)
 		}
 	}
-	if tie {
-		return nil
+	switch len(best) {
+	case 0:
+		return nil, false
+	case 1:
+		return c.Files[best[0]], false
 	}
-	return best
+	seen := map[int]bool{}
+	for _, p := range best {
+		for r := range c.reportsOf(p) {
+			if seen[r] {
+				return nil, true
+			}
+			seen[r] = true
+		}
+	}
+	sort.Strings(best)
+	merged := &FileCoverage{Lines: map[int]int{}}
+	for _, p := range best {
+		merged.add(c.Files[p])
+	}
+	return merged, false
+}
+
+// add folds src into fc: a line or function hit in either counts as hit.
+// Functions are matched by name and start line, so one listed by two
+// reports isn't reported as uncovered by the report that missed it, while
+// two same-named methods in one file stay apart.
+func (fc *FileCoverage) add(src *FileCoverage) {
+	for l, h := range src.Lines {
+		setMax(fc.Lines, l, h)
+	}
+	for _, f := range src.Funcs {
+		i := slices.IndexFunc(fc.Funcs, func(g FuncCoverage) bool { return g.Name == f.Name && g.Start == f.Start })
+		if i < 0 {
+			fc.Funcs = append(fc.Funcs, f)
+			continue
+		}
+		m := &fc.Funcs[i]
+		m.End, m.Hits = max(m.End, f.End), max(m.Hits, f.Hits)
+	}
 }
 
 // exts returns the file extensions the report covers.
@@ -466,6 +534,9 @@ type UncoveredFile struct {
 	// NotInReport is set for a file in a language the report covers that the
 	// report does not list at all (e.g. a Go package with no tests).
 	NotInReport bool `json:"not_in_report,omitempty"`
+	// Ambiguous is set when several report entries could be this file, so
+	// its coverage is unknown. It never blocks a merge.
+	Ambiguous bool `json:"ambiguous,omitempty"`
 }
 
 // FindUncovered checks each changed file against the report. src returns a
@@ -485,7 +556,11 @@ func FindUncovered(changed map[string][]int, cov *Coverage, src func(path string
 	var out []UncoveredFile
 	for _, p := range paths {
 		lines := changed[p]
-		fc := cov.Lookup(p)
+		fc, ambiguous := cov.lookup(p)
+		if ambiguous {
+			out = append(out, UncoveredFile{Path: p, Ambiguous: true})
+			continue
+		}
 		if fc == nil {
 			if exts[path.Ext(p)] {
 				out = append(out, UncoveredFile{Path: p, NotInReport: true})
