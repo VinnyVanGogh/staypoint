@@ -377,6 +377,10 @@ func TestMigrationGate_ExistenceCheckTimeoutFailsClosed(t *testing.T) {
 	if resp.StatusCode == http.StatusOK {
 		t.Fatalf("approve merged an unverified migration whose existence check timed out: %s", body)
 	}
+	// The migration gate must be what stops it, not the test gate's 409 untested.
+	if !strings.Contains(string(body), "could not check migration verification status") {
+		t.Fatalf("approve must be stopped by the migration gate, got %d %s", resp.StatusCode, body)
+	}
 }
 
 // An uncommitted removal of a migration in a task worktree must not hide a migration

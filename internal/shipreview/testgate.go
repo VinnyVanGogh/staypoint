@@ -40,7 +40,9 @@ func ChangeForGate(ctx context.Context, repoDir, headSHA string) ([]string, map[
 			return nil, nil, fmt.Errorf("no merge-base with main: %w", mainErr)
 		}
 	}
-	names, err := gitOutput(ctx, repoDir, "-c", "core.quotePath=false", "diff", "--name-only", "--no-renames", base, headSHA)
+	// A deleted file needs no new test, so it is not part of the change the
+	// gate checks (STA-791). With --no-renames a rename still lists its new path.
+	names, err := gitOutput(ctx, repoDir, "-c", "core.quotePath=false", "diff", "--name-only", "--no-renames", "--diff-filter=d", base, headSHA)
 	if err != nil {
 		return nil, nil, err
 	}
