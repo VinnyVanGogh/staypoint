@@ -181,12 +181,14 @@ func (h *ShipReviewHandler) StartDevGated(boardGate func(http.Handler) http.Hand
 		if !ok {
 			return
 		}
-		cfg, err := shipreview.GetProjectDevConfig(h.db, task.RepoPath)
+		// STA-767: LiveGateConfig matches the live row by directory, so a
+		// task repo_path aliasing a live repo is gated too.
+		_, gated, err := shipreview.LiveGateConfig(h.db, task.RepoPath)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
 			return
 		}
-		if cfg.LiveCredentials {
+		if gated {
 			live.ServeHTTP(w, r)
 			return
 		}
@@ -213,7 +215,7 @@ func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, err := shipreview.GetProjectDevConfig(h.db, task.RepoPath)
+	cfg, gated, err := shipreview.LiveGateConfig(h.db, task.RepoPath)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
 		return
@@ -221,7 +223,7 @@ func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 
 	// STA-727: every gate check happens before any side effect (config
 	// proposal, worktree, process), so a refused live start leaves no trace.
-	if cfg.LiveCredentials {
+	if gated {
 		if passed, _ := r.Context().Value(liveBoardGateKey{}).(bool); !passed {
 			writeBoardError(w, "board_session_required", "forbidden: starting a live_credentials dev server requires a Board session and passkey")
 			return
@@ -254,7 +256,10 @@ func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 	// Auto-detect Supabase project if no config exists yet.
 	if cfg.DevCommand == "" && shipreview.HasSupabaseConfig(task.RepoPath) {
 		proposed := shipreview.ProposeSupabaseDevConfig(task.RepoPath)
-		// The proposal replaces the whole row; keep the Board's settings.
+		// The proposal replaces the whole row; keep the Board's settings, and
+		// write the row already matched for this repo rather than an alias
+		// row keyed by task.RepoPath (STA-767).
+		proposed.RepoPath = cfg.RepoPath
 		proposed.LiveCredentials = cfg.LiveCredentials
 		proposed.MergeMode = cfg.MergeMode
 		proposed.GHConfigDir = cfg.GHConfigDir
