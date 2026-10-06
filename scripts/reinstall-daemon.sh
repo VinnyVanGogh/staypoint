@@ -139,16 +139,34 @@ sign() {
     fi
 }
 
+# Go stamps vcs.revision from the nearest enclosing .git *directory*. A
+# worktree's .git is a file, so a build in .worktrees/<name> was stamped with
+# the shared checkout's HEAD and dirty flag: the 245f42c build restored on
+# 2026-10-06 says vcs.revision=88792ec, vcs.modified=true. A clean tree is
+# built from a throwaway clone at HEAD so the stamp names the commit deployed.
+# A dirty tree (only with --allow-dev-build) has to be built in place.
+BUILD_DIR="$REPO"
+STAGED="$BINARY.staging"
+CLI_STAGED="$CLI_BINARY.staging"
+cleanup() {
+    rm -f "$STAGED" "$CLI_STAGED"
+    [ "$BUILD_DIR" = "$REPO" ] || rm -rf "$BUILD_DIR"
+}
+trap cleanup EXIT
+if [ "$DIRTY" = false ]; then
+    BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/staypoint-build.XXXXXX")"
+    git clone --quiet --shared --no-checkout "$REPO" "$BUILD_DIR"
+    git -C "$BUILD_DIR" checkout --quiet --detach "$FULL_SHA"
+fi
+
 # Build both binaries next to their install paths and move them into place
 # only after the checks below pass, so a refused build never replaces the
 # binary launchd restarts.
 mkdir -p "$(dirname "$BINARY")"
-STAGED="$BINARY.staging"
-CLI_STAGED="$CLI_BINARY.staging"
-trap 'rm -f "$STAGED" "$CLI_STAGED"' EXIT
-echo "→ Building staypointd from $REPO (commit: $BUILD_LABEL) ..."
-go build -ldflags "-X main.GitCommit=$BUILD_LABEL -X main.commit=$BUILD_LABEL -X main.DevBuild=$DEV_BUILD" \
-    -o "$STAGED" "$REPO/cmd/staypointd"
+echo "→ Building staypointd at $FULL_SHA (label: $BUILD_LABEL) ..."
+(cd "$BUILD_DIR" && go build \
+    -ldflags "-X main.GitCommit=$BUILD_LABEL -X main.commit=$BUILD_LABEL -X main.DevBuild=$DEV_BUILD" \
+    -o "$STAGED" ./cmd/staypointd)
 
 # The binary must say which commit it was built from. The 2026-10-06 build
 # reported git_commit "none"; refuse anything nobody could trace.
@@ -159,14 +177,18 @@ if [ -z "$VCS_REVISION" ]; then
         "Build from a git checkout, and check GOFLAGS for -buildvcs=false."
 fi
 if [ "$VCS_REVISION" != "$FULL_SHA" ]; then
-    refuse vcs-mismatch "the built binary has vcs.revision $VCS_REVISION but HEAD is $FULL_SHA."
+    if [ "$DIRTY" = false ]; then
+        refuse vcs-mismatch "the built binary has vcs.revision $VCS_REVISION but HEAD is $FULL_SHA."
+    fi
+    echo "  ! Dev build in place: Go stamped vcs.revision $VCS_REVISION (the enclosing checkout), not $FULL_SHA."
 fi
 sign com.staypoint.daemon "$STAGED"
 
 # Build the staypoint CLI alongside the daemon so the PreToolUse hook binary
 # (STAYPOINT_HOOK_BIN) is always at the same commit as the daemon (STA-525).
-echo "→ Building staypoint CLI from $REPO (commit: $BUILD_LABEL) ..."
-go build -ldflags "-X main.GitCommit=$BUILD_LABEL -X main.commit=$BUILD_LABEL" -o "$CLI_STAGED" "$REPO/cmd/staypoint"
+echo "→ Building staypoint CLI at $FULL_SHA (label: $BUILD_LABEL) ..."
+(cd "$BUILD_DIR" && go build -ldflags "-X main.GitCommit=$BUILD_LABEL -X main.commit=$BUILD_LABEL" \
+    -o "$CLI_STAGED" ./cmd/staypoint)
 sign com.staypoint.cli "$CLI_STAGED"
 
 mv -f "$STAGED" "$BINARY"

@@ -5,7 +5,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"strings"
 	"testing"
 )
@@ -14,6 +13,9 @@ import (
 // repo with a throwaway HOME. go, codesign, launchctl and curl are stubs on
 // PATH, so nothing is built, signed or loaded into launchd.
 
+// The go stub stamps vcs.revision the way Go does: from the nearest enclosing
+// .git *directory*, ignoring a worktree's .git file. STUB_VCS_REV overrides
+// the stamp; STUB_NO_VCS leaves it out.
 const stubGo = `#!/bin/sh
 case "$1" in
 build)
@@ -25,12 +27,19 @@ build)
         esac
         shift
     done
-    printf '#!/bin/sh\nexit 0\n' > "$out"
+    d="$PWD"
+    while [ "$d" != / ] && [ ! -d "$d/.git" ]; do d="$(dirname "$d")"; done
+    rev=""
+    [ -d "$d/.git" ] && rev="$(git -C "$d" rev-parse HEAD)"
+    [ -n "$STUB_VCS_REV" ] && rev="$STUB_VCS_REV"
+    [ -n "$STUB_NO_VCS" ] && rev=""
+    printf '#!/bin/sh\n#rev=%s\nexit 0\n' "$rev" > "$out"
     chmod +x "$out"
-    echo "$out" >> "$STUB_STATE/built" ;;
+    echo "$PWD" >> "$STUB_STATE/built" ;;
 version)
     printf '%s: go1.25\n' "$3"
-    [ -n "$STUB_NO_VCS" ] || printf '\tbuild\tvcs.revision=%s\n' "$(git rev-parse HEAD)" ;;
+    rev="$(sed -n 's/^#rev=//p' "$3")"
+    [ -z "$rev" ] || printf '\tbuild\tvcs.revision=%s\n' "$rev" ;;
 esac
 `
 
@@ -145,9 +154,14 @@ func (f *deployFixture) git(dir string, args ...string) string {
 
 // run executes the script and returns its combined output and exit code.
 func (f *deployFixture) run(extraEnv []string, args ...string) (string, int) {
+	return f.runIn(f.repo, extraEnv, args...)
+}
+
+// runIn runs the copy of the script checked out in dir.
+func (f *deployFixture) runIn(dir string, extraEnv []string, args ...string) (string, int) {
 	f.t.Helper()
-	cmd := exec.Command("bash", append([]string{filepath.Join(f.repo, "scripts", "reinstall-daemon.sh")}, args...)...)
-	cmd.Dir = f.repo
+	cmd := exec.Command("bash", append([]string{filepath.Join(dir, "scripts", "reinstall-daemon.sh")}, args...)...)
+	cmd.Dir = dir
 	cmd.Env = append(append([]string{}, f.env...), extraEnv...)
 	out, err := cmd.CombinedOutput()
 	code := 0
@@ -295,6 +309,45 @@ func TestReinstallScript_RefusesBinaryWithoutVCSRevision(t *testing.T) {
 	}
 }
 
+func TestReinstallScript_RefusesBinaryWithWrongVCSRevision(t *testing.T) {
+	f := newDeployFixture(t)
+	f.seedLiveBinary()
+	out, code := f.run([]string{"STUB_VCS_REV=0123456789abcdef0123456789abcdef01234567"})
+	f.assertRefused(out, code, "vcs-mismatch", "but HEAD is")
+}
+
+// A worktree nested in the shared checkout (.worktrees/deploy-main) must
+// deploy with its own commit stamped, even when the shared checkout is dirty
+// and at another commit. Go would stamp the shared checkout's HEAD for an
+// in-place build, which is what made the restored 245f42c daemon report
+// vcs.revision=88792ec, vcs.modified=true.
+func TestReinstallScript_NestedWorktreeStampsItsOwnCommit(t *testing.T) {
+	f := newDeployFixture(t)
+	deploy := filepath.Join(f.repo, ".worktrees", "deploy-main")
+	f.git(f.repo, "worktree", "add", "-q", "--detach", deploy, "main")
+	want := f.git(deploy, "rev-parse", "HEAD")
+	writeExec(t, filepath.Join(f.repo, "main.go"), "package main // newer\n")
+	f.git(f.repo, "commit", "-q", "-am", "newer main")
+	f.git(f.repo, "push", "-q", "origin", "main")
+	writeExec(t, filepath.Join(f.repo, "patch.go"), "package main\n") // shared checkout now dirty
+
+	out, code := f.runIn(deploy, nil)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0\n%s", code, out)
+	}
+	if got := f.installedBinary(); !strings.Contains(got, "#rev="+want) {
+		t.Errorf("installed binary stamped %q, want vcs.revision %s", got, want)
+	}
+	for _, dir := range strings.Fields(f.read(filepath.Join(f.state, "built"))) {
+		if strings.HasPrefix(dir, f.repo) {
+			t.Errorf("built inside the shared checkout (%s), so Go would stamp its HEAD", dir)
+		}
+	}
+	if log := f.deployLog(); !strings.Contains(log, "sha="+want) || !strings.Contains(log, "result=installed") {
+		t.Errorf("deploys.log does not record the install of %s:\n%s", want, log)
+	}
+}
+
 func TestReinstallScript_RejectsUnknownArgument(t *testing.T) {
 	f := newDeployFixture(t)
 	out, code := f.run(nil, "--allow-devbuild")
@@ -304,25 +357,15 @@ func TestReinstallScript_RejectsUnknownArgument(t *testing.T) {
 }
 
 func TestDevBuildReasonFrom(t *testing.T) {
-	modified := &debug.BuildInfo{Settings: []debug.BuildSetting{
-		{Key: "vcs.revision", Value: "abc"}, {Key: "vcs.modified", Value: "true"},
-	}}
-	clean := &debug.BuildInfo{Settings: []debug.BuildSetting{
-		{Key: "vcs.revision", Value: "abc"}, {Key: "vcs.modified", Value: "false"},
-	}}
 	cases := []struct {
-		name string
-		flag string
-		info *debug.BuildInfo
-		want string
+		name, flag, commit, want string
 	}{
-		{"flag", "true", clean, "deployed with --allow-dev-build"},
-		{"dirty tree without the script", "false", modified, "built from a tree with uncommitted changes"},
-		{"clean main build", "false", clean, ""},
-		{"no build info", "false", nil, ""},
+		{"flag", "true", "245f42c", "deployed with --allow-dev-build"},
+		{"raw go build (the 2026-10-06 binary)", "false", "none", "not built by reinstall-daemon.sh: no commit stamped"},
+		{"script main build", "false", "245f42c", ""},
 	}
 	for _, c := range cases {
-		if got := devBuildReasonFrom(c.flag, c.info); got != c.want {
+		if got := devBuildReasonFrom(c.flag, c.commit); got != c.want {
 			t.Errorf("%s: devBuildReasonFrom = %q, want %q", c.name, got, c.want)
 		}
 	}

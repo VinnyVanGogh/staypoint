@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -39,23 +38,19 @@ var (
 )
 
 // devBuildReason says why this binary is not a reviewed main build, or ""
-// when it is. Besides the --allow-dev-build flag it checks the VCS stamp, so a
-// binary built from a dirty tree without the script is still flagged (STA-805).
+// when it is (STA-805). Go's vcs.modified is not used: Go reads it from the
+// nearest .git directory, so a build in a worktree nested in a dirty checkout
+// reports the checkout's state, not its own.
 func devBuildReason() string {
-	info, _ := debug.ReadBuildInfo()
-	return devBuildReasonFrom(DevBuild, info)
+	return devBuildReasonFrom(DevBuild, GitCommit)
 }
 
-func devBuildReasonFrom(flag string, info *debug.BuildInfo) string {
+func devBuildReasonFrom(flag, gitCommit string) string {
 	if flag == "true" {
 		return "deployed with --allow-dev-build"
 	}
-	if info != nil {
-		for _, s := range info.Settings {
-			if s.Key == "vcs.modified" && s.Value == "true" {
-				return "built from a tree with uncommitted changes"
-			}
-		}
+	if gitCommit == "" || gitCommit == "none" {
+		return "not built by reinstall-daemon.sh: no commit stamped"
 	}
 	return ""
 }

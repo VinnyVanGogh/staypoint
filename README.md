@@ -317,6 +317,8 @@ codesign -s "<identity>" -f --timestamp=none -i com.staypoint.daemon ~/.local/bi
 # Or just run: scripts/reinstall-daemon.sh
 ```
 
+`scripts/reinstall-daemon.sh` refuses to deploy a tree with uncommitted changes (untracked files included) or a HEAD that is not on `origin/main`, and refuses a binary with no `vcs.revision`. Deploy from a clean checkout of `origin/main`, such as a dedicated worktree. `--allow-dev-build` deploys anyway, prints a banner, and makes the daemon report `dev_build: true` in `/api/health` and a DEV BUILD badge in the web UI header. A daemon built with plain `go build` reports `dev_build: true` too. Every install and refused install is logged to `~/.staypoint/deploys.log`.
+
 Verify the installation:
 
 ```bash

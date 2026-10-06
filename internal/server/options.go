@@ -75,8 +75,8 @@ type Options struct {
 	GitCommit string
 
 	// DevBuildReason is non-empty when the running binary is not a reviewed
-	// main build (deployed with --allow-dev-build, or built from a tree with
-	// uncommitted changes). /api/health reports dev_build and this reason, and
+	// main build (deployed with --allow-dev-build, or built without the
+	// deploy script so no commit is stamped). /api/health reports dev_build and this reason, and
 	// the web UI header shows a DEV BUILD badge (STA-805).
 	DevBuildReason string
 
