@@ -152,3 +152,51 @@ func createAliasShipTask(t *testing.T, e *liveShipEnv, alias string) string {
 	}
 	return task.ID
 }
+
+// STA-798: a Board-confirmed start-dev for a task whose repo_path is a symlink
+// to a live Supabase repo with no dev_command auto-proposes a config. The
+// proposal must update the live row it matched, keyed by the live repo's own
+// path, not add a second row keyed by the alias.
+func TestShipReviewLive_AliasSupabaseAutoProposeKeepsLiveRowKey(t *testing.T) {
+	e := newLiveShipEnv(t)
+	e.putDevConfig(t, map[string]any{"live_credentials": true})
+	// supabase/config.toml but no package.json: the proposal has an empty
+	// dev_command, so start-dev ends in 409 after the upsert and never starts
+	// a dev server.
+	if err := os.MkdirAll(filepath.Join(e.repoDir, "supabase"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(e.repoDir, "supabase", "config.toml"), []byte("project_id = \"live\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	link := filepath.Join(t.TempDir(), "live-link")
+	if err := os.Symlink(e.repoDir, link); err != nil {
+		t.Fatal(err)
+	}
+	aliasTaskID := createAliasShipTask(t, e, link)
+
+	startURL := e.baseURL + "/api/tasks/" + aliasTaskID + "/ship-review/start-dev"
+	resp, rb := shipDoReq(t, e.client, e.token, "POST", startURL, []byte(`{"confirm_live":true}`), e.board, "", "mock-assertion")
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("confirmed Board start-dev via symlink: want 409 (proposal has no dev_command), got %d %s", resp.StatusCode, rb)
+	}
+	if n := len(boardAuditRows(t, e.db, "live_dev_start_confirmed")); n != 1 {
+		t.Fatalf("want 1 live_dev_start_confirmed audit row (the Board gate ran), got %d", n)
+	}
+
+	cfgs, err := shipreview.ListProjectDevConfigs(e.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfgs) != 1 || cfgs[0].RepoPath != e.repoDir {
+		keys := make([]string, len(cfgs))
+		for i, c := range cfgs {
+			keys[i] = c.RepoPath
+		}
+		t.Fatalf("dev config rows after auto-propose via symlink = %q, want exactly [%q]", keys, e.repoDir)
+	}
+	if !cfgs[0].SupabaseEnabled || !cfgs[0].LiveCredentials {
+		t.Errorf("live row after auto-propose: supabase_enabled=%v live_credentials=%v, want the proposal written with the live flag kept", cfgs[0].SupabaseEnabled, cfgs[0].LiveCredentials)
+	}
+}
