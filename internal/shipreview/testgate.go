@@ -27,18 +27,18 @@ func ChangeForGate(ctx context.Context, repoDir, headSHA string) ([]string, map[
 	if repoDir == "" || headSHA == "" {
 		return nil, nil, errors.New("card has no repo or head")
 	}
-	base := ""
-	var lastErr error
-	for _, target := range []string{"main", "master"} {
-		out, err := gitOutput(ctx, repoDir, "merge-base", target, headSHA)
-		if err == nil && out != "" {
+	// Report main's error: master is only a fallback, and its "unknown
+	// revision" would hide why main failed (e.g. a git timeout).
+	base, mainErr := gitOutput(ctx, repoDir, "merge-base", "main", headSHA)
+	if mainErr != nil || base == "" {
+		if out, err := gitOutput(ctx, repoDir, "merge-base", "master", headSHA); err == nil && out != "" {
 			base = out
-			break
+		} else {
+			if mainErr == nil {
+				mainErr = errors.New("empty merge-base")
+			}
+			return nil, nil, fmt.Errorf("no merge-base with main: %w", mainErr)
 		}
-		lastErr = err
-	}
-	if base == "" {
-		return nil, nil, fmt.Errorf("no merge-base with main: %v", lastErr)
 	}
 	names, err := gitOutput(ctx, repoDir, "-c", "core.quotePath=false", "diff", "--name-only", "--no-renames", base, headSHA)
 	if err != nil {
