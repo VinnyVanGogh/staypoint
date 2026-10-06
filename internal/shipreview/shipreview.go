@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -1378,7 +1379,8 @@ const (
 // LiveGateLiveCredentials when the project is live_credentials, else
 // LiveGateUnverifiedPath when repoPath cannot be compared with a live project
 // (repoPath cannot be stat'ed, or the live project's path fails to stat for a
-// reason other than not existing).
+// reason other than not existing, or either stat is still running after
+// devConfigStatTimeout). It fails closed.
 func LiveGate(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, reason string, err error) {
 	cfg, unverified, err := lookupDevConfig(db, repoPath)
 	if err != nil {
@@ -1431,41 +1433,234 @@ func scanDevConfig(rows *sql.Rows) (*ProjectDevConfig, error) {
 var statPath = os.Stat
 
 // devConfigStatTimeout bounds how long lookupDevConfig waits for the stats it
-// needs to compare repo paths.
+// needs to compare repo paths (STA-801). A stat can block indefinitely, e.g. on
+// a ~/Documents folder behind a pending macOS TCC prompt (STA-685).
 var devConfigStatTimeout = 2 * time.Second
+
+// errStatTimeout is the result of a stat still running at its deadline.
+var errStatTimeout = errors.New("stat timed out")
+
+// devConfigStats holds the stats in flight, by path. A lookup joins a stat of
+// the same path that is still running instead of starting another, so a path
+// whose stat never returns ties up one goroutine, not one per lookup.
+var devConfigStats = struct {
+	sync.Mutex
+	inflight map[string]*pathStat
+}{inflight: map[string]*pathStat{}}
+
+type pathStat struct {
+	deadline time.Time
+	done     chan struct{}
+	info     os.FileInfo
+	err      error
+}
+
+type statResult struct {
+	info os.FileInfo
+	err  error
+}
+
+// sharedStat stats path, or joins a stat of path already in flight. The
+// deadline runs from when that stat started, so once a hung stat is overdue,
+// later lookups get errStatTimeout at once instead of waiting on it again.
+func sharedStat(stat func(string) (os.FileInfo, error), timeout time.Duration, path string) statResult {
+	devConfigStats.Lock()
+	if s, ok := devConfigStats.inflight[path]; ok {
+		devConfigStats.Unlock()
+		return s.wait()
+	}
+	s := &pathStat{deadline: time.Now().Add(timeout), done: make(chan struct{})}
+	devConfigStats.inflight[path] = s
+	devConfigStats.Unlock()
+
+	s.info, s.err = stat(path)
+	devConfigStats.Lock()
+	delete(devConfigStats.inflight, path)
+	devConfigStats.Unlock()
+	close(s.done)
+	return statResult{s.info, s.err}
+}
+
+// wait returns the stat's result, or errStatTimeout if it is still running at
+// its deadline.
+func (s *pathStat) wait() statResult {
+	t := time.NewTimer(time.Until(s.deadline))
+	defer t.Stop()
+	select {
+	case <-s.done:
+	case <-t.C:
+		select {
+		case <-s.done:
+		default:
+			return statResult{err: errStatTimeout}
+		}
+	}
+	return statResult{s.info, s.err}
+}
+
+// devConfigStatTTL is how long lookups reuse a stat that succeeded or found
+// nothing. Lookups come in bursts (one card render reaches several handlers),
+// and a fresh result skips the background stat entirely. Errors and timeouts
+// are never reused, so a path that failed is retried on the next lookup.
+var devConfigStatTTL = time.Second
+
+var devConfigStatCache = struct {
+	sync.Mutex
+	m map[string]cachedStat
+}{m: map[string]cachedStat{}}
+
+type cachedStat struct {
+	statResult
+	at time.Time
+}
+
+// statPaths stats each of paths (no duplicates) and returns the results by
+// path. A path still unresolved after devConfigStatTimeout gets errStatTimeout.
+//
+// One goroutine stats the paths in order, which costs the same as stat'ing
+// them inline; a goroutine per path measured ~30% slower. If that goroutine
+// makes no progress for a tenth of the timeout, another one takes over the
+// rest of the queue, so a path whose stat blocks holds up only itself.
+func statPaths(paths []string) map[string]statResult {
+	stat, timeout, ttl := statPath, devConfigStatTimeout, devConfigStatTTL
+	start := time.Now()
+	out := make(map[string]statResult, len(paths))
+	var misses []string
+	devConfigStatCache.Lock()
+	for _, p := range paths {
+		if c, ok := devConfigStatCache.m[p]; ok && start.Sub(c.at) < ttl {
+			out[p] = c.statResult
+		} else {
+			misses = append(misses, p)
+		}
+	}
+	devConfigStatCache.Unlock()
+	if len(misses) == 0 {
+		return out
+	}
+
+	type indexed struct {
+		i int
+		statResult
+	}
+	// Room for every path, so a worker that unblocks after we return never
+	// blocks on the send. We only wake when all are in, on a stall check, or
+	// at the deadline, not once per path.
+	results := make(chan indexed, len(misses))
+	allDone := make(chan struct{})
+	var next, completed atomic.Int64
+	work := func() {
+		for {
+			i := int(next.Add(1) - 1)
+			if i >= len(misses) {
+				return
+			}
+			results <- indexed{i, sharedStat(stat, timeout, misses[i])}
+			if completed.Add(1) == int64(len(misses)) {
+				close(allDone)
+			}
+		}
+	}
+	go work()
+
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	stall := time.NewTicker(timeout / 10)
+	defer stall.Stop()
+	var seen int64
+wait:
+	for {
+		select {
+		case <-allDone:
+			break wait
+		case <-stall.C:
+			if n := completed.Load(); n == seen {
+				go work()
+			} else {
+				seen = n
+			}
+		case <-deadline.C:
+			break wait
+		}
+	}
+
+	devConfigStatCache.Lock()
+	defer devConfigStatCache.Unlock()
+	if len(devConfigStatCache.m) > 256 {
+		for p, c := range devConfigStatCache.m {
+			if start.Sub(c.at) >= ttl {
+				delete(devConfigStatCache.m, p)
+			}
+		}
+	}
+	for {
+		select {
+		case r := <-results:
+			out[misses[r.i]] = r.statResult
+			if r.err == nil || errors.Is(r.err, os.ErrNotExist) {
+				// Stamped with when this lookup began, not when the stat
+				// returned, so the entry never outlives the TTL.
+				devConfigStatCache.m[misses[r.i]] = cachedStat{r.statResult, start}
+			}
+			continue
+		default:
+		}
+		break
+	}
+	for _, p := range misses {
+		if _, ok := out[p]; !ok {
+			out[p] = statResult{err: errStatTimeout}
+		}
+	}
+	return out
+}
 
 // lookupDevConfig returns the row for repoPath's directory (see
 // GetProjectDevConfig). unverified is true when that directory could not be
 // compared with every live row; LiveGateConfig gates on it.
 func lookupDevConfig(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, unverified bool, err error) {
-	rows, err := db.Query(`SELECT ` + devConfigColumns + ` FROM project_dev_configs`)
+	configs, err := loadDevConfigs(db)
 	if err != nil {
 		return nil, false, err
 	}
-	defer rows.Close()
 
 	want := filepath.Clean(repoPath)
-	wantInfo, _ := statPath(repoPath)
+	sameString := func(c *ProjectDevConfig) bool {
+		return c.RepoPath == repoPath || filepath.Clean(c.RepoPath) == want
+	}
+	// Stat repoPath and every row it does not match by string, bounded by
+	// devConfigStatTimeout however many of them hang.
+	paths := []string{repoPath}
+	queued := map[string]bool{repoPath: true}
+	for _, c := range configs {
+		if !sameString(c) && !queued[c.RepoPath] {
+			queued[c.RepoPath] = true
+			paths = append(paths, c.RepoPath)
+		}
+	}
+	var stats map[string]statResult
+	var wantInfo os.FileInfo
+	if len(paths) > 1 {
+		stats = statPaths(paths)
+		wantInfo = stats[repoPath].info
+	}
 
 	var exact, alias, live *ProjectDevConfig
-	for rows.Next() {
-		c, err := scanDevConfig(rows)
-		if err != nil {
-			return nil, false, err
-		}
-		same := c.RepoPath == repoPath || filepath.Clean(c.RepoPath) == want
+	for _, c := range configs {
+		same := sameString(c)
 		if !same && wantInfo == nil && c.LiveCredentials {
 			// repoPath cannot be stat'ed, so it cannot be ruled out as an
 			// alias of this live repo.
 			unverified = true
 		}
 		if !same && wantInfo != nil {
-			info, err := statPath(c.RepoPath)
+			info, err := stats[c.RepoPath].info, stats[c.RepoPath].err
 			switch {
 			case err == nil:
 				same = os.SameFile(wantInfo, info)
 			case c.LiveCredentials && !errors.Is(err, os.ErrNotExist):
-				// A live repo we cannot stat could be repoPath itself.
+				// A live repo we cannot stat (in time) could be repoPath
+				// itself. A non-live one is skipped.
 				unverified = true
 			}
 		}
@@ -1482,15 +1677,31 @@ func lookupDevConfig(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, unveri
 			live = c
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return nil, false, err
-	}
 	for _, c := range []*ProjectDevConfig{live, exact, alias} {
 		if c != nil {
 			return c, unverified, nil
 		}
 	}
 	return &ProjectDevConfig{RepoPath: repoPath}, unverified, nil
+}
+
+// loadDevConfigs reads every dev config row. It returns before any stat runs,
+// so a slow stat never holds a database connection.
+func loadDevConfigs(db *sql.DB) ([]*ProjectDevConfig, error) {
+	rows, err := db.Query(`SELECT ` + devConfigColumns + ` FROM project_dev_configs`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var configs []*ProjectDevConfig
+	for rows.Next() {
+		c, err := scanDevConfig(rows)
+		if err != nil {
+			return nil, err
+		}
+		configs = append(configs, c)
+	}
+	return configs, rows.Err()
 }
 
 // devExecer is satisfied by both *sql.DB and *sql.Tx.

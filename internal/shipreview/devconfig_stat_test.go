@@ -130,9 +130,128 @@ func TestLookupDevConfig_HungStatIsBounded(t *testing.T) {
 	}
 }
 
+// STA-801: once a hung stat is past its deadline, later lookups treat it as
+// timed out straight away instead of each waiting the full deadline again.
+func TestLookupDevConfig_OverdueStatNotRewaited(t *testing.T) {
+	const deadline = 500 * time.Millisecond
+
+	db := openTestDB(t)
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hungLive := filepath.Join(base, "hung-live")
+	release := make(chan struct{})
+	shipreview.SetDevConfigStatForTest(t, func(p string) (os.FileInfo, error) {
+		if p == hungLive {
+			<-release
+			return nil, os.ErrPermission
+		}
+		return os.Stat(p)
+	}, deadline)
+	t.Cleanup(func() { close(release) })
+	for _, cfg := range []*shipreview.ProjectDevConfig{{RepoPath: repo}, {RepoPath: hungLive, LiveCredentials: true}} {
+		if err := shipreview.UpsertProjectDevConfig(db, cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	timed := func() time.Duration {
+		t.Helper()
+		start := time.Now()
+		if _, gated, err := shipreview.LiveGateConfig(db, repo); err != nil || !gated {
+			t.Fatalf("LiveGateConfig(repo) gated=%v err=%v, want true, nil", gated, err)
+		}
+		return time.Since(start)
+	}
+	if d := timed(); d < deadline {
+		t.Fatalf("first lookup returned in %v, before the %v deadline", d, deadline)
+	}
+	if d := timed(); d > deadline/2 {
+		t.Errorf("second lookup took %v; an overdue stat should not be waited on again", d)
+	}
+}
+
+// STA-801: lookups within devConfigStatTTL reuse a stat that succeeded, but
+// never one that failed: a live row whose stat errored is stat'ed again, and
+// gates only while it keeps failing.
+func TestLookupDevConfig_StatReuse(t *testing.T) {
+	db := openTestDB(t)
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	live := filepath.Join(base, "live")
+	for _, d := range []string{repo, live} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mu sync.Mutex
+	calls := map[string]int{}
+	liveErr := os.ErrPermission
+	shipreview.SetDevConfigStatForTest(t, func(p string) (os.FileInfo, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls[p]++
+		if p == live && liveErr != nil {
+			return nil, liveErr
+		}
+		return os.Stat(p)
+	}, 2*time.Second)
+	shipreview.SetDevConfigStatTTLForTest(t, time.Hour)
+	for _, cfg := range []*shipreview.ProjectDevConfig{{RepoPath: repo}, {RepoPath: live, LiveCredentials: true}} {
+		if err := shipreview.UpsertProjectDevConfig(db, cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gate := func() bool {
+		t.Helper()
+		_, gated, err := shipreview.LiveGateConfig(db, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return gated
+	}
+
+	if !gate() || !gate() {
+		t.Fatal("live row stat failing: want gated")
+	}
+	mu.Lock()
+	if calls[live] != 2 {
+		t.Errorf("failed stat of live row reused: %d stats over 2 lookups, want 2", calls[live])
+	}
+	if calls[repo] != 1 {
+		t.Errorf("successful stat of repo not reused: %d stats over 2 lookups, want 1", calls[repo])
+	}
+	liveErr = nil
+	mu.Unlock()
+
+	if gate() {
+		t.Error("live row stat recovered: still gated, want the error not reused")
+	}
+	if gate() {
+		t.Error("live row stat recovered: gated on the reused result")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls[live] != 3 {
+		t.Errorf("live row stat'ed %d times, want 3 (two failures, then one success reused)", calls[live])
+	}
+}
+
 // BenchmarkLookupDevConfig measures a lookup with ten configured repos, none
-// hung, which is the normal case STA-801 must not slow down.
+// hung, which is the normal case STA-801 must not slow down. Repeated lookups
+// reuse fresh stat results; BenchmarkLookupDevConfigUncached stats every time.
 func BenchmarkLookupDevConfig(b *testing.B) {
+	benchLookupDevConfig(b)
+}
+
+func BenchmarkLookupDevConfigUncached(b *testing.B) {
+	shipreview.SetDevConfigStatTTLForTest(b, 0)
+	benchLookupDevConfig(b)
+}
+
+func benchLookupDevConfig(b *testing.B) {
 	db := openTestDB(b)
 	base := b.TempDir()
 	var repos []string
