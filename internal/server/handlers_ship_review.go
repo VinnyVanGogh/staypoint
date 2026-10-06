@@ -328,7 +328,7 @@ func migrationFileExistsAtTask(ctx gocontext.Context, task *context.Task, workDi
 	// An uncommitted deletion in the worktree must not hide a migration that
 	// the branch still ships.
 	branch := "staypoint/" + task.ID
-	cmd := gitexec.Command(ctx, "ls-tree", "-z", "--name-only", branch, "--", filepath.ToSlash(relPath))
+	cmd := gitexec.Command(ctx, "ls-tree", "--full-tree", "-z", "--name-only", branch, "--", filepath.ToSlash(relPath))
 	cmd.Dir = task.RepoPath
 	cmd.Env = security.ChildEnv()
 	out, err := cmd.Output()

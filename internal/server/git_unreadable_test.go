@@ -430,3 +430,34 @@ func TestMigrationGate_UncommittedWorktreeRemovalDoesNotBypassGate(t *testing.T)
 		t.Fatalf("Approve: %d %s, want 409 unverified_migrations", resp.StatusCode, body)
 	}
 }
+
+// STA-755: When repo_path is a subdirectory, migrationFileExistsAtTask must not fail open
+// by running ls-tree without --full-tree (which treats the root-relative migration path as deleted).
+func TestMigrationGate_RepoSubdirMigrationOnBranchBlocksApprove(t *testing.T) {
+	database, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	sub := filepath.Join(repoDir, "sub")
+	gitOut(t, repoDir, "update-ref", "refs/staypoint/checkpoints/latest", "main")
+	gitOut(t, repoDir, "checkout", "staypoint/"+taskID)
+	if err := os.MkdirAll(filepath.Join(repoDir, "migrations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "migrations", "001_add.sql"), []byte("ALTER TABLE t ADD COLUMN c TEXT;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repoDir, "add", ".")
+	gitOut(t, repoDir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "task: add migration")
+	gitOut(t, repoDir, "checkout", "main")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE tasks SET repo_path = ? WHERE id = ?`, sub, taskID); err != nil {
+		t.Fatal(err)
+	}
+	ub, _ := json.Marshal(map[string]any{"test_steps": []string{"1. Open /"}})
+	shipDoReq(t, client, token, "PUT", baseURL+"/api/tasks/"+taskID+"/ship-review", ub)
+	resp, body := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", nil, boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "unverified_migrations") {
+		t.Fatalf("Approve: %d %s, want 409 unverified_migrations", resp.StatusCode, body)
+	}
+}
+
