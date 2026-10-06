@@ -227,7 +227,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		shipH := NewShipReviewHandler(s.opts.DB, s.hub)
 		mux.HandleFunc("GET /api/tasks/{id}/ship-review", shipH.GetCard)
 		mux.HandleFunc("PUT /api/tasks/{id}/ship-review", shipH.UpsertCard)
-		mux.HandleFunc("POST /api/tasks/{id}/ship-review/start-dev", shipH.StartDev)
+		// live_credentials projects need the Board session + passkey (STA-727); others stay agent-callable.
+		mux.Handle("POST /api/tasks/{id}/ship-review/start-dev", shipH.StartDevGated(s.secMid.WrapBoardAction))
 		mux.HandleFunc("POST /api/tasks/{id}/ship-review/stop-dev", shipH.StopDev)
 		// Board-only: these three actions merge / reject / revise the branch — agents cannot call them.
 		mux.Handle("POST /api/tasks/{id}/ship-review/approve", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.Approve)))

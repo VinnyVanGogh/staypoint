@@ -324,7 +324,7 @@ func (m *procManager) kill(taskID string) {
 	delete(m.worktrees, taskID)
 	m.mu.Unlock()
 	if ok && p != nil {
-		_ = p.Kill()
+		killDevProcessGroup(p)
 	}
 	if wtPath != "" {
 		removeDevWorktree(repoPath, wtPath)
@@ -810,6 +810,7 @@ func startDevServerSync(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath 
 	emit("server", "Starting dev server…", true)
 	cmd := exec.Command("/bin/sh", "-c", cfg.DevCommand) //nolint:gosec
 	cmd.Dir = wtPath
+	startDevInOwnGroup(cmd)
 	// Strip inherited VITE_* and SUPABASE_* vars: process env beats every .env
 	// file in Vite, so an inherited VITE_SUPABASE_URL would route to production
 	// even when .env.local points at localhost.
@@ -827,7 +828,7 @@ func startDevServerSync(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath 
 	}
 
 	if !devServerManager.storeIfActive(card.TaskID, setup, cmd.Process, repoPath, wtPath) {
-		_ = cmd.Process.Kill()
+		killDevProcessGroup(cmd.Process)
 		_ = cmd.Wait()
 		removeDevWorktree(repoPath, wtPath)
 		return ErrDevSetupCanceled
@@ -927,8 +928,10 @@ func BuildAndStartCard(ctx context.Context, db *sql.DB, taskID, repoPath string,
 	// Auto-detection of Supabase projects is handled in the board-facing StartDev
 	// HTTP endpoint (after the board user explicitly clicks Start), not here —
 	// BuildAndStartCard is agent-reachable and must not silently run dev commands.
+	// A live_credentials project is never auto-started: its previews hit
+	// production, so only a confirmed Board start-dev may run it (STA-727).
 	cfg, _ := GetProjectDevConfig(db, repoPath)
-	if cfg != nil && cfg.DevCommand != "" {
+	if cfg != nil && cfg.DevCommand != "" && !cfg.LiveCredentials {
 		if startedURL, startErr := StartDevServer(db, card, cfg, repoPath); startErr == nil && startedURL != "" && card.DevURL == "" {
 			card.DevURL = startedURL
 			_ = SetDevURL(db, card.ID, startedURL)
@@ -1319,20 +1322,25 @@ type ProjectDevConfig struct {
 	// calls. Work repos must set it in the PR modes so the personal gh login
 	// is never used on them.
 	GHConfigDir string `json:"gh_config_dir"`
+	// LiveCredentials marks a project whose previews run against production
+	// credentials (STA-727). Set only through the Board-gated PUT. Starting
+	// its dev server needs the Board passkey plus an explicit confirm, and
+	// BuildAndStartCard never auto-starts it.
+	LiveCredentials bool `json:"live_credentials"`
 }
 
 // GetProjectDevConfig loads the dev config for a repo path, or returns defaults.
 func GetProjectDevConfig(db *sql.DB, repoPath string) (*ProjectDevConfig, error) {
 	var stepsJSON, devCommand, devURL, migGlobsJSON, sqlEditorURL, mergeMode, ghConfigDir string
-	var supabaseEnabled, supabaseKeepUp int
+	var supabaseEnabled, supabaseKeepUp, liveCredentials int
 	err := db.QueryRow(
 		`SELECT dev_command, dev_url, setup_steps_json,
 		        COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
 		        COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0),
-		        COALESCE(merge_mode,''), COALESCE(gh_config_dir,'')
+		        COALESCE(merge_mode,''), COALESCE(gh_config_dir,''), COALESCE(live_credentials,0)
 		 FROM project_dev_configs WHERE repo_path = ?`,
 		repoPath,
-	).Scan(&devCommand, &devURL, &stepsJSON, &migGlobsJSON, &sqlEditorURL, &supabaseEnabled, &supabaseKeepUp, &mergeMode, &ghConfigDir)
+	).Scan(&devCommand, &devURL, &stepsJSON, &migGlobsJSON, &sqlEditorURL, &supabaseEnabled, &supabaseKeepUp, &mergeMode, &ghConfigDir, &liveCredentials)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return &ProjectDevConfig{RepoPath: repoPath}, nil
@@ -1348,6 +1356,7 @@ func GetProjectDevConfig(db *sql.DB, repoPath string) (*ProjectDevConfig, error)
 		SupabaseKeepUp:  supabaseKeepUp != 0,
 		MergeMode:       mergeMode,
 		GHConfigDir:     ghConfigDir,
+		LiveCredentials: liveCredentials != 0,
 	}
 	if err := json.Unmarshal([]byte(stepsJSON), &cfg.SetupSteps); err != nil {
 		cfg.SetupSteps = []string{}
@@ -1390,11 +1399,15 @@ func upsertDevConfig(exec devExecer, cfg *ProjectDevConfig) error {
 	if cfg.SupabaseKeepUp {
 		supabaseKeepUp = 1
 	}
+	liveCredentials := 0
+	if cfg.LiveCredentials {
+		liveCredentials = 1
+	}
 	_, err = exec.Exec(`
 		INSERT INTO project_dev_configs
 			(repo_path, dev_command, dev_url, setup_steps_json, migration_globs_json,
-			 sql_editor_url, supabase_enabled, supabase_keep_up, merge_mode, gh_config_dir, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			 sql_editor_url, supabase_enabled, supabase_keep_up, merge_mode, gh_config_dir, live_credentials, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 		ON CONFLICT(repo_path) DO UPDATE SET
 			dev_command          = excluded.dev_command,
 			dev_url              = excluded.dev_url,
@@ -1405,10 +1418,11 @@ func upsertDevConfig(exec devExecer, cfg *ProjectDevConfig) error {
 			supabase_keep_up     = excluded.supabase_keep_up,
 			merge_mode           = excluded.merge_mode,
 			gh_config_dir        = excluded.gh_config_dir,
+			live_credentials     = excluded.live_credentials,
 			updated_at           = excluded.updated_at`,
 		cfg.RepoPath, cfg.DevCommand, cfg.DevURL,
 		string(stepsJSON), string(migGlobsJSON), cfg.SQLEditorURL,
-		supabaseEnabled, supabaseKeepUp, cfg.MergeMode, cfg.GHConfigDir,
+		supabaseEnabled, supabaseKeepUp, cfg.MergeMode, cfg.GHConfigDir, liveCredentials,
 	)
 	return err
 }
@@ -1419,7 +1433,7 @@ func ListProjectDevConfigs(db *sql.DB) ([]*ProjectDevConfig, error) {
 		SELECT repo_path, dev_command, dev_url, setup_steps_json,
 		       COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
 		       COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0),
-		       COALESCE(merge_mode,''), COALESCE(gh_config_dir,'')
+		       COALESCE(merge_mode,''), COALESCE(gh_config_dir,''), COALESCE(live_credentials,0)
 		FROM project_dev_configs ORDER BY repo_path`)
 	if err != nil {
 		return nil, err
@@ -1429,12 +1443,13 @@ func ListProjectDevConfigs(db *sql.DB) ([]*ProjectDevConfig, error) {
 	for rows.Next() {
 		var c ProjectDevConfig
 		var stepsJSON, migGlobsJSON string
-		var supEnabled, supKeepUp int
-		if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL, &supEnabled, &supKeepUp, &c.MergeMode, &c.GHConfigDir); err != nil {
+		var supEnabled, supKeepUp, live int
+		if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL, &supEnabled, &supKeepUp, &c.MergeMode, &c.GHConfigDir, &live); err != nil {
 			continue
 		}
 		c.SupabaseEnabled = supEnabled != 0
 		c.SupabaseKeepUp = supKeepUp != 0
+		c.LiveCredentials = live != 0
 		if err := json.Unmarshal([]byte(stepsJSON), &c.SetupSteps); err != nil {
 			c.SetupSteps = []string{}
 		}

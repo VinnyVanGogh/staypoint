@@ -1053,6 +1053,19 @@ var Migrations = []Migration{
 		},
 	},
 	{
+		// Board-assigned numbers: 26/27 #193, 28 this (#196), 29 #195, 30 #192.
+		Version: 28,
+		Name:    "project_dev_configs_live_credentials",
+		Up: func(conn *sql.DB) error {
+			// STA-727: previews of this project run against production credentials.
+			_, err := conn.Exec(`ALTER TABLE project_dev_configs ADD COLUMN live_credentials INTEGER NOT NULL DEFAULT 0;`)
+			if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+				return err
+			}
+			return nil
+		},
+	},
+	{
 		Version: 29,
 		Name:    "ship_review_merge_modes",
 		Up: func(conn *sql.DB) error {

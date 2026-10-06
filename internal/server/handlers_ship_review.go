@@ -70,10 +70,15 @@ func (h *ShipReviewHandler) GetCard(w http.ResponseWriter, r *http.Request) {
 		if jsonErr := json.Unmarshal(cardBytes, &merged); jsonErr == nil {
 			merged["unverified_migrations"] = unverified
 			merged["repo_name"] = filepath.Base(task.RepoPath)
+			// STA-727: the card shows the LIVE banner and confirm from these.
+			// dev_configured: start-dev has something to run (a saved
+			// dev_command, or a Supabase project it will auto-configure).
 			if cfg, cfgErr := shipreview.GetProjectDevConfig(h.db, task.RepoPath); cfgErr == nil {
 				isWork := shipreview.IsWorkRepo(task.RepoPath)
 				merged["is_work_repo"] = isWork
 				merged["effective_merge_mode"] = shipreview.EffectiveMergeMode(cfg, isWork)
+				merged["live_credentials"] = cfg.LiveCredentials
+				merged["dev_configured"] = cfg.DevCommand != "" || shipreview.HasSupabaseConfig(task.RepoPath)
 			}
 			if gitErr != nil {
 				// The card itself is DB-only; return it and say why the
@@ -155,8 +160,42 @@ func (h *ShipReviewHandler) UpsertCard(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(card)
 }
 
+// liveDevWarning is the warning the Board confirms before starting a dev
+// server for a live_credentials project (STA-727). The UI shows the same text.
+const liveDevWarning = "LIVE PRODUCTION DATA. Actions in this preview are real."
+
+type liveBoardGateKey struct{}
+
+// StartDevGated routes POST start-dev. Non-live projects go straight to
+// StartDev, agent-callable as before. A live_credentials project must first
+// pass boardGate (WrapBoardAction: Board session + passkey assertion); StartDev
+// then also requires {"confirm_live": true} and audits the confirmation.
+func (h *ShipReviewHandler) StartDevGated(boardGate func(http.Handler) http.Handler) http.Handler {
+	live := boardGate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.StartDev(w, r.WithContext(gocontext.WithValue(r.Context(), liveBoardGateKey{}, true)))
+	}))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, task, ok := h.requireCard(w, r.PathValue("id"))
+		if !ok {
+			return
+		}
+		cfg, err := shipreview.GetProjectDevConfig(h.db, task.RepoPath)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
+			return
+		}
+		if cfg.LiveCredentials {
+			live.ServeHTTP(w, r)
+			return
+		}
+		h.StartDev(w, r)
+	})
+}
+
 // StartDev handles POST /api/tasks/{id}/ship-review/start-dev
 // Returns 202 immediately; setup runs async and streams progress via SSE.
+// Mount it through StartDevGated: on a live_credentials project it refuses any
+// request that did not pass the Board gate.
 func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
 	card, task, ok := h.requireCard(w, taskID)
@@ -178,9 +217,45 @@ func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// STA-727: every gate check happens before any side effect (config
+	// proposal, worktree, process), so a refused live start leaves no trace.
+	if cfg.LiveCredentials {
+		if passed, _ := r.Context().Value(liveBoardGateKey{}).(bool); !passed {
+			writeBoardError(w, "board_session_required", "forbidden: starting a live_credentials dev server requires a Board session and passkey")
+			return
+		}
+		var body struct {
+			ConfirmLive bool `json:"confirm_live"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if !body.ConfirmLive {
+			writeErrorJSON(w, http.StatusConflict, map[string]any{
+				"error":   "live_confirmation_required",
+				"message": liveDevWarning + " Confirm to start the dev server.",
+				"warning": liveDevWarning,
+			})
+			return
+		}
+		if err := governance.LogBoardEvent(h.db, "board", governance.AuditBoardAction, map[string]any{
+			"action":     "live_dev_start_confirmed",
+			"task_id":    taskID,
+			"repo_path":  task.RepoPath,
+			"warning":    liveDevWarning,
+			"ip":         r.RemoteAddr,
+			"user_agent": r.UserAgent(),
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "audit log write failed: "+err.Error())
+			return
+		}
+	}
+
 	// Auto-detect Supabase project if no config exists yet.
 	if cfg.DevCommand == "" && shipreview.HasSupabaseConfig(task.RepoPath) {
 		proposed := shipreview.ProposeSupabaseDevConfig(task.RepoPath)
+		// The proposal replaces the whole row; keep the Board's settings.
+		proposed.LiveCredentials = cfg.LiveCredentials
+		proposed.MergeMode = cfg.MergeMode
+		proposed.GHConfigDir = cfg.GHConfigDir
 		if uErr := shipreview.UpsertProjectDevConfig(h.db, proposed); uErr == nil {
 			cfg = proposed
 			h.hub.Publish("ship_review_dev_config_proposed", map[string]any{
@@ -777,6 +852,7 @@ type devConfigUpdateReq struct {
 	SupabaseKeepUp  *bool     `json:"supabase_keep_up"`
 	MergeMode       *string   `json:"merge_mode"`
 	GHConfigDir     *string   `json:"gh_config_dir"`
+	LiveCredentials *bool     `json:"live_credentials"`
 }
 
 // UpsertProjectDevConfig handles PUT /api/project-dev-configs.
@@ -847,6 +923,9 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 	if req.GHConfigDir != nil {
 		cfg.GHConfigDir = *req.GHConfigDir
 	}
+	if req.LiveCredentials != nil {
+		cfg.LiveCredentials = *req.LiveCredentials
+	}
 
 	// Audit failure must roll back the config write; both go in one transaction.
 	tx, txErr := h.db.Begin()
@@ -872,6 +951,10 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 		"new_merge_mode":    cfg.MergeMode,
 		"old_gh_config_dir": old.GHConfigDir,
 		"new_gh_config_dir": cfg.GHConfigDir,
+		// STA-727: the live flag is only ever changed here, so this row is
+		// its full history.
+		"old_live_credentials": old.LiveCredentials,
+		"new_live_credentials": cfg.LiveCredentials,
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "audit log write failed: "+err.Error())
 		return
