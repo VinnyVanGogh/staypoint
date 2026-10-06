@@ -57,3 +57,39 @@ func TestGetProjectDevConfig_AliasResolvesToLiveRow(t *testing.T) {
 		t.Errorf("unrelated repo: got live=%v dev_command=%q, want its own non-live row", cfg.LiveCredentials, cfg.DevCommand)
 	}
 }
+
+// STA-767: a repo path that cannot be stat'ed cannot be ruled out as an alias
+// of a live repo, so LiveGateConfig gates it. With no live project at all
+// there is nothing to alias and it is not gated.
+func TestLiveGateConfig_UnstattablePathFailsClosed(t *testing.T) {
+	db := openTestDB(t)
+	base := t.TempDir()
+	missing := filepath.Join(base, "missing")
+
+	if _, gated, err := shipreview.LiveGateConfig(db, missing); err != nil || gated {
+		t.Fatalf("no live projects: gated=%v err=%v, want false, nil", gated, err)
+	}
+
+	live := filepath.Join(base, "live")
+	if err := os.MkdirAll(live, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := shipreview.UpsertProjectDevConfig(db, &shipreview.ProjectDevConfig{RepoPath: live, LiveCredentials: true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, gated, err := shipreview.LiveGateConfig(db, missing)
+	if err != nil || !gated {
+		t.Fatalf("unstattable path with a live project: gated=%v err=%v, want true, nil", gated, err)
+	}
+	if cfg.LiveCredentials {
+		t.Errorf("unstattable path loaded the live row; want defaults (gated only)")
+	}
+
+	other := filepath.Join(base, "other")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, gated, err := shipreview.LiveGateConfig(db, other); err != nil || gated {
+		t.Errorf("unrelated existing repo: gated=%v err=%v, want false, nil", gated, err)
+	}
+}

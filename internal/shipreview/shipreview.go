@@ -929,9 +929,10 @@ func BuildAndStartCard(ctx context.Context, db *sql.DB, taskID, repoPath string,
 	// HTTP endpoint (after the board user explicitly clicks Start), not here —
 	// BuildAndStartCard is agent-reachable and must not silently run dev commands.
 	// A live_credentials project is never auto-started: its previews hit
-	// production, so only a confirmed Board start-dev may run it (STA-727).
-	cfg, _ := GetProjectDevConfig(db, repoPath)
-	if cfg != nil && cfg.DevCommand != "" && !cfg.LiveCredentials {
+	// production, so only a confirmed Board start-dev may run it (STA-727),
+	// and neither is a repo path that cannot be told apart from one (STA-767).
+	cfg, gated, err := LiveGateConfig(db, repoPath)
+	if err == nil && !gated && cfg.DevCommand != "" {
 		if startedURL, startErr := StartDevServer(db, card, cfg, repoPath); startErr == nil && startedURL != "" && card.DevURL == "" {
 			card.DevURL = startedURL
 			_ = SetDevURL(db, card.ID, startedURL)
@@ -1330,41 +1331,112 @@ type ProjectDevConfig struct {
 }
 
 // GetProjectDevConfig loads the dev config for a repo path, or returns defaults.
+//
+// Rows are matched by directory, not by string (STA-767): a path that reaches
+// a configured repo through a symlink, a trailing "/", "/./" or a different
+// case on a case-insensitive volume loads that repo's row. When several rows
+// name the same directory, a live_credentials row wins, so an alias row can
+// never hide the live flag. The returned RepoPath is the matched row's key, so
+// saving the config back updates that row instead of adding an alias row.
 func GetProjectDevConfig(db *sql.DB, repoPath string) (*ProjectDevConfig, error) {
-	var stepsJSON, devCommand, devURL, migGlobsJSON, sqlEditorURL, mergeMode, ghConfigDir string
-	var supabaseEnabled, supabaseKeepUp, liveCredentials int
-	err := db.QueryRow(
-		`SELECT dev_command, dev_url, setup_steps_json,
-		        COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
-		        COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0),
-		        COALESCE(merge_mode,''), COALESCE(gh_config_dir,''), COALESCE(live_credentials,0)
-		 FROM project_dev_configs WHERE repo_path = ?`,
-		repoPath,
-	).Scan(&devCommand, &devURL, &stepsJSON, &migGlobsJSON, &sqlEditorURL, &supabaseEnabled, &supabaseKeepUp, &mergeMode, &ghConfigDir, &liveCredentials)
+	cfg, _, err := lookupDevConfig(db, repoPath)
+	return cfg, err
+}
+
+// LiveGateConfig loads repoPath's dev config for starting a dev server and
+// reports whether the start needs the Board gate: the project is
+// live_credentials, or repoPath cannot be compared with a live project
+// (repoPath cannot be stat'ed, or the live project's path fails to stat for a
+// reason other than not existing). It fails closed.
+func LiveGateConfig(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, gated bool, err error) {
+	cfg, unverified, err := lookupDevConfig(db, repoPath)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return &ProjectDevConfig{RepoPath: repoPath}, nil
-		}
+		return nil, true, err
+	}
+	return cfg, cfg.LiveCredentials || unverified, nil
+}
+
+const devConfigColumns = `repo_path, dev_command, dev_url, setup_steps_json,
+	COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
+	COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0),
+	COALESCE(merge_mode,''), COALESCE(gh_config_dir,''), COALESCE(live_credentials,0)`
+
+func scanDevConfig(rows *sql.Rows) (*ProjectDevConfig, error) {
+	var c ProjectDevConfig
+	var stepsJSON, migGlobsJSON string
+	var supEnabled, supKeepUp, live int
+	if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL, &supEnabled, &supKeepUp, &c.MergeMode, &c.GHConfigDir, &live); err != nil {
 		return nil, err
 	}
-	cfg := &ProjectDevConfig{
-		RepoPath:        repoPath,
-		DevCommand:      devCommand,
-		DevURL:          devURL,
-		SQLEditorURL:    sqlEditorURL,
-		SupabaseEnabled: supabaseEnabled != 0,
-		SupabaseKeepUp:  supabaseKeepUp != 0,
-		MergeMode:       mergeMode,
-		GHConfigDir:     ghConfigDir,
-		LiveCredentials: liveCredentials != 0,
+	c.SupabaseEnabled = supEnabled != 0
+	c.SupabaseKeepUp = supKeepUp != 0
+	c.LiveCredentials = live != 0
+	if err := json.Unmarshal([]byte(stepsJSON), &c.SetupSteps); err != nil {
+		c.SetupSteps = []string{}
 	}
-	if err := json.Unmarshal([]byte(stepsJSON), &cfg.SetupSteps); err != nil {
-		cfg.SetupSteps = []string{}
+	if err := json.Unmarshal([]byte(migGlobsJSON), &c.MigrationGlobs); err != nil {
+		c.MigrationGlobs = []string{}
 	}
-	if err := json.Unmarshal([]byte(migGlobsJSON), &cfg.MigrationGlobs); err != nil {
-		cfg.MigrationGlobs = []string{}
+	return &c, nil
+}
+
+// lookupDevConfig returns the row for repoPath's directory (see
+// GetProjectDevConfig). unverified is true when that directory could not be
+// compared with every live row; LiveGateConfig gates on it.
+func lookupDevConfig(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, unverified bool, err error) {
+	rows, err := db.Query(`SELECT ` + devConfigColumns + ` FROM project_dev_configs`)
+	if err != nil {
+		return nil, false, err
 	}
-	return cfg, nil
+	defer rows.Close()
+
+	want := filepath.Clean(repoPath)
+	wantInfo, _ := os.Stat(repoPath)
+
+	var exact, alias, live *ProjectDevConfig
+	for rows.Next() {
+		c, err := scanDevConfig(rows)
+		if err != nil {
+			return nil, false, err
+		}
+		same := c.RepoPath == repoPath || filepath.Clean(c.RepoPath) == want
+		if !same && wantInfo == nil && c.LiveCredentials {
+			// repoPath cannot be stat'ed, so it cannot be ruled out as an
+			// alias of this live repo.
+			unverified = true
+		}
+		if !same && wantInfo != nil {
+			info, err := os.Stat(c.RepoPath)
+			switch {
+			case err == nil:
+				same = os.SameFile(wantInfo, info)
+			case c.LiveCredentials && !errors.Is(err, os.ErrNotExist):
+				// A live repo we cannot stat could be repoPath itself.
+				unverified = true
+			}
+		}
+		if !same {
+			continue
+		}
+		switch {
+		case c.RepoPath == repoPath:
+			exact = c
+		case alias == nil:
+			alias = c
+		}
+		if c.LiveCredentials && (live == nil || c.RepoPath == repoPath) {
+			live = c
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	for _, c := range []*ProjectDevConfig{live, exact, alias} {
+		if c != nil {
+			return c, unverified, nil
+		}
+	}
+	return &ProjectDevConfig{RepoPath: repoPath}, unverified, nil
 }
 
 // devExecer is satisfied by both *sql.DB and *sql.Tx.
@@ -1429,34 +1501,18 @@ func upsertDevConfig(exec devExecer, cfg *ProjectDevConfig) error {
 
 // ListProjectDevConfigs returns all project dev configs.
 func ListProjectDevConfigs(db *sql.DB) ([]*ProjectDevConfig, error) {
-	rows, err := db.Query(`
-		SELECT repo_path, dev_command, dev_url, setup_steps_json,
-		       COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
-		       COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0),
-		       COALESCE(merge_mode,''), COALESCE(gh_config_dir,''), COALESCE(live_credentials,0)
-		FROM project_dev_configs ORDER BY repo_path`)
+	rows, err := db.Query(`SELECT ` + devConfigColumns + ` FROM project_dev_configs ORDER BY repo_path`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []*ProjectDevConfig
 	for rows.Next() {
-		var c ProjectDevConfig
-		var stepsJSON, migGlobsJSON string
-		var supEnabled, supKeepUp, live int
-		if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL, &supEnabled, &supKeepUp, &c.MergeMode, &c.GHConfigDir, &live); err != nil {
+		c, err := scanDevConfig(rows)
+		if err != nil {
 			continue
 		}
-		c.SupabaseEnabled = supEnabled != 0
-		c.SupabaseKeepUp = supKeepUp != 0
-		c.LiveCredentials = live != 0
-		if err := json.Unmarshal([]byte(stepsJSON), &c.SetupSteps); err != nil {
-			c.SetupSteps = []string{}
-		}
-		if err := json.Unmarshal([]byte(migGlobsJSON), &c.MigrationGlobs); err != nil {
-			c.MigrationGlobs = []string{}
-		}
-		out = append(out, &c)
+		out = append(out, c)
 	}
 	return out, rows.Err()
 }
