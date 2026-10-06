@@ -7,8 +7,98 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # go build resolves the module from the cwd, so build from the repo root.
 cd "$REPO"
 BINARY="$HOME/.local/bin/staypointd"
+CLI_BINARY="$HOME/.local/bin/staypoint"
 PLIST="$HOME/Library/LaunchAgents/com.staypoint.daemon.plist"
 LABEL="com.staypoint.daemon"
+DEPLOY_LOG="$HOME/.staypoint/deploys.log"
+
+ALLOW_DEV_BUILD=0
+for arg in "$@"; do
+    case "$arg" in
+        --allow-dev-build) ALLOW_DEV_BUILD=1 ;;
+        --allow-unmerged)
+            echo "  ! --allow-unmerged is now --allow-dev-build; treating it as that."
+            ALLOW_DEV_BUILD=1 ;;
+        *)
+            echo "✗ Unknown argument: $arg (the only flag is --allow-dev-build)" >&2
+            exit 2 ;;
+    esac
+done
+
+# Every install and every refused install gets one line in $DEPLOY_LOG: when,
+# the outcome, who ran it and from what parent process, on which host, and
+# what it would deploy.
+FULL_SHA=""
+DIRTY=false
+IN_MAIN=false
+DEV_BUILD=false
+log_deploy() {
+    local parent
+    parent="$(ps -o command= -p "$PPID" 2>/dev/null | tr '\t\n' '  ' | cut -c1-200 || true)"
+    mkdir -p "$(dirname "$DEPLOY_LOG")"
+    printf '%s\tresult=%s\tuser=%s\thost=%s\tsha=%s\tdirty=%s\tin_main=%s\tdev_build=%s\trepo=%s\tparent=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "${USER:-$(id -un)}" "$(hostname)" \
+        "${FULL_SHA:-none}" "$DIRTY" "$IN_MAIN" "$DEV_BUILD" "$REPO" "$parent" >> "$DEPLOY_LOG"
+}
+
+# refuse <log-reason> <headline> [detail lines...]
+refuse() {
+    log_deploy "refused:$1"
+    echo "✗ ABORTING: $2" >&2
+    shift 2
+    for line in "$@"; do echo "  $line" >&2; done
+    exit 1
+}
+
+# Deploy guards (STA-805). The live daemon must be a reviewed build: a clean
+# tree whose HEAD is on origin/main. On 2026-10-06 a session working in the
+# shared checkout installed a build with 12 uncommitted files, which rolled the
+# daemon back past four merged PRs and ran unreviewed code. --allow-dev-build
+# deploys anyway, and the daemon then reports dev_build: true in /api/health
+# and in the web UI header so nobody mistakes it for a main build.
+FULL_SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+if [ -z "$FULL_SHA" ]; then
+    refuse no-git "$REPO is not a git checkout, so the build would have no commit to report."
+fi
+COMMIT="$(git -C "$REPO" rev-parse --short HEAD)"
+# Untracked files count: a new .go file changes the build as much as an edit.
+PORCELAIN="$(git -C "$REPO" status --porcelain)"
+[ -n "$PORCELAIN" ] && DIRTY=true
+git -C "$REPO" fetch --quiet origin main 2>/dev/null \
+    || echo "  ! Could not fetch origin/main; checking against the local origin/main ref."
+if ! git -C "$REPO" rev-parse -q --verify "origin/main^{commit}" >/dev/null; then
+    refuse no-origin-main "$REPO has no origin/main ref, so there is nothing to check HEAD against."
+fi
+git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null && IN_MAIN=true
+
+if [ "$ALLOW_DEV_BUILD" = 0 ]; then
+    if [ "$DIRTY" = true ]; then
+        refuse dirty "$REPO has uncommitted changes:" \
+            "$(echo "$PORCELAIN" | head -20)" \
+            "Deploy from a clean checkout of origin/main (e.g. a dedicated worktree)," \
+            "or pass --allow-dev-build to deploy this tree as a dev build."
+    fi
+    if [ "$IN_MAIN" != true ]; then
+        refuse not-in-main "HEAD ($COMMIT — $(git -C "$REPO" log --format=%s -1 HEAD)) is not on origin/main." \
+            "Merge it first, or pass --allow-dev-build to deploy it as a dev build."
+    fi
+else
+    DEV_BUILD=true
+    cat <<EOF
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!!  DEV BUILD (--allow-dev-build)
+!!!  This daemon will NOT be a reviewed main build.
+!!!    commit:          $COMMIT
+!!!    on origin/main:  $IN_MAIN
+!!!    uncommitted:     $DIRTY
+!!!  /api/health and the web UI header will show dev_build: true.
+!!!  Redeploy from a clean origin/main checkout when you are done.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+EOF
+fi
+
+BUILD_LABEL="$COMMIT"
+[ "$DIRTY" = true ] && BUILD_LABEL="$COMMIT-dirty"
 
 # macOS privacy grants (TCC, e.g. "access files in your Documents folder") are
 # keyed to the binary's designated requirement. An ad-hoc signature's
@@ -41,54 +131,50 @@ if [ "$(uname)" = "Darwin" ]; then
     fi
 fi
 
-COMMIT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo 'none')"
-DIRTY=false
-if [ "$COMMIT" != "none" ] && [ -n "$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-    DIRTY=true
-    echo "  ! Uncommitted changes to tracked files: labelling this build $COMMIT-dirty."
-    echo "    The checklist commit gate stays closed until the daemon is rebuilt from a clean tree."
-fi
-BUILD_LABEL="$COMMIT"
-[ "$DIRTY" = true ] && BUILD_LABEL="$COMMIT-dirty"
-
-# Deploy guard: refuse to build from a branch that is not origin/main unless
-# --allow-unmerged is passed. This prevents accidentally deploying work that
-# hasn't been reviewed and merged.
-ALLOW_UNMERGED=0
-for arg in "$@"; do
-    [ "$arg" = "--allow-unmerged" ] && ALLOW_UNMERGED=1
-done
-if [ "$ALLOW_UNMERGED" = "0" ] && [ "$COMMIT" != "none" ]; then
-    git -C "$REPO" fetch --all --prune --quiet 2>/dev/null || true
-    if ! git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
-        HEAD_SUBJECT="$(git -C "$REPO" log --format="%s" -1 HEAD 2>/dev/null || echo 'unknown')"
-        echo "✗ ABORTING: HEAD ($COMMIT — $HEAD_SUBJECT) is not in origin/main." >&2
-        echo "  Merge your branch before deploying, or pass --allow-unmerged to override." >&2
-        exit 1
+sign() {
+    if [ -n "$SIGN_IDENTITY" ] && [ "$SIGN_IDENTITY" != "-" ]; then
+        codesign -s "$SIGN_IDENTITY" -f --timestamp=none -i "$1" "$2"
+    else
+        codesign -s - -f -i "$1" "$2"
     fi
-fi
+}
 
+# Build both binaries next to their install paths and move them into place
+# only after the checks below pass, so a refused build never replaces the
+# binary launchd restarts.
+mkdir -p "$(dirname "$BINARY")"
+STAGED="$BINARY.staging"
+CLI_STAGED="$CLI_BINARY.staging"
+trap 'rm -f "$STAGED" "$CLI_STAGED"' EXIT
 echo "→ Building staypointd from $REPO (commit: $BUILD_LABEL) ..."
-go build -ldflags "-X main.GitCommit=$BUILD_LABEL -X main.commit=$BUILD_LABEL" -o "$BINARY" "$REPO/cmd/staypointd"
-if [ -n "$SIGN_IDENTITY" ] && [ "$SIGN_IDENTITY" != "-" ]; then
-    codesign -s "$SIGN_IDENTITY" -f --timestamp=none -i com.staypoint.daemon "$BINARY"
-else
-    codesign -s - -f -i com.staypoint.daemon "$BINARY"
+go build -ldflags "-X main.GitCommit=$BUILD_LABEL -X main.commit=$BUILD_LABEL -X main.DevBuild=$DEV_BUILD" \
+    -o "$STAGED" "$REPO/cmd/staypointd"
+
+# The binary must say which commit it was built from. The 2026-10-06 build
+# reported git_commit "none"; refuse anything nobody could trace.
+VCS_REVISION="$(go version -m "$STAGED" 2>/dev/null \
+    | awk '$1 == "build" && index($2, "vcs.revision=") == 1 { sub("vcs.revision=", "", $2); print $2 }')"
+if [ -z "$VCS_REVISION" ]; then
+    refuse no-vcs-revision "the built binary has no vcs.revision, so it could not say which commit it runs." \
+        "Build from a git checkout, and check GOFLAGS for -buildvcs=false."
 fi
-echo "  Built: $BINARY ($(staypointd -version 2>/dev/null || echo 'ok'))"
+if [ "$VCS_REVISION" != "$FULL_SHA" ]; then
+    refuse vcs-mismatch "the built binary has vcs.revision $VCS_REVISION but HEAD is $FULL_SHA."
+fi
+sign com.staypoint.daemon "$STAGED"
 
 # Build the staypoint CLI alongside the daemon so the PreToolUse hook binary
 # (STAYPOINT_HOOK_BIN) is always at the same commit as the daemon (STA-525).
-CLI_BINARY="$HOME/.local/bin/staypoint"
-mkdir -p "$(dirname "$CLI_BINARY")"
 echo "→ Building staypoint CLI from $REPO (commit: $BUILD_LABEL) ..."
-go build -ldflags "-X main.GitCommit=$BUILD_LABEL -X main.commit=$BUILD_LABEL" -o "$CLI_BINARY" "$REPO/cmd/staypoint"
-if [ -n "$SIGN_IDENTITY" ] && [ "$SIGN_IDENTITY" != "-" ]; then
-    codesign -s "$SIGN_IDENTITY" -f --timestamp=none -i com.staypoint.cli "$CLI_BINARY"
-else
-    codesign -s - -f -i com.staypoint.cli "$CLI_BINARY"
-fi
+go build -ldflags "-X main.GitCommit=$BUILD_LABEL -X main.commit=$BUILD_LABEL" -o "$CLI_STAGED" "$REPO/cmd/staypoint"
+sign com.staypoint.cli "$CLI_STAGED"
+
+mv -f "$STAGED" "$BINARY"
+mv -f "$CLI_STAGED" "$CLI_BINARY"
+log_deploy installed
+echo "  Built: $BINARY ($(staypointd -version 2>/dev/null || echo 'ok'))"
 echo "  Built: $CLI_BINARY"
+echo "  Logged to $DEPLOY_LOG"
 
 # Record which commits this binary contains. The checklist commit gate reads
 # this instead of running git: under launchd, macOS blocks the daemon from the

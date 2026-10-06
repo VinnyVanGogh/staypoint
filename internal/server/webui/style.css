@@ -46,6 +46,12 @@ html, body {
 .logo { font-weight: 700; font-size: 17px; letter-spacing: .5px; color: var(--accent-light); }
 .badge-version { font-size: 10px; background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
 .header-right { display: flex; align-items: center; gap: 10px; }
+/* Daemon is not a reviewed main build (STA-805). */
+.badge-dev-build {
+  background: rgba(239, 68, 68, 0.18); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.6);
+  font-weight: 700; letter-spacing: .5px; cursor: help;
+}
+.badge-dev-build[hidden] { display: none; }
 
 .sidebar-toggle {
   background: none; border: none; color: var(--muted); cursor: pointer;

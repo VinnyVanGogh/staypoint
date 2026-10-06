@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -33,7 +34,31 @@ var (
 	commit    = "none"
 	GitCommit = "none"
 	date      = "unknown"
+	// DevBuild is set to "true" by reinstall-daemon.sh --allow-dev-build.
+	DevBuild = "false"
 )
+
+// devBuildReason says why this binary is not a reviewed main build, or ""
+// when it is. Besides the --allow-dev-build flag it checks the VCS stamp, so a
+// binary built from a dirty tree without the script is still flagged (STA-805).
+func devBuildReason() string {
+	info, _ := debug.ReadBuildInfo()
+	return devBuildReasonFrom(DevBuild, info)
+}
+
+func devBuildReasonFrom(flag string, info *debug.BuildInfo) string {
+	if flag == "true" {
+		return "deployed with --allow-dev-build"
+	}
+	if info != nil {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.modified" && s.Value == "true" {
+				return "built from a tree with uncommitted changes"
+			}
+		}
+	}
+	return ""
+}
 
 func init() {
 	if GitCommit != "none" && commit == "none" {
@@ -204,6 +229,7 @@ func runDaemon(ctx context.Context) error {
 		BoardTokenPath: boardTokenPath,
 		DB:             dbStore.DB(),
 		GitCommit:      GitCommit,
+		DevBuildReason: devBuildReason(),
 		CORSAllowAll:   cfg.CORSAllowAll,
 		RepoAccess:     repoChecker,
 	}); err != nil {

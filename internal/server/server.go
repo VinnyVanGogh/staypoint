@@ -113,13 +113,16 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
 		snap := s.repoAccessSnapshot()
 		writeJSONUnescaped(w, struct {
-			Status     string           `json:"status"`
-			Version    string           `json:"version"`
-			GitCommit  string           `json:"git_commit"`
-			Commit     string           `json:"commit"`
-			RepoAccess healthRepoAccess `json:"repo_access"`
+			Status         string           `json:"status"`
+			Version        string           `json:"version"`
+			GitCommit      string           `json:"git_commit"`
+			Commit         string           `json:"commit"`
+			DevBuild       bool             `json:"dev_build"`
+			DevBuildReason string           `json:"dev_build_reason,omitempty"`
+			RepoAccess     healthRepoAccess `json:"repo_access"`
 		}{
 			Status: "ok", Version: "1.0", GitCommit: s.opts.GitCommit, Commit: s.opts.GitCommit,
+			DevBuild: s.opts.DevBuildReason != "", DevBuildReason: s.opts.DevBuildReason,
 			RepoAccess: healthRepoAccess{snap.Checked, snap.CheckedAt, snap.Failing()},
 		})
 	})
