@@ -112,6 +112,14 @@ type ProviderQuotaGauge struct {
 	ProjectionStatus     string     `json:"projection_status"` // on_track, overpaced, locked_out, unknown
 	ProjectionMessage    string     `json:"projection_message"`
 	RunwayTurns          int        `json:"runway_turns"`
+	// Measured is false when no source reported this provider/seat at all;
+	// the percentages are then placeholders and the UI must show "No data",
+	// never "0% used". The per-window flags say which window was reported.
+	Measured         bool `json:"measured"`
+	FiveHourMeasured bool `json:"five_hour_measured"`
+	WeeklyMeasured   bool `json:"weekly_measured"`
+
+	measuredAt time.Time // newest reading applied so far; older overlays are skipped
 }
 
 // OrgFleetSummary summarizes an individual organization's fleet metrics.
