@@ -301,33 +301,50 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	if err := h.DB.QueryRowContext(ctx, "SELECT COALESCE(repo_path,'') FROM tasks WHERE id=?", taskID).Scan(&repoPath); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("fetch repo path: %w", err)
 	}
-	if repoPath == "" {
+	// Non-git tasks (STA-864): an existing directory that is not a git repo,
+	// or no repo_path at all (per-task scratch dir), runs in place with a
+	// warning: no worktree, checkpoints or ship review. See plaindir.go.
+	taskDir, err := workspace.ResolveTaskDir(repoPath, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("task directory: %w", err)
+	}
+	nonGit := !taskDir.Git
+	if nonGit {
+		repoPath = taskDir.Dir
+		ctx = withPlainDir(ctx)
+	} else if repoPath == "" {
 		repoPath = h.RepoRoot
 	}
 
-	// When the task names a specific repo that differs from the harness default,
-	// build a fresh WorktreeManager for that repo so worktrees land in the right
-	// place and never touch h.RepoRoot.
-	wm := h.WM
-	if repoPath != h.RepoRoot {
-		wm = workspace.NewWorktreeManager(repoPath, h.DB)
-	}
-
-	wtPath, err := wm.CreateContext(ctx, taskID, runID)
-	if err != nil {
-		return nil, fmt.Errorf("create worktree: %w", err)
-	}
-	defer func() {
-		if pruneErr := wm.PruneWorktreeDirContext(context.Background(), taskID); pruneErr != nil {
-			runLog.Warn("worktree prune failed", slog.Any("error", pruneErr))
+	var wtPath string
+	var preCP *checkpoint.Checkpoint
+	if nonGit {
+		wtPath = taskDir.Dir
+	} else {
+		// When the task names a specific repo that differs from the harness default,
+		// build a fresh WorktreeManager for that repo so worktrees land in the right
+		// place and never touch h.RepoRoot.
+		wm := h.WM
+		if repoPath != h.RepoRoot {
+			wm = workspace.NewWorktreeManager(repoPath, h.DB)
 		}
-	}()
 
-	preCP, _ := checkpoint.CreateCheckpoint(ctx, checkpoint.CreateOptions{
-		WorkDir:   wtPath,
-		SessionID: runID,
-		Message:   "pre-run " + taskID,
-	})
+		wtPath, err = wm.CreateContext(ctx, taskID, runID)
+		if err != nil {
+			return nil, fmt.Errorf("create worktree: %w", err)
+		}
+		defer func() {
+			if pruneErr := wm.PruneWorktreeDirContext(context.Background(), taskID); pruneErr != nil {
+				runLog.Warn("worktree prune failed", slog.Any("error", pruneErr))
+			}
+		}()
+
+		preCP, _ = checkpoint.CreateCheckpoint(ctx, checkpoint.CreateOptions{
+			WorkDir:   wtPath,
+			SessionID: runID,
+			Message:   "pre-run " + taskID,
+		})
+	}
 
 	providerEnv := security.ChildEnv(defaultProviderEnvKeys...)
 	if cfg.SkipPermissions {
@@ -409,10 +426,14 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		}
 	}
 
+	if nonGit {
+		h.announceNonGit(ctx, taskID, taskDir, sr)
+	}
+
 	// Git pre-flight: fetch, dirty check, fast-forward.
 	// A failure is logged as a timeline comment and blocks the run.
 	// Skipped when cfg.SkipGitPreflight is true (tests running in a non-git dir).
-	if !cfg.SkipGitPreflight {
+	if !cfg.SkipGitPreflight && !nonGit {
 		gfCtx, gfCancel := context.WithTimeout(ctx, 60*time.Second)
 		gfResult, gfErr := gitgate.PreFlight(gfCtx, wtPath, "main")
 		gfCancel()
@@ -463,6 +484,11 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 
 	// Fetch the task brief once; pass it to each turn.
 	brief := fetchTaskBrief(ctx, h.DB, taskID)
+	if nonGit {
+		brief.RepoPath = wtPath
+		brief.PlainDir = true
+		brief.ShipReviewGate = false // nothing to merge, no card
+	}
 
 	// Track the highest comment id seen so far so each turn only injects new comments.
 	var lastSeenCommentID int64
@@ -509,7 +535,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			break
 		}
 
-		if turn > 0 && !lastTurnWasAdapterError {
+		if turn > 0 && !lastTurnWasAdapterError && !nonGit {
 			cp, _ := checkpoint.CreateCheckpoint(ctx, checkpoint.CreateOptions{
 				WorkDir:   wtPath,
 				SessionID: runID,
@@ -528,7 +554,13 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		// Gemini turn's changes can be checked and reverted afterwards.
 		var guardSnap *geminiguard.Snapshot
 		var guardSnapErr error
-		if cfg.GeminiDocsOnly && cfg.RunAdapter != nil {
+		if nonGit && cfg.RunAdapter != nil {
+			// No checkpoint to restore from: snapshot only, never run git.
+			guardSnap, guardSnapErr = geminiguard.TakeNoGit(wtPath)
+			if cfg.TurnUsedGemini != nil {
+				_ = cfg.TurnUsedGemini()
+			}
+		} else if cfg.GeminiDocsOnly && cfg.RunAdapter != nil {
 			cpSHA := ""
 			if turnCP != nil {
 				cpSHA = turnCP.CommitSHA
@@ -591,9 +623,22 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			lastExitCode = exitCodeFrom(turnErr)
 			lastStderr = stderrBuf.String()
 
+			// Non-git dir (STA-864): any Gemini turn that changed a non-doc
+			// file fails the run; it cannot be reverted. Fails closed.
+			if nonGit && cfg.turnUsedGemini() {
+				nr := geminiguard.NoGitResult{Dir: wtPath, Err: guardSnapErr}
+				if guardSnapErr == nil {
+					nr = geminiguard.CheckNoGit(ctx, guardSnap)
+				}
+				if nr.Violated() {
+					h.blockGeminiNoGit(result, nr, taskID, turn, stdout, sr, runLog)
+					sawOutput = true
+					break
+				}
+			}
 			// Board rule (STA-856): Gemini never writes code in a work repo.
 			// Checked before error handling so a failed Gemini turn is checked too.
-			if cfg.GeminiDocsOnly && cfg.turnUsedGemini() {
+			if cfg.GeminiDocsOnly && !nonGit && cfg.turnUsedGemini() {
 				gr := geminiguard.Result{Err: guardSnapErr}
 				if guardSnapErr == nil {
 					gCtx, gCancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -705,6 +750,9 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			// STA-391 ordering: register the branch work product BEFORE the interceptor
 			// so checkWorkProducts finds it. Eagerly compute the diff; calling
 			// DiffCheckpoint here is idempotent with the post-loop call.
+			if !workProductRegistered && nonGit {
+				workProductRegistered = h.registerPlainDirProduct(ctx, taskID, wtPath)
+			}
 			if !workProductRegistered && preCP != nil {
 				if ds, dsErr := checkpoint.DiffCheckpoint(ctx, wtPath, preCP.ID); dsErr == nil && ds != "" {
 					result.DiffStat = ds
@@ -794,7 +842,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// Git post-flight: dirty check, unpushed commits, merged-to-main report.
 	// A failure is recorded but does not override the disposition — it annotates
 	// the timeline and blocks `Mark done` at the UI/interceptor layer.
-	{
+	if !nonGit {
 		pfCtx, pfCancel := context.WithTimeout(context.Background(), 60*time.Second)
 		pfResult, pfErr := gitgate.PostFlight(pfCtx, wtPath, "main")
 		pfCancel()
@@ -980,6 +1028,8 @@ type taskBrief struct {
 	GitBranch       string
 	Description     string
 	ShipReviewGate  bool // true when gates.ship_review is enabled
+	// PlainDir is set when the task runs in a non-git directory (STA-864).
+	PlainDir bool
 	// Handoff is the daemon-stored handoff from the parent task (STA-820).
 	Handoff string
 }
@@ -1090,6 +1140,9 @@ func buildBriefBlock(brief taskBrief, comments []harnessComment, isFirstTurn boo
 			b.WriteString("Project: " + safeField(brief.Org+"/"+brief.Project) + "\n")
 		}
 		b.WriteString("Repo: " + safeField(brief.RepoPath) + "\n")
+		if brief.PlainDir {
+			b.WriteString("Workspace: this folder is not a git repository. Work in it directly: there is no branch, no commit and no Ship Review card, and StayPoint cannot undo your edits, so change only what the task needs. Do not run git init.\n")
+		}
 		if brief.GitBranch != "" {
 			b.WriteString("Branch: " + safeField(brief.GitBranch) + "\n")
 		}

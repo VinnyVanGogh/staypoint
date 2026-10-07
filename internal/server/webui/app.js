@@ -7085,6 +7085,7 @@ async function fetchTaskViewData(resolvedId) {
   if (taskResp.dependencies) task.dependencies = taskResp.dependencies;
   task.queue = taskResp.queue || null;
   task.turn = taskResp.turn || null;
+  task.workspace = taskResp.workspace || null;
   const comments = (taskResp.comments && taskResp.comments.length)
     ? taskResp.comments
     : (commentsResp?.comments || (Array.isArray(commentsResp) ? commentsResp : []));
@@ -7905,7 +7906,8 @@ function buildTimelineStats(task, steps, elapsedMs, isStuck) {
 
 function buildRunStepRow(s) {
   const isError = s.status === 'error';
-  const row = el('div', `timeline-row timeline-row-${s.kind || 'unknown'}${isError ? ' timeline-row-error' : ''}`);
+  const isWarn = !isError && s.kind === 'message' && /^Warning:/.test(s.title || '');
+  const row = el('div', `timeline-row timeline-row-${s.kind || 'unknown'}${isError ? ' timeline-row-error' : ''}${isWarn ? ' timeline-row-warn' : ''}`);
   row.setAttribute('data-step-id', s.id);
 
   // Route rows render as a compact banner: icon + plain text, no kind badge.
@@ -10144,6 +10146,17 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   queueLine.setAttribute('role', 'status');
   setRunQueueLine(queueLine, task.queue);
   container.appendChild(queueLine);
+
+  // Non-git task (STA-864): runs in place; nothing is checkpointed, and
+  // there is no ship review card or Approve.
+  if (task.workspace && task.workspace.git === false) {
+    const warn = el('div', 'task-page-nongit-banner',
+      task.workspace.warning || 'Warning: not a git repository — changes are not checkpointed and can\'t be reviewed or undone');
+    warn.id = `nongit-banner-${task.id}`;
+    warn.setAttribute('role', 'note');
+    if (task.workspace.dir) warn.title = task.workspace.dir;
+    container.appendChild(warn);
+  }
 
   // Two-column body: timeline left, panel right, each scrolling internally.
   const layout = el('div', 'task-page-layout');

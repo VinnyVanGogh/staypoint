@@ -58,6 +58,7 @@ func resolveTaskRouteApproved(db *sql.DB, taskID, repoRoot string, pacer *router
 		slog.Warn("route: task lookup failed; routing as coding on the personal seat",
 			slog.String("task", taskID), slog.Any("error", err))
 	}
+	rawRepoPath := repoPath
 	if repoPath == "" {
 		repoPath = repoRoot
 	}
@@ -65,9 +66,15 @@ func resolveTaskRouteApproved(db *sql.DB, taskID, repoRoot string, pacer *router
 	if repoPath != "" {
 		isWork, _, _ = router.IsWorkRepo(repoPath)
 	}
+	// Non-git dir (STA-864): no checkpoint to revert, so a Board Touch ID
+	// approval never lets Gemini write code there, and code kinds drop Gemini.
+	if !taskDirIsGit(rawRepoPath, taskID) {
+		approvalID = ""
+	}
 	choice := router.ChoiceFromStored(provider, model)
 	choice.CodeApprovalID = approvalID
-	return router.ResolveRouteChoice(workKind, isWork, pacer, choice, now)
+	route := router.ResolveRouteChoice(workKind, isWork, pacer, choice, now)
+	return barGeminiOutsideGit(route, rawRepoPath, taskID)
 }
 
 // slotProvider is the adapter/stream-parser key for a routed slot.

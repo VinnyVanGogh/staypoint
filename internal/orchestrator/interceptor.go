@@ -115,7 +115,7 @@ func (ic *Interceptor) checkWorkProducts(_ context.Context, taskID, _, _ string)
 //  1. No uncommitted changes in the worktree.
 //  2. No unpushed commits (branch tracks a remote and is not ahead).
 func (ic *Interceptor) checkGitSync(ctx context.Context, _, wtPath, _ string) (string, error) {
-	if wtPath == "" {
+	if wtPath == "" || isPlainDir(ctx) { // non-git task: nothing to sync (STA-864)
 		return "", nil
 	}
 	if _, err := os.Stat(wtPath); err != nil {
@@ -190,8 +190,8 @@ func (ic *Interceptor) checkMutexLease(_ context.Context, taskID, _, repoRoot st
 // ship_review gate is enabled and the task's branch has commits ahead of main.
 // This prevents a run from silently transitioning to in_review without giving
 // the Board anything to act on.
-func (ic *Interceptor) checkShipReviewCard(_ context.Context, taskID, wtPath, _ string) (string, error) {
-	if ic.DB == nil {
+func (ic *Interceptor) checkShipReviewCard(ctx context.Context, taskID, wtPath, _ string) (string, error) {
+	if ic.DB == nil || isPlainDir(ctx) { // non-git task: nothing to merge, no card (STA-864)
 		return "", nil
 	}
 
