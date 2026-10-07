@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -236,7 +237,9 @@ func (g *Gate) Evaluate(req Request) Decision {
 // uses the same rule as the post-turn guard (geminiguard.IsDocPath) on the
 // repo-relative path, so docs/** non-code files pass and code-named .txt files
 // such as requirements.txt do not. Outside a git checkout only the file name
-// is judged.
+// is judged. The path is lowercased first: on a case-insensitive filesystem
+// .GITHUB/ is .github/. Unlike the post-turn guard, .staypoint/ is held to the
+// file-type rule here.
 func isWorkRepoDocPath(p string) bool {
 	rel := filepath.Base(p)
 	if root, ok := gitRoot(p); ok {
@@ -246,7 +249,14 @@ func isWorkRepoDocPath(p string) bool {
 		}
 		rel = r
 	}
-	return geminiguard.IsDocPath(filepath.ToSlash(rel))
+	rel = strings.ToLower(filepath.ToSlash(rel))
+	if !geminiguard.IsDocPath(rel) {
+		return false
+	}
+	if strings.HasPrefix(path.Clean(rel), ".staypoint/") {
+		return geminiguard.IsDocPath(path.Base(rel))
+	}
+	return true
 }
 
 // geminiWorkRepoDeny enforces the Board decision of 2026-10-06: Gemini (agy)

@@ -470,12 +470,12 @@ func TestGeminiWorkRepoDocRuleAndReason(t *testing.T) {
 	write := func(rel string) Request {
 		return Request{Client: ClientGemini, ToolName: "write_to_file", FilePaths: []string{filepath.Join(repo, rel)}, CWD: repo, SessionID: "conv-1", TaskID: "task-1"}
 	}
-	for _, rel := range []string{"README.md", "notes.txt", "docs/guide.md", "docs/diagram.png", "sub/CHANGELOG.rst"} {
+	for _, rel := range []string{"README.md", "notes.txt", "docs/guide.md", "docs/diagram.png", "sub/CHANGELOG.rst", ".staypoint/plan.md"} {
 		if d := g.Evaluate(write(rel)); d.Block {
 			t.Errorf("doc write %s denied:\n%s", rel, d.Reason)
 		}
 	}
-	for _, rel := range []string{"app.py", "requirements.txt", "docs/build.sh", ".github/workflows/ci.md", "Dockerfile"} {
+	for _, rel := range []string{"app.py", "requirements.txt", "docs/build.sh", ".github/workflows/ci.md", ".GITHUB/workflows/ci.md", ".staypoint/run.sh", "Dockerfile"} {
 		d := g.Evaluate(write(rel))
 		want := "Gemini may not write code in work repos: " + filepath.Join(repo, rel)
 		if !d.Block || !strings.HasPrefix(d.Reason, want) {
