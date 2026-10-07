@@ -231,6 +231,44 @@ func (a *trustAnalyzer) segment(s segment, dir, baseDir string, depth int) {
 		for _, p := range plainArgs(args, map[string]bool{"-s": true, "--size": true, "-r": true, "--reference": true}) {
 			a.deleteArg(p, dynAt, dir, baseDir, name)
 		}
+	case name == "ssh":
+		// SSH is allowed under trust, but a remote command may still merge
+		// or push to a protected branch.
+		if rc := sshRemoteCommand(args); rc != "" {
+			if mergeTextRe.MatchString(rc) {
+				a.f.protect("ssh remote command may merge a pull request")
+			}
+			if pushTextRe.MatchString(rc) {
+				a.f.protect("ssh remote command may run git push")
+			}
+		}
+	case name == "tee":
+		for _, p := range plainArgs(args, nil) {
+			if !hasFlag(args, "-a", "--append") {
+				a.deleteArg(p, dynAt, dir, baseDir, "tee truncates")
+			}
+		}
+	case name == "dd":
+		for i, x := range args {
+			if strings.HasPrefix(x, "of=") {
+				a.deleteArg(plainArg{v: x[3:], i: i}, dynAt, dir, baseDir, "dd overwrites")
+			}
+		}
+	case name == "mv":
+		// A move removes its sources and may overwrite its destination.
+		for _, p := range plainArgs(args, map[string]bool{"-t": true, "--target-directory": true, "-S": true, "--suffix": true}) {
+			a.deleteArg(p, dynAt, dir, baseDir, "mv")
+		}
+	case name == "cp" || name == "ln" || name == "install":
+		pos := plainArgs(args, map[string]bool{"-t": true, "--target-directory": true, "-S": true, "--suffix": true, "-m": true, "-o": true, "-g": true, "--mode": true, "--owner": true, "--group": true})
+		if len(pos) > 0 {
+			a.deleteArg(pos[len(pos)-1], dynAt, dir, baseDir, name+" overwrites")
+		}
+		for i, x := range args {
+			if (x == "-t" || x == "--target-directory") && i+1 < len(args) {
+				a.deleteArg(plainArg{v: args[i+1], i: i + 1}, dynAt, dir, baseDir, name+" overwrites")
+			}
+		}
 	case name == "find":
 		a.find(args, dynAt, dir, baseDir, depth)
 	case name == "rsync":
@@ -256,6 +294,54 @@ func (a *trustAnalyzer) segment(s segment, dir, baseDir string, depth int) {
 			a.script(argv[0], dir, depth, false)
 		}
 	}
+}
+
+func hasFlag(args []string, flags ...string) bool {
+	for _, a := range args {
+		for _, f := range flags {
+			if a == f {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sshValueFlags are ssh options that take a separate value.
+var sshValueFlags = map[string]bool{"-b": true, "-c": true, "-D": true, "-E": true, "-e": true, "-F": true, "-I": true,
+	"-i": true, "-J": true, "-L": true, "-l": true, "-m": true, "-O": true, "-o": true, "-p": true, "-Q": true,
+	"-R": true, "-S": true, "-W": true, "-w": true, "-B": true}
+
+// sshRemoteCommand returns the command ssh runs on the remote host, "" for a
+// login shell.
+func sshRemoteCommand(args []string) string {
+	i := 0
+	for i < len(args) && strings.HasPrefix(args[i], "-") {
+		if sshValueFlags[args[i]] {
+			i++
+		}
+		i++
+	}
+	if i+1 >= len(args) {
+		return ""
+	}
+	return strings.Join(args[i+1:], " ")
+}
+
+// gitBuiltins are git subcommands; anything else may be an alias that runs
+// an arbitrary command (git config alias.x '!git push origin main').
+var gitBuiltins = map[string]bool{
+	"add": true, "am": true, "apply": true, "archive": true, "bisect": true, "blame": true, "branch": true,
+	"bundle": true, "cat-file": true, "checkout": true, "cherry": true, "cherry-pick": true, "clean": true,
+	"clone": true, "commit": true, "config": true, "count-objects": true, "describe": true, "diff": true,
+	"fetch": true, "for-each-ref": true, "format-patch": true, "fsck": true, "gc": true, "grep": true,
+	"help": true, "init": true, "log": true, "ls-files": true, "ls-remote": true, "ls-tree": true,
+	"merge": true, "merge-base": true, "mv": true, "name-rev": true, "notes": true, "pull": true, "push": true,
+	"range-diff": true, "rebase": true, "reflog": true, "remote": true, "reset": true, "restore": true,
+	"rev-list": true, "rev-parse": true, "revert": true, "rm": true, "shortlog": true, "show": true,
+	"show-ref": true, "sparse-checkout": true, "stash": true, "status": true, "submodule": true,
+	"subtree": true, "switch": true, "symbolic-ref": true, "tag": true, "update-index": true,
+	"update-ref": true, "version": true, "worktree": true, "lfs": true,
 }
 
 // skipPrivFlags returns the command sudo/doas runs.
@@ -492,9 +578,18 @@ func (a *trustAnalyzer) git(args []string, dir, baseDir string) {
 		return
 	}
 	sub, rest := args[i], args[i+1:]
+	if !gitBuiltins[sub] {
+		a.f.protect("git " + sub + ": not a built-in command (may be an alias)")
+		return
+	}
 	switch sub {
 	case "push":
 		a.gitPush(rest, eff, cfgOverride)
+	case "submodule":
+		// submodule foreach runs an arbitrary command.
+		if len(rest) > 0 && rest[0] == "foreach" {
+			a.line(strings.Join(rest[1:], " "), eff, 1)
+		}
 	case "clean":
 		force := false
 		for _, x := range rest {

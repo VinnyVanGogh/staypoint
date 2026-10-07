@@ -61,6 +61,11 @@ func TestAnalyzeForTrust_ProtectedAlwaysHeld(t *testing.T) {
 		"eval 'git push origin main'",
 		"python3 < script.py",
 		"unparseable 'quote",
+		"ssh build-host 'cd repo && git push origin main'",
+		"ssh -p 22 build-host gh pr merge 4",
+		"git -c alias.ship='!git push origin main' ship",
+		"git ship",
+		"git submodule foreach 'git push origin main'",
 	}
 	for _, c := range cases {
 		if f := AnalyzeForTrust(c, tc); !f.Protected {
@@ -142,6 +147,11 @@ func TestAnalyzeForTrust_DeleteOutsideWorktree(t *testing.T) {
 		"sudo rm -rf /opt",
 		"rm -rf /tmp/*",
 		"./cleanup.sh",
+		"echo x | tee /etc/hosts",
+		"sudo dd if=/dev/zero of=/etc/hosts",
+		"mv ~/notes.txt ./",
+		"cp out.txt /etc/hosts",
+		"ln -sf x /usr/local/bin/tool",
 	}
 	for _, c := range outside {
 		if f := AnalyzeForTrust(c, tc); !f.DeleteOutside {
@@ -162,6 +172,10 @@ func TestAnalyzeForTrust_DeleteInsideAllowed(t *testing.T) {
 		"echo hi > out.txt",
 		"go test ./... 2>&1 > /dev/null",
 		"cat a >> log.txt",
+		"echo x | tee -a /etc/hosts",
+		"mv a.txt b.txt",
+		"cp " + "/etc/hosts" + " ./hosts.copy",
+		"ssh build-host 'rm -rf /tmp/build && make'",
 	}
 	for _, c := range inside {
 		if f := AnalyzeForTrust(c, tc); f.DeleteOutside || f.Protected {
