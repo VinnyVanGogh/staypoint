@@ -8132,26 +8132,42 @@ function renderBranchDeleteWarning(taskId, headSHA, mainSHA, cleanup) {
 
 // SHIP_REVIEW_LIVE_WARNING matches liveDevWarning in handlers_ship_review.go.
 const SHIP_REVIEW_LIVE_WARNING = 'LIVE PRODUCTION DATA. Actions in this preview are real.';
+// SHIP_REVIEW_UNVERIFIED_WARNING matches unverifiedDevWarning in handlers_ship_review.go.
+const SHIP_REVIEW_UNVERIFIED_WARNING = 'UNVERIFIED REPO PATH. This repo could not be verified as separate from a live_credentials project, so treat this preview as live.';
 
-function markShipReviewLiveButton(btn, liveClass) {
-  btn.classList.add(liveClass);
-  btn.appendChild(el('span', 'ship-review-live-tag', 'LIVE'));
+// shipReviewLiveGate returns why start-dev needs the Board gate
+// ('live_credentials' | 'unverified_path'), or '' when it does not (STA-799).
+function shipReviewLiveGate(card) {
+  if (card.live_gate_reason) return card.live_gate_reason;
+  return card.live_gate || card.live_credentials ? 'live_credentials' : '';
 }
 
-// showShipReviewLiveConfirm shows the inline confirm a live_credentials dev
-// server start needs every time (STA-727). Confirm sends start-dev with the
-// Board passkey headers and {"confirm_live": true}; Cancel sends nothing.
-function showShipReviewLiveConfirm(section, afterRow, taskId, triggerBtn) {
+function shipReviewGateWarning(gate) {
+  return gate === 'unverified_path' ? SHIP_REVIEW_UNVERIFIED_WARNING : SHIP_REVIEW_LIVE_WARNING;
+}
+
+function markShipReviewLiveButton(btn, liveClass, gate) {
+  btn.classList.add(liveClass);
+  btn.appendChild(el('span', 'ship-review-live-tag', gate === 'unverified_path' ? 'UNVERIFIED' : 'LIVE'));
+}
+
+// showShipReviewLiveConfirm shows the inline confirm a gated dev server start
+// needs every time (STA-727; STA-799 for an unverified repo path). Confirm
+// sends start-dev with the Board passkey headers and {"confirm_live": true};
+// Cancel sends nothing.
+function showShipReviewLiveConfirm(section, afterRow, taskId, triggerBtn, gate) {
   const existing = section.querySelector('.ship-review-live-confirm');
   if (existing) existing.remove();
+  const unverified = gate === 'unverified_path';
   const box = el('div', 'ship-review-live-confirm');
-  box.appendChild(el('div', 'ship-review-live-confirm-warning', SHIP_REVIEW_LIVE_WARNING));
-  box.appendChild(el('div', 'ship-review-live-confirm-text',
-    'This dev server runs with production credentials. Anything you do in the preview changes real data.'));
+  box.appendChild(el('div', 'ship-review-live-confirm-warning', shipReviewGateWarning(gate)));
+  box.appendChild(el('div', 'ship-review-live-confirm-text', unverified
+    ? 'A live_credentials project path could not be read, so StayPoint cannot rule out that this repo is that project. Start only if you are sure; anything you do in the preview may change real data.'
+    : 'This dev server runs with production credentials. Anything you do in the preview changes real data.'));
   const err = el('div', 'ship-review-live-confirm-error');
   err.hidden = true;
   const actions = el('div', 'ship-review-live-confirm-actions');
-  const ok = el('button', 'ship-review-live-confirm-btn', 'Start LIVE dev server');
+  const ok = el('button', 'ship-review-live-confirm-btn', unverified ? 'Start dev server' : 'Start LIVE dev server');
   const cancel = el('button', 'ship-review-live-cancel-btn', 'Cancel');
   const close = () => { box.remove(); triggerBtn.disabled = false; };
   cancel.addEventListener('click', close);
@@ -8601,9 +8617,11 @@ function renderShipReviewCardFromData(container, taskId, card) {
 
   // STA-727: previews of a live_credentials project hit production. The red
   // banner sits above the dev env / Preview rows and the Start button.
-  const live = !!card.live_credentials;
+  // STA-799: a repo path the server could not verify is gated the same way.
+  const gate = shipReviewLiveGate(card);
+  const live = gate !== '';
   if (live) {
-    section.appendChild(el('div', 'ship-review-live-banner', SHIP_REVIEW_LIVE_WARNING));
+    section.appendChild(el('div', 'ship-review-live-banner', shipReviewGateWarning(gate)));
   }
 
   // Dev env state (async setup progress).
@@ -8650,9 +8668,9 @@ function renderShipReviewCardFromData(container, taskId, card) {
     if (card.status === 'pending') {
       const restartBtn = el('button', 'ship-review-restart-btn', '↺ Restart');
       restartBtn.title = 'Restart dev server';
-      if (live) markShipReviewLiveButton(restartBtn, 'ship-review-restart-btn--live');
+      if (live) markShipReviewLiveButton(restartBtn, 'ship-review-restart-btn--live', gate);
       restartBtn.addEventListener('click', async () => {
-        if (live) { showShipReviewLiveConfirm(section, devRow, taskId, restartBtn); return; }
+        if (live) { showShipReviewLiveConfirm(section, devRow, taskId, restartBtn, gate); return; }
         restartBtn.disabled = true;
         await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/start-dev`, { method: 'POST' }).catch(() => {});
         restartBtn.disabled = false;
@@ -8665,9 +8683,9 @@ function renderShipReviewCardFromData(container, taskId, card) {
     const startRow = el('div', 'ship-review-row');
     startRow.appendChild(el('span', 'ship-review-row-label', 'Preview'));
     const startBtn = el('button', 'ship-review-start-dev-btn', '▶ Start dev server');
-    if (live) markShipReviewLiveButton(startBtn, 'ship-review-start-dev-btn--live');
+    if (live) markShipReviewLiveButton(startBtn, 'ship-review-start-dev-btn--live', gate);
     startBtn.addEventListener('click', async () => {
-      if (live) { showShipReviewLiveConfirm(section, startRow, taskId, startBtn); return; }
+      if (live) { showShipReviewLiveConfirm(section, startRow, taskId, startBtn, gate); return; }
       startBtn.disabled = true;
       await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/start-dev`, { method: 'POST' }).catch(() => {});
       startBtn.disabled = false;

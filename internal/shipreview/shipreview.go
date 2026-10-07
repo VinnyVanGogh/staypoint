@@ -1364,17 +1364,43 @@ func GetProjectDevConfig(db *sql.DB, repoPath string) (*ProjectDevConfig, error)
 	return cfg, err
 }
 
-// LiveGateConfig loads repoPath's dev config for starting a dev server and
-// reports whether the start needs the Board gate: the project is
-// live_credentials, or repoPath cannot be compared with a live project
+// Reasons LiveGate reports for gating a dev server start (STA-799).
+const (
+	// LiveGateLiveCredentials: the project is flagged live_credentials.
+	LiveGateLiveCredentials = "live_credentials"
+	// LiveGateUnverifiedPath: repoPath cannot be ruled out as an alias of a
+	// live_credentials project.
+	LiveGateUnverifiedPath = "unverified_path"
+)
+
+// LiveGate loads repoPath's dev config for starting a dev server and reports
+// why the start needs the Board gate, or "" when it does not:
+// LiveGateLiveCredentials when the project is live_credentials, else
+// LiveGateUnverifiedPath when repoPath cannot be compared with a live project
 // (repoPath cannot be stat'ed, or the live project's path fails to stat for a
-// reason other than not existing). It fails closed.
-func LiveGateConfig(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, gated bool, err error) {
+// reason other than not existing).
+func LiveGate(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, reason string, err error) {
 	cfg, unverified, err := lookupDevConfig(db, repoPath)
+	if err != nil {
+		return nil, "", err
+	}
+	switch {
+	case cfg.LiveCredentials:
+		reason = LiveGateLiveCredentials
+	case unverified:
+		reason = LiveGateUnverifiedPath
+	}
+	return cfg, reason, nil
+}
+
+// LiveGateConfig is LiveGate reduced to whether the start is gated. It fails
+// closed: an error reports gated.
+func LiveGateConfig(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, gated bool, err error) {
+	cfg, reason, err := LiveGate(db, repoPath)
 	if err != nil {
 		return nil, true, err
 	}
-	return cfg, cfg.LiveCredentials || unverified, nil
+	return cfg, reason != "", nil
 }
 
 const devConfigColumns = `repo_path, dev_command, dev_url, setup_steps_json,

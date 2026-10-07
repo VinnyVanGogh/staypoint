@@ -74,13 +74,18 @@ func (h *ShipReviewHandler) GetCard(w http.ResponseWriter, r *http.Request) {
 			merged["unverified_migrations"] = unverified
 			merged["repo_name"] = filepath.Base(task.RepoPath)
 			// STA-727: the card shows the LIVE banner and confirm from these.
+			// live_gate/live_gate_reason (STA-799): start-dev needs the Board
+			// gate, either because the project is live_credentials or because
+			// the repo path could not be verified against the live projects.
 			// dev_configured: start-dev has something to run (a saved
 			// dev_command, or a Supabase project it will auto-configure).
-			if cfg, cfgErr := shipreview.GetProjectDevConfig(h.db, task.RepoPath); cfgErr == nil {
+			if cfg, reason, cfgErr := shipreview.LiveGate(h.db, task.RepoPath); cfgErr == nil {
 				isWork := shipreview.IsWorkRepo(task.RepoPath)
 				merged["is_work_repo"] = isWork
 				merged["effective_merge_mode"] = shipreview.EffectiveMergeMode(cfg, isWork)
 				merged["live_credentials"] = cfg.LiveCredentials
+				merged["live_gate"] = reason != ""
+				merged["live_gate_reason"] = reason
 				merged["dev_configured"] = cfg.DevCommand != "" || shipreview.HasSupabaseConfig(task.RepoPath)
 			}
 			if gitErr != nil {
@@ -209,39 +214,100 @@ func (h *ShipReviewHandler) verifyCardBase(w http.ResponseWriter, r *http.Reques
 // server for a live_credentials project (STA-727). The UI shows the same text.
 const liveDevWarning = "LIVE PRODUCTION DATA. Actions in this preview are real."
 
+// unverifiedDevWarning is the warning the Board confirms when start-dev is
+// gated because the repo path could not be verified against the
+// live_credentials projects (STA-799). The UI shows the same text.
+const unverifiedDevWarning = "UNVERIFIED REPO PATH. This repo could not be verified as separate from a live_credentials project, so treat this preview as live."
+
+// liveGateWarning returns the warning for a shipreview.LiveGate reason.
+func liveGateWarning(reason string) string {
+	if reason == shipreview.LiveGateUnverifiedPath {
+		return unverifiedDevWarning
+	}
+	return liveDevWarning
+}
+
+// liveGateRefusal returns the 403 message for a gated start-dev that did not
+// pass the Board gate.
+func liveGateRefusal(reason string) string {
+	if reason == shipreview.LiveGateUnverifiedPath {
+		return "forbidden: this repo path could not be verified as separate from a live_credentials project, so starting its dev server requires a Board session and passkey"
+	}
+	return "forbidden: starting a live_credentials dev server requires a Board session and passkey"
+}
+
 type liveBoardGateKey struct{}
 
-// StartDevGated routes POST start-dev. Non-live projects go straight to
-// StartDev, agent-callable as before. A live_credentials project must first
-// pass boardGate (WrapBoardAction: Board session + passkey assertion); StartDev
-// then also requires {"confirm_live": true} and audits the confirmation.
+// StartDevGated routes POST start-dev. Ungated projects go straight to
+// StartDev, agent-callable as before. A gated project (shipreview.LiveGate)
+// must first pass boardGate (WrapBoardAction: Board session + passkey
+// assertion); StartDev then also requires {"confirm_live": true} and audits
+// the confirmation. A refusal from boardGate keeps its error code and gains
+// live_gate_reason and a message saying why the start is gated.
 func (h *ShipReviewHandler) StartDevGated(boardGate func(http.Handler) http.Handler) http.Handler {
-	live := boardGate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h.StartDev(w, r.WithContext(gocontext.WithValue(r.Context(), liveBoardGateKey{}, true)))
-	}))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, task, ok := h.requireCard(w, r.PathValue("id"))
 		if !ok {
 			return
 		}
-		// STA-767: LiveGateConfig matches the live row by directory, so a
-		// task repo_path aliasing a live repo is gated too.
-		_, gated, err := shipreview.LiveGateConfig(h.db, task.RepoPath)
+		// STA-767: LiveGate matches the live row by directory, so a task
+		// repo_path aliasing a live repo is gated too.
+		_, reason, err := shipreview.LiveGate(h.db, task.RepoPath)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
 			return
 		}
-		if gated {
-			live.ServeHTTP(w, r)
+		if reason == "" {
+			h.StartDev(w, r)
 			return
 		}
-		h.StartDev(w, r)
+		var passed *http.Request
+		refusal := &boardGateRefusal{header: http.Header{}, status: http.StatusOK}
+		boardGate(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			passed = r
+		})).ServeHTTP(refusal, r)
+		if passed == nil {
+			refusal.writeTo(w, reason)
+			return
+		}
+		h.StartDev(w, passed.WithContext(gocontext.WithValue(passed.Context(), liveBoardGateKey{}, true)))
 	})
+}
+
+// boardGateRefusal records the response boardGate writes when it refuses a
+// request, so StartDevGated can add why the start is gated.
+type boardGateRefusal struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (b *boardGateRefusal) Header() http.Header         { return b.header }
+func (b *boardGateRefusal) WriteHeader(status int)      { b.status = status }
+func (b *boardGateRefusal) Write(p []byte) (int, error) { return b.body.Write(p) }
+
+func (b *boardGateRefusal) writeTo(w http.ResponseWriter, reason string) {
+	var payload map[string]any
+	if err := json.Unmarshal(b.body.Bytes(), &payload); err != nil {
+		for k, v := range b.header {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(b.status)
+		_, _ = w.Write(b.body.Bytes())
+		return
+	}
+	msg := liveGateRefusal(reason)
+	if gateMsg, _ := payload["message"].(string); gateMsg != "" {
+		msg += " (" + strings.TrimPrefix(gateMsg, "forbidden: ") + ")"
+	}
+	payload["message"] = msg
+	payload["live_gate_reason"] = reason
+	writeErrorJSON(w, b.status, payload)
 }
 
 // StartDev handles POST /api/tasks/{id}/ship-review/start-dev
 // Returns 202 immediately; setup runs async and streams progress via SSE.
-// Mount it through StartDevGated: on a live_credentials project it refuses any
+// Mount it through StartDevGated: on a gated project (shipreview.LiveGate) it refuses any
 // request that did not pass the Board gate.
 func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
@@ -258,7 +324,7 @@ func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, gated, err := shipreview.LiveGateConfig(h.db, task.RepoPath)
+	cfg, reason, err := shipreview.LiveGate(h.db, task.RepoPath)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
 		return
@@ -266,30 +332,37 @@ func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 
 	// STA-727: every gate check happens before any side effect (config
 	// proposal, worktree, process), so a refused live start leaves no trace.
-	if gated {
+	if reason != "" {
 		if passed, _ := r.Context().Value(liveBoardGateKey{}).(bool); !passed {
-			writeBoardError(w, "board_session_required", "forbidden: starting a live_credentials dev server requires a Board session and passkey")
+			writeErrorJSON(w, http.StatusForbidden, map[string]any{
+				"error":            "board_session_required",
+				"message":          liveGateRefusal(reason),
+				"live_gate_reason": reason,
+			})
 			return
 		}
 		var body struct {
 			ConfirmLive bool `json:"confirm_live"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		warning := liveGateWarning(reason)
 		if !body.ConfirmLive {
 			writeErrorJSON(w, http.StatusConflict, map[string]any{
-				"error":   "live_confirmation_required",
-				"message": liveDevWarning + " Confirm to start the dev server.",
-				"warning": liveDevWarning,
+				"error":            "live_confirmation_required",
+				"message":          warning + " Confirm to start the dev server.",
+				"warning":          warning,
+				"live_gate_reason": reason,
 			})
 			return
 		}
 		if err := governance.LogBoardEvent(h.db, "board", governance.AuditBoardAction, map[string]any{
-			"action":     "live_dev_start_confirmed",
-			"task_id":    taskID,
-			"repo_path":  task.RepoPath,
-			"warning":    liveDevWarning,
-			"ip":         r.RemoteAddr,
-			"user_agent": r.UserAgent(),
+			"action":           "live_dev_start_confirmed",
+			"task_id":          taskID,
+			"repo_path":        task.RepoPath,
+			"warning":          warning,
+			"live_gate_reason": reason,
+			"ip":               r.RemoteAddr,
+			"user_agent":       r.UserAgent(),
 		}); err != nil {
 			writeError(w, http.StatusInternalServerError, "audit log write failed: "+err.Error())
 			return

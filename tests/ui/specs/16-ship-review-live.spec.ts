@@ -209,3 +209,77 @@ test.describe('ship review card: live_credentials project', () => {
     expect(body ? JSON.parse(body).confirm_live : undefined, 'non-live start-dev sends no confirm_live').toBeUndefined();
   });
 });
+
+// STA-799: the server also gates start-dev when it cannot verify the task repo
+// is not a live_credentials project (a live repo path it cannot stat). GET
+// /ship-review reports that as live_gate=true, live_gate_reason=unverified_path
+// with live_credentials=false. The card must say so and take the same Board
+// passkey + confirm path, without claiming the project is live.
+const UNVERIFIED_TEXT = 'could not be verified';
+
+function unverifiedCard(taskId: string, devUrl = '') {
+  return { ...syntheticCard(taskId, { live: false, devUrl }), live_gate: true, live_gate_reason: 'unverified_path' };
+}
+
+test.describe('ship review card: start-dev gated on an unverified repo path', () => {
+  test('banner says the repo path could not be verified, not LIVE PRODUCTION DATA', async ({ page, api }) => {
+    const task = await api.createTask('sr-unverified-banner');
+    await serveCard(page, task.id, unverifiedCard(task.id));
+
+    await gotoTaskPage(page, task);
+    const card = page.locator('.ship-review-card');
+    await expect(card).toBeVisible({ timeout: 12_000 });
+
+    const banner = card.locator('.ship-review-live-banner');
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText(UNVERIFIED_TEXT);
+    await expect(banner).not.toContainText(LIVE_WARNING);
+  });
+
+  test('Start dev server confirms with the unverified warning and sends passkey + confirm_live', async ({ boardPage: page, api }) => {
+    const task = await api.createTask('sr-unverified-confirm');
+    const startDev = await serveCard(page, task.id, unverifiedCard(task.id));
+    noBrowserDialogs(page);
+
+    await gotoTaskPage(page, task);
+    const card = page.locator('.ship-review-card');
+    await expect(card).toBeVisible({ timeout: 12_000 });
+
+    const startBtn = card.locator('.ship-review-start-dev-btn');
+    await expect(startBtn, 'gated card must offer Start dev server').toBeVisible();
+    await startBtn.click();
+    const confirmForm = card.locator('.ship-review-live-confirm');
+    await expect(confirmForm).toBeVisible({ timeout: 3_000 });
+    await expect(confirmForm).toContainText(UNVERIFIED_TEXT);
+    await expect(confirmForm).not.toContainText(LIVE_WARNING);
+    await page.waitForTimeout(500);
+    expect(startDev.length, 'start-dev must wait for the confirm').toBe(0);
+
+    const challenge = page.waitForResponse((r) => r.url().includes('/api/board/webauthn/challenge'));
+    await confirmForm.getByRole('button', { name: /start/i }).click();
+    await challenge;
+    await expect.poll(() => startDev.length, { timeout: 5_000 }).toBe(1);
+
+    const headers = startDev[0].headers();
+    expect(headers['x-webauthn-assertion'], 'passkey assertion header').toBeTruthy();
+    expect(headers['x-webauthn-session'], 'passkey session header').toBeTruthy();
+    expect(startDev[0].postDataJSON()).toMatchObject({ confirm_live: true });
+  });
+
+  test('Restart on a gated card also needs the confirm', async ({ boardPage: page, api }) => {
+    const task = await api.createTask('sr-unverified-restart');
+    const startDev = await serveCard(page, task.id, unverifiedCard(task.id, DEV_URL));
+    noBrowserDialogs(page);
+
+    await gotoTaskPage(page, task);
+    const card = page.locator('.ship-review-card');
+    await expect(card).toBeVisible({ timeout: 12_000 });
+
+    await card.locator('.ship-review-restart-btn').click();
+    const confirmForm = card.locator('.ship-review-live-confirm');
+    await expect(confirmForm).toBeVisible({ timeout: 3_000 });
+    await expect(confirmForm).toContainText(UNVERIFIED_TEXT);
+    await page.waitForTimeout(500);
+    expect(startDev.length, 'gated Restart must wait for the confirm').toBe(0);
+  });
+});
