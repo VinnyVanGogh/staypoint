@@ -1,6 +1,9 @@
 package context
 
-import "errors"
+import (
+	"errors"
+	"strings"
+)
 
 // Task origins (tasks.origin). See Task.Origin.
 const (
@@ -12,6 +15,8 @@ const (
 var (
 	ErrInvalidOrigin = errors.New("invalid origin")
 	ErrInvalidStage  = errors.New("invalid execution stage")
+	ErrNoRepo        = errors.New("task has no repo")
+	ErrInvalidRepo   = errors.New("invalid repo path")
 )
 
 // IsValidOrigin reports whether origin is one of the task origins.
@@ -36,4 +41,18 @@ func FilterLegacy(tasks []Task, includeLegacy bool) []Task {
 		}
 	}
 	return out
+}
+
+// NormalizeTaskPriority maps a priority to low, medium, high or critical
+// ("urgent" is critical); anything else is medium.
+func NormalizeTaskPriority(p string) string {
+	switch strings.ToLower(strings.TrimSpace(p)) {
+	case "critical", "urgent":
+		return "critical"
+	case "high":
+		return "high"
+	case "low":
+		return "low"
+	}
+	return "medium"
 }

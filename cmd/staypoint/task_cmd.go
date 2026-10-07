@@ -103,6 +103,9 @@ var taskListCmd = &cobra.Command{
 			if t.Origin != "" && t.Origin != meshContext.OriginNative {
 				originInfo = " [" + t.Origin + "]"
 			}
+			if t.SourceRef != "" {
+				originInfo += " (imported from " + t.SourceRef + ")"
+			}
 			fmt.Printf("  • %s[%s/%s]\033[0m \033[1m%s\033[0m%s%s (branch: %s, role: %s)%s\n",
 				statusColor, t.Status, t.ExecutionStage, t.Name, orgProjInfo, originInfo, t.GitBranch, t.AccountRole, budgetInfo)
 		}

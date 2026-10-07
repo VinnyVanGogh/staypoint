@@ -171,3 +171,25 @@ func TestMigration33_RerunKeepsNativeOrigins(t *testing.T) {
 		t.Errorf("re-run must still normalize organization, got %q", org)
 	}
 }
+
+func TestMigration35_SourceRefUnique(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "m35.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	conn := store.DB()
+	ins := `INSERT INTO tasks (id, name, repo_path, git_branch, account_role, source_ref, source_id, priority) VALUES (?, 'n', '', '', 'personal', ?, ?, 'high')`
+	if _, err := conn.Exec(ins, "task-a", "STA-1", "uuid-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ins, "task-b", "STA-1", "uuid-1"); err == nil {
+		t.Fatal("duplicate source_id accepted")
+	}
+	// Native tasks (empty source_id) are not constrained.
+	for _, id := range []string{"task-c", "task-d"} {
+		if _, err := conn.Exec(ins, id, "", ""); err != nil {
+			t.Fatalf("native task %s: %v", id, err)
+		}
+	}
+}

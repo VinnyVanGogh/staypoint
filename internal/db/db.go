@@ -1168,6 +1168,29 @@ var Migrations = []Migration{
 			return err
 		},
 	},
+	{
+		// 35: 33 is backlog-stage (task origins), 34 is STA-854 on main.
+		Version: 35,
+		Name:    "task_source_ref",
+		Up: func(conn *sql.DB) error {
+			// staypoint import paperclip: where an imported task came from.
+			// source_ref is the human identifier (STA-772), source_id the
+			// Paperclip uuid; the unique index makes re-imports skip.
+			// The live DB already has tasks.priority (added outside the
+			// ledger); fresh DBs get it here, the duplicate is ignored.
+			for _, stmt := range []string{
+				`ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium';`,
+				`ALTER TABLE tasks ADD COLUMN source_ref TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE tasks ADD COLUMN source_id  TEXT NOT NULL DEFAULT '';`,
+				`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_source_id ON tasks (source_id) WHERE source_id != '';`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {

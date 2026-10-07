@@ -56,7 +56,29 @@ func filterTaskList(tasks []meshContext.Task, includeLegacy bool, stage string) 
 	return out
 }
 
+var taskSetRepoCmd = &cobra.Command{
+	Use:   "set-repo <id> <path>",
+	Short: "Set the repo a task runs in (imported tasks start without one)",
+	Args:  cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		branch, _ := cmd.Flags().GetString("branch")
+		store, err := db.Open(cfg.DBPath)
+		if err != nil {
+			return fmt.Errorf("open db: %w", err)
+		}
+		defer store.Close()
+		task, err := meshContext.SetTaskRepo(store.DB(), args[0], args[1], branch)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "Task %s repo set to %s (%s)\n", task.ID, task.RepoPath, task.GitBranch)
+		return nil
+	},
+}
+
 func init() {
+	taskCmd.AddCommand(taskSetRepoCmd)
+	taskSetRepoCmd.Flags().String("branch", "", "Git branch (default: the repo's current branch)")
 	taskCmd.AddCommand(taskStageCmd)
 	taskStageCmd.Flags().Bool("override", false, "Board override: mark done while child tasks are open")
 }

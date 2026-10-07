@@ -5925,7 +5925,7 @@ function makeTaskCard(task) {
   card.appendChild(el('div', 'card-title', task.title || task.name || '(untitled)'));
   const meta = el('div', 'card-meta');
   meta.appendChild(el('span', `card-status-dot dot-${boardColumnFor(task) || task.status}`));
-  meta.appendChild(el('span', 'card-id', task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : '')));
+  meta.appendChild(el('span', 'card-id', task.source_ref || task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : '')));
   if (isLegacy(task)) meta.appendChild(el('span', 'card-origin-badge', 'legacy'));
   card.appendChild(meta);
   card.addEventListener('click', () => openDetail(task.id));
@@ -10354,6 +10354,13 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     meta.appendChild(lblWrap);
   }
 
+  if (task.source_ref) {
+    // Paperclip import (STA-857): where this task came from.
+    meta.appendChild(el('div', 'task-source-ref', `Imported from ${task.source_ref}`));
+  }
+  if (task.origin === 'paperclip_import' && !task.repo_path) {
+    meta.appendChild(el('div', 'task-source-ref muted-text', 'No repo yet: set one (staypoint task set-repo) before moving it out of backlog.'));
+  }
   appendTaskRelations(meta, task, openTask);
 
   // A ship review card in pending/sent_back/approved/rejected state blocks
