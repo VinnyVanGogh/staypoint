@@ -24,17 +24,17 @@ func TestStages_CancelledAndBacklogEdges(t *testing.T) {
 }
 
 func TestStages_Runnable(t *testing.T) {
-	for _, s := range []string{"backlog", "done", "cancelled", "rejected"} {
+	for _, s := range []string{"backlog", "done", "cancelled", "rejected", "stopped"} {
 		if governance.IsRunnableStage(s) {
 			t.Errorf("%s must not be runnable", s)
 		}
 	}
-	for _, s := range []string{"todo", "in_progress", "in_review", "blocked", "paused", "capped", "stopped"} {
+	for _, s := range []string{"todo", "in_progress", "in_review", "blocked", "paused", "capped"} {
 		if !governance.IsRunnableStage(s) {
 			t.Errorf("%s must be runnable", s)
 		}
 	}
-	if got := governance.NonRunnableStagesSQL(); got != "'backlog', 'done', 'cancelled', 'rejected'" {
+	if got := governance.NonRunnableStagesSQL(); got != "'backlog', 'done', 'cancelled', 'rejected', 'stopped'" {
 		t.Errorf("NonRunnableStagesSQL = %s", got)
 	}
 }

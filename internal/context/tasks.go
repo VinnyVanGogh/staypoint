@@ -3,6 +3,7 @@ package context
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -967,29 +968,40 @@ func MarkTaskDoneWithOptions(db *sql.DB, id string, opts DoneOptions) error {
 		}
 	}
 
-	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM task_work_products WHERE task_id = ?`, task.ID).Scan(&count); err != nil {
-		return fmt.Errorf("failed to check work products: %w", err)
-	}
-	if count == 0 {
-		return fmt.Errorf("cannot mark task as done without a registered work product")
+	if !opts.BoardDone {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM task_work_products WHERE task_id = ?`, task.ID).Scan(&count); err != nil {
+			return fmt.Errorf("failed to check work products: %w", err)
+		}
+		if count == 0 {
+			return ErrNoWorkProduct
+		}
+
+		// Watchdog: evaluate criteria on deliverable-status change before allowing done.
+		_ = governance.TriggerWatchdogEval(db, task.ID, "deliverable_update")
+		// Re-read block status — watchdog may have just set is_blocked = 1.
+		var isBlocked int
+		var blockReason string
+		_ = db.QueryRow(`SELECT is_blocked, COALESCE(block_reason,'') FROM tasks WHERE id = ?`, task.ID).Scan(&isBlocked, &blockReason)
+		if isBlocked == 1 {
+			return fmt.Errorf("task is blocked by watchdog: %s", blockReason)
+		}
 	}
 
-	// Watchdog: evaluate criteria on deliverable-status change before allowing done.
-	_ = governance.TriggerWatchdogEval(db, task.ID, "deliverable_update")
-	// Re-read block status — watchdog may have just set is_blocked = 1.
-	var isBlocked int
-	var blockReason string
-	_ = db.QueryRow(`SELECT is_blocked, COALESCE(block_reason,'') FROM tasks WHERE id = ?`, task.ID).Scan(&isBlocked, &blockReason)
-	if isBlocked == 1 {
-		return fmt.Errorf("task is blocked by watchdog: %s", blockReason)
-	}
-
+	// A Board close also clears any block: the task is finished.
 	query := `
 		UPDATE tasks
 		SET status = 'done', execution_stage = 'done', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 		WHERE id = ?
 	`
+	if opts.BoardDone {
+		query = `
+		UPDATE tasks
+		SET status = 'done', execution_stage = 'done', is_blocked = 0, block_reason = NULL,
+		    deleted_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		WHERE id = ?
+	`
+	}
 	res, err := db.Exec(query, task.ID)
 	if err != nil {
 		return fmt.Errorf("failed to mark task as done: %w", err)
@@ -998,6 +1010,17 @@ func MarkTaskDoneWithOptions(db *sql.DB, id string, opts DoneOptions) error {
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
 		return fmt.Errorf("task not found: %s", id)
+	}
+
+	if opts.BoardDone {
+		msg := "Marked done by Board"
+		if note := strings.TrimSpace(opts.BoardNote); note != "" {
+			msg += ": " + note
+		}
+		// Written directly, not through AddTaskComment: the note must not
+		// notify the daemon.
+		_, _ = db.Exec(`INSERT INTO task_comments (task_id, author, message) VALUES (?, 'board', ?)`, task.ID, msg)
+		_ = LogActivity(db, task.ID, "board_done", msg)
 	}
 
 	// Unblock any tasks that were waiting on this one
@@ -1072,8 +1095,35 @@ func AddTaskComment(db *sql.DB, taskID, author, message string) error {
 	_, _ = SupersedeInteractionsOnComment(db, task.ID)
 	// Watchdog: re-evaluate criteria on every comment (update-triggered, no polling).
 	_ = governance.TriggerWatchdogEval(db, task.ID, "comment")
-	_ = orchestrator.NotifyDaemon(task.ID, "comment", "")
+	if commentWakes(db, task.ID) {
+		_ = orchestrator.NotifyDaemon(task.ID, "comment", "")
+	}
 	return nil
+}
+
+// commentWakes reports whether a new comment should wake the task's agent
+// (STA-861). It does not when the task is not runnable (backlog, including
+// interactive tasks; stopped; closed) or when a Board stop is pending for the
+// run that is still winding down: only Run Now or a stage change resumes a
+// stopped task.
+func commentWakes(db *sql.DB, taskID string) bool {
+	var stage string
+	if err := db.QueryRow(`SELECT COALESCE(execution_stage, '') FROM tasks WHERE id = ?`, taskID).Scan(&stage); err != nil {
+		return false
+	}
+	if !governance.IsRunnableStage(stage) {
+		return false
+	}
+	// A stop is pending while the stopped run still holds the checkout; once
+	// it exits the stage is stopped (not runnable).
+	var stop int
+	if err := db.QueryRow(
+		`SELECT rc.stop_requested FROM run_control rc JOIN tasks t ON t.id = rc.task_id
+		  WHERE rc.task_id = ? AND t.checkout_run_id IS NOT NULL`, taskID,
+	).Scan(&stop); err == nil && stop != 0 {
+		return false
+	}
+	return true
 }
 
 func GetTaskComments(db *sql.DB, taskID string) ([]TaskComment, error) {
@@ -1398,6 +1448,63 @@ func AddTaskDocument(db *sql.DB, taskID, docKey, content string) error {
 	}
 	_, err = db.Exec(`INSERT INTO task_documents (task_id, doc_key, version, content) VALUES (?, ?, ?, ?)`, taskID, docKey, v, content)
 	return err
+}
+
+// ErrInvalidWorkProduct is returned for an unknown work product type or an
+// empty reference.
+var ErrInvalidWorkProduct = errors.New("invalid work product")
+
+// workProductTypeAliases maps the CLI/API names to task_work_products types.
+var workProductTypeAliases = map[string]string{
+	"pr":             "pull_request",
+	"pull_request":   "pull_request",
+	"pull-request":   "pull_request",
+	"commit":         "commit",
+	"branch":         "branch",
+	"doc":            "doc",
+	"workspace_file": "workspace_file",
+	"workspace-file": "workspace_file",
+	"file":           "workspace_file",
+}
+
+// WorkProductTypeNames are the type names RegisterWorkProduct accepts, for
+// help and error text.
+const WorkProductTypeNames = "pr, commit, branch, doc, workspace_file"
+
+// NormalizeWorkProductType maps a CLI/API type name to the stored type.
+func NormalizeWorkProductType(t string) (string, bool) {
+	v, ok := workProductTypeAliases[strings.ToLower(strings.TrimSpace(t))]
+	return v, ok
+}
+
+// RegisterWorkProduct records a work product (PR, commit, branch, doc or
+// workspace file) for a task from the CLI or API (STA-861), so an interactive
+// task can be marked done. taskID may be an id or name, as for GetTask.
+func RegisterWorkProduct(db *sql.DB, taskID, productType, reference string) (*TaskWorkProduct, error) {
+	task, err := GetTask(db, taskID)
+	if err != nil {
+		return nil, err
+	}
+	typ, ok := NormalizeWorkProductType(productType)
+	if !ok {
+		return nil, fmt.Errorf("%w: type %q must be one of %s", ErrInvalidWorkProduct, productType, WorkProductTypeNames)
+	}
+	reference = strings.TrimSpace(reference)
+	if reference == "" {
+		return nil, fmt.Errorf("%w: a reference (--ref) is required", ErrInvalidWorkProduct)
+	}
+	res, err := db.Exec(`INSERT INTO task_work_products (task_id, product_type, reference) VALUES (?, ?, ?)`, task.ID, typ, reference)
+	if err != nil {
+		return nil, fmt.Errorf("register work product: %w", err)
+	}
+	id, _ := res.LastInsertId()
+	_ = LogActivity(db, task.ID, "work_product_added", fmt.Sprintf("%s %s", typ, reference))
+	var p TaskWorkProduct
+	if err := db.QueryRow(`SELECT id, task_id, product_type, reference, created_at FROM task_work_products WHERE id = ?`, id).
+		Scan(&p.ID, &p.TaskID, &p.ProductType, &p.Reference, &p.CreatedAt); err != nil {
+		return nil, err
+	}
+	return &p, nil
 }
 
 func AddWorkProduct(db *sql.DB, taskID, productType, reference string) error {

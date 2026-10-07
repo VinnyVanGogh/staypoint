@@ -12,6 +12,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/bridge"
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
+	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/paperclip"
 	"github.com/VinnyVanGogh/staypoint/internal/ui"
 	"github.com/charmbracelet/glamour"
@@ -409,19 +410,34 @@ func runTaskCreate(cmd *cobra.Command, args []string) error {
 			}
 			budget, _ := cmd.Flags().GetFloat64("budget")
 			maxTurns, _ := cmd.Flags().GetInt("max-turns")
-			_, _ = meshContext.CreateTaskWithOptions(store.DB(), meshContext.TaskCreateOptions{
-				Name:          genResult.Task.Title,
-				RepoPath:      cwd,
-				GitBranch:     branch,
-				AccountRole:   role,
-				MaxBudgetUSD:  budget,
-				MaxTurns:      maxTurns,
-				Organization:  genResult.Task.Organization,
-				Project:       genResult.Task.Project,
-				WorkKind:      kindFlag,
-				Provider:      choice.Provider,
-				ModelOverride: choice.Model,
+			// STA-861: --session means an interactive session tracks this
+			// task: park it in backlog (never claimed) and attach.
+			sessionFlag, _ := cmd.Flags().GetString("session")
+			stage := ""
+			if strings.TrimSpace(sessionFlag) != "" {
+				stage = governance.StageBacklog
+			}
+			created, createErr := meshContext.CreateTaskWithOptions(store.DB(), meshContext.TaskCreateOptions{
+				Name:           genResult.Task.Title,
+				RepoPath:       cwd,
+				GitBranch:      branch,
+				AccountRole:    role,
+				MaxBudgetUSD:   budget,
+				MaxTurns:       maxTurns,
+				Organization:   genResult.Task.Organization,
+				Project:        genResult.Task.Project,
+				WorkKind:       kindFlag,
+				Provider:       choice.Provider,
+				ModelOverride:  choice.Model,
+				ExecutionStage: stage,
 			})
+			if createErr == nil && stage != "" {
+				if session, client, _, err := attachFlags(cmd); err == nil {
+					if err := attachSession(out, store.DB(), created.ID, session, client, created.RepoPath); err != nil {
+						fmt.Fprintf(out, "attach session: %v\n", err)
+					}
+				}
+			}
 		}
 	}
 

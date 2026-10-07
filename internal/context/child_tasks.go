@@ -19,6 +19,7 @@ var (
 	ErrChildLimit      = errors.New("parent already has the maximum number of child tasks")
 	ErrDepthLimit      = errors.New("child task would exceed the maximum nesting depth")
 	ErrOpenChildren    = errors.New("task has open child tasks")
+	ErrNoWorkProduct   = errors.New("cannot mark task as done without a registered work product")
 )
 
 // HandoffDocKey is the task_documents key holding a child's handoff context.
@@ -236,6 +237,14 @@ func GetTaskHandoff(db *sql.DB, taskID string) (string, error) {
 type DoneOptions struct {
 	// BoardOverride marks a parent done even while children are open.
 	BoardOverride bool
+	// BoardDone is the Board closing the task from the task page (STA-861):
+	// no registered work product is required and a block (watchdog or
+	// blocker) does not stop it. Only set it after the Board gate passed;
+	// agents and token-only callers keep the work-product requirement.
+	BoardDone bool
+	// BoardNote is recorded on the timeline with a BoardDone close as
+	// "Marked done by Board: <note>".
+	BoardNote string
 }
 
 func checkOpenChildren(db *sql.DB, taskID string) error {

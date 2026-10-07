@@ -9,6 +9,7 @@ import (
 
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
+	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/trackgate"
 	"github.com/spf13/cobra"
@@ -147,21 +148,27 @@ func createLocalOrgTask(out io.Writer, conn *sql.DB, org, project, title, repo, 
 // createLocalOrgTaskWith is createLocalOrgTask with a work_kind and the
 // Board's provider choice (already validated by router.ValidateTaskChoice).
 func createLocalOrgTaskWith(out io.Writer, conn *sql.DB, org, project, title, repo, session string, client trackgate.Client, budget float64, maxTurns int, kind string, choice router.RouteChoice) error {
+	// STA-861: the task tracks an interactive session's work, so it is
+	// created in backlog, which the daemon never claims or wakes. Without
+	// this the daemon started a headless run that redid the session's work.
+	// The Board's Run Now still starts a run (backlog -> todo -> in_progress).
 	task, err := meshContext.CreateTaskWithOptions(conn, meshContext.TaskCreateOptions{
-		Name:          title,
-		RepoPath:      repo,
-		Organization:  org,
-		Project:       project,
-		MaxBudgetUSD:  budget,
-		MaxTurns:      maxTurns,
-		WorkKind:      kind,
-		Provider:      choice.Provider,
-		ModelOverride: choice.Model,
+		Name:           title,
+		RepoPath:       repo,
+		Organization:   org,
+		Project:        project,
+		MaxBudgetUSD:   budget,
+		MaxTurns:       maxTurns,
+		WorkKind:       kind,
+		Provider:       choice.Provider,
+		ModelOverride:  choice.Model,
+		ExecutionStage: governance.StageBacklog,
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "Created task %s (%s): %s\n", task.ID, org, task.Name)
+	fmt.Fprintf(out, "Interactive task: parked in backlog, so the daemon will not run it. Close it with: staypoint task done %s --pr <url>\n", task.ID)
 	if session == "" {
 		fmt.Fprintf(out, "No session id found; attach with: staypoint task attach %s --session <id>\n", task.ID)
 		return nil

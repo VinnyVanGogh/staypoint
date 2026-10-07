@@ -6714,6 +6714,62 @@ function buildProviderField(task) {
   return wrap;
 }
 
+// buildKindField is the task page's work-kind select (STA-861), next to the
+// provider select. PUT /api/tasks/{id}/kind; refused while a run holds the
+// task, and Gemini never takes a code kind in a work repo.
+function buildKindField(task) {
+  const wrap = el('div', 'task-kind-field');
+  const select = document.createElement('select');
+  select.className = 'task-kind-select';
+  select.setAttribute('aria-label', 'Kind of work');
+  for (const k of WORK_KINDS) {
+    const opt = document.createElement('option');
+    opt.value = k;
+    opt.textContent = workKindLabel(k);
+    select.appendChild(opt);
+  }
+  select.value = task.work_kind || 'coding';
+  const hint = el('div', 'form-hint');
+  const isWork = task.account_role === 'work';
+  if (taskRunActive(task) || taskIsTerminal(task)) {
+    select.disabled = true;
+    if (taskRunActive(task)) hint.textContent = 'Stop the run before changing the kind of work.';
+  }
+  select.addEventListener('change', async () => {
+    const prev = task.work_kind || 'coding';
+    const refusal = kindChangeRefusal(task, select.value, isWork);
+    if (refusal) {
+      select.value = prev;
+      hint.textContent = refusal;
+      return;
+    }
+    select.disabled = true;
+    try {
+      const r = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/kind`, {
+        method: 'PUT',
+        headers: { ...authHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ work_kind: select.value }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || `${r.status} ${r.statusText}`);
+      task.work_kind = data.work_kind || select.value;
+      if (state.tasks[task.id]) state.tasks[task.id].work_kind = task.work_kind;
+      hint.textContent = 'Saved. The next run routes for this kind.';
+      const provSelect = wrap.parentElement && wrap.parentElement.parentElement
+        ? wrap.parentElement.parentElement.querySelector('.task-provider-select') : null;
+      if (provSelect) gateGeminiOptions(provSelect, task.work_kind, null, isWork);
+    } catch (err) {
+      select.value = prev;
+      hint.textContent = err.message || 'Failed to set kind.';
+    } finally {
+      select.disabled = false;
+    }
+  });
+  wrap.appendChild(select);
+  wrap.appendChild(hint);
+  return wrap;
+}
+
 function addPanelField(content, label, value) {
   if (!value && value !== 0) return;
   const field = el('div', 'panel-field');
@@ -10462,8 +10518,12 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   addMetaField('Project', projectSlug(task) !== 'default' ? projectSlug(task) : null);
   addMetaField('Org', task.organization || null);
   addMetaField('Stage', task.execution_stage || null);
-  addMetaField('Kind of work', workKindLabel(task.work_kind));
-  if (task.id && !isFleetTaskId(task.id)) addMetaField('Provider', buildProviderField(task));
+  if (task.id && !isFleetTaskId(task.id)) {
+    addMetaField('Kind of work', buildKindField(task));
+    addMetaField('Provider', buildProviderField(task));
+  } else {
+    addMetaField('Kind of work', workKindLabel(task.work_kind));
+  }
   addMetaField('Goal', task.goal_title || (task.goal_id ? task.goal_id.slice(0, 12) : null));
   addMetaField('Repo', task.repo_path ? `${task.repo_path} (${task.git_branch || 'main'})` : null);
   addMetaField('Spend',
@@ -10548,41 +10608,83 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     meta.appendChild(reviewLink);
   }
 
-  // ── Mark done button (in_review only) ──
-  if (task.id && (task.execution_stage === 'in_review' || task.status === 'in_review') && !hasActiveCard) {
+  // ── Mark done / Cancel task (any non-terminal stage, STA-861) ──
+  // The Board can close any open task from here. Mark done goes through the
+  // Board gate (passkey) with {board: true}, so no work product is needed; an
+  // active run is stopped first.
+  const closeActions = taskCloseActions(task);
+  if (closeActions.markDone && !isFleetTaskId(task.id)) {
     const doneError = el('div', 'mark-done-error');
     doneError.style.display = 'none';
+    const showCloseError = (msg) => {
+      doneError.textContent = msg;
+      doneError.style.display = 'block';
+    };
+    const stopRunFirst = async () => {
+      if (!taskRunActive(task)) return;
+      const r = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/run-control`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeader() },
+        body: JSON.stringify({ action: 'stop' }),
+      });
+      if (!r.ok) throw await boardActionError(r);
+    };
 
     const doneBtn = el('button', 'mark-done-btn', '✓ Mark done');
     doneBtn.type = 'button';
     doneBtn.addEventListener('click', async () => {
+      const confirmText = markDoneConfirmText(task, { hasActiveCard });
+      if (confirmText && !confirm(confirmText)) return;
+      const note = prompt('Optional note for the timeline (why this is done):', '');
+      if (note === null) return;
       doneBtn.disabled = true;
       doneBtn.textContent = 'Marking done…';
       doneError.style.display = 'none';
       try {
-        const res = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/done`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...authHeader() },
-        });
-        if (!res.ok) {
-          let msg = `Error ${res.status}`;
-          try { const j = await res.json(); msg = j.error || j.message || msg; } catch { /* ignore */ }
-          doneError.textContent = msg;
-          doneError.style.display = 'block';
-          doneBtn.disabled = false;
-          doneBtn.textContent = '✓ Mark done';
-          return;
-        }
+        await stopRunFirst();
+        const res = await withBoardWebAuthn((sessionToken, assertion) =>
+          fetch(`/api/tasks/${encodeURIComponent(task.id)}/done`, {
+            method: 'POST',
+            headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+            body: JSON.stringify(markDoneBody(note)),
+          }), 'marking the task done',
+        );
+        if (res === null) { doneBtn.disabled = false; doneBtn.textContent = '✓ Mark done'; return; }
+        if (!res.ok) throw await boardActionError(res);
         doneBtn.textContent = '✓ Done';
         setTimeout(reopen, 800);
       } catch (err) {
-        doneError.textContent = err.message || 'Request failed';
-        doneError.style.display = 'block';
+        showCloseError(err.message || 'Request failed');
         doneBtn.disabled = false;
         doneBtn.textContent = '✓ Mark done';
         console.error('mark-done failed:', err);
       }
     });
+
+    const cancelBtn = el('button', 'cancel-task-btn', '✕ Cancel task');
+    cancelBtn.type = 'button';
+    cancelBtn.addEventListener('click', async () => {
+      if (!confirm(cancelConfirmText(task))) return;
+      cancelBtn.disabled = true;
+      doneError.style.display = 'none';
+      try {
+        await stopRunFirst();
+        const res = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/stage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...authHeader() },
+          body: JSON.stringify({ stage: 'cancelled' }),
+        });
+        if (!res.ok) throw await boardActionError(res);
+        cancelBtn.textContent = '✕ Cancelled';
+        setTimeout(reopen, 800);
+      } catch (err) {
+        showCloseError(err.message || 'Request failed');
+        cancelBtn.disabled = false;
+        console.error('cancel-task failed:', err);
+      }
+    });
+
+    headerActions.prepend(cancelBtn);
     headerActions.prepend(doneBtn);
     actionTray.appendChild(doneError);
   }

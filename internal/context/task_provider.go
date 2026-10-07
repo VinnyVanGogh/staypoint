@@ -58,3 +58,36 @@ func SetTaskProvider(db *sql.DB, taskID, provider, model string) (*Task, error) 
 	_ = LogActivity(db, t.ID, "provider_set", "provider: "+label)
 	return GetTask(db, t.ID)
 }
+
+// ErrRunInProgress is returned when a change must wait for the task's run to
+// finish (or be stopped).
+var ErrRunInProgress = errors.New("a run is in progress")
+
+// SetTaskWorkKind changes a task's work_kind after creation (STA-861). kind
+// must be one of ValidWorkKinds. It is refused with ErrRunInProgress while a
+// run holds the task (checked out, in_progress or paused): the live run was
+// routed for the old kind. The caller checks the provider rules
+// (router.ValidateTaskChoice) for the new kind first.
+func SetTaskWorkKind(db *sql.DB, taskID, kind string) (*Task, error) {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if !IsValidWorkKind(kind) {
+		return nil, fmt.Errorf("%w %q: must be one of %s", ErrInvalidWorkKind, kind, strings.Join(validWorkKinds, ", "))
+	}
+	t, err := GetTask(db, taskID)
+	if err != nil {
+		return nil, err
+	}
+	res, err := db.Exec(
+		`UPDATE tasks SET work_kind = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		  WHERE id = ? AND checkout_run_id IS NULL AND execution_stage NOT IN ('in_progress', 'paused')`,
+		kind, t.ID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("set task work kind: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, fmt.Errorf("%w: stop it before changing the kind of task %s", ErrRunInProgress, t.ID)
+	}
+	_ = LogActivity(db, t.ID, "work_kind_set", "work kind: "+kind)
+	return GetTask(db, t.ID)
+}

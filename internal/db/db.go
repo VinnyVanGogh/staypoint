@@ -1229,6 +1229,46 @@ var Migrations = []Migration{
 			return err
 		},
 	},
+	{
+		Version: 38,
+		Name:    "work_product_doc_type",
+		Up: func(conn *sql.DB) error {
+			// STA-861: `staypoint task product add --type doc` and
+			// POST /api/tasks/{id}/work-products register a doc (a design
+			// doc or report link) as a work product. SQLite cannot alter a
+			// CHECK constraint, so the table is rebuilt with 'doc' allowed.
+			var ddl string
+			if err := conn.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task_work_products'`).Scan(&ddl); err != nil {
+				return err
+			}
+			if strings.Contains(ddl, "'doc'") {
+				return nil
+			}
+			tx, err := conn.Begin()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = tx.Rollback() }()
+			for _, stmt := range []string{
+				`CREATE TABLE task_work_products_new (
+					id            INTEGER PRIMARY KEY AUTOINCREMENT,
+					task_id       TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+					product_type  TEXT NOT NULL CHECK (product_type IN ('pull_request', 'commit', 'branch', 'workspace_file', 'doc')),
+					reference     TEXT NOT NULL,
+					created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+				);`,
+				`INSERT INTO task_work_products_new (id, task_id, product_type, reference, created_at)
+					SELECT id, task_id, product_type, reference, created_at FROM task_work_products;`,
+				`DROP TABLE task_work_products;`,
+				`ALTER TABLE task_work_products_new RENAME TO task_work_products;`,
+			} {
+				if _, err := tx.Exec(stmt); err != nil {
+					return err
+				}
+			}
+			return tx.Commit()
+		},
+	},
 }
 
 func copyFile(src, dst string) error {
