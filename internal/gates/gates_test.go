@@ -41,7 +41,7 @@ func script(t *testing.T, body string) string {
 // runs and mark it pinned (the hook runs exactly those bytes).
 func hookSnapshot(cmd string) []security.ScriptHash {
 	var hs []HookScript
-	for _, r := range security.ScriptRefs(cmd, "", os.ReadFile, 0) {
+	for _, r := range security.ScriptRefs(cmd, "", security.NewSnapshotter(), 0) {
 		hs = append(hs, HookScript{Path: r.Path, Content: string(r.Full)})
 	}
 	return ScriptsFromHook(hs, true)

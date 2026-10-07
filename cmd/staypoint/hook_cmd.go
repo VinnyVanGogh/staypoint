@@ -444,8 +444,11 @@ func pinJudged(cmd string, v *security.Verdict) string {
 // snapshotScripts reads the scripts a held command runs, once, and returns
 // them for the gate request plus the command pinned to those bytes ("" when
 // it cannot be pinned; such a request is never auto-approved by a rule).
-func snapshotScripts(cmd, cwd string) ([]hookScript, string) {
-	refs := security.ScriptRefs(cmd, cwd, os.ReadFile, 0)
+//
+// snap must be the Snapshotter the classifier used, so a script judged by
+// content and snapshotted for the Board is one read with one set of bytes.
+func snapshotScripts(cmd, cwd string, snap *security.Snapshotter) ([]hookScript, string) {
+	refs := security.ScriptRefs(cmd, cwd, snap, 0)
 	if len(refs) == 0 {
 		return nil, ""
 	}
@@ -529,11 +532,14 @@ func handleHookPreTool() {
 		return
 	}
 
-	// Resolve effective working directory for bare-push detection.
+	// Resolve effective working directory for bare-push detection. Only a
+	// cwd from the payload is the shell's real one; the hook's own Getwd is a
+	// guess, so relative script paths are not resolved against it (STA-868).
 	cwd := payload.CWD
 	if cwd == "" {
 		cwd = bashInput.CWD
 	}
+	cwdTrusted := cwd != ""
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
@@ -542,7 +548,12 @@ func handleHookPreTool() {
 	// same parsed argv handles `git -C /dir push` correctly.
 	// ReadFile + ScratchDirs let a script in /tmp or the run's scratch dir be
 	// judged by its contents instead of held as opaque (STA-868).
-	c := &security.Classifier{CWD: cwd, ReadFile: os.ReadFile, ScratchDirs: hookScratchDirs(os.Getenv("STAYPOINT_TASK_ID"))}
+	// One Snapshotter per hook run: every script is read exactly once, through
+	// one O_NOFOLLOW descriptor, and the same bytes are judged, shown to the
+	// Board and pinned into the command that runs.
+	snap := security.NewSnapshotter()
+	c := &security.Classifier{CWD: cwd, CWDTrusted: cwdTrusted, Snap: snap,
+		ScratchDirs: hookScratchDirs(os.Getenv("STAYPOINT_TASK_ID"))}
 	verdict := c.Classify(bashInput.Command)
 
 	if pinned := pinJudged(bashInput.Command, &verdict); pinned != "" {
@@ -572,7 +583,7 @@ func handleHookPreTool() {
 
 	// Snapshot the scripts the command runs: what the Board, advisors and
 	// rules see is what runs, when the command can be pinned.
-	scripts, pinned := snapshotScripts(bashInput.Command, cwd)
+	scripts, pinned := snapshotScripts(bashInput.Command, cwd, snap)
 	allow := func() {
 		if pinned != "" {
 			preToolAllowPinned(payload.ToolInput, pinned)

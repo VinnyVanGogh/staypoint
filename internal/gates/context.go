@@ -3,9 +3,8 @@ package gates
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"database/sql"
-	"os"
+	"encoding/hex"
 	"path/filepath"
 	"strings"
 	"time"
@@ -21,17 +20,8 @@ const ScriptContentLimit = 4096
 // the real filesystem and git.
 type Resolver struct {
 	DB *sql.DB
-	// ReadFile reads scripts to hash (default os.ReadFile).
-	ReadFile func(string) ([]byte, error)
 	// RepoRoot returns the git toplevel for a dir, "" if none (default: git).
 	RepoRoot func(dir string) string
-}
-
-func (r *Resolver) readFile() func(string) ([]byte, error) {
-	if r.ReadFile != nil {
-		return r.ReadFile
-	}
-	return os.ReadFile
 }
 
 func gitRepoRoot(dir string) string {
@@ -97,7 +87,7 @@ func (r *Resolver) Resolve(in *security.GateRequestInput) []security.ScriptRef {
 	if in.Scripts != nil {
 		return AdviceScripts(in.Scripts)
 	}
-	refs := security.ScriptRefs(in.Cmdline, in.CWD, r.readFile(), ScriptContentLimit)
+	refs := security.ScriptRefs(in.Cmdline, in.CWD, security.NewSnapshotter(), ScriptContentLimit)
 	in.Scripts = make([]security.ScriptHash, 0, len(refs))
 	for _, s := range refs {
 		in.Scripts = append(in.Scripts, security.ScriptHash{Path: s.Path, SHA256: s.SHA256, Content: s.Content})

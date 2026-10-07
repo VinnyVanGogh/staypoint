@@ -393,7 +393,7 @@ func TestRedTeam_PinnedBytesSurviveRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "cd " + dir + " && bash -c 'ls -la '\\''it'\\'''\\''s'\\''\n' ./s.sh --all > " + dir + "/out.tsv"
+	want := "cd " + dir + " && bash -c 'ls -la '\\''it'\\'\\''s'\\''\n' ./s.sh --all > " + dir + "/out.tsv"
 	if pinned != want {
 		t.Fatalf("pinned:\n%s\nwant:\n%s", pinned, want)
 	}

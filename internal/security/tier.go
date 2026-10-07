@@ -96,18 +96,34 @@ type Classifier struct {
 	// ReadFile, when set, lets the classifier judge a script that a shell is
 	// asked to run (bash x.sh, ./x.sh) by its contents when the script lives in
 	// a scratch dir (STA-868). Nil keeps such calls Red ("runs an opaque script").
+	//
+	// Deprecated as a reader: any non-nil value only enables script reading;
+	// scripts are read once through ReadScriptOnce via Snap.
 	ReadFile func(path string) ([]byte, error)
+	// Snap reads each script once per hook run (shared with ScriptRefs so
+	// the judged and the snapshotted bytes are the same). Classify creates
+	// one per Classify call when ReadFile is set and Snap is nil.
+	Snap *Snapshotter
+	// CWDTrusted says CWD is the shell's real working directory (from the
+	// hook payload), so a relative script path may be resolved against it.
+	CWDTrusted bool
 	// ScratchDirs are where an agent's throwaway files live: the run's scratch
 	// dir and the system temp dirs. Nil means DefaultScratchDirs().
 	ScratchDirs []string
 
-	line    *lineCtx // facts about the whole command line being classified
-	baseCWD string   // CWD before any `cd` in the line
-	inner   bool     // classifying a wrapper's inner command (env/xargs/find -exec ...)
+	line      *lineCtx // facts about the whole command line being classified
+	baseCWD   string   // CWD before any `cd` in the line
+	inner     bool     // classifying a wrapper's inner command (env/xargs/find -exec ...)
+	cwdFromCd bool     // CWD was set by an absolute `cd` earlier in the line
 }
 
 // Classify classifies a shell command line. Unparseable input is Red (fail closed).
 func (c *Classifier) Classify(line string) Verdict {
+	if c.ReadFile != nil && c.Snap == nil {
+		cc := *c
+		cc.Snap = NewSnapshotter() // fresh reads for this command line
+		return cc.classifyLine(line, 0)
+	}
 	return c.classifyLine(line, 0)
 }
 
@@ -136,13 +152,17 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 	}
 	lc := c.lineContext(line, segs, subs, depth)
 	dir := c.CWD
+	fromCd := c.cwdFromCd
 	for i, s := range segs {
 		cc := *c
-		cc.CWD, cc.line = dir, lc
+		cc.CWD, cc.line, cc.cwdFromCd = dir, lc, fromCd
 		if cc.baseCWD == "" {
 			cc.baseCWD = c.CWD
 		}
 		cc.classifySegment(s, &v, depth)
+		if a := stripPrefixes(s.argv); baseCmd(a) == "cd" {
+			fromCd = len(a) == 2 && filepath.IsAbs(a[1]) && !segDyn(s, len(s.argv)-len(a)+1)
+		}
 		dir = c.nextDir(s, dir)
 		// remote-shell pipe: anything | sh
 		if i > 0 && segs[i-1].piped {
