@@ -104,7 +104,21 @@
     return i < 0 ? { queued: false, ahead: 0 } : { queued: true, ahead: i, wait: list[i].wait };
   }
 
-  const api = { groupStepsByRun, isRealRunGroup, latestRunSteps, currentRunSteps, runElapsedMs, isStuck, routeModel, queueLabel, queuePositionIn };
+  // Stats strip "Step" label for a run's steps (STA-775). A run that ended
+  // with an error message row (e.g. "Run ended with no output") reads
+  // "Failed: <that title>" rather than a bare state row; no steps is 'idle'.
+  function runStepLabel(runSteps) {
+    const steps = Array.isArray(runSteps) ? runSteps.filter(Boolean) : [];
+    if (!steps.length) return 'idle';
+    const last = steps[steps.length - 1];
+    if (last.kind === 'state' && /error$/i.test(String(last.title || ''))) {
+      const why = [...steps].reverse().find(s => s.kind === 'message' && s.status === 'error' && s.title);
+      if (why) return `Failed: ${why.title}`;
+    }
+    return last.title || 'idle';
+  }
+
+  const api = { groupStepsByRun, isRealRunGroup, latestRunSteps, currentRunSteps, runElapsedMs, isStuck, routeModel, queueLabel, queuePositionIn, runStepLabel };
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;

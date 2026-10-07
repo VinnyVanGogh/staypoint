@@ -445,6 +445,13 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// (→ post-loop interceptor run, old behaviour).
 	var completionRejected bool
 
+	// Silent-run detection (STA-775): whether any adapter turn ran, whether
+	// the agent produced any output, and the last turn's exit code and stderr
+	// for the "Run ended with no output" reason.
+	var adapterRan, sawOutput bool
+	var lastExitCode int
+	var lastStderr string
+
 	for turn := 0; turn < maxTurns; turn++ {
 		if ctx.Err() != nil {
 			result.Disposition = "capped"
@@ -497,6 +504,9 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 
 			turnErr := cfg.RunAdapter(turnCtx, wtPath, cfg.Provider, rawArgs, providerEnv, stdout, &stderrBuf)
 			turnCancel()
+			adapterRan = true
+			lastExitCode = exitCodeFrom(turnErr)
+			lastStderr = stderrBuf.String()
 
 			turnDuration := time.Since(turnStart)
 			if turnErr != nil {
@@ -551,6 +561,12 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		if n := outBuf.Len(); n > 0 {
 			lastTurnOutput = make([]byte, n)
 			copy(lastTurnOutput, outBuf.Bytes())
+		}
+		if extractFinalResponse(outBuf.Bytes()) != "" {
+			sawOutput = true
+		} else if _, parsed := stdout.(*stepTeeWriter); !parsed && len(bytes.TrimSpace(outBuf.Bytes())) > 0 {
+			// No stream parser wired: any printed output counts.
+			sawOutput = true
 		}
 
 		// Prefer text-only detection when the stream parser is active; fall back
@@ -732,6 +748,34 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		}
 	}
 
+	// Silent run (STA-775): the adapter ran but the agent printed nothing and
+	// changed nothing. Say so with the exit code and stderr tail, and mark the
+	// run failed instead of leaving it in_progress looking idle. A run the
+	// Board stopped or a cap ended keeps that disposition; only the reason
+	// is added to the timeline.
+	var noOutputMsg string
+	if sr != nil && sr.SawContent() {
+		sawOutput = true
+	}
+	// A run the interceptor approved (in_review, e.g. from earlier work
+	// products) is left alone: the task is ready regardless of this run.
+	if adapterRan && !sawOutput && result.DiffStat == "" && result.Disposition != "in_review" {
+		noOutputMsg = noOutputMessage(lastExitCode, lastStderr)
+		switch result.Disposition {
+		case "stopped", "capped":
+		case "error":
+			if result.DiagnosticMsg == "" {
+				result.DiagnosticMsg = noOutputMsg
+			}
+		default: // in_progress: ended without completing and said nothing
+			result.Disposition = "error"
+			result.DiagnosticMsg = noOutputMsg
+		}
+		if sr != nil {
+			sr.EmitMessage("Run ended with no output", noOutputMsg, "error")
+		}
+	}
+
 	// Inject stop comment before updating execution_stage.
 	if result.Disposition == "stopped" {
 		result.DiagnosticMsg = "Run stopped by user request."
@@ -769,6 +813,8 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		var summaryBody string
 		if agentText != "" {
 			summaryBody = agentText + "\n\n" + footer
+		} else if noOutputMsg != "" {
+			summaryBody = noOutputMsg + "\n\n" + footer
 		} else {
 			summaryBody = footer
 		}

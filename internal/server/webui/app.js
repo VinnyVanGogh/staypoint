@@ -7510,6 +7510,7 @@ const STEP_KIND_ICON = {
   edit:       '✏️',
   checkpoint: '📌',
   state:      '💾',
+  message:    '💬',
   tool:       '🔧',
   error:      '❌',
   result:     '✅',
@@ -7697,8 +7698,7 @@ function buildTimelineStats(task, steps, elapsedMs, isStuck) {
   const filesEdited  = steps.filter(s => s && s.kind === 'edit'  && s.status === 'done').length;
   const commandsOk   = steps.filter(s => s && s.kind === 'run'   && s.status === 'done').length;
   const commandsFail = steps.filter(s => s && s.kind === 'run' && (s.status === 'error' || s.status === 'failed')).length;
-  const lastStep     = steps.length ? steps[steps.length - 1] : null;
-  const currentStep  = (lastStep && lastStep.title) ? lastStep.title : 'idle';
+  const currentStep  = runStepLabel(steps);
 
   add(stat('Elapsed', fmtDuration(elapsedMs)));
   const stepTile = stat('Step', currentStep, 'timeline-stat-step');
