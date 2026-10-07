@@ -141,8 +141,27 @@ func productionTrackingGate() *trackgate.Gate {
 	}
 }
 
-// preToolDeny renders a block decision in the calling client's format.
+// preToolAllowJSON renders an allow decision in the calling client's format.
+// agy's PreToolUse output schema marks "decision" required: a bare {} is read
+// as a deny with an empty reason, which blocked every agy tool call (reads
+// included) from the day the hook was installed.
+func preToolAllowJSON(client trackgate.Client) string {
+	if client == trackgate.ClientGemini {
+		return `{"decision":"allow"}`
+	}
+	return "{}"
+}
+
+// fallbackDenyReason stands in for an empty deny reason; agy shows the reason
+// verbatim, and an empty one leaves the agent nothing to act on.
+const fallbackDenyReason = "STAYPOINT: tool call denied by the StayPoint pre-tool hook, which recorded no reason. Report this to the Board; do not retry the call."
+
+// preToolDeny renders a block decision in the calling client's format. The
+// reason is never empty.
 func preToolDeny(client trackgate.Client, reason string) string {
+	if strings.TrimSpace(reason) == "" {
+		reason = fallbackDenyReason
+	}
 	if client == trackgate.ClientGemini {
 		out, _ := json.Marshal(map[string]string{"decision": "deny", "reason": reason})
 		return string(out)

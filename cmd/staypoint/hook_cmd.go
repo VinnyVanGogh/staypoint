@@ -503,7 +503,7 @@ func handleHookPreTool() {
 	if client == trackgate.ClientGemini || hookPreToolTrackingOnly {
 		// The Red-tier Board gate below understands Claude payloads only, and
 		// interactive registrations (hook install) opt out of it.
-		preToolAllow()
+		fmt.Println(preToolAllowJSON(client))
 		return
 	}
 

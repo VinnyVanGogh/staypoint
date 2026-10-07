@@ -454,3 +454,43 @@ func TestGeminiWorkRepoForgedApprovalStillDenied(t *testing.T) {
 		t.Fatalf("work repo with forged approval: %+v", d)
 	}
 }
+
+// task-7c9df5b6: in a work repo Gemini may read anything and write docs; code
+// writes are denied with a reason that names the path. The doc rule matches
+// the post-turn guard (geminiguard.IsDocPath) on the repo-relative path.
+func TestGeminiWorkRepoDocRuleAndReason(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	g := &Gate{
+		OpenDB:     func() (*sql.DB, func(), error) { return openStore(t), func() {}, nil },
+		IsWorkRepo: func(p string) bool { return strings.HasPrefix(p, repo) },
+	}
+	write := func(rel string) Request {
+		return Request{Client: ClientGemini, ToolName: "write_to_file", FilePaths: []string{filepath.Join(repo, rel)}, CWD: repo, SessionID: "conv-1", TaskID: "task-1"}
+	}
+	for _, rel := range []string{"README.md", "notes.txt", "docs/guide.md", "docs/diagram.png", "sub/CHANGELOG.rst", ".staypoint/plan.md"} {
+		if d := g.Evaluate(write(rel)); d.Block {
+			t.Errorf("doc write %s denied:\n%s", rel, d.Reason)
+		}
+	}
+	for _, rel := range []string{"app.py", "requirements.txt", "docs/build.sh", ".github/workflows/ci.md", ".GITHUB/workflows/ci.md", ".staypoint/run.sh", "Dockerfile"} {
+		d := g.Evaluate(write(rel))
+		want := "Gemini may not write code in work repos: " + filepath.Join(repo, rel)
+		if !d.Block || !strings.HasPrefix(d.Reason, want) {
+			t.Errorf("code write %s: block=%v reason=%q, want prefix %q", rel, d.Block, d.Reason, want)
+		}
+	}
+	for _, req := range []Request{
+		{Client: ClientGemini, ToolName: "view_file", FilePaths: []string{filepath.Join(repo, "app.py")}, CWD: repo},
+		{Client: ClientGemini, ToolName: "list_dir", FilePaths: []string{repo}, CWD: repo},
+		{Client: ClientGemini, ToolName: "grep_search", CWD: repo},
+		{Client: ClientGemini, ToolName: "run_command", Command: "echo hi", CWD: repo},
+		{Client: ClientGemini, ToolName: "run_command", Command: "cat app.py", CWD: repo},
+	} {
+		if d := g.Evaluate(req); d.Block {
+			t.Errorf("read-only %s %q denied:\n%s", req.ToolName, req.Command, d.Reason)
+		}
+	}
+}
