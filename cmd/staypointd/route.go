@@ -81,6 +81,9 @@ type routeTracker struct {
 	announced router.RouteSlot
 	provider  string
 	emit      func(title, body string)
+	// geminiSpawned is set whenever a Gemini CLI is about to stream; the
+	// harness consumes it after each turn for the STA-856 guard.
+	geminiSpawned bool
 }
 
 func newRouteTracker(route router.KindRoute, emit func(title, body string)) *routeTracker {
@@ -105,6 +108,9 @@ func (t *routeTracker) Observe(a adapter.AttemptInfo) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.provider = a.Provider
+	if a.Provider == "gemini" || a.Slot.Family == router.FamilyGemini {
+		t.geminiSpawned = true
+	}
 	if a.Slot == t.announced {
 		return
 	}
@@ -116,6 +122,20 @@ func (t *routeTracker) Observe(a adapter.AttemptInfo) {
 	if t.emit != nil {
 		t.emit(title, t.route.Body())
 	}
+}
+
+// geminiDocsOnly applies the Board rule (STA-856) to a run: in a work repo the
+// harness reverts any non-doc change a Gemini turn makes and fails the run.
+func geminiDocsOnly(r router.KindRoute) bool { return router.GeminiCodeForbidden(r.IsWork) }
+
+// TakeGeminiSpawned reports whether a Gemini CLI was spawned since the last
+// call, and resets the flag (RunConfig.TurnUsedGemini).
+func (t *routeTracker) TakeGeminiSpawned() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	v := t.geminiSpawned
+	t.geminiSpawned = false
+	return v
 }
 
 // Provider is the provider of the most recent (or planned) spawn.

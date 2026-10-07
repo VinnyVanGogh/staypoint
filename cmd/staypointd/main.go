@@ -357,7 +357,7 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 		}
 		// Respect pacer locks per pool (STA-773): a run whose whole provider
 		// chain is quota-locked waits in the queue instead of taking a slot.
-		if taskQuotaLocked(dbStore.DB(), taskID) {
+		if taskQuotaLocked(dbStore.DB(), taskID, repoRoot) {
 			queueRun(h, taskID, reason, orchestrator.WaitQuota)
 			return
 		}
@@ -461,6 +461,9 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			RunControl:       orchestrator.GlobalRunControl,
 			SkipGitPreflight: adapterOverride != nil || testSkipGitPreflight,
 			HookBin:          resolveStaypointCLIBin(),
+			// Board rule (STA-856): Gemini may only edit docs in a work repo.
+			GeminiDocsOnly: geminiDocsOnly(route),
+			TurnUsedGemini: tracker.TakeGeminiSpawned,
 		})
 		if runErr != nil {
 			if errors.Is(runErr, orchestrator.ErrConcurrencyCap) {
