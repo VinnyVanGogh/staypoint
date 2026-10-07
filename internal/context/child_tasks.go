@@ -37,7 +37,8 @@ const (
 // validWorkKinds mirrors router.ValidWorkKinds (internal/router/kinds.go).
 // The router package imports this one, so the list cannot be imported here;
 // TestWorkKindsMatchRouter in internal/mcp keeps the two in step.
-var validWorkKinds = []string{"coding", "architecture", "planning", "qa"}
+// "review" (Claude Opus first) lands in the router with STA-772 / PR #213.
+var validWorkKinds = []string{"coding", "review", "architecture", "planning", "qa"}
 
 // ValidWorkKinds returns the accepted work_kind values.
 func ValidWorkKinds() []string {

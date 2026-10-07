@@ -63,8 +63,8 @@ func TestToolCallTaskCreateChild_RejectsInvalidKindAndMissingParent(t *testing.T
 	parent, _ := meshContext.CreateTask(database, "p", "/tmp/repo", "main", "personal")
 	t.Setenv("STAYPOINT_TASK_ID", parent.ID)
 
-	if res := callChildTool(t, s, "staypoint_task_create_child", map[string]any{"title": "x", "work_kind": "review"}); !res.IsError {
-		t.Error("work_kind review should be rejected")
+	if res := callChildTool(t, s, "staypoint_task_create_child", map[string]any{"title": "x", "work_kind": "deploy"}); !res.IsError {
+		t.Error("work_kind deploy should be rejected")
 	}
 	if res := callChildTool(t, s, "staypoint_task_create_child", map[string]any{"title": "x"}); !res.IsError {
 		t.Error("missing work_kind should be rejected")
@@ -89,12 +89,31 @@ func TestToolsListIncludesTaskCreateChild(t *testing.T) {
 // The context package cannot import router (router imports context), so it
 // keeps its own copy of the kinds; this keeps them in step.
 func TestWorkKindsMatchRouter(t *testing.T) {
-	var want []string
+	// Kinds context accepts ahead of the router. Delete an entry once its PR
+	// merges; the test then requires an exact match for it.
+	pendingInRouter := map[string]string{"review": "STA-772 / PR #213"}
+
+	routerKinds := map[string]bool{}
 	for _, k := range router.ValidWorkKinds {
-		want = append(want, string(k))
+		routerKinds[string(k)] = true
 	}
-	got := meshContext.ValidWorkKinds()
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Errorf("context kinds %v != router kinds %v", got, want)
+	contextKinds := map[string]bool{}
+	for _, k := range meshContext.ValidWorkKinds() {
+		contextKinds[k] = true
+	}
+	for k := range routerKinds {
+		if !contextKinds[k] {
+			t.Errorf("router kind %q missing from context.validWorkKinds (internal/context/child_tasks.go)", k)
+		}
+	}
+	for k := range contextKinds {
+		if routerKinds[k] {
+			continue
+		}
+		if pr, ok := pendingInRouter[k]; ok {
+			t.Logf("kind %q not in router yet (pending %s)", k, pr)
+			continue
+		}
+		t.Errorf("context kind %q is not a router kind (internal/router/kinds.go)", k)
 	}
 }

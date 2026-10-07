@@ -96,7 +96,7 @@ func TestCreateTask_ChildErrors(t *testing.T) {
 	_, parent := postTask(t, base, token, map[string]any{"name": "p", "repo_path": "/repo/x", "work_kind": "planning"})
 	parentID := parent["id"].(string)
 
-	if resp, body := postTask(t, base, token, map[string]any{"name": "c", "parent_id": parentID, "work_kind": "review"}); resp.StatusCode != http.StatusBadRequest {
+	if resp, body := postTask(t, base, token, map[string]any{"name": "c", "parent_id": parentID, "work_kind": "deploy"}); resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("invalid kind: want 400, got %d %v", resp.StatusCode, body)
 	}
 	if resp, body := postTask(t, base, token, map[string]any{"name": "c", "parent_id": "task-missing"}); resp.StatusCode != http.StatusNotFound {

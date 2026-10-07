@@ -86,11 +86,23 @@ func TestCreateChildTask_PlanFallsBackToParentPlanDocument(t *testing.T) {
 
 func TestCreateChildTask_RejectsInvalidKind(t *testing.T) {
 	database, parent := createPlanningParent(t)
-	for _, kind := range []string{"", "review", "CODING ", "deploy"} {
+	for _, kind := range []string{"", "reviewer", "CODING ", "deploy"} {
 		_, err := CreateChildTask(database, ChildTaskOptions{ParentID: parent.ID, Name: "x", WorkKind: kind})
 		if !errors.Is(err, ErrInvalidWorkKind) {
 			t.Errorf("kind %q: want ErrInvalidWorkKind, got %v", kind, err)
 		}
+	}
+}
+
+// A planning task hands its plan to a review child (Claude Opus first, STA-772).
+func TestCreateChildTask_AcceptsReviewKind(t *testing.T) {
+	database, parent := createPlanningParent(t)
+	child, err := CreateChildTask(database, ChildTaskOptions{ParentID: parent.ID, Name: "Review the plan", WorkKind: "review", Handoff: "review this"})
+	if err != nil {
+		t.Fatalf("review child: %v", err)
+	}
+	if child.WorkKind != "review" || child.ParentID != parent.ID {
+		t.Errorf("review child: kind %q parent %q", child.WorkKind, child.ParentID)
 	}
 }
 
@@ -219,7 +231,7 @@ func TestIsValidWorkKind(t *testing.T) {
 			t.Errorf("%q should be valid", k)
 		}
 	}
-	if IsValidWorkKind("review") {
-		t.Error("review is not a routing kind")
+	if IsValidWorkKind("deploy") {
+		t.Error("deploy is not a routing kind")
 	}
 }

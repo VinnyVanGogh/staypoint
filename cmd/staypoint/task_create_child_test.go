@@ -87,9 +87,9 @@ func TestRunTaskCreateChild(t *testing.T) {
 		t.Errorf("handoff: %q", h)
 	}
 
-	bad, _ := newChildTestCmd(t, "--parent", parent.ID, "--kind", "review")
+	bad, _ := newChildTestCmd(t, "--parent", parent.ID, "--kind", "deploy")
 	if err := runTaskCreateChild(bad, []string{"x"}); err == nil {
-		t.Error("--kind review should be rejected")
+		t.Error("--kind deploy should be rejected")
 	}
 	noTitle, _ := newChildTestCmd(t, "--parent", parent.ID)
 	if err := runTaskCreateChild(noTitle, nil); err == nil {
