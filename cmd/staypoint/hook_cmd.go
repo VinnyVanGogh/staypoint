@@ -175,9 +175,11 @@ func handleHookPrompt() {
 			notices = append(notices, circuitBreakerNotice(cb))
 		}
 
-		// D. Task Budget Evaluation
-		activeTask, _ := meshContext.GetActiveTaskForRepo(dbConn, cwd)
-		if activeTask != nil {
+		// D. Task Budget Evaluation. Only the task this session runs for
+		// counts: a daemon run's own task, or the task this interactive
+		// session is attached to. Picking "the newest task in this repo"
+		// blocked unrelated sessions on another task's spent budget.
+		if activeTask := budgetTaskForSession(dbConn, sessionID, os.Getenv); activeTask != nil {
 			eval := meshContext.EvaluateTaskBudget(activeTask)
 			if eval.IsBlocked {
 				fmt.Fprintf(os.Stderr, "❌ [STAYPOINT TASK BUDGET EXCEEDED]\nTask %q budget limit reached: %s\nSpent: $%.2f / $%.2f (%d / %d turns)\nHalting execution to prevent runaway costs.\nTo increase budget, run: staypoint task budget %s --usd <limit>\n", activeTask.Name, eval.Reason, activeTask.SpentUSD, activeTask.MaxBudgetUSD, activeTask.SpentTurns, activeTask.MaxTurns, activeTask.ID)
@@ -781,4 +783,22 @@ func circuitBreakerNotice(cb *telemetry.CircuitBreaker) string {
 		what = fmt.Sprintf("repeated failures of %s", cb.FailingCommand)
 	}
 	return fmt.Sprintf("🚨 [STAYPOINT CIRCUIT BREAKER ACTIVE]: Execution pause active because an agent loop was detected (%s).\nLast error: %s\nTo reset and proceed, run: staypoint breaker reset %s", what, cb.LastError, cb.SessionID)
+}
+
+// budgetTaskForSession returns the task whose budget governs this session:
+// STAYPOINT_TASK_ID for a daemon run, else the task the session is attached
+// to, else nil (no budget applies).
+func budgetTaskForSession(db *sql.DB, sessionID string, getenv func(string) string) *meshContext.Task {
+	id := getenv("STAYPOINT_TASK_ID")
+	if id == "" && sessionID != "" {
+		id, _ = trackgate.SessionTask(db, sessionID)
+	}
+	if id == "" {
+		return nil
+	}
+	t, err := meshContext.GetTask(db, id)
+	if err != nil {
+		return nil
+	}
+	return t
 }
