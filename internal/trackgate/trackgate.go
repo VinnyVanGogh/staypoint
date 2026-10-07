@@ -525,7 +525,23 @@ func Attach(conn *sql.DB, sessionID, taskID string, client Client, repoPath stri
 		details += ", repo " + repoPath
 	}
 	details += ")"
-	_, err := conn.Exec(`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'interactive_session_attached', ?)`, taskID, details)
+	if _, err := conn.Exec(`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'interactive_session_attached', ?)`, taskID, details); err != nil {
+		return err
+	}
+	// STA-861: an attached task is interactive. A todo task nothing has
+	// claimed yet is parked in backlog so the daemon does not start a run that
+	// duplicates the session's work; the Board's Run Now still runs it.
+	// Attaching never wakes the daemon.
+	res, err := conn.Exec(
+		`UPDATE tasks SET execution_stage = 'backlog', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		  WHERE id = ? AND execution_stage = 'todo' AND checkout_run_id IS NULL`, taskID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		_, err = conn.Exec(`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'stage_change', ?)`,
+			taskID, "execution stage set to backlog (interactive session attached; the daemon will not run it)")
+	}
 	return err
 }
 

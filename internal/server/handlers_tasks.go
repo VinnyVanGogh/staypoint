@@ -399,6 +399,12 @@ func (h *TasksHandler) AddComment(w http.ResponseWriter, r *http.Request) {
 // MarkDone handles POST /api/tasks/{id}/done. A parent with open child tasks
 // is refused with 409 unless the Board passes {"override": true}; the
 // override is honored only through the Board gate (STA-859).
+//
+// {"board": true, "note": "..."} is the Board closing the task from the task
+// page (STA-861): it must pass the same Board gate, and then no work product
+// is required and the note is recorded on the timeline. A run still holding
+// the task is told to stop. Agents and token-only callers (no board flag)
+// keep the work-product requirement.
 func (h *TasksHandler) MarkDone(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -406,19 +412,32 @@ func (h *TasksHandler) MarkDone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Override bool `json:"override"`
+		Override bool   `json:"override"`
+		Board    bool   `json:"board"`
+		Note     string `json:"note"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req) // body is optional
-	if req.Override && !h.requireBoardForOverride(w, r, "override") {
+	if req.Board {
+		if !h.requireBoardForOverride(w, r, "board") {
+			return
+		}
+	} else if req.Override && !h.requireBoardForOverride(w, r, "override") {
 		return
 	}
 
-	if err := context.MarkTaskDoneWithOptions(h.db, id, context.DoneOptions{BoardOverride: req.Override}); err != nil {
+	if req.Board {
+		if task, err := context.GetTask(h.db, id); err == nil && task.CheckoutRunID != "" {
+			_ = orchestrator.GlobalRunControl.SetStop(task.ID)
+		}
+	}
+
+	opts := context.DoneOptions{BoardOverride: req.Override, BoardDone: req.Board, BoardNote: req.Note}
+	if err := context.MarkTaskDoneWithOptions(h.db, id, opts); err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, err.Error())
 		} else if errors.Is(err, context.ErrOpenChildren) {
 			writeError(w, http.StatusConflict, err.Error())
-		} else if strings.Contains(err.Error(), "without a registered work product") {
+		} else if errors.Is(err, context.ErrNoWorkProduct) {
 			writeError(w, http.StatusConflict, err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "failed to mark task done: "+err.Error())
@@ -806,6 +825,87 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 		"task_id": id,
 		"stage":   req.Stage,
 	})
+}
+
+// AddWorkProduct handles POST /api/tasks/{id}/work-products
+// {"type": "pr|commit|branch|doc|workspace_file", "ref": "..."} (STA-861).
+// Agent-callable: registering a product is how an agent or interactive
+// session satisfies the done gate.
+func (h *TasksHandler) AddWorkProduct(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Type string `json:"type"`
+		Ref  string `json:"ref"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	p, err := context.RegisterWorkProduct(h.db, r.PathValue("id"), req.Type, req.Ref)
+	if err != nil {
+		switch {
+		case isNotFound(err):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, context.ErrInvalidWorkProduct):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	if h.hub != nil {
+		h.hub.Publish("task_work_product_added", map[string]any{"task_id": p.TaskID, "product": p})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(p)
+}
+
+// SetKind handles PUT /api/tasks/{id}/kind {"work_kind": "docs"} (STA-861):
+// the Board changes a task's work_kind after creation. Refused (409) while a
+// run holds the task. The provider rules (#231) apply to the new kind: a task
+// whose provider is gemini cannot take a code kind in a work repo.
+func (h *TasksHandler) SetKind(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		WorkKind string `json:"work_kind"`
+		Kind     string `json:"kind"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	kind := strings.ToLower(strings.TrimSpace(req.WorkKind))
+	if kind == "" {
+		kind = strings.ToLower(strings.TrimSpace(req.Kind))
+	}
+	if !context.IsValidWorkKind(kind) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid work_kind %q: must be one of %s", kind, strings.Join(context.ValidWorkKinds(), ", ")))
+		return
+	}
+	task, err := context.GetTask(h.db, r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if _, err := router.ValidateTaskChoice(kind, repoIsWork(task.RepoPath), task.Provider, task.ModelOverride); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated, err := context.SetTaskWorkKind(h.db, task.ID, kind)
+	if err != nil {
+		switch {
+		case errors.Is(err, context.ErrRunInProgress):
+			writeError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, context.ErrInvalidWorkKind):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	if h.hub != nil {
+		h.hub.Publish("task_updated", updated)
+	}
+	writeJSON(w, updated)
 }
 
 // SetRepo handles PUT /api/tasks/{id}/repo {"repo_path": "/abs", "git_branch": ""}.

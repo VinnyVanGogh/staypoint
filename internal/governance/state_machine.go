@@ -58,7 +58,10 @@ func IsBoardSettableStage(stage string) bool {
 }
 
 // nonRunnableStages are never claimed by a run or woken by the dispatcher.
-var nonRunnableStages = []string{StageBacklog, StageDone, StageCancelled, StageRejected}
+// stopped is here (STA-861): a run the Board stopped stays stopped until the
+// Board resumes it with Run Now (which writes in_progress first) or moves it
+// to another stage; a comment, unblock or other wake must not restart it.
+var nonRunnableStages = []string{StageBacklog, StageDone, StageCancelled, StageRejected, StageStopped}
 
 // IsRunnableStage reports whether a task in stage may be claimed by a run.
 func IsRunnableStage(stage string) bool {

@@ -17,7 +17,7 @@ task is `in_progress`: `Harness.Claim` sets it when a run checks the task out.
 | `in_progress` | in_progress | active | yes (claimed) | `Harness.Claim` (a run started); Board (Run Now) |
 | `in_review` | in_review | active | yes | harness on completion; Board |
 | `blocked` | blocked | active | yes | `POST /api/tasks/{id}/block` / `task block` (needs a reason). The watchdog sets `is_blocked` without changing the stage; the board shows either as Blocked |
-| `done` | done | done | no | Board / `task done` (needs a work product, no open children) |
+| `done` | done | done | no | `task done` (needs a work product: `--pr <url>` or `task product add`; no open children). The Board's task-page Mark done (Board gate, `{"board": true}`) needs no work product and records its note on the timeline |
 | `cancelled` | cancelled | soft_deleted | no | Board; `task cancel`/delete; duplicate cleanup |
 
 Run sub-states of `in_progress`, written only by the harness. They are not
@@ -27,18 +27,25 @@ settable from the API, CLI or board:
 |---|---|---|
 | `paused` | run paused at a step boundary, still checked out | In Progress |
 | `capped` | turn or budget cap hit; the daemon resets it to `todo` on restart | Todo |
-| `stopped` | the Board stopped the run; Run Now starts a new one | Todo |
+| `stopped` | the Board stopped the run; not runnable: only Run Now (or a Board stage change) resumes it, a comment or other wake does not | Todo |
 
 `rejected` is the governance review outcome (`in_review -> rejected`). It is
 closed and not runnable.
 
 ### Not runnable
 
-`backlog`, `done`, `cancelled` and `rejected` are never claimed:
+`backlog`, `stopped`, `done`, `cancelled` and `rejected` are never claimed:
 `Harness.Claim` refuses them with `ErrNotRunnable`, so no wake (assignment,
 comment, queue re-dispatch, MCP `staypoint_wake`) can start a run. Creating a
 task in `backlog` does not notify the daemon, and `staypoint_wake` refuses a
-non-runnable task outright. A backlog task (or one with no repo) is also never
+non-runnable task outright. A comment does not notify the daemon for a
+non-runnable task, or while a Board stop is pending for the run still holding
+the task.
+
+Interactive tasks (STA-861): `staypoint task create --org`/`--session` creates
+the task in `backlog`, and `staypoint task attach` parks an unclaimed `todo`
+task in `backlog`, so the daemon never starts a run that duplicates the
+attached session's work. The Board's Run Now still runs it. A backlog task (or one with no repo) is also never
 "the active task" for a repo (`GetActiveTaskForRepo`: hooks, `staypoint
 context`, statusline) and never receives the watcher's token spend.
 

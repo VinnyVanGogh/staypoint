@@ -124,7 +124,7 @@ var taskAddCmd = &cobra.Command{
 
 var taskDoneCmd = &cobra.Command{
 	Use:   "done [id|name]",
-	Short: "Mark a task as completed",
+	Short: "Mark a task as completed (needs a work product: --pr <url>, or `task product add`)",
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		store, err := db.Open(cfg.DBPath)
@@ -133,11 +133,11 @@ var taskDoneCmd = &cobra.Command{
 			os.Exit(1)
 		}
 		defer store.Close()
-		if err := meshContext.MarkTaskDone(store.DB(), args[0]); err != nil {
+		pr, _ := cmd.Flags().GetString("pr")
+		if err := markTaskDoneCLI(cmd.OutOrStdout(), store.DB(), args[0], pr); err != nil {
 			fmt.Fprintf(os.Stderr, "Error updating task: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("\033[1;32m✔ Task %q marked as done\033[0m\n", args[0])
 	},
 }
 

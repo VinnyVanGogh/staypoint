@@ -194,6 +194,49 @@ func TestRun_SilentStoppedRunStaysStopped(t *testing.T) {
 	}
 }
 
+// STA-861: the Board marks a task done while its run is stopping. The run's
+// final stage write must not put "stopped" back over done.
+func TestRun_BoardDoneDuringStopIsKept(t *testing.T) {
+	const taskID = "board-done-task"
+	h := silentHarness(t, taskID)
+	store, err := db.Open(t.TempDir() + "/rc.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	if _, err := store.DB().Exec(`INSERT INTO tasks (id, name, repo_path) VALUES (?, 'stop', '/tmp')`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	rc := NewRunControl(store.DB())
+	result, err := h.Run(context.Background(), taskID, RunConfig{
+		MaxTurns:         3,
+		AgentID:          "tester",
+		MaxWallclock:     10 * time.Second,
+		SkipGitPreflight: true,
+		RunControl:       rc,
+		RunAdapter: func(context.Context, string, string, []string, []string, io.Writer, io.Writer) error {
+			_ = rc.SetStop(taskID)
+			if _, err := h.DB.Exec(`UPDATE tasks SET execution_stage = 'done', status = 'done' WHERE id = ?`, taskID); err != nil {
+				t.Error(err)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != "stopped" {
+		t.Fatalf("disposition = %q, want stopped", result.Disposition)
+	}
+	var stage string
+	if err := h.DB.QueryRow(`SELECT execution_stage FROM tasks WHERE id = ?`, taskID).Scan(&stage); err != nil {
+		t.Fatal(err)
+	}
+	if stage != "done" {
+		t.Fatalf("stage after stopped run = %q, want done (the Board closed it)", stage)
+	}
+}
+
 func TestNoOutputMessage(t *testing.T) {
 	if got := noOutputMessage(0, ""); got != "Run ended with no output (exit 0, no stderr)." {
 		t.Fatalf("empty stderr: %q", got)

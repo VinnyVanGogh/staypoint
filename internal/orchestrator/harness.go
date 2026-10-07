@@ -27,7 +27,7 @@ var (
 	ErrTaskNotFound   = errors.New("task not found")
 	// ErrNotRunnable: the task is parked (backlog) or closed (done,
 	// cancelled, rejected). Run Now moves a backlog task to todo first.
-	ErrNotRunnable    = errors.New("Can't start run: this task is not runnable in its current stage (backlog, done or cancelled). Move it to todo first.")
+	ErrNotRunnable    = errors.New("Can't start run: this task is not runnable in its current stage (backlog, stopped, done or cancelled). Move it to todo or press Run Now first.")
 	ErrConcurrencyCap = errors.New("Can't start run: the maximum number of parallel runs (max_concurrent_runs) is already active.")
 )
 
@@ -204,6 +204,11 @@ func NewHarness(db *sql.DB, repoRoot string) *Harness {
 		Interceptor: NewInterceptor(db),
 	}
 }
+
+// closedStageGuard keeps a run's stage writes off a task the Board closed
+// while it ran (STA-861: Mark done / Cancel stop the run, then close the task;
+// the stopping run must not write stopped or in_progress over done).
+const closedStageGuard = " AND execution_stage NOT IN ('done', 'cancelled')"
 
 // Claim atomically checks out a task for the given runID.
 //
@@ -410,7 +415,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 				defer capCancel()
 				capNow := time.Now().UTC().Format(time.RFC3339Nano)
 				_, _ = h.DB.ExecContext(capCtx,
-					`UPDATE tasks SET execution_stage='capped', updated_at=? WHERE id=?`,
+					`UPDATE tasks SET execution_stage='capped', updated_at=? WHERE id=?`+closedStageGuard,
 					capNow, taskID,
 				)
 				_, _ = h.DB.ExecContext(capCtx,
@@ -461,7 +466,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			defer cleanCancel2()
 			now2 := time.Now().UTC().Format(time.RFC3339Nano)
 			_, _ = h.DB.ExecContext(cleanCtx2,
-				`UPDATE tasks SET execution_stage='in_progress', updated_at=? WHERE id=?`,
+				`UPDATE tasks SET execution_stage='in_progress', updated_at=? WHERE id=?`+closedStageGuard,
 				now2, taskID,
 			)
 			_, _ = h.DB.ExecContext(cleanCtx2,
@@ -812,7 +817,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 				}
 				now := time.Now().UTC().Format(time.RFC3339Nano)
 				_, _ = h.DB.ExecContext(ctx,
-					`UPDATE tasks SET execution_stage='paused', updated_at=? WHERE id=?`,
+					`UPDATE tasks SET execution_stage='paused', updated_at=? WHERE id=?`+closedStageGuard,
 					now, taskID,
 				)
 				runLog.Info("run paused after step", slog.Int("turn", turn))
@@ -824,7 +829,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 				// Resumed — update execution_stage back to in_progress.
 				now = time.Now().UTC().Format(time.RFC3339Nano)
 				_, _ = h.DB.ExecContext(ctx,
-					`UPDATE tasks SET execution_stage='in_progress', updated_at=? WHERE id=?`,
+					`UPDATE tasks SET execution_stage='in_progress', updated_at=? WHERE id=?`+closedStageGuard,
 					now, taskID,
 				)
 				if sr != nil {
@@ -960,7 +965,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
 	if _, err := h.DB.ExecContext(cleanCtx,
-		`UPDATE tasks SET execution_stage=?, updated_at=? WHERE id=?`,
+		`UPDATE tasks SET execution_stage=?, updated_at=? WHERE id=?`+closedStageGuard,
 		result.Disposition, now, taskID,
 	); err != nil {
 		runLog.Error("persist disposition failed", slog.String("disposition", result.Disposition), slog.Any("error", err))
