@@ -414,6 +414,7 @@ body.has-passkey-banner { --passkey-banner-h: 40px; }
 [data-status="done"]        .col-title { color: var(--green); }
 
 .card-list { display: flex; flex-direction: column; gap: 7px; min-height: 40px; }
+.task-source-ref { font-size: 12px; color: var(--muted); margin-top: 6px; }
 .kanban-board-wrap { display: flex; flex-direction: column; gap: 18px; }
 .kanban-lane-title {
   font-size: 13px; font-weight: 700; margin: 0 0 8px; color: var(--text);

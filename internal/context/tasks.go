@@ -51,6 +51,13 @@ type Task struct {
 	// paperclip_import (staypoint import paperclip) or legacy (existed before
 	// origins were tracked). Boards and lists hide legacy by default.
 	Origin string `json:"origin"`
+	// Priority is low, medium (default), high or critical.
+	Priority string `json:"priority,omitempty"`
+	// SourceRef / SourceID identify an imported task's source record
+	// (Paperclip identifier such as STA-772, and its uuid). Empty for
+	// tasks created in StayPoint.
+	SourceRef string `json:"source_ref,omitempty"`
+	SourceID  string `json:"source_id,omitempty"`
 }
 
 // TaskBlockerInfo contains summarized info about an upstream or downstream related task.
@@ -111,6 +118,15 @@ type TaskCreateOptions struct {
 	ExecutionStage string
 	// Origin defaults to OriginNative.
 	Origin string
+	// Priority defaults to medium.
+	Priority string
+	// SourceRef / SourceID record an imported task's source (see Task).
+	SourceRef string
+	SourceID  string
+	// NoRepo leaves repo_path and git_branch empty instead of defaulting to
+	// the working directory. The task cannot leave backlog until the Board
+	// sets a repo (SetTaskRepo).
+	NoRepo bool
 }
 
 // GetCurrentGitBranch returns the current active git branch for a directory.
@@ -146,21 +162,23 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 	}
 
 	repoPath := opts.RepoPath
-	if repoPath == "" {
-		var err error
-		repoPath, err = os.Getwd()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get current working directory: %w", err)
-		}
-	}
-	absRepoPath, err := filepath.Abs(repoPath)
-	if err == nil {
-		repoPath = absRepoPath
-	}
-
 	gitBranch := opts.GitBranch
-	if gitBranch == "" {
-		gitBranch = GetCurrentGitBranch(repoPath)
+	if opts.NoRepo {
+		repoPath, gitBranch = "", ""
+	} else {
+		if repoPath == "" {
+			var err error
+			repoPath, err = os.Getwd()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get current working directory: %w", err)
+			}
+		}
+		if absRepoPath, err := filepath.Abs(repoPath); err == nil {
+			repoPath = absRepoPath
+		}
+		if gitBranch == "" {
+			gitBranch = GetCurrentGitBranch(repoPath)
+		}
 	}
 
 	role := opts.AccountRole
@@ -193,15 +211,16 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 	if !IsValidOrigin(origin) {
 		return nil, fmt.Errorf("%w %q", ErrInvalidOrigin, origin)
 	}
+	priority := NormalizeTaskPriority(opts.Priority)
 
 	query := `
 		INSERT INTO tasks (
 			id, name, repo_path, git_branch, status, account_role,
 			max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 			organization, project, parent_id, assignee_agent_id, work_kind,
-			execution_stage, origin, created_at, updated_at
+			execution_stage, origin, priority, source_ref, source_id, created_at, updated_at
 		)
-		VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+		VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 	`
 
 	var parentID interface{}
@@ -214,7 +233,7 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 		assigneeAgentID = opts.AssigneeAgentID
 	}
 
-	if _, err := db.Exec(query, taskID, name, repoPath, gitBranch, role, opts.MaxBudgetUSD, opts.MaxTurns, opts.Organization, opts.Project, parentID, assigneeAgentID, workKind, stage, origin); err != nil {
+	if _, err := db.Exec(query, taskID, name, repoPath, gitBranch, role, opts.MaxBudgetUSD, opts.MaxTurns, opts.Organization, opts.Project, parentID, assigneeAgentID, workKind, stage, origin, priority, opts.SourceRef, opts.SourceID); err != nil {
 		return nil, fmt.Errorf("failed to insert task: %w", err)
 	}
 
@@ -347,7 +366,7 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 			       max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 			       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
 			       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
-			       COALESCE(origin, 'native')
+			       COALESCE(origin, 'native'), COALESCE(priority, 'medium'), source_ref, source_id
 			FROM tasks
 			WHERE status != 'soft_deleted'
 			ORDER BY created_at DESC
@@ -358,7 +377,7 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 			       max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 			       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
 			       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
-			       COALESCE(origin, 'native')
+			       COALESCE(origin, 'native'), COALESCE(priority, 'medium'), source_ref, source_id
 			FROM tasks
 			WHERE status = 'active'
 			ORDER BY created_at DESC
@@ -400,6 +419,9 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 			&t.UpdatedAt,
 			&deletedAt,
 			&t.Origin,
+			&t.Priority,
+			&t.SourceRef,
+			&t.SourceID,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan task row: %w", err)
 		}
@@ -478,7 +500,7 @@ func GetTask(db *sql.DB, id string) (*Task, error) {
 		       max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 		       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
 		       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
-		       COALESCE(work_kind, 'coding'), COALESCE(origin, 'native')
+		       COALESCE(work_kind, 'coding'), COALESCE(origin, 'native'), COALESCE(priority, 'medium'), source_ref, source_id
 		FROM tasks
 		WHERE id = ? OR id = ? OR id LIKE ?
 		ORDER BY created_at DESC
@@ -519,6 +541,9 @@ func GetTask(db *sql.DB, id string) (*Task, error) {
 		&deletedAt,
 		&t.WorkKind,
 		&t.Origin,
+		&t.Priority,
+		&t.SourceRef,
+		&t.SourceID,
 	); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("task not found: %s", id)
@@ -1423,6 +1448,9 @@ func SetTaskExecutionStageWithOptions(db *sql.DB, taskID, stage string, opts Don
 			return err
 		}
 	}
+	if strings.TrimSpace(task.RepoPath) == "" && governance.IsRunnableStage(stage) {
+		return fmt.Errorf("%w: set one with 'staypoint task set-repo %s <path>' first", ErrNoRepo, task.ID)
+	}
 	if task.ExecutionStage == governance.StageBacklog && stage == governance.StageInProgress {
 		if err := writeStage(db, task.ID, governance.StageTodo); err != nil {
 			return err
@@ -1434,6 +1462,30 @@ func SetTaskExecutionStageWithOptions(db *sql.DB, taskID, stage string, opts Don
 	}
 	_ = LogActivity(db, task.ID, "stage_change", fmt.Sprintf("execution stage set to %s", stage))
 	return nil
+}
+
+// SetTaskRepo sets a task's repo_path (absolute, cleaned) and git_branch
+// (empty: the repo's current branch). Imported tasks start without a repo
+// and cannot leave backlog until one is set.
+func SetTaskRepo(db *sql.DB, taskID, repoPath, gitBranch string) (*Task, error) {
+	task, err := GetTask(db, taskID)
+	if err != nil {
+		return nil, err
+	}
+	repoPath = strings.TrimSpace(repoPath)
+	if repoPath == "" || !filepath.IsAbs(repoPath) {
+		return nil, fmt.Errorf("%w: repo path must be absolute, got %q", ErrInvalidRepo, repoPath)
+	}
+	repoPath = filepath.Clean(repoPath)
+	gitBranch = strings.TrimSpace(gitBranch)
+	if gitBranch == "" {
+		gitBranch = GetCurrentGitBranch(repoPath)
+	}
+	if _, err := db.Exec(`UPDATE tasks SET repo_path = ?, git_branch = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`, repoPath, gitBranch, task.ID); err != nil {
+		return nil, fmt.Errorf("set task repo: %w", err)
+	}
+	_ = LogActivity(db, task.ID, "repo_set", fmt.Sprintf("repo set to %s (%s)", repoPath, gitBranch))
+	return GetTask(db, task.ID)
 }
 
 func writeStage(db *sql.DB, taskID, stage string) error {

@@ -151,6 +151,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("POST /api/tasks/{id}/blockers", tasksH.AddBlocker)
 		mux.HandleFunc("DELETE /api/tasks/{id}/blockers/{bid}", tasksH.RemoveBlocker)
 		mux.HandleFunc("POST /api/tasks/{id}/stage", tasksH.SetStage)
+		mux.HandleFunc("PUT /api/tasks/{id}/repo", tasksH.SetRepo)
 		mux.HandleFunc("GET /api/tasks/{id}/run-steps", tasksH.GetRunSteps)
 		mux.HandleFunc("GET /api/tasks/{id}/run-errors", tasksH.GetRunErrors)
 		mux.HandleFunc("GET /api/run-errors", tasksH.GetAllRunErrors)

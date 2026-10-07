@@ -741,6 +741,8 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, err.Error())
 		} else if errors.Is(err, context.ErrInvalidStage) {
 			writeError(w, http.StatusBadRequest, err.Error())
+		} else if errors.Is(err, context.ErrNoRepo) {
+			writeError(w, http.StatusConflict, err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "failed to update task stage: "+err.Error())
 		}
@@ -767,6 +769,32 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 		"task_id": id,
 		"stage":   req.Stage,
 	})
+}
+
+// SetRepo handles PUT /api/tasks/{id}/repo {"repo_path": "/abs", "git_branch": ""}.
+// Imported tasks start without a repo and stay in backlog until it is set.
+func (h *TasksHandler) SetRepo(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RepoPath  string `json:"repo_path"`
+		GitBranch string `json:"git_branch"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	task, err := context.SetTaskRepo(h.db, r.PathValue("id"), req.RepoPath, req.GitBranch)
+	if err != nil {
+		switch {
+		case isNotFound(err):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, context.ErrInvalidRepo):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, task)
 }
 
 // GetRunSteps handles GET /api/tasks/{id}/run-steps

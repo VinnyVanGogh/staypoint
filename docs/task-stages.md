@@ -107,3 +107,45 @@ Runs once, in one transaction:
 
 Steps 2 and 3 are idempotent (`db.NormalizeTaskOrganizations`,
 `db.MergeLegacyDuplicates`).
+
+## Paperclip import (`staypoint import paperclip`)
+
+A Board command that runs on the Board's terminal. It is refused when
+`STAYPOINT_TASK_ID` is set, and the real import asks for confirmation (type
+`import`) on a TTY.
+
+- It reads every company, and for each one every issue whose status is
+  `backlog`, `todo`, `in_progress`, `in_review` or `blocked`. The issue list
+  endpoint returns 500 rows when no `limit` is given, so the import pages with
+  `limit=200&offset=N` until it gets a short page. Long descriptions come back
+  truncated in the list (`descriptionTruncated`), so for those issues it
+  fetches the full text from `GET /api/issues/{id}`.
+- It creates one parent per company, `Paperclip backlog — <Company>`, in
+  organization `StayPoint` (STA), `Managed Solution` (MAN), `Research` (RES),
+  `Maintenance` (PER) or `RuneLite` (RUN). An unknown company uses its own
+  name.
+- Each issue becomes a child task with title `[STA-772] <title>`, the
+  Paperclip description and priority, stage `backlog`, no assignee, origin
+  `paperclip_import`, `source_ref` set to the identifier and `source_id` to
+  the uuid. The task page shows "Imported from STA-772". Assignees, agents,
+  comments and status history are not imported.
+- Paperclip parent→child links are kept when the parent is also open. Nesting
+  deeper than `tasks.max_child_depth` (the company parent is depth 0) is
+  flattened under the deepest ancestor that fits, and the description says
+  which issue was its Paperclip parent. Children are inserted directly, so
+  `tasks.max_children` does not limit the import; the global setting is not
+  changed.
+- `repo_path` comes from the Paperclip project's primary workspace `cwd`, or
+  else from its codebase `localFolder`. Paperclip's managed folders are never
+  used. If neither is set the repo stays empty. A task with no repo can't
+  move to a runnable stage (409 / `ErrNoRepo`) until
+  `staypoint task set-repo <id> <path>` or `PUT /api/tasks/{id}/repo` gives it
+  one.
+- Running it again is safe: `source_id` has a unique index, and issues already
+  imported are skipped. A later issue is added under the existing parents.
+- `--dry-run` opens the task database read-only and runs no migrations, then
+  prints per-company counts and sample titles. `--company STA,MAN` limits the
+  import to those companies.
+
+Migration 35 (`task_source_ref`) adds `tasks.source_ref`, `tasks.source_id`
+(with the unique index) and, on databases that lack it, `tasks.priority`.
