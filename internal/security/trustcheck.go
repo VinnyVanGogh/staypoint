@@ -436,7 +436,13 @@ func (a *trustAnalyzer) copyLike(name string, args []string, dynAt func(int) boo
 			a.f.deleteOut(name + ": option after an operand: " + x)
 		case strings.HasPrefix(x, "--"):
 			k, v, hasV := strings.Cut(x, "=")
-			if k = longOpt(k, longValue); k == "" {
+			full := longOpt(k, longValue)
+			if full != k && len(k) > 2 {
+				// Abbreviations resolve against each tool's full option
+				// table, which we do not model: do not guess.
+				a.f.deleteOut(name + ": abbreviated long option " + k)
+			}
+			if k = full; k == "" {
 				continue
 			}
 			if !hasV {
