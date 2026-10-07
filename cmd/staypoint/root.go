@@ -159,6 +159,9 @@ func runSmartLaunch(cmd *cobra.Command, args []string) {
 
 	if dryRun {
 		fmt.Printf("\n\033[1;36m[Staypoint :: Dry Run]\033[0m\n")
+		if targetTool == "agy" && isWorkRepo {
+			fmt.Printf("  • REFUSED:     agy is not allowed in work repos (use claude --work)\n")
+		}
 		fmt.Printf("  • Tool:        %s\n", targetTool)
 		fmt.Printf("  • Model:       %s\n", targetModel)
 		fmt.Printf("  • Remote Work: %t\n", isRemoteWork)
@@ -203,6 +206,8 @@ func runSmartLaunch(cmd *cobra.Command, args []string) {
 		}
 		binName = altBin
 	}
+
+	exitIfAgyInWorkRepo(binName, cwd) // STA-854: never agy in a work repo
 
 	env := os.Environ()
 	if binName == "claude" {

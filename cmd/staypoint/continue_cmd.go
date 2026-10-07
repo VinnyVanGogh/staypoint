@@ -93,6 +93,7 @@ func handleContinueFlow(cmd *cobra.Command, handoffOnly bool) {
 		}
 		_ = syscall.Exec(binPath, []string{"claude", "-c"}, os.Environ())
 	} else {
+		exitIfAgyInWorkRepo("agy", "") // STA-854
 		binPath, err := exec.LookPath("agy")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: agy not found on PATH: %v\n", err)
@@ -237,6 +238,7 @@ func handleResumeFlow(cmd *cobra.Command, args []string, handoffOnly bool) {
 		}
 		_ = syscall.Exec(binPath, []string{"claude", "--resume", selectedSess.ID}, os.Environ())
 	} else {
+		exitIfAgyInWorkRepo("agy", "") // STA-854
 		binPath, err := exec.LookPath("agy")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: agy not found on PATH: %v\n", err)
