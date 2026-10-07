@@ -799,6 +799,19 @@ func (a *trustAnalyzer) git(args []string, dir, baseDir string, depth int) {
 		return
 	}
 	switch sub {
+	case "config":
+		// A config write can set an alias, hook path, helper or push
+		// destination that a later command uses: hold every write.
+		read := false
+		for _, x := range rest {
+			switch x {
+			case "--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "get", "list":
+				read = true
+			}
+		}
+		if !read {
+			a.f.protect("git config write under trust")
+		}
 	case "push":
 		a.gitPush(rest, eff, cfgOverride)
 	case "submodule":
