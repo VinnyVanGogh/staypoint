@@ -88,9 +88,12 @@ func IsWorkRepo(cwd string) (bool, string, error) {
 		evalCwd = cleanCwd
 	}
 
-	// 1. Check patterns: ~/Documents/dev/work*, ~/Documents/dev/mansol*
-	workPrefix := filepath.Join(home, "Documents", "dev", "work")
-	if strings.HasPrefix(cleanCwd, workPrefix) || strings.HasPrefix(evalCwd, workPrefix) {
+	// 1. Check patterns: ~/Documents/dev/work[-_]*, ~/Documents/dev/mansol*
+	// The work pattern matches a whole directory name, so the shared
+	// ~/Documents/dev/worktrees folder (personal and work worktrees side by
+	// side) is classified by its git remote below instead.
+	devDir := filepath.Join(home, "Documents", "dev")
+	if isWorkDirName(firstComponentUnder(devDir, cleanCwd)) || isWorkDirName(firstComponentUnder(devDir, evalCwd)) {
 		return true, "prefix: ~/Documents/dev/work*", nil
 	}
 	mansolPrefix := filepath.Join(home, "Documents", "dev", "mansol")
@@ -506,4 +509,21 @@ func Route(ctx context.Context, cwd string, pacerState *PacerState, opts RouteOp
 	}
 
 	return decision, nil
+}
+
+// firstComponentUnder returns the first path element of p below root, or ""
+// when p is not inside root.
+func firstComponentUnder(root, p string) string {
+	rel, err := filepath.Rel(root, p)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	return strings.SplitN(rel, string(filepath.Separator), 2)[0]
+}
+
+// isWorkDirName reports whether a ~/Documents/dev entry is a work folder by
+// name: "work" itself or "work-…"/"work_…". "worktrees" is not.
+func isWorkDirName(name string) bool {
+	n := strings.ToLower(name)
+	return n == "work" || strings.HasPrefix(n, "work-") || strings.HasPrefix(n, "work_")
 }
