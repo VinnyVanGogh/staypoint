@@ -118,7 +118,7 @@ func newDeployFixture(t *testing.T) *deployFixture {
 		t.Fatal(err)
 	}
 	writeExec(t, filepath.Join(f.repo, "scripts", "reinstall-daemon.sh"), string(body))
-	writeExec(t, filepath.Join(f.repo, "scripts", "check-signing-cert.sh"), "#!/bin/sh\necho IDENTITY=-\nexit 0\n")
+	writeExec(t, filepath.Join(f.repo, "scripts", "check-signing-cert.sh"), "#!/bin/sh\necho IDENTITY=-\nexit \"${STUB_CERT_STATUS:-0}\"\n")
 	if err := os.WriteFile(filepath.Join(f.repo, "main.go"), []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestReinstallScript_CleanMainInstallsAndLogs(t *testing.T) {
 	}
 	sha := f.git(f.repo, "rev-parse", "HEAD")
 	log := f.deployLog()
-	for _, want := range []string{"result=installed", "sha=" + sha, "dirty=false", "in_main=true", "dev_build=false", "user=", "host="} {
+	for _, want := range []string{"result=installed", "sha=" + sha, "dirty=false", "in_main=true", "at_main=true", "dev_build=false", "user=", "host="} {
 		if !strings.Contains(log, want) {
 			t.Errorf("deploys.log lacks %q:\n%s", want, log)
 		}
@@ -325,11 +325,16 @@ func TestReinstallScript_NestedWorktreeStampsItsOwnCommit(t *testing.T) {
 	f := newDeployFixture(t)
 	deploy := filepath.Join(f.repo, ".worktrees", "deploy-main")
 	f.git(f.repo, "worktree", "add", "-q", "--detach", deploy, "main")
+	// Main moves on in the deploy worktree, so the deploy is at origin/main's
+	// tip while the shared checkout is left one commit behind and dirty.
+	writeExec(t, filepath.Join(deploy, "main.go"), "package main // newer\n")
+	f.git(deploy, "commit", "-q", "-am", "newer main")
+	f.git(deploy, "push", "-q", "origin", "HEAD:main")
 	want := f.git(deploy, "rev-parse", "HEAD")
-	writeExec(t, filepath.Join(f.repo, "main.go"), "package main // newer\n")
-	f.git(f.repo, "commit", "-q", "-am", "newer main")
-	f.git(f.repo, "push", "-q", "origin", "main")
 	writeExec(t, filepath.Join(f.repo, "patch.go"), "package main\n") // shared checkout now dirty
+	if shared := f.git(f.repo, "rev-parse", "HEAD"); shared == want {
+		t.Fatalf("shared checkout should be at another commit than the deploy worktree")
+	}
 
 	out, code := f.runIn(deploy, nil)
 	if code != 0 {
@@ -348,24 +353,88 @@ func TestReinstallScript_NestedWorktreeStampsItsOwnCommit(t *testing.T) {
 	}
 }
 
+// A clean checkout that is behind origin/main is on main's history, but
+// deploying it rolls the daemon back past merged PRs: the STA-805 incident
+// through a clean tree (git stash in the stale shared checkout, then deploy).
+func TestReinstallScript_RefusesCleanCheckoutBehindMain(t *testing.T) {
+	f := newDeployFixture(t)
+	f.seedLiveBinary()
+	writeExec(t, filepath.Join(f.repo, "main.go"), "package main // newer\n")
+	f.git(f.repo, "commit", "-q", "-am", "newer main")
+	f.git(f.repo, "push", "-q", "origin", "main")
+	f.git(f.repo, "checkout", "-q", "--detach", "HEAD~1")
+
+	out, code := f.run(nil)
+	f.assertRefused(out, code, "behind-main", "1 commit(s) behind origin/main")
+	if f.read(filepath.Join(f.state, "built")) != "" {
+		t.Errorf("script ran go build on a commit behind origin/main")
+	}
+	if log := f.deployLog(); !strings.Contains(log, "in_main=true") || !strings.Contains(log, "at_main=false") {
+		t.Errorf("deploys.log should record in_main=true at_main=false:\n%s", log)
+	}
+
+	out, code = f.run(nil, "--allow-dev-build")
+	if code != 0 {
+		t.Fatalf("--allow-dev-build: exit code = %d, want 0\n%s", code, out)
+	}
+	if !strings.Contains(out, "origin/main tip: false") {
+		t.Errorf("dev banner does not say HEAD is not origin/main's tip:\n%s", out)
+	}
+	if log := f.deployLog(); !strings.Contains(log, "result=installed") || !strings.Contains(log, "dev_build=true") {
+		t.Errorf("deploys.log does not record the dev-build install:\n%s", log)
+	}
+}
+
 func TestReinstallScript_RejectsUnknownArgument(t *testing.T) {
 	f := newDeployFixture(t)
+	f.seedLiveBinary()
 	out, code := f.run(nil, "--allow-devbuild")
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2\n%s", code, out)
 	}
+	if !strings.Contains(f.deployLog(), "result=refused:bad-arg") {
+		t.Errorf("deploys.log lacks result=refused:bad-arg:\n%s", f.deployLog())
+	}
+	if got := f.installedBinary(); got != "old binary\n" {
+		t.Errorf("live binary was replaced: %q", got)
+	}
+}
+
+// The signing-certificate check only runs on macOS, so a uname stub makes the
+// script take that path on any host.
+func TestReinstallScript_RefusesWithoutSigningCertAndLogs(t *testing.T) {
+	f := newDeployFixture(t)
+	f.seedLiveBinary()
+	darwin := t.TempDir()
+	writeExec(t, filepath.Join(darwin, "uname"), "#!/bin/sh\necho Darwin\n")
+	path := ""
+	for _, kv := range f.env {
+		if strings.HasPrefix(kv, "PATH=") {
+			path = strings.TrimPrefix(kv, "PATH=")
+		}
+	}
+	out, code := f.run([]string{"STUB_CERT_STATUS=1", "PATH=" + darwin + string(os.PathListSeparator) + path})
+	f.assertRefused(out, code, "no-cert", "no valid signing certificate")
+	if f.read(filepath.Join(f.state, "built")) != "" {
+		t.Errorf("script ran go build without a signing certificate")
+	}
 }
 
 func TestDevBuildReasonFrom(t *testing.T) {
+	const sha = "245f42c0123456789abcdef0123456789abcdef0"
 	cases := []struct {
-		name, flag, commit, want string
+		name, flag, commit, rev, modified, want string
 	}{
-		{"flag", "true", "245f42c", "deployed with --allow-dev-build"},
-		{"raw go build (the 2026-10-06 binary)", "false", "none", "not built by reinstall-daemon.sh: no commit stamped"},
-		{"script main build", "false", "245f42c", ""},
+		{"flag", "true", "245f42c", sha, "false", "deployed with --allow-dev-build"},
+		{"raw go build (the 2026-10-06 binary)", "false", "none", "88792ec", "true", "not built by reinstall-daemon.sh: no commit stamped"},
+		{"script main build", "false", "245f42c", sha, "false", ""},
+		{"raw build from a dirty tree with GitCommit set", "false", "245f42c", sha, "true", "built from a tree with uncommitted changes (vcs.modified=true)"},
+		{"raw build of another commit with GitCommit set", "false", "245f42c", "88792ec0123456789abcdef0123456789abcdef0", "false",
+			"vcs.revision 88792ec0123456789abcdef0123456789abcdef0 does not match the stamped commit 245f42c"},
+		{"raw build with -buildvcs=false", "false", "245f42c", "", "", "no vcs.revision stamped: reinstall-daemon.sh refuses such builds"},
 	}
 	for _, c := range cases {
-		if got := devBuildReasonFrom(c.flag, c.commit); got != c.want {
+		if got := devBuildReasonFrom(c.flag, c.commit, c.rev, c.modified); got != c.want {
 			t.Errorf("%s: devBuildReasonFrom = %q, want %q", c.name, got, c.want)
 		}
 	}

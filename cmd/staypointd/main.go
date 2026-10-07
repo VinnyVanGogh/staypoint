@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,19 +40,49 @@ var (
 )
 
 // devBuildReason says why this binary is not a reviewed main build, or ""
-// when it is (STA-805). Go's vcs.modified is not used: Go reads it from the
-// nearest .git directory, so a build in a worktree nested in a dirty checkout
-// reports the checkout's state, not its own.
+// when it is (STA-805). The Go VCS stamp is trusted here because
+// reinstall-daemon.sh builds clean trees from a throwaway clone, so for a
+// script main build vcs.revision is the deployed commit and vcs.modified is
+// false. A raw `go build -ldflags "-X main.GitCommit=x"` from a dirty or
+// different tree is caught by the stamp even though GitCommit looks real.
 func devBuildReason() string {
-	return devBuildReasonFrom(DevBuild, GitCommit)
+	rev, modified := vcsStamp()
+	return devBuildReasonFrom(DevBuild, GitCommit, rev, modified)
 }
 
-func devBuildReasonFrom(flag, gitCommit string) string {
+// vcsStamp returns the vcs.revision and vcs.modified settings Go embedded in
+// this binary, or "" for each one that is missing.
+func vcsStamp() (revision, modified string) {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "", ""
+	}
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = s.Value
+		case "vcs.modified":
+			modified = s.Value
+		}
+	}
+	return revision, modified
+}
+
+func devBuildReasonFrom(flag, gitCommit, vcsRevision, vcsModified string) string {
 	if flag == "true" {
 		return "deployed with --allow-dev-build"
 	}
 	if gitCommit == "" || gitCommit == "none" {
 		return "not built by reinstall-daemon.sh: no commit stamped"
+	}
+	if vcsRevision == "" {
+		return "no vcs.revision stamped: reinstall-daemon.sh refuses such builds"
+	}
+	if vcsModified == "true" {
+		return "built from a tree with uncommitted changes (vcs.modified=true)"
+	}
+	if !strings.HasPrefix(vcsRevision, strings.TrimSuffix(gitCommit, "-dirty")) {
+		return fmt.Sprintf("vcs.revision %s does not match the stamped commit %s", vcsRevision, gitCommit)
 	}
 	return ""
 }

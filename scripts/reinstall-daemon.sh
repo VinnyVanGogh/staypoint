@@ -12,33 +12,21 @@ PLIST="$HOME/Library/LaunchAgents/com.staypoint.daemon.plist"
 LABEL="com.staypoint.daemon"
 DEPLOY_LOG="$HOME/.staypoint/deploys.log"
 
-ALLOW_DEV_BUILD=0
-for arg in "$@"; do
-    case "$arg" in
-        --allow-dev-build) ALLOW_DEV_BUILD=1 ;;
-        --allow-unmerged)
-            echo "  ! --allow-unmerged is now --allow-dev-build; treating it as that."
-            ALLOW_DEV_BUILD=1 ;;
-        *)
-            echo "✗ Unknown argument: $arg (the only flag is --allow-dev-build)" >&2
-            exit 2 ;;
-    esac
-done
-
 # Every install and every refused install gets one line in $DEPLOY_LOG: when,
 # the outcome, who ran it and from what parent process, on which host, and
 # what it would deploy.
 FULL_SHA=""
 DIRTY=false
 IN_MAIN=false
+AT_MAIN=false
 DEV_BUILD=false
 log_deploy() {
     local parent
     parent="$(ps -o command= -p "$PPID" 2>/dev/null | tr '\t\n' '  ' | cut -c1-200 || true)"
     mkdir -p "$(dirname "$DEPLOY_LOG")"
-    printf '%s\tresult=%s\tuser=%s\thost=%s\tsha=%s\tdirty=%s\tin_main=%s\tdev_build=%s\trepo=%s\tparent=%s\n' \
+    printf '%s\tresult=%s\tuser=%s\thost=%s\tsha=%s\tdirty=%s\tin_main=%s\tat_main=%s\tdev_build=%s\trepo=%s\tparent=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "${USER:-$(id -un)}" "$(hostname)" \
-        "${FULL_SHA:-none}" "$DIRTY" "$IN_MAIN" "$DEV_BUILD" "$REPO" "$parent" >> "$DEPLOY_LOG"
+        "${FULL_SHA:-none}" "$DIRTY" "$IN_MAIN" "$AT_MAIN" "$DEV_BUILD" "$REPO" "$parent" >> "$DEPLOY_LOG"
 }
 
 # refuse <log-reason> <headline> [detail lines...]
@@ -49,6 +37,21 @@ refuse() {
     for line in "$@"; do echo "  $line" >&2; done
     exit 1
 }
+
+ALLOW_DEV_BUILD=0
+for arg in "$@"; do
+    case "$arg" in
+        --allow-dev-build) ALLOW_DEV_BUILD=1 ;;
+        --allow-unmerged)
+            echo "  ! --allow-unmerged is now --allow-dev-build; treating it as that."
+            ALLOW_DEV_BUILD=1 ;;
+        *)
+            # Exit 2 (usage error), but still leave a trace in the deploy log.
+            log_deploy "refused:bad-arg"
+            echo "✗ Unknown argument: $arg (the only flag is --allow-dev-build)" >&2
+            exit 2 ;;
+    esac
+done
 
 # Deploy guards (STA-805). The live daemon must be a reviewed build: a clean
 # tree whose HEAD is on origin/main. On 2026-10-06 a session working in the
@@ -69,7 +72,13 @@ git -C "$REPO" fetch --quiet origin main 2>/dev/null \
 if ! git -C "$REPO" rev-parse -q --verify "origin/main^{commit}" >/dev/null; then
     refuse no-origin-main "$REPO has no origin/main ref, so there is nothing to check HEAD against."
 fi
+MAIN_SHA="$(git -C "$REPO" rev-parse origin/main)"
 git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null && IN_MAIN=true
+# Being an ancestor of origin/main is not enough: a clean checkout that is
+# behind main would install an older daemon and roll back merged PRs, which is
+# the STA-805 incident through a clean tree (e.g. `git stash` in the stale
+# shared checkout, then deploy). Only origin/main's tip is a main build.
+[ "$FULL_SHA" = "$MAIN_SHA" ] && AT_MAIN=true
 
 if [ "$ALLOW_DEV_BUILD" = 0 ]; then
     if [ "$DIRTY" = true ]; then
@@ -82,6 +91,12 @@ if [ "$ALLOW_DEV_BUILD" = 0 ]; then
         refuse not-in-main "HEAD ($COMMIT — $(git -C "$REPO" log --format=%s -1 HEAD)) is not on origin/main." \
             "Merge it first, or pass --allow-dev-build to deploy it as a dev build."
     fi
+    if [ "$AT_MAIN" != true ]; then
+        refuse behind-main "HEAD ($COMMIT) is $(git -C "$REPO" rev-list --count HEAD..origin/main) commit(s) behind origin/main ($(git -C "$REPO" rev-parse --short origin/main))." \
+            "Deploying it would roll the daemon back past merged work." \
+            "Deploy from origin/main's tip (e.g. git -C .worktrees/deploy-main checkout --detach origin/main)," \
+            "or pass --allow-dev-build to deploy this older commit as a dev build."
+    fi
 else
     DEV_BUILD=true
     cat <<EOF
@@ -90,6 +105,7 @@ else
 !!!  This daemon will NOT be a reviewed main build.
 !!!    commit:          $COMMIT
 !!!    on origin/main:  $IN_MAIN
+!!!    origin/main tip: $AT_MAIN
 !!!    uncommitted:     $DIRTY
 !!!  /api/health and the web UI header will show dev_build: true.
 !!!  Redeploy from a clean origin/main checkout when you are done.
@@ -121,10 +137,9 @@ if [ "$(uname)" = "Darwin" ]; then
             echo "  ! STAYPOINT_ALLOW_ADHOC=1: building ad-hoc. macOS WILL re-prompt for permissions after every rebuild."
             SIGN_IDENTITY="-"
         else
-            echo "✗ ABORTING: no valid signing certificate. Building ad-hoc would bring back the"
-            echo "  'staypointd would like to access your Documents folder' popup on every rebuild."
-            echo "  Fix the certificate (see above), or rerun with STAYPOINT_ALLOW_ADHOC=1 to accept that."
-            exit 1
+            refuse no-cert "no valid signing certificate. Building ad-hoc would bring back the" \
+                "'staypointd would like to access your Documents folder' popup on every rebuild." \
+                "Fix the certificate (see above), or rerun with STAYPOINT_ALLOW_ADHOC=1 to accept that."
         fi
     elif [ "$CERT_STATUS" -eq 2 ]; then
         echo "  !!! RENEW THE SIGNING CERTIFICATE SOON (see above). Building with it for now."
