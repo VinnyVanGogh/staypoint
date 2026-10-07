@@ -184,7 +184,7 @@ func TestWireOnWake_ParseDeltaUsesClaudeAdapter(t *testing.T) {
 	// With the correct ClaudeAdapter, the tool_use line in the fixture must produce
 	// at least one such step (kind = 'run', 'read', 'edit', or similar tool step).
 	rows, err := store.DB().QueryContext(context.Background(),
-		`SELECT kind FROM run_steps WHERE task_id = ? AND kind NOT IN ('wake','state','checkpoint')`,
+		`SELECT kind FROM run_steps WHERE task_id = ? AND kind NOT IN ('wake','route','state','checkpoint')`,
 		taskID,
 	)
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -22,6 +23,13 @@ import (
 // Spawns whose args contain failOn exit 1 before any output.
 func fakeCLI(t *testing.T, failOn string) (bin, logPath string) {
 	t.Helper()
+	return fakeCLIOutput(t, failOn, "")
+}
+
+// fakeCLIOutput is fakeCLI whose non-failing spawns print stdoutFile (a
+// captured CLI stream) when set, else "done".
+func fakeCLIOutput(t *testing.T, failOn, stdoutFile string) (bin, logPath string) {
+	t.Helper()
 	dir := t.TempDir()
 	logPath = filepath.Join(dir, "spawns.log")
 	bin = filepath.Join(dir, "fakecli.sh")
@@ -29,7 +37,11 @@ func fakeCLI(t *testing.T, failOn string) (bin, logPath string) {
 	if failOn != "" {
 		script += "case \"$*\" in *" + failOn + "*) exit 1;; esac\n"
 	}
-	script += "echo 'done'\n"
+	if stdoutFile != "" {
+		script += "cat '" + stdoutFile + "'\n"
+	} else {
+		script += "echo 'done'\n"
+	}
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -40,6 +52,7 @@ type wakeResult struct {
 	spawns []string // "<CLAUDE_CONFIG_DIR>|<args>"
 	routes []string // route row titles in order
 	bodies []string
+	steps  []string // kinds of the agent's own steps (no bookkeeping rows)
 	// interceptorComments counts completion-interceptor feedback rows. The
 	// harness writes one only when it saw [[TASK_COMPLETE]] in a turn.
 	interceptorComments int
@@ -156,6 +169,18 @@ func runWakeIn(t *testing.T, repoRoot, workKind string, pacer *router.PacerState
 	}
 	if err := store.DB().QueryRow(`SELECT COUNT(1) FROM task_comments WHERE task_id=? AND author='interceptor'`, taskID).Scan(&res.interceptorComments); err != nil {
 		t.Fatalf("count interceptor comments: %v", err)
+	}
+	steps, err := store.DB().Query(`SELECT kind FROM run_steps WHERE task_id=? AND kind IN ('think','read','run','edit') ORDER BY seq`, taskID)
+	if err != nil {
+		t.Fatalf("query agent steps: %v", err)
+	}
+	defer steps.Close()
+	for steps.Next() {
+		var kind string
+		if err := steps.Scan(&kind); err != nil {
+			t.Fatal(err)
+		}
+		res.steps = append(res.steps, kind)
 	}
 	return res
 }
@@ -434,6 +459,24 @@ func TestWake_CodingClaudeFailureNeverSpawnsGemini(t *testing.T) {
 		if strings.Contains(title, "Gemini") {
 			t.Errorf("route row names Gemini: %q", title)
 		}
+	}
+}
+
+// A Gemini-routed run's agy stream is parsed with the agy parser, so its tool
+// calls reach the timeline (STA-775: they were parsed as Claude and dropped,
+// leaving only wake/route/checkpoint rows).
+func TestWake_GeminiRunRecordsAgySteps(t *testing.T) {
+	fixture, err := filepath.Abs(filepath.Join("..", "..", "internal", "adapter", "testdata", "agy_stream_success.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, logPath := fakeCLIOutput(t, "", fixture)
+	r := runWakeBin(t, personalRepo(t), "planning", openPacer(), bin, logPath)
+	if _, args := mustOneSpawn(t, r); isClaude(args) {
+		t.Fatalf("spawned %q, want agy", args)
+	}
+	if !slices.Contains(r.steps, "read") {
+		t.Fatalf("agent steps = %q, want the fixture's view_file as a read step", r.steps)
 	}
 }
 
