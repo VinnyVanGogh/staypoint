@@ -23,7 +23,6 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/mcp"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/repoaccess"
-	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/server"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
 )
@@ -309,43 +308,6 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			sessID = "paperclip-" + taskID[:8]
 		}
 
-		// resolvedProv is set by adapterFn before each adapter turn writes to
-		// stdout; parseDelta reads it to select the right stream parser.
-		var resolvedProv string
-
-		var adapterFn orchestrator.AdapterRunFunc
-		if adapterOverride != nil {
-			adapterFn = func(runCtx context.Context, cwd, prov string, rawArgs, extraEnv []string, stdout, stderr io.Writer) error {
-				agentType := prov
-				if agentType == "" {
-					agentType = "claude"
-				}
-				resolvedProv = agentType
-				return adapterOverride(runCtx, cwd, prov, rawArgs, extraEnv, stdout, stderr)
-			}
-		} else {
-			adapterFn = func(runCtx context.Context, cwd, prov string, rawArgs, extraEnv []string, stdout, stderr io.Writer) error {
-				agentType := prov
-				if agentType == "" {
-					agentType = "claude"
-				}
-				resolvedProv = agentType
-				if err := telemetry.HeartbeatSession(dbStore.DB(), telemetry.AgentSession{
-					ID:        sessID,
-					AgentType: agentType,
-					RepoPath:  cwd,
-					PID:       os.Getpid(),
-				}); err != nil {
-					slog.Warn("wake: session heartbeat failed",
-						slog.String("task", taskID), slog.Any("error", err))
-				}
-				if len(extraEnv) > 0 {
-					runCtx = adapter.WithExtraEnv(runCtx, extraEnv)
-				}
-				return adapter.RunAdapter(runCtx, cwd, nil, prov, rawArgs, nil, stdout, stderr)
-			}
-		}
-
 		// Build a per-run StepRecorder when a live EventHub is available.
 		// ParseDelta bridges adapter.StreamDelta → orchestrator.StepDelta without
 		// importing the adapter package from inside the orchestrator.
@@ -365,12 +327,35 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 		// Wake and route steps are now emitted from inside harness.Run() after
 		// Claim() succeeds, so refused runs (ErrConcurrencyCap) never write steps.
 
-		parseDelta := func(line []byte) ([]orchestrator.StepDelta, error) {
-			prov := resolvedProv
-			if prov == "" {
-				prov = "claude"
+		// One routing decision per run (STA-772): work_kind + repo seat + quota
+		// pick the chain. The spawned CLI and the route row both come from it,
+		// and the tracker re-labels the row if a turn spawns a different slot.
+		route := resolveTaskRoute(dbStore.DB(), taskID, repoRoot, currentPacer(), time.Now())
+		tracker := newRouteTracker(route, sr.EmitRoute)
+
+		var adapterFn orchestrator.AdapterRunFunc
+		if adapterOverride != nil {
+			adapterFn = adapterOverride
+		} else {
+			adapterFn = func(runCtx context.Context, cwd, _ string, rawArgs, extraEnv []string, stdout, stderr io.Writer) error {
+				if err := telemetry.HeartbeatSession(dbStore.DB(), telemetry.AgentSession{
+					ID:        sessID,
+					AgentType: tracker.Provider(),
+					RepoPath:  cwd,
+					PID:       os.Getpid(),
+				}); err != nil {
+					slog.Warn("wake: session heartbeat failed",
+						slog.String("task", taskID), slog.Any("error", err))
+				}
+				if len(extraEnv) > 0 {
+					runCtx = adapter.WithExtraEnv(runCtx, extraEnv)
+				}
+				return tracker.runRouted(runCtx, cwd, rawArgs, stdout, stderr)
 			}
-			raw, err := adapter.AdapterFor(prov).ParseStreamDelta(line)
+		}
+
+		parseDelta := func(line []byte) ([]orchestrator.StepDelta, error) {
+			raw, err := adapter.AdapterFor(tracker.Provider()).ParseStreamDelta(line)
 			if err != nil {
 				return nil, err
 			}
@@ -401,18 +386,17 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 		// Use context.Background() so daemon shutdown does not abruptly kill
 		// in-flight harness work; the dispatcher's Drain() provides the graceful
 		// drain window during shutdown.
-		db := dbStore.DB()
 		result, runErr := h.Run(context.Background(), taskID, orchestrator.RunConfig{
 			AgentID:    agentID,
 			WakeReason: reason,
 			RunAdapter: adapterFn,
-			EmitRoute: func(sr *orchestrator.StepRecorder) {
-				emitRouteStep(sr, db, taskID)
+			EmitRoute: func(*orchestrator.StepRecorder) {
+				tracker.EmitPlanned()
 			},
 			StepRecorder:     sr,
 			ParseDelta:       parseDelta,
 			RunControl:       orchestrator.GlobalRunControl,
-			SkipGitPreflight: adapterOverride != nil,
+			SkipGitPreflight: adapterOverride != nil || testSkipGitPreflight,
 			HookBin:          resolveStaypointCLIBin(),
 		})
 		if runErr != nil {
@@ -432,49 +416,6 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			slog.String("disposition", result.Disposition),
 			slog.Int("turns", result.Turns),
 		)
-	}
-}
-
-// emitRouteStep looks up the task's repo_path and work_kind, resolves the
-// actual adapter provider chain (the same chain RunAdapter will execute), and
-// emits a route step as the first substantive timeline row.
-//
-// Using adapter.ResolveProviderChain instead of router.DefaultKindChains
-// ensures the label matches the provider that actually runs (STA-481).
-func emitRouteStep(sr *orchestrator.StepRecorder, dbConn *sql.DB, taskID string) {
-	var repoPath, workKind string
-	if err := dbConn.QueryRowContext(context.Background(),
-		"SELECT COALESCE(repo_path,''), COALESCE(work_kind,'coding') FROM tasks WHERE id=?", taskID,
-	).Scan(&repoPath, &workKind); err != nil {
-		slog.Warn("route step: task lookup failed", slog.String("task", taskID), slog.Any("err", err))
-		return
-	}
-
-	isWork, _, _ := router.IsWorkRepo(repoPath)
-
-	pacer, err := router.LoadPacerState()
-	if err != nil {
-		slog.Warn("route step: pacer state load failed", slog.Any("err", err))
-		pacer = &router.PacerState{Pools: make(map[router.PoolID]*router.QuotaPool)}
-	}
-
-	res := adapter.ResolveProviderChain(isWork, "", pacer)
-
-	if res.AllLocked {
-		sr.EmitRoute("All providers locked", "No viable provider in the chain")
-		return
-	}
-	if res.IsCloud {
-		sr.EmitRoute("Running in Claude Cloud", "Kind of work: "+workKind)
-		return
-	}
-	if res.FallbackFromDisplay != "" {
-		sr.EmitRoute(
-			"Fell back to "+res.SelectedDisplay+": "+res.FallbackFromDisplay+" quota locked",
-			"Kind of work: "+workKind,
-		)
-	} else {
-		sr.EmitRoute("Ran on "+res.SelectedDisplay, "Kind of work: "+workKind)
 	}
 }
 
