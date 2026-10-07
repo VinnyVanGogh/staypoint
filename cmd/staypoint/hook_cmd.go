@@ -167,16 +167,11 @@ func handleHookPrompt() {
 			}
 		}
 
-		// C. Agent Circuit Breaker check
-		cb, _ := telemetry.GetCircuitBreaker(dbConn, sessionID)
-		if cb == nil {
-			cbs, _ := telemetry.ListCircuitBreakers(dbConn, cwd, true)
-			if len(cbs) > 0 {
-				cb = &cbs[0]
-			}
-		}
-		if cb != nil && cb.IsTripped {
-			notices = append(notices, fmt.Sprintf("🚨 [STAYPOINT CIRCUIT BREAKER ACTIVE]: Execution pause active because an agent loop was detected (%s on %s).\nLast error: %s\nTo reset and proceed, run: staypoint breaker reset %s", cb.FailingTool, cb.FailingCommand, cb.LastError, cb.SessionID))
+		// C. Agent Circuit Breaker check. Only this session's own breaker
+		// pauses it: borrowing another session's tripped breaker for the same
+		// repo told unrelated agents (e.g. a reviewer) to stop working.
+		if cb, _ := telemetry.GetCircuitBreaker(dbConn, sessionID); cb != nil && cb.IsTripped {
+			notices = append(notices, circuitBreakerNotice(cb))
 		}
 
 		// D. Task Budget Evaluation
@@ -650,4 +645,19 @@ func init() {
 	hookCmd.AddCommand(hookPromptCmd)
 	hookCmd.AddCommand(hookPreToolCmd)
 	hookCmd.AddCommand(hookInstallCmd)
+}
+
+// circuitBreakerNotice renders a tripped breaker for the prompt hook, leaving
+// out the tool and command when the watcher could not attribute the failure.
+func circuitBreakerNotice(cb *telemetry.CircuitBreaker) string {
+	what := "repeated tool failures"
+	switch {
+	case cb.FailingTool != "" && cb.FailingTool != "tool" && cb.FailingCommand != "":
+		what = fmt.Sprintf("repeated failures of %s on %s", cb.FailingTool, cb.FailingCommand)
+	case cb.FailingTool != "" && cb.FailingTool != "tool":
+		what = fmt.Sprintf("repeated failures of %s", cb.FailingTool)
+	case cb.FailingCommand != "":
+		what = fmt.Sprintf("repeated failures of %s", cb.FailingCommand)
+	}
+	return fmt.Sprintf("🚨 [STAYPOINT CIRCUIT BREAKER ACTIVE]: Execution pause active because an agent loop was detected (%s).\nLast error: %s\nTo reset and proceed, run: staypoint breaker reset %s", what, cb.LastError, cb.SessionID)
 }
