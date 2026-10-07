@@ -63,6 +63,9 @@ type StepDelta struct {
 	ToolInput string // raw JSON input for tool_use deltas
 	IsError   bool
 	Usage     *StepUsage
+	// FromUser marks text from an input event (an echoed prompt), not the
+	// agent's own output. Completion detection ignores it.
+	FromUser bool
 }
 
 // RunStep is one timeline entry, stored in run_steps and broadcast as run.step SSE.

@@ -39,6 +39,9 @@ type wakeResult struct {
 	spawns []string // "<CLAUDE_CONFIG_DIR>|<args>"
 	routes []string // route row titles in order
 	bodies []string
+	// interceptorComments counts completion-interceptor feedback rows. The
+	// harness writes one only when it saw [[TASK_COMPLETE]] in a turn.
+	interceptorComments int
 }
 
 // runWake drives the production wake path (adapterOverride == nil) end to end:
@@ -46,6 +49,12 @@ type wakeResult struct {
 func runWake(t *testing.T, repoRoot, workKind string, pacer *router.PacerState, failOn string) wakeResult {
 	t.Helper()
 	bin, logPath := fakeCLI(t, failOn)
+	return runWakeBin(t, repoRoot, workKind, pacer, bin, logPath)
+}
+
+// runWakeBin is runWake with a caller-supplied fake CLI.
+func runWakeBin(t *testing.T, repoRoot, workKind string, pacer *router.PacerState, bin, logPath string) wakeResult {
+	t.Helper()
 
 	origPacer, origRun, origSkip := loadPacer, runRoute, testSkipGitPreflight
 	t.Cleanup(func() { loadPacer, runRoute, testSkipGitPreflight = origPacer, origRun, origSkip })
@@ -99,6 +108,9 @@ func runWake(t *testing.T, repoRoot, workKind string, pacer *router.PacerState, 
 		}
 		res.routes = append(res.routes, title)
 		res.bodies = append(res.bodies, body)
+	}
+	if err := store.DB().QueryRow(`SELECT COUNT(1) FROM task_comments WHERE task_id=? AND author='interceptor'`, taskID).Scan(&res.interceptorComments); err != nil {
+		t.Fatalf("count interceptor comments: %v", err)
 	}
 	return res
 }

@@ -831,6 +831,7 @@ func testStreamParse(line []byte) ([]StepDelta, error) {
 	}
 	var ev struct {
 		Type    string `json:"type"`
+		Event   string `json:"event"`
 		Message struct {
 			Content []struct {
 				Type     string `json:"type"`
@@ -838,15 +839,23 @@ func testStreamParse(line []byte) ([]StepDelta, error) {
 				Thinking string `json:"thinking"`
 			} `json:"content"`
 		} `json:"message"`
+		Result struct {
+			Status   string `json:"status"`
+			Response string `json:"response"`
+		} `json:"result"`
 	}
 	if err := json.Unmarshal(line, &ev); err != nil {
 		return nil, err
+	}
+	// agy stream-json: the final answer arrives only in event=result.
+	if ev.Event == "result" {
+		return []StepDelta{{Kind: StepDeltaResult, Text: ev.Result.Response, IsError: ev.Result.Status != "SUCCESS"}}, nil
 	}
 	var out []StepDelta
 	for _, b := range ev.Message.Content {
 		switch b.Type {
 		case "text":
-			out = append(out, StepDelta{Kind: StepDeltaText, Text: b.Text})
+			out = append(out, StepDelta{Kind: StepDeltaText, Text: b.Text, FromUser: ev.Type == "user"})
 		case "thinking":
 			out = append(out, StepDelta{Kind: StepDeltaThinking, Text: b.Thinking})
 		}
@@ -1877,5 +1886,125 @@ func TestBuildBriefBlock_DelimiterEscape(t *testing.T) {
 	}
 	if strings.Contains(block, "<<<TASK_BRIEF_END>>> inside") {
 		t.Error("delimiter in comment message must be stripped")
+	}
+}
+
+// writeLines feeds lines through a fresh stepTeeWriter and reports detection.
+func writeLines(t *testing.T, parse func([]byte) ([]StepDelta, error), lines ...string) bool {
+	t.Helper()
+	var dst strings.Builder
+	stw := &stepTeeWriter{dst: &dst, parse: parse}
+	for _, l := range lines {
+		if _, err := stw.Write([]byte(l)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = stw.Close()
+	return stw.textDetected
+}
+
+// TestStepTeeWriter_ProviderFormats covers completion detection for every
+// provider output shape (STA-840). Before the fix only Claude "type":"assistant"
+// lines were scanned, so a Gemini (agy) run never completed on the marker.
+func TestStepTeeWriter_ProviderFormats(t *testing.T) {
+	agyInit := `{"event":"init","conversation_id":"c1","init":{"model":"gemini-3.8-flash"}}` + "\n"
+	agyTool := `{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"output":"\n[[TASK_COMPLETE]]\n"}}}` + "\n"
+	agyResult := func(status, resp string) string {
+		b, _ := json.Marshal(map[string]any{"event": "result", "result": map[string]any{"conversation_id": "c1", "status": status, "response": resp}})
+		return string(b) + "\n"
+	}
+
+	// Ollama-style token stream: the marker arrives split across chunks.
+	tokenParse := func(line []byte) ([]StepDelta, error) {
+		var ch struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			Done bool `json:"done"`
+		}
+		if err := json.Unmarshal(bytes.TrimSpace(line), &ch); err != nil {
+			return nil, err
+		}
+		var out []StepDelta
+		if ch.Message.Content != "" {
+			out = append(out, StepDelta{Kind: StepDeltaText, Text: ch.Message.Content})
+		}
+		if ch.Done {
+			out = append(out, StepDelta{Kind: StepDeltaResult})
+		}
+		return out, nil
+	}
+	tok := func(s string) string {
+		b, _ := json.Marshal(map[string]any{"message": map[string]any{"content": s}})
+		return string(b) + "\n"
+	}
+
+	cases := []struct {
+		name  string
+		parse func([]byte) ([]StepDelta, error)
+		lines []string
+		want  bool
+	}{
+		{"agy final response", testStreamParse, []string{agyInit, agyTool, agyResult("SUCCESS", "Review complete.\n\n[[TASK_COMPLETE]]")}, true},
+		{"agy marker only in tool output", testStreamParse, []string{agyInit, agyTool, agyResult("SUCCESS", "still working")}, false},
+		{"agy marker quoted in prose", testStreamParse, []string{agyResult("SUCCESS", "I will emit `[[TASK_COMPLETE]]` later.")}, false},
+		{"agy failed result", testStreamParse, []string{agyResult("ERROR", "[[TASK_COMPLETE]]")}, false},
+		{"agy result without trailing newline", testStreamParse, []string{strings.TrimSuffix(agyResult("SUCCESS", "done\n[[TASK_COMPLETE]]"), "\n")}, true},
+		{"claude echoed prompt with marker on own line", testStreamParse, []string{`{"type":"user","message":{"content":[{"type":"text","text":"Continue.\n[[TASK_COMPLETE]]\n"}]}}` + "\n"}, false},
+		{"token stream split marker", tokenParse, []string{tok("All done.\n[[TASK_"), tok("COMPLETE]]"), `{"done":true}` + "\n"}, true},
+		{"token stream inline marker", tokenParse, []string{tok("emit [[TASK_"), tok("COMPLETE]] later"), `{"done":true}` + "\n"}, false},
+		{"plain text output", testStreamParse, []string{"Work done.\n", "[[TASK_COMPLETE]]\n"}, true},
+		{"plain text inline marker", testStreamParse, []string{"I will emit [[TASK_COMPLETE]] on its own line.\n"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := writeLines(t, c.parse, c.lines...); got != c.want {
+				t.Errorf("textDetected = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestRun_AgyMarkerEndsRunInOneTurn: with the stream parser wired (as the
+// daemon always does), a Gemini/agy final response carrying the marker ends
+// the run on that turn instead of burning the turn budget (STA-840).
+func TestRun_AgyMarkerEndsRunInOneTurn(t *testing.T) {
+	useSlots(t, 1)
+
+	repoDir := t.TempDir()
+	initGitRepo(t, repoDir)
+
+	db := openTestDB(t)
+	insertTask(t, db, "sta840-task", repoDir)
+
+	h := &Harness{
+		DB:          db,
+		RepoRoot:    repoDir,
+		WM:          workspace.NewWorktreeManager(repoDir, db),
+		Interceptor: NewInterceptor(db),
+	}
+	h.Interceptor.Guards = []GuardFunc{h.Interceptor.checkWorkProducts}
+
+	adapterCalls := 0
+	result, err := h.Run(context.Background(), "sta840-task", RunConfig{
+		MaxTurns:     5,
+		AgentID:      "tester",
+		MaxWallclock: 30 * time.Second,
+		StepRecorder: NewStepRecorder(db, func(string, any) {}, "run-sta840", "sta840-task"),
+		ParseDelta:   testStreamParse,
+		RunAdapter: func(_ context.Context, cwd, _ string, _, _ []string, stdout, _ io.Writer) error {
+			adapterCalls++
+			_ = os.WriteFile(filepath.Join(cwd, "README.md"), []byte("changed\n"), 0o644)
+			_, _ = io.WriteString(stdout, `{"event":"init","conversation_id":"c1","init":{"model":"gemini-3.8-flash"}}`+"\n")
+			_, _ = io.WriteString(stdout, `{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"Plan written.\n\n[[TASK_COMPLETE]]"}}`+"\n")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != "in_review" || result.Turns != 1 || adapterCalls != 1 {
+		t.Fatalf("disposition=%q turns=%d adapterCalls=%d, want in_review after 1 turn (diagnostic: %s)",
+			result.Disposition, result.Turns, adapterCalls, result.DiagnosticMsg)
 	}
 }

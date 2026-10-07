@@ -430,6 +430,7 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 					ToolID:    d.ToolID,
 					ToolInput: d.ToolInput,
 					IsError:   d.IsError,
+					FromUser:  d.FromUser,
 				}
 				if d.Usage != nil {
 					sd.Usage = &orchestrator.StepUsage{
