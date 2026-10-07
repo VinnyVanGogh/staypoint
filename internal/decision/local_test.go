@@ -2,6 +2,7 @@ package decision
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,7 +23,7 @@ func TestNewLocal_IgnoresTogetherAndRemoteURLs(t *testing.T) {
 	} {
 		t.Setenv("DECISION_LOCAL_URL", remote)
 		c := NewLocal()
-		if c.BaseURL() != defaultLocalURL {
+		if c.BaseURL() != defaultSystemOneURL {
 			t.Errorf("DECISION_LOCAL_URL=%q: base URL %q, want default local", remote, c.BaseURL())
 		}
 		if c.apiKey != "" {
@@ -54,5 +55,59 @@ func TestNewLocal_SendsNoAuthorizationHeader(t *testing.T) {
 		Options: []Option{{Key: "a", Letter: "A", Label: "a"}, {Key: "b", Letter: "B", Label: "b"}}})
 	if auth != "" {
 		t.Fatalf("local client sent Authorization header %q", auth)
+	}
+}
+
+// tev1 answers only on Ollama's /v1/systemone (decision capability).
+func TestSystemOne_RequestShapeAndParse(t *testing.T) {
+	var got map[string]any
+	var auth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/systemone" {
+			http.NotFound(w, r)
+			return
+		}
+		auth = r.Header.Get("Authorization")
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		_, _ = w.Write([]byte(`{"model":"tev1-4b","answers":{"decision":{"type":"choice","choice":"denied","probabilities":{"approved":0.2,"denied":0.8},"confidence":0.27}}}`))
+	}))
+	defer srv.Close()
+	t.Setenv("TOGETHER_API_KEY", "sk-should-never-be-sent")
+	t.Setenv("DECISION_LOCAL_URL", srv.URL+"/v1/systemone")
+	c := NewLocal()
+	res, err := c.DecideWithReason(context.Background(), DecisionRequest{
+		State: "Command: rm -rf ~", Question: "Approve?",
+		Options: []Option{{Key: "approved", Letter: "A", Label: "Approve"}, {Key: "denied", Letter: "B", Label: "Deny"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.SelectedKey != "denied" || res.SelectedLetter != "B" {
+		t.Fatalf("got %+v, want denied/B", res)
+	}
+	if !strings.Contains(res.Reason, "p=0.80") {
+		t.Errorf("reason should carry the probability, got %q", res.Reason)
+	}
+	if auth != "" {
+		t.Fatalf("local client sent Authorization %q", auth)
+	}
+	q := got["questions"].(map[string]any)["decision"].(map[string]any)
+	if q["type"] != "choice" || q["instructions"] != "Approve?" {
+		t.Fatalf("bad question: %v", q)
+	}
+	if crit := q["criteria"].(map[string]any); crit["approved"] != "Approve" || crit["denied"] != "Deny" {
+		t.Fatalf("criteria must be option keys to labels: %v", crit)
+	}
+}
+
+func TestSystemOne_UnknownChoiceIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"answers":{"decision":{"choice":"maybe"}}}`))
+	}))
+	defer srv.Close()
+	t.Setenv("DECISION_LOCAL_URL", srv.URL+"/v1/systemone")
+	_, err := NewLocal().Decide(context.Background(), DecisionRequest{Options: []Option{{Key: "approved", Letter: "A"}}})
+	if err == nil {
+		t.Fatal("an unknown choice must be an error, never a silent approve")
 	}
 }

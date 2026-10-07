@@ -19,10 +19,13 @@ import (
 )
 
 const (
-	defaultLocalURL    = "http://localhost:11434/v1/chat/completions"
-	defaultTogetherURL = "https://api.together.xyz/v1/chat/completions"
-	defaultLocalModel  = "tev1-4b"
-	defaultRemoteModel = "tev1-4B-experimental"
+	defaultLocalURL = "http://localhost:11434/v1/chat/completions"
+	// defaultSystemOneURL is Ollama's decision-model endpoint (0.35+). tev1
+	// only answers here: it has the "decision" capability, not chat.
+	defaultSystemOneURL = "http://localhost:11434/v1/systemone"
+	defaultTogetherURL  = "https://api.together.xyz/v1/chat/completions"
+	defaultLocalModel   = "tev1-4b"
+	defaultRemoteModel  = "tev1-4B-experimental"
 )
 
 // ErrNoKey is returned when a Together AI call is attempted but TOGETHER_API_KEY is unset.
@@ -123,7 +126,7 @@ func NewTogether() (*TogetherDecisionClient, error) {
 // DECISION_LOCAL_URL only when it points at a loopback host; anything else
 // falls back to the default Ollama endpoint.
 func NewLocal() *TogetherDecisionClient {
-	baseURL := defaultLocalURL
+	baseURL := defaultSystemOneURL
 	if u := os.Getenv("DECISION_LOCAL_URL"); u != "" && isLoopbackURL(u) {
 		baseURL = u
 	}
@@ -165,12 +168,20 @@ func (c *TogetherDecisionClient) Model() string { return c.model }
 
 // Decide sends req to the configured endpoint and returns the parsed single-letter pick.
 func (c *TogetherDecisionClient) Decide(ctx context.Context, req DecisionRequest) (DecisionResult, error) {
+	if c.isSystemOne() {
+		return c.callSystemOne(ctx, req)
+	}
 	return c.call(ctx, buildPrompt(req), 8, req.Options)
 }
 
 // DecideWithReason is Decide plus a one-line reason after the letter
 // ("A - read-only du/git survey"), for advisories shown to the Board (STA-868).
 func (c *TogetherDecisionClient) DecideWithReason(ctx context.Context, req DecisionRequest) (DecisionResult, error) {
+	if c.isSystemOne() {
+		// Decision models return probabilities, not prose: the reason is
+		// the winning probability and the model's confidence.
+		return c.callSystemOne(ctx, req)
+	}
 	prompt := buildPrompt(req) + "\nReply as: <letter> - <one-line reason, at most 15 words>\n"
 	res, err := c.call(ctx, prompt, 60, req.Options)
 	if err != nil {
@@ -304,4 +315,82 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// isSystemOne reports whether the client targets Ollama's decision endpoint.
+func (c *TogetherDecisionClient) isSystemOne() bool {
+	u, err := url.Parse(c.baseURL)
+	return err == nil && strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/v1/systemone")
+}
+
+// systemOneResponse is the part of a /v1/systemone reply we use.
+type systemOneResponse struct {
+	Answers map[string]struct {
+		Choice        string             `json:"choice"`
+		Probabilities map[string]float64 `json:"probabilities"`
+		Confidence    float64            `json:"confidence"`
+	} `json:"answers"`
+}
+
+// callSystemOne asks one "choice" question whose criteria are the option
+// keys, and maps the winning key back to its option.
+func (c *TogetherDecisionClient) callSystemOne(ctx context.Context, req DecisionRequest) (DecisionResult, error) {
+	criteria := make(map[string]string, len(req.Options))
+	for _, o := range req.Options {
+		criteria[o.Key] = o.Label
+	}
+	body := map[string]any{
+		"model": c.model,
+		"state": map[string]string{"context": req.State},
+		"questions": map[string]any{
+			"decision": map[string]any{
+				"type":         "choice",
+				"instructions": req.Question,
+				"criteria":     criteria,
+			},
+		},
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return DecisionResult{}, fmt.Errorf("decision: marshal request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(b))
+	if err != nil {
+		return DecisionResult{}, fmt.Errorf("decision: build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return DecisionResult{}, fmt.Errorf("decision: http: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	if err != nil {
+		return DecisionResult{}, fmt.Errorf("decision: read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return DecisionResult{}, fmt.Errorf("decision: server %d: %s", resp.StatusCode, raw)
+	}
+	var sr systemOneResponse
+	if err := json.Unmarshal(raw, &sr); err != nil {
+		return DecisionResult{RawResponse: string(raw)}, fmt.Errorf("decision: parse response: %w", err)
+	}
+	ans, ok := sr.Answers["decision"]
+	if !ok || ans.Choice == "" {
+		return DecisionResult{RawResponse: string(raw)}, fmt.Errorf("decision: no answer in response")
+	}
+	for _, o := range req.Options {
+		if o.Key == ans.Choice {
+			return DecisionResult{
+				SelectedKey:    o.Key,
+				SelectedLetter: o.Letter,
+				RawResponse:    string(raw),
+				Reason:         fmt.Sprintf("p=%.2f, confidence %.2f", ans.Probabilities[o.Key], ans.Confidence),
+			}, nil
+		}
+	}
+	return DecisionResult{RawResponse: string(raw)}, fmt.Errorf("decision: unknown choice %q", ans.Choice)
 }
