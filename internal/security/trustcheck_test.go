@@ -66,6 +66,21 @@ func TestAnalyzeForTrust_ProtectedAlwaysHeld(t *testing.T) {
 		"git -c alias.ship='!git push origin main' ship",
 		"git ship",
 		"git submodule foreach 'git push origin main'",
+		"git submodule --quiet foreach --recursive 'git push'",
+		"git -c core.sshCommand=x push origin feature",
+		"git -ccore.hooksPath=/tmp/h commit -m x && rm -rf /x",
+		"git --exec-path=/tmp/evil push origin feature",
+		"GIT_DIR=/other/.git git push",
+		"env GIT_SSH_COMMAND='sh -c x' git push origin feature",
+		"git rebase -x 'git push origin main' HEAD~3",
+		"git bisect run gh pr merge 1",
+		"ssh -o ProxyCommand='gh pr merge 1' host true",
+		"ssh -oLocalCommand=x -oPermitLocalCommand=yes host",
+		"ssh -F ./cfg host true",
+		"ssh host < deploy.sh",
+		"ssh host bash -s < deploy.sh",
+		"ssh localhost 'git push origin main'",
+		"ssh -o= host 'gh pr merge 1'",
 	}
 	for _, c := range cases {
 		if f := AnalyzeForTrust(c, tc); !f.Protected {
@@ -152,6 +167,12 @@ func TestAnalyzeForTrust_DeleteOutsideWorktree(t *testing.T) {
 		"mv ~/notes.txt ./",
 		"cp out.txt /etc/hosts",
 		"ln -sf x /usr/local/bin/tool",
+		"mv -t /etc a.txt",
+		"mv --target-directory=/etc a.txt",
+		"cp -t/etc out.txt",
+		"cp -ft/etc out.txt",
+		"install -m 755 tool /usr/local/bin/",
+		"ssh me@127.0.0.1 'rm -rf ~/Documents'",
 	}
 	for _, c := range outside {
 		if f := AnalyzeForTrust(c, tc); !f.DeleteOutside {

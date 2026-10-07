@@ -200,7 +200,15 @@ func (a *trustAnalyzer) segment(s segment, dir, baseDir string, depth int) {
 			a.argvUnknownPaths(inner, dir, baseDir, depth)
 			return
 		}
-		a.segment(segment{argv: inner}, dir, baseDir, depth+1)
+		// Keep env-style assignments (env GIT_DIR=x git ...) in front of
+		// the inner command, where segment() sees them as prefixes.
+		var assigns []string
+		for _, x := range args[:len(args)-len(inner)] {
+			if isAssign(x) {
+				assigns = append(assigns, x)
+			}
+		}
+		a.segment(segment{argv: append(assigns, inner...)}, dir, baseDir, depth+1)
 	case name == "sudo" || name == "doas":
 		if inner := skipPrivFlags(args); len(inner) > 0 {
 			a.segment(segment{argv: inner}, dir, baseDir, depth+1)
@@ -232,16 +240,7 @@ func (a *trustAnalyzer) segment(s segment, dir, baseDir string, depth int) {
 			a.deleteArg(p, dynAt, dir, baseDir, name)
 		}
 	case name == "ssh":
-		// SSH is allowed under trust, but a remote command may still merge
-		// or push to a protected branch.
-		if rc := sshRemoteCommand(args); rc != "" {
-			if mergeTextRe.MatchString(rc) {
-				a.f.protect("ssh remote command may merge a pull request")
-			}
-			if pushTextRe.MatchString(rc) {
-				a.f.protect("ssh remote command may run git push")
-			}
-		}
+		a.ssh(s, args, depth)
 	case name == "tee":
 		for _, p := range plainArgs(args, nil) {
 			if !hasFlag(args, "-a", "--append") {
@@ -254,27 +253,19 @@ func (a *trustAnalyzer) segment(s segment, dir, baseDir string, depth int) {
 				a.deleteArg(plainArg{v: x[3:], i: i}, dynAt, dir, baseDir, "dd overwrites")
 			}
 		}
-	case name == "mv":
-		// A move removes its sources and may overwrite its destination.
-		for _, p := range plainArgs(args, map[string]bool{"-t": true, "--target-directory": true, "-S": true, "--suffix": true}) {
-			a.deleteArg(p, dynAt, dir, baseDir, "mv")
-		}
-	case name == "cp" || name == "ln" || name == "install":
-		pos := plainArgs(args, map[string]bool{"-t": true, "--target-directory": true, "-S": true, "--suffix": true, "-m": true, "-o": true, "-g": true, "--mode": true, "--owner": true, "--group": true})
-		if len(pos) > 0 {
-			a.deleteArg(pos[len(pos)-1], dynAt, dir, baseDir, name+" overwrites")
-		}
-		for i, x := range args {
-			if (x == "-t" || x == "--target-directory") && i+1 < len(args) {
-				a.deleteArg(plainArg{v: args[i+1], i: i + 1}, dynAt, dir, baseDir, name+" overwrites")
-			}
-		}
+	case name == "mv" || name == "cp" || name == "ln" || name == "install":
+		a.copyLike(name, args, dynAt, dir, baseDir)
 	case name == "find":
 		a.find(args, dynAt, dir, baseDir, depth)
 	case name == "rsync":
 		a.rsync(args, dynAt, dir, baseDir)
 	case name == "git":
-		a.git(args, dir, baseDir)
+		for _, x := range s.argv[:off] {
+			if strings.HasPrefix(x, "GIT_") {
+				a.f.protect("git with a GIT_* environment override")
+			}
+		}
+		a.git(args, dir, baseDir, depth)
 	case name == "gh":
 		a.gh(args)
 	case name == "staypoint":
@@ -326,6 +317,123 @@ func sshRemoteCommand(args []string) string {
 		return ""
 	}
 	return strings.Join(args[i+1:], " ")
+}
+
+// sshCommandOptions run a command on this machine.
+var sshCommandOptions = map[string]bool{"proxycommand": true, "localcommand": true, "knownhostscommand": true,
+	"permitlocalcommand": true, "proxyusefdpass": true, "remotecommand": true, "match": true, "include": true}
+
+// ssh: SSH is allowed under trust, but a remote command may still merge or
+// push to a protected branch, an option can run a local command, and an
+// ssh to this machine is local execution.
+func (a *trustAnalyzer) ssh(s segment, args []string, depth int) {
+	i := 0
+	for i < len(args) && strings.HasPrefix(args[i], "-") {
+		x := args[i]
+		opt := ""
+		switch {
+		case x == "-o" && i+1 < len(args):
+			opt = args[i+1]
+		case strings.HasPrefix(x, "-o") && len(x) > 2:
+			opt = x[2:]
+		case x == "-F" || strings.HasPrefix(x, "-F"):
+			a.unsure("ssh with a custom config file")
+		}
+		if opt != "" {
+			fields := strings.FieldsFunc(opt, func(r rune) bool { return r == '=' || r == ' ' || r == '\t' })
+			if len(fields) == 0 {
+				a.unsure("ssh option is empty: " + opt)
+			} else if key := strings.ToLower(fields[0]); sshCommandOptions[key] {
+				a.unsure("ssh option " + key + " runs a command")
+			}
+		}
+		if sshValueFlags[x] {
+			i++
+		}
+		i++
+	}
+	if i >= len(args) {
+		return
+	}
+	host := args[i]
+	if at := strings.LastIndex(host, "@"); at >= 0 {
+		host = host[at+1:]
+	}
+	rc := strings.Join(args[i+1:], " ")
+	if rc == "" {
+		// A login shell fed from stdin runs a script we cannot see.
+		for _, r := range s.redirects {
+			if strings.HasPrefix(r.op, "<") {
+				a.unsure("ssh runs a script from stdin")
+			}
+		}
+		return
+	}
+	switch strings.ToLower(host) {
+	case "localhost", "127.0.0.1", "::1", "0.0.0.0":
+		a.line(rc, "", depth+1)
+		return
+	}
+	if mergeTextRe.MatchString(rc) {
+		a.f.protect("ssh remote command may merge a pull request")
+	}
+	if pushTextRe.MatchString(rc) {
+		a.f.protect("ssh remote command may run git push")
+	}
+	if strings.Contains(rc, " -s") || strings.HasSuffix(rc, "sh") {
+		for _, r := range s.redirects {
+			if strings.HasPrefix(r.op, "<") {
+				a.unsure("ssh remote shell reads a script from stdin")
+			}
+		}
+	}
+}
+
+// copyLike checks mv (sources removed, destination overwritten) and
+// cp/ln/install (destination overwritten), including every -t form.
+func (a *trustAnalyzer) copyLike(name string, args []string, dynAt func(int) bool, dir, baseDir string) {
+	what := name + " overwrites"
+	valueFlags := map[string]bool{"-t": true, "--target-directory": true, "-S": true, "--suffix": true,
+		"-m": true, "-o": true, "-g": true, "--mode": true, "--owner": true, "--group": true}
+	targetSet := false
+flags:
+	for i, x := range args {
+		switch {
+		case x == "--":
+			break flags
+		case x == "-t" || x == "--target-directory":
+			targetSet = true
+			if i+1 < len(args) {
+				a.deleteArg(plainArg{v: args[i+1], i: i + 1}, dynAt, dir, baseDir, what)
+			} else {
+				a.f.deleteOut(name + " -t without a value")
+			}
+		case strings.HasPrefix(x, "--target-directory="):
+			targetSet = true
+			a.deletePath(strings.TrimPrefix(x, "--target-directory="), dir, baseDir, what)
+		case len(x) > 2 && x[0] == '-' && x[1] != '-' && strings.Contains(x[1:], "t"):
+			// -tDIR or a cluster like -ft/etc: the value follows the t.
+			targetSet = true
+			v := x[strings.Index(x, "t")+1:]
+			if v == "" {
+				if i+1 < len(args) {
+					a.deleteArg(plainArg{v: args[i+1], i: i + 1}, dynAt, dir, baseDir, what)
+				}
+			} else {
+				a.deletePath(v, dir, baseDir, what)
+			}
+		}
+	}
+	pos := plainArgs(args, valueFlags)
+	if name == "mv" {
+		for _, p := range pos {
+			a.deleteArg(p, dynAt, dir, baseDir, "mv")
+		}
+		return
+	}
+	if len(pos) > 0 && !targetSet {
+		a.deleteArg(pos[len(pos)-1], dynAt, dir, baseDir, what)
+	}
 }
 
 // gitBuiltins are git subcommands; anything else may be an alias that runs
@@ -550,7 +658,7 @@ func (a *trustAnalyzer) rsync(args []string, dynAt func(int) bool, dir, baseDir 
 	}
 }
 
-func (a *trustAnalyzer) git(args []string, dir, baseDir string) {
+func (a *trustAnalyzer) git(args []string, dir, baseDir string, depth int) {
 	eff := dir
 	cfgOverride := false
 	i := 0
@@ -568,9 +676,17 @@ func (a *trustAnalyzer) git(args []string, dir, baseDir string) {
 			i++
 		case strings.HasPrefix(args[i], "--git-dir=") || strings.HasPrefix(args[i], "--work-tree=") || strings.HasPrefix(args[i], "--namespace="):
 			eff, cfgOverride = "", true
-		case args[i] == "-c":
+		case args[i] == "-c" || strings.HasPrefix(args[i], "-c") || strings.HasPrefix(args[i], "--config-env"):
+			// A config override can set a command (alias.*, core.sshCommand,
+			// core.hooksPath, credential.helper, ...): fail closed.
+			a.f.protect("git -c / --config-env override")
+			if args[i] == "-c" || args[i] == "--config-env" {
+				i++
+			}
 			cfgOverride = true
-			i++
+		case strings.HasPrefix(args[i], "--exec-path"):
+			a.f.protect("git --exec-path override")
+			cfgOverride = true
 		}
 		i++
 	}
@@ -586,9 +702,36 @@ func (a *trustAnalyzer) git(args []string, dir, baseDir string) {
 	case "push":
 		a.gitPush(rest, eff, cfgOverride)
 	case "submodule":
-		// submodule foreach runs an arbitrary command.
-		if len(rest) > 0 && rest[0] == "foreach" {
-			a.line(strings.Join(rest[1:], " "), eff, 1)
+		// submodule [opts] foreach [opts] <cmd> runs a command in each
+		// submodule, a dir we do not track.
+		j := 0
+		for j < len(rest) && strings.HasPrefix(rest[j], "-") {
+			j++
+		}
+		if j < len(rest) && rest[j] == "foreach" {
+			j++
+			for j < len(rest) && strings.HasPrefix(rest[j], "-") {
+				j++
+			}
+			if j < len(rest) {
+				a.line(strings.Join(rest[j:], " "), "", depth+1)
+			}
+		}
+	case "rebase":
+		for k, x := range rest {
+			if x == "-x" || x == "--exec" {
+				if k+1 < len(rest) {
+					a.line(rest[k+1], eff, depth+1)
+				}
+			} else if strings.HasPrefix(x, "--exec=") {
+				a.line(strings.TrimPrefix(x, "--exec="), eff, depth+1)
+			} else if strings.HasPrefix(x, "-x") && len(x) > 2 {
+				a.line(x[2:], eff, depth+1)
+			}
+		}
+	case "bisect":
+		if len(rest) > 1 && rest[0] == "run" {
+			a.segment(segment{argv: rest[1:]}, eff, eff, depth+1)
 		}
 	case "clean":
 		force := false
