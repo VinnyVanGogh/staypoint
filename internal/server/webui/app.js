@@ -569,6 +569,15 @@ function handleEvent(evt) {
     }
     return;
   }
+  if (type === 'run.queue' && evt.data) {
+    const tid = state.openDetailTaskId;
+    if (tid) {
+      const pos = queuePositionIn(evt.data.queue, tid);
+      if (state.tasks[tid]) state.tasks[tid].queue = pos;
+      setRunQueueLine(document.getElementById(`run-queue-line-${tid}`), pos);
+    }
+    return;
+  }
   if (type === 'run_control' && evt.data) {
     const { task_id: tid, action } = evt.data;
     if (tid && (action === 'pause' || action === 'resume') && tid === state.openDetailTaskId) {
@@ -6907,6 +6916,7 @@ async function fetchTaskViewData(resolvedId) {
   ]);
   const task = taskResp.task || taskResp;
   if (taskResp.dependencies) task.dependencies = taskResp.dependencies;
+  task.queue = taskResp.queue || null;
   const comments = (taskResp.comments && taskResp.comments.length)
     ? taskResp.comments
     : (commentsResp?.comments || (Array.isArray(commentsResp) ? commentsResp : []));
@@ -7597,6 +7607,14 @@ async function syncRunControlBar(taskId) {
   } catch {
     // ignore — bar stays in current state
   }
+}
+
+// Show or hide the task page run-queue line for a queue position.
+function setRunQueueLine(line, pos) {
+  if (!line) return;
+  const text = queueLabel(pos);
+  line.textContent = text;
+  line.classList.toggle('hidden', !text);
 }
 
 // ── Timeline stats helpers ─────────────────────────────────
@@ -9881,6 +9899,14 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     statsBar.appendChild(buildTimelineStats(task, curSteps, elapsedMs, stuck));
   }
   container.appendChild(statsBar);
+
+  // Run queue line (STA-773): a run refused for capacity waits here until a
+  // slot, its repo, or its quota pool frees up. Kept current by run.queue SSE.
+  const queueLine = el('div', 'task-page-queue-line');
+  queueLine.id = `run-queue-line-${task.id}`;
+  queueLine.setAttribute('role', 'status');
+  setRunQueueLine(queueLine, task.queue);
+  container.appendChild(queueLine);
 
   // Two-column body: timeline left, panel right, each scrolling internally.
   const layout = el('div', 'task-page-layout');

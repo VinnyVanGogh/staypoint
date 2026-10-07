@@ -81,7 +81,30 @@
     return m ? m[1].trim() : '';
   }
 
-  const api = { groupStepsByRun, isRealRunGroup, latestRunSteps, currentRunSteps, runElapsedMs, isStuck, routeModel };
+  // Task page line for a run waiting in the daemon's run queue (STA-773).
+  // pos is GET /api/tasks/{id} .queue: { queued, ahead, wait }. Returns ''
+  // when the task is not queued.
+  const QUEUE_WAIT_TEXT = {
+    repo: 'waiting for another run in this repo',
+    slots: 'all parallel run slots are busy',
+    quota: 'provider quota is locked',
+  };
+  function queueLabel(pos) {
+    if (!pos || !pos.queued) return '';
+    const n = Math.max(0, Number(pos.ahead) || 0);
+    const base = `Queued: ${n} run${n === 1 ? '' : 's'} ahead`;
+    const why = QUEUE_WAIT_TEXT[pos.wait];
+    return why ? `${base} (${why})` : base;
+  }
+
+  // Queue position of taskId in a "run.queue" SSE payload's queue array.
+  function queuePositionIn(queue, taskId) {
+    const list = Array.isArray(queue) ? queue : [];
+    const i = list.findIndex(q => q && q.task_id === taskId);
+    return i < 0 ? { queued: false, ahead: 0 } : { queued: true, ahead: i, wait: list[i].wait };
+  }
+
+  const api = { groupStepsByRun, isRealRunGroup, latestRunSteps, currentRunSteps, runElapsedMs, isStuck, routeModel, queueLabel, queuePositionIn };
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;

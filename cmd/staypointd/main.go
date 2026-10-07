@@ -242,6 +242,7 @@ func runDaemon(ctx context.Context) error {
 	// HarnessRepoRoot comes from STAYPOINT_REPO_ROOT env or harness_repo_root config key.
 	// work_repo_root is intentionally NOT used here — it belongs to billing/bridge.
 	orchestrator.GlobalRunControl.SetDB(dbStore.DB())
+	wireRunQueue(ctx, cfg.MaxConcurrentRunsOrDefault(), httpServer)
 
 	repoRoot := cfg.HarnessRepoRoot
 	if repoRoot == "" {
@@ -297,6 +298,14 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			}
 			slog.Log(context.Background(), lvl, "wake: agent id lookup failed; skipping run",
 				slog.String("task", taskID), slog.Any("error", err))
+			// A queued run whose task is gone must not hold its queue place.
+			orchestrator.GlobalRunSlots.Dequeue(taskID)
+			return
+		}
+		// Respect pacer locks per pool (STA-773): a run whose whole provider
+		// chain is quota-locked waits in the queue instead of taking a slot.
+		if taskQuotaLocked(dbStore.DB(), taskID) {
+			queueRun(h, taskID, reason, orchestrator.WaitQuota)
 			return
 		}
 		if agentID == "" {
@@ -401,9 +410,17 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 		})
 		if runErr != nil {
 			if errors.Is(runErr, orchestrator.ErrConcurrencyCap) {
-				// Refused: lock held by another run. No steps were emitted (wake/route
-				// are now deferred to after Claim), so nothing to close out.
-				slog.Warn("run refused: concurrency cap", slog.String("task", taskID))
+				// Refused for capacity (global cap or repo busy). No steps were
+				// emitted (wake/route come after Claim). Queue it so it starts on
+				// its own when a slot or its repo frees (STA-773).
+				queueRun(h, taskID, reason, orchestrator.WaitFor(runErr))
+				return
+			}
+			if errors.Is(runErr, orchestrator.ErrAlreadyClaimed) {
+				// The task is already running (e.g. Run Now pressed again). With
+				// parallel slots this no longer hits the global cap first; it must
+				// stay quiet and not post an error state over the live run.
+				slog.Info("run refused: task already running", slog.String("task", taskID))
 				return
 			}
 			slog.Error("harness run failed", slog.String("task", taskID), slog.Any("error", runErr))

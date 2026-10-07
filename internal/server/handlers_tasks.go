@@ -123,6 +123,8 @@ func (h *TasksHandler) GetTask(w http.ResponseWriter, r *http.Request) {
 		"comments":     comments,
 		"dependencies": depGraph,
 		"work_kind":    task.WorkKind,
+		// Run queue position (STA-773): {queued, ahead, wait}.
+		"queue": orchestrator.GlobalRunSlots.Position(task.ID),
 	})
 }
 

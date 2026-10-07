@@ -31,6 +31,10 @@ type Config struct {
 	ClaudePlanTier        string  `json:"claude_plan_tier" toml:"claude_plan_tier"` // e.g. "Max 5x" or "Pro"
 	MaxHandoffsPerRepo    int     `json:"max_handoffs_per_repo" toml:"max_handoffs_per_repo"`
 	PreferredPersonalTool string  `json:"preferred_personal_tool" toml:"preferred_personal_tool"` // "auto" (default), "claude", or "agy"
+	// MaxConcurrentRuns caps how many agent runs the daemon runs in parallel
+	// (STA-773). Each repo still runs one at a time. Zero or unset = 3.
+	// Top-level key: it must appear before any [table] in config.toml.
+	MaxConcurrentRuns int `json:"max_concurrent_runs" toml:"max_concurrent_runs"`
 	// Use-it-or-lose-it routing (only active in the last UIOLIWindowHours before the weekly reset; zero = default).
 	UIOLIDisabled        bool    `json:"uioli_disabled" toml:"uioli_disabled"`
 	UIOLIWindowHours     float64 `json:"uioli_window_hours" toml:"uioli_window_hours"`
@@ -69,6 +73,19 @@ type GatesConfig struct {
 	// branch is merged. Default true. When off, tasks finish the way they do
 	// today — no card, no dev server.
 	ShipReview *bool `json:"ship_review,omitempty" toml:"ship_review"`
+}
+
+// DefaultMaxConcurrentRuns is the parallel-run cap when config.toml does not
+// set max_concurrent_runs.
+const DefaultMaxConcurrentRuns = 3
+
+// MaxConcurrentRunsOrDefault returns max_concurrent_runs, or 3 when unset or
+// not positive.
+func (c *Config) MaxConcurrentRunsOrDefault() int {
+	if c == nil || c.MaxConcurrentRuns <= 0 {
+		return DefaultMaxConcurrentRuns
+	}
+	return c.MaxConcurrentRuns
 }
 
 // MainMergeApprovalEnabled returns true unless explicitly disabled.

@@ -9,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
@@ -24,11 +23,8 @@ import (
 var (
 	ErrAlreadyClaimed = errors.New("Can't start run: this task is already checked out by another run in this session. Wait for it to finish or clear the stale checkout.")
 	ErrTaskNotFound   = errors.New("task not found")
-	ErrConcurrencyCap = errors.New("Can't start run: only one agent may run at a time and another is currently active. Try again in a moment.")
+	ErrConcurrencyCap = errors.New("Can't start run: the maximum number of parallel runs (max_concurrent_runs) is already active.")
 )
-
-// Hard cap: at most one agent may hold a task claim inside this process.
-var activeClaims atomic.Int32
 
 // taskCompleteMarker is the canonical signal an adapter emits on completion.
 const taskCompleteMarker = "[[TASK_COMPLETE]]"
@@ -138,6 +134,26 @@ type Harness struct {
 	RepoRoot    string
 	WM          WorktreeManagerIface
 	Interceptor *Interceptor
+	// Slots enforces the parallel-run caps. Nil uses GlobalRunSlots.
+	Slots *RunSlots
+}
+
+func (h *Harness) slots() *RunSlots {
+	if h.Slots != nil {
+		return h.Slots
+	}
+	return GlobalRunSlots
+}
+
+// RepoKeyForTask returns the slot key for the repo a task runs in: its
+// repo_path, or the harness default repo when unset.
+func (h *Harness) RepoKeyForTask(ctx context.Context, taskID string) string {
+	var repoPath string
+	_ = h.DB.QueryRowContext(ctx, "SELECT COALESCE(repo_path,'') FROM tasks WHERE id=?", taskID).Scan(&repoPath)
+	if repoPath == "" {
+		repoPath = h.RepoRoot
+	}
+	return RepoKey(repoPath)
 }
 
 // NewHarness creates a Harness backed by the given SQLite DB and repo root.
@@ -152,14 +168,16 @@ func NewHarness(db *sql.DB, repoRoot string) *Harness {
 
 // Claim atomically checks out a task for the given runID.
 //
-// The hard concurrency cap of 1 is enforced via an atomic counter within the
-// process. Across restarts, RecoveryScan clears stale checkout_run_id values so
+// Parallelism is bounded by RunSlots (STA-773): a global cap
+// (max_concurrent_runs, default 3) and one run per repo. A refusal returns an
+// error matching errors.Is(err, ErrConcurrencyCap); callers queue the run and
+// RunSlots re-dispatches it when a slot frees. Across restarts, RecoveryScan clears stale checkout_run_id values so
 // the DB guard (checkout_run_id IS NULL) unblocks on the next wake.
 // Terminal tasks (execution_stage = 'done') are never re-claimed.
 func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) error {
-	if activeClaims.Add(1) > 1 {
-		activeClaims.Add(-1)
-		return ErrConcurrencyCap
+	slots := h.slots()
+	if err := slots.Acquire(taskID, h.RepoKeyForTask(ctx, taskID)); err != nil {
+		return err
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -170,12 +188,12 @@ func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) erro
 		runID, agentID, now, taskID,
 	)
 	if err != nil {
-		activeClaims.Add(-1)
+		slots.Release(taskID)
 		return fmt.Errorf("claim db update: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		activeClaims.Add(-1)
+		slots.Release(taskID)
 		var stage string
 		_ = h.DB.QueryRowContext(ctx, "SELECT execution_stage FROM tasks WHERE id=?", taskID).Scan(&stage)
 		if stage == "" {
@@ -188,10 +206,11 @@ func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) erro
 	return nil
 }
 
-// Release decrements the concurrency counter and clears the task checkout.
-// Always called via defer; uses a fresh context to survive parent cancellation.
+// Release clears the task checkout, then frees the run slot (which
+// re-dispatches queued runs). Always called via defer; uses a fresh context to
+// survive parent cancellation.
 func (h *Harness) Release(taskID, runID string) {
-	activeClaims.Add(-1)
+	defer h.slots().Release(taskID)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, _ = h.DB.ExecContext(ctx,

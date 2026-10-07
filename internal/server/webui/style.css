@@ -3719,6 +3719,18 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 
 /* ── Timeline ──────────────────────────────────────────── */
 .timeline-stats-bar { margin-bottom: 10px; }
+/* Run queue line under the stats strip (STA-773). */
+.task-page-queue-line {
+  margin: 0 0 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--amber);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+}
+.task-page-queue-line.hidden { display: none; }
 .timeline-stats-inner {
   display: flex;
   flex-wrap: wrap;
