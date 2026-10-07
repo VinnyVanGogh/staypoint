@@ -4956,3 +4956,31 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .gates-stats, .gates-settings { padding: 12px; border-bottom: 1px solid var(--border, #30363d); display: flex; flex-direction: column; gap: 6px; }
 .gates-stats-title { font-weight: 600; font-size: 13px; }
 .gates-stat-line, .gates-setting-row { font-size: 13px; }
+
+/* ── Artifacts (task documents) ───────────────────────────── */
+.task-artifacts { display: flex; flex-direction: column; gap: 12px; }
+.artifact-key-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.artifact-key-btn {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface2); color: var(--text); cursor: pointer; text-align: left;
+}
+.artifact-key-btn:hover { border-color: var(--accent); }
+.artifact-key-btn.active { border-color: var(--accent); background: rgba(99, 102, 241, 0.12); }
+.artifact-key-name { font-family: monospace; font-size: 13px; font-weight: 600; }
+.artifact-key-meta { font-size: 11px; color: var(--muted); }
+.artifact-viewer { border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; min-width: 0; }
+.artifact-viewer-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+.artifact-viewer-key { font-family: monospace; font-weight: 600; margin-right: auto; }
+.artifact-version-select { max-width: 100%; }
+.artifact-download-btn { padding: 5px 12px; }
+.artifact-viewer-meta { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+.artifact-viewer-body { overflow-wrap: anywhere; }
+.artifact-viewer-body pre { overflow-x: auto; }
+.artifacts-list { padding: 0 1.5rem 1.5rem; }
+.artifacts-empty { color: var(--muted); padding: 1.5rem 0; }
+.artifacts-error { color: var(--red); }
+.artifacts-row { cursor: pointer; }
+.artifacts-row:hover, .artifacts-row:focus { background: var(--surface2); outline: none; }
+.artifacts-row td { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.artifacts-doc-key { font-family: monospace; font-weight: 600; }
