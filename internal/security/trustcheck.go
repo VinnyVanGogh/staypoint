@@ -359,11 +359,14 @@ func (a *trustAnalyzer) ssh(s segment, args []string, depth int) {
 		}
 		return
 	}
-	if isLocalHost(host) || numericHost(host) {
-		// This machine, or an address form (127.1, 0x7f000001) we do not
-		// normalise: analyse the command as local.
+	if isLocalHost(host) {
 		a.line(rc, "", depth+1)
 		return
+	}
+	if numericHost(host) {
+		// An address form we do not normalise (127.1, 0x7f000001) may be
+		// this machine: analyse it as local and as remote.
+		a.line(rc, "", depth+1)
 	}
 	if mergeTextRe.MatchString(rc) {
 		a.f.protect("ssh remote command may merge a pull request")
@@ -508,7 +511,7 @@ func longOpt(k string, known map[string]bool) string {
 	}
 	match := ""
 	for o := range known {
-		if len(k) >= 4 && strings.HasPrefix(o, k) {
+		if len(k) > 2 && strings.HasPrefix(o, k) {
 			if match != "" {
 				return "" // ambiguous: getopt refuses it too
 			}

@@ -192,6 +192,7 @@ func TestAnalyzeForTrust_DeleteOutsideWorktree(t *testing.T) {
 		"ln -s target /usr/local/bin/x",
 		"cp --target /etc a.txt b.txt",
 		"cp --target-dir=/etc a.txt",
+		"cp --t=/etc a.txt",
 		"cp a.txt -t /etc b.txt",
 	}
 	for _, c := range outside {
