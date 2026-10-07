@@ -893,7 +893,9 @@ func (h *ShipReviewHandler) cleanupMergedBranch(reqCtx gocontext.Context, card *
 	// commands halfway through.
 	ctx := gocontext.WithoutCancel(reqCtx)
 	errMsg := ""
-	if err := shipreview.CleanupMergedBranch(ctx, task.RepoPath, card, mainSHA); err != nil {
+	// #245-2: only a branch the task owns is deleted; anything else stays,
+	// with the reason shown on the card.
+	if err := shipreview.CleanupTaskBranch(ctx, h.db, task.RepoPath, card, mainSHA); err != nil {
 		errMsg = err.Error()
 	}
 	_ = shipreview.SetBranchCleanup(h.db, card.ID, errMsg == "", errMsg)

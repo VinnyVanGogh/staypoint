@@ -28,14 +28,49 @@ const taskBranchPrefix = "staypoint/"
 var ErrInvalidTargetBranch = errors.New("target_branch must be a plain branch name, e.g. dev-server")
 
 // ValidTargetBranch accepts "" (unset) or a plain branch name that is not a
-// StayPoint task branch.
+// StayPoint task branch. A plain name follows `git check-ref-format --branch`
+// (and so cannot be HEAD, "@", a revision expression such as "a^" or "a@{1}",
+// or a glob), carries no refs/ or origin/ prefix, and is safe to pass to git
+// as an argument.
 func ValidTargetBranch(b string) error {
 	if b == "" {
 		return nil
 	}
-	if validateBranch(b) != nil || strings.HasPrefix(b, "refs/") || strings.HasPrefix(b, "origin/") ||
-		strings.HasPrefix(b, taskBranchPrefix) || strings.Contains(b, "..") || strings.HasSuffix(b, "/") {
+	if validateBranch(b) != nil || checkRefFormatBranch(b) != nil || strings.HasPrefix(b, "refs/") ||
+		strings.HasPrefix(b, "origin/") || strings.HasPrefix(b, taskBranchPrefix) {
 		return fmt.Errorf("%w: %q", ErrInvalidTargetBranch, b)
+	}
+	return nil
+}
+
+// checkRefFormatBranch mirrors `git check-ref-format --branch <b>` for a
+// plain branch name: the rules of git-check-ref-format(1), plus --branch's
+// refusal of names starting with '-' and of "HEAD".
+func checkRefFormatBranch(b string) error {
+	bad := func(why string) error { return fmt.Errorf("%w: %q %s", ErrInvalidTargetBranch, b, why) }
+	switch {
+	case b == "" || b == "@" || b == "HEAD":
+		return bad("is reserved")
+	case strings.HasPrefix(b, "-"):
+		return bad("starts with '-'")
+	case strings.HasPrefix(b, "/") || strings.HasSuffix(b, "/") || strings.Contains(b, "//"):
+		return bad("has an empty path component")
+	case strings.HasSuffix(b, "."):
+		return bad("ends with '.'")
+	case strings.Contains(b, ".."):
+		return bad("contains '..'")
+	case strings.Contains(b, "@{"):
+		return bad("contains '@{'")
+	}
+	for _, r := range b {
+		if r < 0x20 || r == 0x7f || strings.ContainsRune(" ~^:?*[\\", r) {
+			return bad(fmt.Sprintf("contains %q", r))
+		}
+	}
+	for _, comp := range strings.Split(b, "/") {
+		if strings.HasPrefix(comp, ".") || strings.HasSuffix(comp, ".lock") {
+			return bad("has a component starting with '.' or ending with '.lock'")
+		}
 	}
 	return nil
 }
@@ -154,25 +189,30 @@ func workProductSource(ctx context.Context, db *sql.DB, repo, taskID, target str
 	if src.head, err = CurrentBranchHEAD(ctx, repo, src.branch); err != nil {
 		return cardSource{}, false, fmt.Errorf("registered branch %q: %w", src.branch, err)
 	}
+	// #245: a registered branch at the tip of the target or default branch
+	// is that branch under another name (or an alias the name checks
+	// missed): there is nothing to merge, and cleanup would delete a ref
+	// equal to the target.
+	for _, tip := range refTips(ctx, repo, append([]string{target}, defaultBranchNames(ctx, repo)...)...) {
+		if tip == src.head {
+			return cardSource{}, false, fmt.Errorf("registered branch %q is at the tip of the target or default branch (%s): %w",
+				src.branch, tip, ErrProtectedBranch)
+		}
+	}
 	return src, true, nil
 }
 
 // checkWorkProductBranch refuses registered branches a card must never ship
 // and Approve must never delete: protected and default branches, the task's
-// target, the project's configured target, and StayPoint task branches.
+// target, the project's configured target (all compared ignoring case),
+// StayPoint task branches, and names git resolves only through another ref
+// (a case-insensitive filesystem alias).
 func checkWorkProductBranch(ctx context.Context, db *sql.DB, repo, branch, target string) error {
-	if err := ValidTargetBranch(branch); err != nil {
-		return fmt.Errorf("registered branch %q cannot be reviewed: %w", branch, err)
+	if err := checkRegisteredBranchName(ctx, db, repo, branch, target); err != nil {
+		return err
 	}
 	if err := guardDeletableBranch(ctx, repo, branch); err != nil {
 		return fmt.Errorf("registered branch %q cannot be reviewed: %w", branch, err)
-	}
-	projectTarget, err := ProjectTargetBranch(ctx, db, repo)
-	if err != nil {
-		return err
-	}
-	if branch == target || branch == projectTarget {
-		return fmt.Errorf("registered branch %q is a merge target: %w", branch, ErrProtectedBranch)
 	}
 	return nil
 }

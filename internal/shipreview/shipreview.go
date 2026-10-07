@@ -1133,22 +1133,20 @@ func DeleteBranch(ctx context.Context, repoDir, branch string) error {
 }
 
 // guardDeletableBranch rejects branch names that must never be deleted:
-// malformed names, main, master, and the remote default branch.
+// malformed names; main, master, dev-server and the remote default branch in
+// any letter case; and names that git resolves only through a ref of another
+// name (#245: on a case-insensitive filesystem refs/heads/Main is main).
 func guardDeletableBranch(ctx context.Context, repoDir, branch string) error {
 	if err := validateBranch(branch); err != nil {
 		return err
 	}
-	if branch == "main" || branch == "master" || branch == WorkTargetBranch {
+	if protectedName(branch) {
 		return fmt.Errorf("%w: %q", ErrProtectedBranch, branch)
 	}
-	// Detect remote default branch (e.g. "origin/main" → "main").
-	if remoteRef, err := gitOutput(ctx, repoDir, "rev-parse", "--abbrev-ref", "origin/HEAD"); err == nil {
-		defaultBranch := strings.TrimPrefix(remoteRef, "origin/")
-		if defaultBranch != "" && branch == defaultBranch {
-			return fmt.Errorf("%w: %q is the remote default branch", ErrProtectedBranch, branch)
-		}
+	if protectedName(branch, defaultBranchNames(ctx, repoDir)...) {
+		return fmt.Errorf("%w: %q is the remote default branch", ErrProtectedBranch, branch)
 	}
-	return nil
+	return requireExactRefs(ctx, repoDir, branch)
 }
 
 // CleanupMergedBranch removes what is left of a task once its review has been
@@ -1171,7 +1169,7 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 	if err := guardDeletableBranch(ctx, repoDir, branch); err != nil {
 		return err
 	}
-	if card.TargetBranch != "" && branch == card.TargetBranch {
+	if card.TargetBranch != "" && strings.EqualFold(branch, card.TargetBranch) {
 		return fmt.Errorf("%w: %q is the merge target", ErrProtectedBranch, branch)
 	}
 	if mainSHA == "" {
@@ -1184,7 +1182,7 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 	}
 	// git refuses to delete a branch that is checked out, so never touch the
 	// branch repoDir itself is on (the merge leaves it on main).
-	if cur, err := gitOutput(ctx, repoDir, "symbolic-ref", "--short", "-q", "HEAD"); err == nil && cur == branch {
+	if cur, err := gitOutput(ctx, repoDir, "symbolic-ref", "--short", "-q", "HEAD"); err == nil && strings.EqualFold(cur, branch) {
 		return fmt.Errorf("%w: %q is checked out in %s", ErrProtectedBranch, branch, repoDir)
 	}
 
@@ -1236,9 +1234,8 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 		if err != nil {
 			return fmt.Errorf("read remote branch %s: %w; nothing deleted", branch, err)
 		}
-		if fields := strings.Fields(out); len(fields) > 0 {
-			remoteTip = fields[0]
-		}
+		// Only exactly refs/heads/<branch>: ls-remote matches name tails.
+		remoteTip = lsRemoteTip(out, branch)
 		// A tip missing locally cannot be part of main's history, so the
 		// ancestor check fails closed for it too.
 		if remoteTip != "" && verifyAncestor(ctx, repoDir, remoteTip, mainSHA) != nil {
@@ -1365,19 +1362,35 @@ func SetBranchCleanup(db *sql.DB, cardID string, deleted bool, errMsg string) er
 
 // CurrentBranchHEAD resolves the HEAD SHA for a branch in repoDir: the local
 // branch, else origin's copy (a registered branch the agent pushed from
-// another checkout), else whatever git resolves the name to (e.g. HEAD).
+// another checkout), else HEAD or a commit name. A name that resolves only
+// through a ref of another name (refs/heads/Main opening refs/heads/main on
+// a case-insensitive filesystem) is refused, never resolved (#245).
 func CurrentBranchHEAD(ctx context.Context, repoDir, branch string) (string, error) {
 	if err := validateBranch(branch); err != nil {
 		return "", err
 	}
-	sha, err := gitOutput(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch+"^{commit}")
-	if err == nil && sha != "" {
-		return sha, nil
+	if err := requireExactRefs(ctx, repoDir, branch); err != nil {
+		return "", err
 	}
-	if remote, rErr := gitOutput(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch+"^{commit}"); rErr == nil && remote != "" {
-		return remote, nil
+	found, err := exactRefs(ctx, repoDir, branch)
+	if err != nil {
+		return "", err
 	}
-	// Anything else git resolves (HEAD, a commit) as before.
+	if found["refs/heads/"+branch] {
+		if sha, err := gitOutput(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch+"^{commit}"); err == nil && sha != "" {
+			return sha, nil
+		}
+	}
+	if found["refs/remotes/origin/"+branch] {
+		if remote, err := gitOutput(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch+"^{commit}"); err == nil && remote != "" {
+			return remote, nil
+		}
+	}
+	// HEAD or a commit name, as before; never another branch-like name,
+	// which git would look up through refs/heads and refs/remotes again.
+	if branch != "HEAD" && !hexObjectRe.MatchString(branch) {
+		return "", fmt.Errorf("branch %q not found", branch)
+	}
 	return gitOutput(ctx, repoDir, "rev-parse", "--verify", "--quiet", branch+"^{commit}")
 }
 
