@@ -83,6 +83,13 @@ func (h *ShipReviewHandler) GetCard(w http.ResponseWriter, r *http.Request) {
 				isWork := shipreview.IsWorkRepo(task.RepoPath)
 				merged["is_work_repo"] = isWork
 				merged["effective_merge_mode"] = shipreview.EffectiveMergeMode(cfg, isWork)
+				if card.TargetBranch == "" {
+					tctx, tcancel := gitRequestContext(r)
+					if target, tErr := shipreview.TaskTargetBranch(tctx, h.db, task.RepoPath, task.ID); tErr == nil {
+						merged["target_branch"] = target
+					}
+					tcancel()
+				}
 				merged["live_credentials"] = cfg.LiveCredentials
 				merged["live_gate"] = reason != ""
 				merged["live_gate_reason"] = reason
@@ -150,7 +157,8 @@ func (h *ShipReviewHandler) UpsertCard(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		code := http.StatusInternalServerError
-		if errors.Is(err, shipreview.ErrTestStepsRequired) || errors.Is(err, shipreview.ErrInvalidBranch) || errors.Is(err, shipreview.ErrInvalidDevURL) {
+		if errors.Is(err, shipreview.ErrTestStepsRequired) || errors.Is(err, shipreview.ErrInvalidBranch) || errors.Is(err, shipreview.ErrInvalidDevURL) ||
+			errors.Is(err, shipreview.ErrProtectedBranch) || errors.Is(err, shipreview.ErrInvalidTargetBranch) {
 			code = http.StatusBadRequest
 		}
 		writeError(w, code, err.Error())
@@ -764,9 +772,21 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Always merge from the repo root (on main), never from a task worktree which
-	// may be gone or have main checked out elsewhere (causing checkout conflicts).
-	mainSHA, err := shipreview.ApproveAndMerge(r.Context(), h.db, card, task.RepoPath, "main")
+	// Merge into the card's target (dev-server for work repos), never into
+	// main implicitly. Cards made before targets were recorded use the
+	// task's target.
+	target := card.TargetBranch
+	if target == "" {
+		if target, err = shipreview.TaskTargetBranch(r.Context(), h.db, task.RepoPath, task.ID); err != nil {
+			writeError(w, gitErrorStatus(err), "resolve target branch: "+err.Error())
+			return
+		}
+		card.TargetBranch = target
+	}
+
+	// Always merge from the repo root, never from a task worktree which may
+	// be gone or have the target checked out elsewhere (checkout conflicts).
+	mainSHA, err := shipreview.ApproveAndMerge(r.Context(), h.db, card, task.RepoPath, target)
 	if errors.Is(err, shipreview.ErrHeadMoved) {
 		newHead, _ := shipreview.CurrentBranchHEAD(r.Context(), task.RepoPath, card.Branch)
 		w.Header().Set("Content-Type", "application/json")
@@ -1052,6 +1072,7 @@ type devConfigUpdateReq struct {
 	SupabaseEnabled *bool     `json:"supabase_enabled"`
 	SupabaseKeepUp  *bool     `json:"supabase_keep_up"`
 	MergeMode       *string   `json:"merge_mode"`
+	TargetBranch    *string   `json:"target_branch"`
 	GHConfigDir     *string   `json:"gh_config_dir"`
 	LiveCredentials *bool     `json:"live_credentials"`
 	// TestExemptGlobs are the project's own test-gate exempt paths (STA-734).
@@ -1086,6 +1107,12 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 	if req.MergeMode != nil && !shipreview.ValidMergeMode(*req.MergeMode) {
 		writeError(w, http.StatusBadRequest, shipreview.ErrInvalidMergeMode.Error())
 		return
+	}
+	if req.TargetBranch != nil {
+		if err := shipreview.ValidTargetBranch(*req.TargetBranch); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	if req.GHConfigDir != nil && *req.GHConfigDir != "" && !filepath.IsAbs(*req.GHConfigDir) {
 		writeError(w, http.StatusBadRequest, "gh_config_dir must be an absolute path")
@@ -1122,6 +1149,9 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 	}
 	if req.MergeMode != nil {
 		cfg.MergeMode = *req.MergeMode
+	}
+	if req.TargetBranch != nil {
+		cfg.TargetBranch = *req.TargetBranch
 	}
 	if req.GHConfigDir != nil {
 		cfg.GHConfigDir = *req.GHConfigDir
@@ -1167,6 +1197,8 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 
 		"old_merge_mode":    old.MergeMode,
 		"new_merge_mode":    cfg.MergeMode,
+		"old_target_branch": old.TargetBranch,
+		"new_target_branch": cfg.TargetBranch,
 		"old_gh_config_dir": old.GHConfigDir,
 		"new_gh_config_dir": cfg.GHConfigDir,
 		// STA-727: the live flag is only ever changed here, so this row is

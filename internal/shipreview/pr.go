@@ -392,12 +392,13 @@ func prTitle(ctx context.Context, a GHAuth, card *Card) string {
 }
 
 // OpenOrUpdatePR pushes card.HeadSHA to the task branch and opens a PR
-// against the default branch, or reuses the open one for that branch. The
+// against the card's target branch (the default branch when the card has
+// none), or reuses the open one for that branch, which must target it too. The
 // local branch must still be at the pinned SHA. force allows a leased
 // non-fast-forward push (Board Approve); the agent-triggered re-push after a
 // CI send-back passes false.
 func OpenOrUpdatePR(ctx context.Context, a GHAuth, card *Card, force bool) (*PRInfo, error) {
-	cur, err := gitOutput(ctx, a.RepoDir, "rev-parse", card.Branch)
+	cur, err := CurrentBranchHEAD(ctx, a.RepoDir, card.Branch)
 	if err != nil {
 		return nil, fmt.Errorf("resolve branch HEAD: %w", err)
 	}
@@ -411,10 +412,16 @@ func OpenOrUpdatePR(ctx context.Context, a GHAuth, card *Card, force bool) (*PRI
 	if err != nil {
 		return nil, fmt.Errorf("look up PR: %w", err)
 	}
+	if pr != nil && card.TargetBranch != "" && pr.BaseRefName != card.TargetBranch {
+		return nil, fmt.Errorf("PR #%d targets %s, but this card merges into %s; retarget or close the PR",
+			pr.Number, pr.BaseRefName, card.TargetBranch)
+	}
 	if pr == nil {
-		base, err := a.defaultBranch(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("default branch: %w", err)
+		base := card.TargetBranch
+		if base == "" {
+			if base, err = a.defaultBranch(ctx); err != nil {
+				return nil, fmt.Errorf("default branch: %w", err)
+			}
 		}
 		out, err := a.gh(ctx, "pr", "create", "--head", card.Branch, "--base", base,
 			"--title", prTitle(ctx, a, card), "--body", prBody(card))
@@ -622,7 +629,7 @@ func MergePR(ctx context.Context, db *sql.DB, a GHAuth, card *Card, override boo
 	if card.PRNumber <= 0 {
 		return nil, ErrNoPR
 	}
-	cur, err := gitOutput(ctx, a.RepoDir, "rev-parse", card.Branch)
+	cur, err := CurrentBranchHEAD(ctx, a.RepoDir, card.Branch)
 	if err != nil {
 		return nil, fmt.Errorf("resolve branch HEAD: %w", err)
 	}

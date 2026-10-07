@@ -36,7 +36,7 @@ func gateRepo(t *testing.T, branch string) (dir, head string) {
 // main failed, not master's fallback "unknown revision".
 func TestChangeForGateReportsMainsError(t *testing.T) {
 	dir, head := gateRepo(t, "trunk")
-	_, _, err := ChangeForGate(context.Background(), dir, head)
+	_, _, err := ChangeForGate(context.Background(), dir, head, "")
 	if err == nil || !strings.Contains(err.Error(), "no merge-base with main") || strings.Contains(err.Error(), "master") {
 		t.Fatalf("err = %v, want main's merge-base error", err)
 	}
@@ -44,7 +44,7 @@ func TestChangeForGateReportsMainsError(t *testing.T) {
 
 func TestChangeForGateFallsBackToMaster(t *testing.T) {
 	dir, head := gateRepo(t, "master")
-	if _, _, err := ChangeForGate(context.Background(), dir, head); err != nil {
+	if _, _, err := ChangeForGate(context.Background(), dir, head, ""); err != nil {
 		t.Fatalf("master repo: %v", err)
 	}
 }
@@ -82,7 +82,7 @@ func TestChangeForGateSkipsDeletedFiles(t *testing.T) {
 	run("checkout", "-q", "-b", "delete-only")
 	run("rm", "-q", "migrations/005_to_delete.sql", "old.go")
 	run("commit", "-q", "-m", "delete")
-	files, lines, err := ChangeForGate(context.Background(), dir, run("rev-parse", "HEAD"))
+	files, lines, err := ChangeForGate(context.Background(), dir, run("rev-parse", "HEAD"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestChangeForGateSkipsDeletedFiles(t *testing.T) {
 	run("checkout", "-q", "-b", "rename", "main")
 	run("mv", "moved.go", "renamed.go")
 	run("commit", "-q", "-m", "rename")
-	files, _, err = ChangeForGate(context.Background(), dir, run("rev-parse", "HEAD"))
+	files, _, err = ChangeForGate(context.Background(), dir, run("rev-parse", "HEAD"), "")
 	if err != nil {
 		t.Fatal(err)
 	}

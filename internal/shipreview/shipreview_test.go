@@ -71,6 +71,7 @@ func openTestDB(t testing.TB) *sql.DB {
 			pr_checks_sha TEXT NOT NULL DEFAULT '',
 			pr_checks_at TEXT NOT NULL DEFAULT '',
 			pr_merge_error TEXT NOT NULL DEFAULT '',
+			target_branch TEXT NOT NULL DEFAULT '',
 			ci_fix_requested INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 			updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -87,6 +88,7 @@ func openTestDB(t testing.TB) *sql.DB {
 			merge_mode TEXT NOT NULL DEFAULT '',
 			gh_config_dir TEXT NOT NULL DEFAULT '',
 			live_credentials INTEGER NOT NULL DEFAULT 0,
+			target_branch TEXT NOT NULL DEFAULT '',
 			updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		);
 		CREATE TABLE IF NOT EXISTS task_comments (

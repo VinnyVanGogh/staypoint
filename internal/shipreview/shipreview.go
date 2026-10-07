@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,6 +54,10 @@ type Card struct {
 	ID              string     `json:"id"`
 	TaskID          string     `json:"task_id"`
 	Branch          string     `json:"branch"`
+	// TargetBranch is the branch Approve merges into (e.g. dev-server), set
+	// by the daemon at card creation. Empty on cards made before targets
+	// were recorded; Approve then uses TaskTargetBranch.
+	TargetBranch    string     `json:"target_branch,omitempty"`
 	HeadSHA         string     `json:"head_sha"`
 	TestSteps       []string   `json:"test_steps"`
 	DevURL          string     `json:"dev_url"`
@@ -366,6 +371,11 @@ func removeDevWorktree(repoPath, wtPath string) {
 // repoDir is used to derive files changed via git diff; pass "" to skip.
 // checkRuns is optional evidence from CI / verification commands.
 func CreateCard(db *sql.DB, taskID, branch, headSHA string, testSteps []string, devURL string, repoDir string, checkRuns []CheckRun) (*Card, error) {
+	return createCard(db, taskID, branch, headSHA, "", testSteps, devURL, repoDir, checkRuns)
+}
+
+// createCard is CreateCard with the branch the card's Approve merges into.
+func createCard(db *sql.DB, taskID, branch, headSHA, targetBranch string, testSteps []string, devURL string, repoDir string, checkRuns []CheckRun) (*Card, error) {
 	if len(testSteps) == 0 {
 		return nil, ErrTestStepsRequired
 	}
@@ -387,6 +397,14 @@ func CreateCard(db *sql.DB, taskID, branch, headSHA string, testSteps []string, 
 	filesChanged, err := diffFilesChanged(db, repoDir, taskID, headSHA)
 	if err != nil {
 		return nil, err
+	}
+	if targetBranch != "" && repoDir != "" {
+		// What the merge into the target lands is listed too: when the
+		// target is not where the task was cut from (a registered PR based
+		// elsewhere), the base diff alone could leave commits unlisted.
+		if filesChanged, err = withLandingFiles(repoDir, targetBranch, headSHA, filesChanged); err != nil {
+			return nil, err
+		}
 	}
 	filesJSON, err := json.Marshal(filesChanged)
 	if err != nil {
@@ -413,10 +431,10 @@ func CreateCard(db *sql.DB, taskID, branch, headSHA string, testSteps []string, 
 	_, err = db.Exec(`
 		INSERT INTO ship_review_cards
 			(id, task_id, branch, head_sha, test_steps_json, dev_url, dev_pid, status,
-			 files_changed_json, check_runs_json, merge_mode, pr_number, pr_url, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
+			 files_changed_json, check_runs_json, merge_mode, pr_number, pr_url, target_branch, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, taskID, branch, headSHA, string(stepsJSON), devURL,
-		string(filesJSON), string(checksJSON), prev.mode, prev.number, prev.url,
+		string(filesJSON), string(checksJSON), prev.mode, prev.number, prev.url, targetBranch,
 		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -438,6 +456,37 @@ func diffFilesChanged(db *sql.DB, repoDir, taskID, headSHA string) ([]string, er
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return taskChanges(ctx, db, repoDir, taskID, headSHA)
+}
+
+// withLandingFiles adds to files those that merging head into target would
+// change: everything since their merge-base. It only ever adds.
+func withLandingFiles(repoDir, target, head string, files []string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	ref, err := workspace.TargetBranchRef(ctx, repoDir, target)
+	if err != nil {
+		return nil, err
+	}
+	mb, err := gitOutput(ctx, repoDir, "merge-base", ref, head)
+	if err != nil || mb == "" {
+		return nil, fmt.Errorf("merge-base of %s and %s: %w", target, head, err)
+	}
+	out, err := gitOutput(ctx, repoDir, "diff", "--name-only", "-z", "--no-renames", mb, head)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(files))
+	for _, f := range files {
+		seen[f] = true
+	}
+	for _, f := range strings.Split(out, "\x00") {
+		if f != "" && !seen[f] {
+			seen[f] = true
+			files = append(files, f)
+		}
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 // taskChanges lists the files head changes against the task's verified base:
@@ -480,6 +529,7 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 		       COALESCE(merge_mode,''), COALESCE(pr_number,0), COALESCE(pr_url,''),
 		       COALESCE(pr_checks_json,'[]'), COALESCE(pr_checks_sha,''), COALESCE(pr_checks_at,''),
 		       COALESCE(pr_merge_error,''), COALESCE(ci_fix_requested,0),
+		       COALESCE(target_branch,''),
 		       created_at, updated_at
 		FROM ship_review_cards
 		WHERE task_id = ?
@@ -499,6 +549,7 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 		&c.MergeMode, &c.PRNumber, &c.PRURL,
 		&prChecksJSON, &c.PRChecksSHA, &c.PRChecksAt,
 		&c.PRMergeError, &c.CIFixRequested,
+		&c.TargetBranch,
 		&createdAt, &updatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -905,26 +956,52 @@ func StopDevServer(db *sql.DB, card *Card) {
 // It must be used by all callers (HTTP handler, MCP tool, CLI) so they all
 // behave identically.
 //
-// Key invariant: the branch is ALWAYS "staypoint/<taskID>". task.GitBranch is
-// set to the repo's active branch at task-creation time (usually "main") and
-// must never be used here — doing so was the bug fixed by STA-571.
+// Key invariant: the branch is "staypoint/<taskID>" unless that branch has
+// no changes and the agent registered another branch or PR as the task's
+// work (workProductSource), e.g. a branch it cut from dev-server.
+// task.GitBranch is set to the repo's active branch at task-creation time
+// (usually "main") and must never be used here — doing so was the bug fixed
+// by STA-571. Either way the card is measured against the task's recorded
+// base.
 //
 // It resolves HEAD from repoPath, creates the card, then auto-starts the dev
 // server from the project config (if any) and persists dev_url.
 func BuildAndStartCard(ctx context.Context, db *sql.DB, taskID, repoPath string, testSteps []string, devURL string, checkRuns []CheckRun) (*Card, error) {
-	branch := "staypoint/" + taskID
+	branch := taskBranchPrefix + taskID
 	if repoPath == "" {
 		// Files changed cannot be measured against a verified base.
 		return nil, fmt.Errorf("task %s has no repo path: %w", taskID, workspace.ErrNoTaskBase)
 	}
-
-	headSHA, err := CurrentBranchHEAD(ctx, repoPath, branch)
+	target, err := TaskTargetBranch(ctx, db, repoPath, taskID)
 	if err != nil {
-		return nil, fmt.Errorf("cannot resolve branch HEAD for %q: %w", branch, err)
+		return nil, fmt.Errorf("resolve target branch: %w", err)
 	}
 
 	prev := previousOpenPR(db, taskID)
-	card, err := CreateCard(db, taskID, branch, headSHA, testSteps, devURL, repoPath, checkRuns)
+	headSHA, headErr := CurrentBranchHEAD(ctx, repoPath, branch)
+	var card *Card
+	if headErr == nil {
+		card, err = createCard(db, taskID, branch, headSHA, target, testSteps, devURL, repoPath, checkRuns)
+	}
+	if headErr != nil || errors.Is(err, ErrNoChanges) {
+		// The task branch is missing or empty: ship the branch or PR the
+		// agent registered as its work, if any.
+		src, ok, srcErr := workProductSource(ctx, db, repoPath, taskID)
+		switch {
+		case srcErr != nil:
+			return nil, srcErr
+		case !ok && headErr != nil:
+			return nil, fmt.Errorf("cannot resolve branch HEAD for %q: %w", branch, headErr)
+		case ok:
+			if src.target == "" {
+				src.target = target
+			}
+			if src.branch == src.target {
+				return nil, fmt.Errorf("registered branch %q is the target branch: %w", src.branch, ErrProtectedBranch)
+			}
+			card, err = createCard(db, taskID, src.branch, src.head, src.target, testSteps, devURL, repoPath, checkRuns)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -968,8 +1045,14 @@ func BuildAndStartCard(ctx context.Context, db *sql.DB, taskID, repoPath string,
 // the current HEAD matches card.HeadSHA. After merge, verifies the reviewed SHA
 // is an ancestor of the new main HEAD.
 func ApproveAndMerge(ctx context.Context, db *sql.DB, card *Card, repoDir, targetBranch string) (mainSHA string, err error) {
+	if err := ValidTargetBranch(targetBranch); err != nil || targetBranch == "" {
+		return "", fmt.Errorf("merge target: %w: %q", ErrInvalidTargetBranch, targetBranch)
+	}
+	if targetBranch == card.Branch {
+		return "", fmt.Errorf("%w: %q is the card's own branch", ErrInvalidTargetBranch, targetBranch)
+	}
 	// 1. Check that HEAD hasn't moved.
-	currentHEAD, err := gitOutput(ctx, repoDir, "rev-parse", card.Branch)
+	currentHEAD, err := CurrentBranchHEAD(ctx, repoDir, card.Branch)
 	if err != nil {
 		return "", fmt.Errorf("resolve branch HEAD: %w", err)
 	}
@@ -1017,9 +1100,9 @@ func ApproveAndMerge(ctx context.Context, db *sql.DB, card *Card, repoDir, targe
 	// 7. Persist outcome.
 	_, err = db.Exec(`
 		UPDATE ship_review_cards
-		SET status = 'approved', approved_sha = ?, main_sha = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		SET status = 'approved', approved_sha = ?, main_sha = ?, target_branch = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 		WHERE id = ?`,
-		card.HeadSHA, mainSHA, card.ID,
+		card.HeadSHA, mainSHA, targetBranch, card.ID,
 	)
 	return mainSHA, err
 }
@@ -1061,7 +1144,7 @@ func guardDeletableBranch(ctx context.Context, repoDir, branch string) error {
 	if err := validateBranch(branch); err != nil {
 		return err
 	}
-	if branch == "main" || branch == "master" {
+	if branch == "main" || branch == "master" || branch == WorkTargetBranch {
 		return fmt.Errorf("%w: %q", ErrProtectedBranch, branch)
 	}
 	// Detect remote default branch (e.g. "origin/main" → "main").
@@ -1094,6 +1177,9 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 	if err := guardDeletableBranch(ctx, repoDir, branch); err != nil {
 		return err
 	}
+	if card.TargetBranch != "" && branch == card.TargetBranch {
+		return fmt.Errorf("%w: %q is the merge target", ErrProtectedBranch, branch)
+	}
 	if mainSHA == "" {
 		return errors.New("cleanup: merged main SHA unknown")
 	}
@@ -1119,7 +1205,15 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 
 	// ── Checks: nothing below this block is destructive until all pass. ──
 
-	if _, err := os.Stat(agentWT); err == nil {
+	// A card shipping a registered branch leaves the task worktree alone
+	// when it still holds the task's own staypoint/<task> branch: that is
+	// not the branch that was merged.
+	if branch != taskBranchPrefix+card.TaskID {
+		if cur, err := gitOutput(ctx, agentWT, "symbolic-ref", "-q", "HEAD"); err == nil && cur == "refs/heads/"+taskBranchPrefix+card.TaskID {
+			agentWT = ""
+		}
+	}
+	if _, err := os.Stat(agentWT); agentWT != "" && err == nil {
 		// Fail closed: a worktree whose HEAD cannot be read may hold anything.
 		head, err := gitOutput(ctx, agentWT, "rev-parse", "--verify", "-q", "HEAD")
 		if err != nil || head == "" {
@@ -1162,6 +1256,9 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 
 	// Worktrees first: they hold the branch checked out.
 	for _, wt := range []string{devWT, agentWT} {
+		if wt == "" {
+			continue
+		}
 		_, _ = gitOutput(ctx, repoDir, "worktree", "remove", "--force", wt)
 		if err := os.RemoveAll(wt); err != nil {
 			return fmt.Errorf("remove worktree %s: %w", wt, err)
@@ -1272,9 +1369,22 @@ func SetBranchCleanup(db *sql.DB, cardID string, deleted bool, errMsg string) er
 	return err
 }
 
-// CurrentBranchHEAD resolves the HEAD SHA for a branch in repoDir.
+// CurrentBranchHEAD resolves the HEAD SHA for a branch in repoDir: the local
+// branch, else origin's copy (a registered branch the agent pushed from
+// another checkout), else whatever git resolves the name to (e.g. HEAD).
 func CurrentBranchHEAD(ctx context.Context, repoDir, branch string) (string, error) {
-	return gitOutput(ctx, repoDir, "rev-parse", branch)
+	if err := validateBranch(branch); err != nil {
+		return "", err
+	}
+	sha, err := gitOutput(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch+"^{commit}")
+	if err == nil && sha != "" {
+		return sha, nil
+	}
+	if remote, rErr := gitOutput(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch+"^{commit}"); rErr == nil && remote != "" {
+		return remote, nil
+	}
+	// Anything else git resolves (HEAD, a commit) as before.
+	return gitOutput(ctx, repoDir, "rev-parse", "--verify", "--quiet", branch+"^{commit}")
 }
 
 // verifyAncestor returns nil if sha is an ancestor of ref in repoDir.
@@ -1341,6 +1451,9 @@ type ProjectDevConfig struct {
 	// opens a PR and merges it once CI is green. Empty means unset; see
 	// EffectiveMergeMode for the default.
 	MergeMode string `json:"merge_mode"`
+	// TargetBranch is the branch new tasks are cut from and Approve merges
+	// into. Empty means unset; see ProjectTargetBranch for the default.
+	TargetBranch string `json:"target_branch"`
 	// GHConfigDir is the GH_CONFIG_DIR used for this repo's gh and git push
 	// calls. Work repos must set it in the PR modes so the personal gh login
 	// is never used on them.
@@ -1408,13 +1521,14 @@ func LiveGateConfig(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, gated b
 const devConfigColumns = `repo_path, dev_command, dev_url, setup_steps_json,
 	COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
 	COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0),
-	COALESCE(merge_mode,''), COALESCE(gh_config_dir,''), COALESCE(live_credentials,0)`
+	COALESCE(merge_mode,''), COALESCE(gh_config_dir,''), COALESCE(live_credentials,0),
+	COALESCE(target_branch,'')`
 
 func scanDevConfig(rows *sql.Rows) (*ProjectDevConfig, error) {
 	var c ProjectDevConfig
 	var stepsJSON, migGlobsJSON string
 	var supEnabled, supKeepUp, live int
-	if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL, &supEnabled, &supKeepUp, &c.MergeMode, &c.GHConfigDir, &live); err != nil {
+	if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL, &supEnabled, &supKeepUp, &c.MergeMode, &c.GHConfigDir, &live, &c.TargetBranch); err != nil {
 		return nil, err
 	}
 	c.SupabaseEnabled = supEnabled != 0
@@ -1743,8 +1857,9 @@ func upsertDevConfig(exec devExecer, cfg *ProjectDevConfig) error {
 	_, err = exec.Exec(`
 		INSERT INTO project_dev_configs
 			(repo_path, dev_command, dev_url, setup_steps_json, migration_globs_json,
-			 sql_editor_url, supabase_enabled, supabase_keep_up, merge_mode, gh_config_dir, live_credentials, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			 sql_editor_url, supabase_enabled, supabase_keep_up, merge_mode, gh_config_dir, live_credentials,
+			 target_branch, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 		ON CONFLICT(repo_path) DO UPDATE SET
 			dev_command          = excluded.dev_command,
 			dev_url              = excluded.dev_url,
@@ -1756,10 +1871,12 @@ func upsertDevConfig(exec devExecer, cfg *ProjectDevConfig) error {
 			merge_mode           = excluded.merge_mode,
 			gh_config_dir        = excluded.gh_config_dir,
 			live_credentials     = excluded.live_credentials,
+			target_branch        = excluded.target_branch,
 			updated_at           = excluded.updated_at`,
 		cfg.RepoPath, cfg.DevCommand, cfg.DevURL,
 		string(stepsJSON), string(migGlobsJSON), cfg.SQLEditorURL,
 		supabaseEnabled, supabaseKeepUp, cfg.MergeMode, cfg.GHConfigDir, liveCredentials,
+		cfg.TargetBranch,
 	)
 	return err
 }

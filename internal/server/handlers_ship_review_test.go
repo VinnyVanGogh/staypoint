@@ -573,3 +573,49 @@ func TestShipReview_StartDevRefusesNonPendingCard(t *testing.T) {
 		})
 	}
 }
+
+// A task cut from dev-server makes a card targeting dev-server, and Approve
+// merges into dev-server, never into main.
+func TestShipReview_ApproveMergesIntoTaskTarget(t *testing.T) {
+	database := setupTestDB(t)
+	seedBoardWebAuthnCredential(t, database)
+	srv, token := startTestServer(t, database)
+	any(srv).(webAuthnVerifierSetter).SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
+	baseURL, boardToken, client := srv.URL(), srv.BoardToken(), &http.Client{}
+
+	taskID, repoDir := createShipTask(t, database, baseURL, token, client)
+	bare := gitOut(t, repoDir, "remote", "get-url", "origin")
+	gitOut(t, repoDir, "branch", "dev-server", "main")
+	gitOut(t, repoDir, "push", "origin", "dev-server")
+	if err := workspace.RecordTaskTarget(gocontext.Background(), database, taskID, "dev-server"); err != nil {
+		t.Fatalf("RecordTaskTarget: %v", err)
+	}
+	mainBefore := gitOut(t, bare, "rev-parse", "main")
+
+	upsertBody, _ := json.Marshal(map[string]any{"test_steps": []string{"1. Open /"}})
+	resp, rb := shipDoReq(t, client, token, "PUT", baseURL+"/api/tasks/"+taskID+"/ship-review", upsertBody)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("UpsertCard: %d %s", resp.StatusCode, rb)
+	}
+	var card struct {
+		TargetBranch string `json:"target_branch"`
+	}
+	if err := json.Unmarshal(rb, &card); err != nil || card.TargetBranch != "dev-server" {
+		t.Fatalf("card target = %q (err %v), want dev-server: %s", card.TargetBranch, err, rb)
+	}
+
+	resp, rb = shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", nil, boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Approve: %d %s", resp.StatusCode, rb)
+	}
+	var res approveResult
+	if err := json.Unmarshal(rb, &res); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := gitOut(t, bare, "rev-parse", "dev-server"); got != res.MainSHA {
+		t.Errorf("remote dev-server = %s, want merge %s", got, res.MainSHA)
+	}
+	if got := gitOut(t, bare, "rev-parse", "main"); got != mainBefore {
+		t.Errorf("remote main moved to %s; Approve must merge into dev-server only", got)
+	}
+}
