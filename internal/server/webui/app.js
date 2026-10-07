@@ -326,6 +326,19 @@ async function refreshBoardPasskeyStatus() {
   return boardPasskeyState;
 }
 
+// refreshDevBuildBadge shows the header's DEV BUILD badge when /api/health
+// says the daemon is not a reviewed main build (STA-805).
+async function refreshDevBuildBadge() {
+  let health = null;
+  try { health = await apiFetch('/api/health'); } catch { return; }
+  const badge = document.getElementById('dev-build-badge');
+  if (!badge) return;
+  badge.hidden = !health.dev_build;
+  badge.title = health.dev_build
+    ? `Not a reviewed main build: ${health.dev_build_reason || 'unknown reason'} (commit ${health.git_commit || 'none'})`
+    : '';
+}
+
 // enrollBoardPasskey runs boardEnrollPasskey for an explicit "Enroll passkey"
 // click. A second passkey needs an assertion from an existing one, so that is
 // collected first when one is believed enrolled; if the server says none is
@@ -11792,6 +11805,7 @@ document.getElementById('projects-org-filter')?.addEventListener('change', (e) =
 
   connectSSE();
   refreshBoardPasskeyStatus();
+  refreshDevBuildBadge();
   const bannerEnrollBtn = document.getElementById('board-passkey-banner-enroll');
   bannerEnrollBtn?.addEventListener('click', async () => {
     bannerEnrollBtn.disabled = true;

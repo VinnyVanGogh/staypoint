@@ -74,6 +74,12 @@ type Options struct {
 	// GitCommit is the injected git commit hash of the running binary.
 	GitCommit string
 
+	// DevBuildReason is non-empty when the running binary is not a reviewed
+	// main build (deployed with --allow-dev-build, or built without the
+	// deploy script so no commit is stamped). /api/health reports dev_build and this reason, and
+	// the web UI header shows a DEV BUILD badge (STA-805).
+	DevBuildReason string
+
 	// RepoAccess, when set, supplies the latest repo access check for
 	// /api/health so redeploy scripts can flag repos macOS has blocked.
 	RepoAccess RepoAccessReporter
