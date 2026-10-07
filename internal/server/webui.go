@@ -27,6 +27,7 @@ var validSPARoutes = map[string]bool{
 	"kanban":       true,
 	"recent-tasks": true,
 	"task-status":  true,
+	"all-tasks":    true,
 	"cost":         true,
 	"boss":         true,
 	"checklist":    true,

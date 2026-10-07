@@ -65,6 +65,72 @@
     return isLegacy(task) || isArchived(task);
   }
 
+  // Legacy tasks and archived imports are hidden on every page and count by
+  // default. Only these three pages carry a "Show archive & legacy" toggle;
+  // the All Tasks page shows everything by default and has its own filters.
+  const HIDDEN_TOGGLE_PAGES = ['recent-tasks', 'task-status', 'kanban'];
+  const ALL_TASKS_PAGE = 'all-tasks';
+
+  function hasHiddenToggle(page) {
+    return HIDDEN_TOGGLE_PAGES.includes(page);
+  }
+
+  // includeHiddenFor: whether a page lists legacy/archived tasks. All Tasks
+  // always does; the toggle pages only while their toggle is on; every other
+  // page never does.
+  function includeHiddenFor(page, toggleOn) {
+    if (page === ALL_TASKS_PAGE) return true;
+    if (hasHiddenToggle(page)) return !!toggleOn;
+    return false;
+  }
+
+  // visibleTasks drops legacy tasks and archived imports unless includeHidden.
+  // It never mutates its input.
+  function visibleTasks(tasks, includeHidden) {
+    const list = Array.isArray(tasks) ? tasks : [];
+    if (includeHidden) return list.slice();
+    return list.filter(t => t && !isHiddenByDefault(t));
+  }
+
+  // taskVisibility labels a task for badges and the All Tasks visibility
+  // filter: 'legacy', 'archive' or 'current'.
+  function taskVisibility(task) {
+    if (isLegacy(task)) return 'legacy';
+    if (isArchived(task)) return 'archive';
+    return 'current';
+  }
+
+  function taskStageOf(task) {
+    return String((task && (task.execution_stage || task.status)) || '').toLowerCase();
+  }
+
+  // filterAllTasks backs the All Tasks page: every task, narrowed by org,
+  // origin, stage, visibility ('all' | 'current' | 'hidden' | 'legacy' |
+  // 'archive') and a free-text query over title, identifier, org and project.
+  // 'all' (or empty) means no filter. Sorted newest update first.
+  function filterAllTasks(tasks, f) {
+    const o = f || {};
+    const q = String(o.q || '').trim().toLowerCase();
+    const want = (v) => v && v !== 'all';
+    const out = (Array.isArray(tasks) ? tasks : []).filter(t => {
+      if (!t) return false;
+      if (want(o.org) && companyOf(t) !== o.org) return false;
+      if (want(o.origin) && String(t.origin || '') !== o.origin) return false;
+      if (want(o.stage) && taskStageOf(t) !== o.stage) return false;
+      if (want(o.visibility)) {
+        const v = taskVisibility(t);
+        if (o.visibility === 'hidden' ? v === 'current' : v !== o.visibility) return false;
+      }
+      if (q) {
+        const hay = [t.title, t.name, t.identifier, t.source_ref, t.id, t.organization, t.project]
+          .map(x => String(x || '').toLowerCase()).join(' ');
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+    return out.sort(byUpdatedDesc);
+  }
+
   function companyOf(task) {
     const org = String((task && (task.organization || task.org)) || '').trim();
     return org || NO_COMPANY;
@@ -121,7 +187,11 @@
     return n;
   }
 
-  const api = { BOARD_COLUMNS, BOARD_COLUMN_TITLES, NO_COMPANY, boardColumnFor, isLegacy, isArchived, isHiddenByDefault, companyOf, buildBoard, countLegacy };
+  const api = {
+    BOARD_COLUMNS, BOARD_COLUMN_TITLES, NO_COMPANY, HIDDEN_TOGGLE_PAGES, ALL_TASKS_PAGE,
+    boardColumnFor, isLegacy, isArchived, isHiddenByDefault, hasHiddenToggle, includeHiddenFor,
+    visibleTasks, taskVisibility, taskStageOf, filterAllTasks, companyOf, buildBoard, countLegacy,
+  };
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;

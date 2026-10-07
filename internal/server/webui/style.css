@@ -4926,3 +4926,6 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   font-weight: 600;
 }
 .timeline-row-warn .timeline-title { color: var(--amber); }
+
+/* Legacy / archived badge on a task page header (direct links to hidden tasks). */
+.card-origin-badge.task-page-origin-badge { margin-left: 0; font-size: 11px; padding: 2px 6px; align-self: center; }

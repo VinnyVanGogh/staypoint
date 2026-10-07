@@ -445,6 +445,62 @@ async function fetchAllTasks() {
   return { tasks };
 }
 
+// ── Task visibility ───────────────────────────────────────
+// state.tasks holds every task, legacy tasks and archived Paperclip imports
+// included, so task pages and direct links still open them. Every list, count
+// and badge reads tasks through taskValues()/fleetTaskValues(), which hide
+// them unless includeHidden: true only on All Tasks, or on Recent Tasks, Task
+// Status and the Kanban board while their "Show archive & legacy" toggle is on
+// (lib/taskboard.js includeHiddenFor). /api/fleet/overview already hides them
+// server side; filtering here too keeps the merged lists consistent.
+function taskValues(includeHidden = false) {
+  return visibleTasks(Object.values(state.tasks || {}), includeHidden);
+}
+
+function fleetTaskValues(includeHidden = false) {
+  return visibleTasks(state.fleet?.tasks || [], includeHidden);
+}
+
+const SHOW_HIDDEN_TOGGLES = {
+  'recent-tasks': { id: 'recent-tasks-show-legacy', key: 'staypoint_recent_tasks_show_legacy' },
+  'task-status': { id: 'ts-show-legacy', key: 'staypoint_task_status_show_legacy' },
+  kanban: { id: 'kanban-show-legacy', key: 'staypoint_kanban_show_legacy' },
+};
+
+// showHiddenOn: whether page lists legacy/archived tasks right now.
+function showHiddenOn(page) {
+  const t = SHOW_HIDDEN_TOGGLES[page];
+  const on = !!(t && document.getElementById(t.id)?.checked);
+  return includeHiddenFor(page, on);
+}
+
+// wireShowHiddenToggles restores each toggle from localStorage (a per-viewer
+// convenience) and re-renders its page on change.
+function wireShowHiddenToggles() {
+  for (const [page, t] of Object.entries(SHOW_HIDDEN_TOGGLES)) {
+    if (page === 'kanban') continue; // wireKanbanControls owns it
+    const box = document.getElementById(t.id);
+    if (!box || box.dataset.wired) continue;
+    box.dataset.wired = '1';
+    try { box.checked = localStorage.getItem(t.key) === '1'; } catch { box.checked = false; }
+    box.addEventListener('change', () => {
+      try { localStorage.setItem(t.key, box.checked ? '1' : '0'); } catch { /* ignore */ }
+      if (page === 'recent-tasks') { populateRecentTasksFilters(); renderRecentTasks(); }
+      else renderTaskStatusPage();
+    });
+  }
+}
+
+// updateShowHiddenCounts writes "(n)" next to each toggle: how many tasks it
+// would reveal.
+function updateShowHiddenCounts() {
+  const hidden = Object.values(state.tasks || {}).filter(isHiddenByDefault).length;
+  for (const id of ['recent-tasks-legacy-count', 'ts-legacy-count']) {
+    const span = document.getElementById(id);
+    if (span) span.textContent = `(${hidden})`;
+  }
+}
+
 // ── Initial data load ─────────────────────────────────────
 async function loadAll() {
   try {
@@ -1027,6 +1083,7 @@ function navigateTo(viewName, orgName = null, pushHistory = true) {
     if (viewName === 'agents')       { populateAgentsFilters(); renderAgentsPage(); }
     if (viewName === 'recent-tasks') { populateRecentTasksFilters(); renderRecentTasks(); }
     if (viewName === 'task-status')  renderTaskStatusPage();
+    if (viewName === 'all-tasks')    { wireAllTasksControls(); populateAllTasksOrgFilter(); renderAllTasksPage(); }
     if (viewName === 'cost')         renderCostPage();
     if (viewName === 'settings')     renderSettings();
     if (viewName === 'checklist')    loadChecklistSprints().then(() => loadChecklist());
@@ -1869,7 +1926,7 @@ function getTaskSearchMatch(t, term) {
 }
 
 async function prefetchTaskComments() {
-  const allTasks = [...(state.fleet?.tasks || []), ...Object.values(state.tasks)];
+  const allTasks = [...fleetTaskValues(), ...taskValues()];
   const toFetch = [];
   const seen = new Set();
   for (const t of allTasks) {
@@ -1913,8 +1970,8 @@ function renderGlobalTaskTable() {
 
   tbody.innerHTML = '';
 
-  let tasks = state.fleet?.tasks || [];
-  if (!tasks.length) tasks = Object.values(state.tasks);
+  let tasks = fleetTaskValues();
+  if (!tasks.length) tasks = taskValues();
 
   const sTerm = (state.taskFilter.search || '').toLowerCase().trim();
   const orgFilter = state.taskFilter.org || 'all';
@@ -2057,10 +2114,10 @@ function populateProjectsOrgFilter() {
   for (const org of (state.fleet?.organizations || [])) {
     if (org.name) orgNames.add(org.name);
   }
-  for (const t of Object.values(state.tasks)) {
+  for (const t of taskValues()) {
     if (t.organization) orgNames.add(t.organization);
   }
-  for (const t of (state.fleet?.tasks || [])) {
+  for (const t of fleetTaskValues()) {
     if (t.organization) orgNames.add(t.organization);
   }
   for (const s of Object.values(state.sessions)) {
@@ -2087,9 +2144,9 @@ function populateProjectsOrgFilter() {
 
   // Task counts per org
   const orgTaskCounts = {};
-  const allTasks = [...(state.fleet?.tasks || []), ...Object.values(state.tasks)];
+  const allTasks = [...fleetTaskValues(), ...taskValues()];
   for (const org of (state.fleet?.organizations || [])) {
-    for (const t of (org.tasks || [])) allTasks.push(t);
+    for (const t of visibleTasks(org.tasks, false)) allTasks.push(t);
   }
   const seen = new Set();
   for (const t of allTasks) {
@@ -2176,9 +2233,9 @@ function renderProjects() {
   if (!grid) return;
   grid.innerHTML = '';
 
-  const allTasks = [...(state.fleet?.tasks || []), ...Object.values(state.tasks)];
+  const allTasks = [...fleetTaskValues(), ...taskValues()];
   for (const org of (state.fleet?.organizations || [])) {
-    for (const t of (org.tasks || [])) {
+    for (const t of visibleTasks(org.tasks, false)) {
       if (!t.organization) t.organization = org.name;
       allTasks.push(t);
     }
@@ -2505,7 +2562,7 @@ function orgMatches(itemOrg, targetOrg) {
 }
 
 function getProjectsForOrg(orgName = 'all') {
-  const allTasks = [...(state.fleet?.tasks || []), ...Object.values(state.tasks)];
+  const allTasks = [...fleetTaskValues(), ...taskValues()];
   const projects = new Set();
 
   for (const t of allTasks) {
@@ -2525,7 +2582,7 @@ function getProjectsForOrg(orgName = 'all') {
         if (name && name !== '(No Project)') projects.add(name);
       }
     }
-    for (const t of (org.tasks || [])) {
+    for (const t of visibleTasks(org.tasks, false)) {
       if (t.project && t.project !== '(No Project)') {
         projects.add(t.project);
       }
@@ -2563,7 +2620,7 @@ function getAgentProjects(agent) {
   }
 
   // Also check tasks checked out by or assigned to this agent across all tasks
-  const allTasks = [...(state.fleet?.tasks || []), ...Object.values(state.tasks)];
+  const allTasks = [...fleetTaskValues(), ...taskValues()];
   for (const t of allTasks) {
     const matchesAgent =
       (t.checkout_agent_id && t.checkout_agent_id === agent.id) ||
@@ -2590,7 +2647,7 @@ function populateAgentsOrgFilter() {
   for (const org of (state.fleet?.organizations || [])) {
     if (org.name) orgNames.add(org.name);
   }
-  for (const t of Object.values(state.tasks)) {
+  for (const t of taskValues()) {
     if (t.organization) orgNames.add(t.organization);
   }
   for (const s of Object.values(state.sessions)) {
@@ -2821,7 +2878,7 @@ function renderAgentsPage() {
   }
 
   // Match each agent with its assigned and current running task
-  const allTasks = [...(state.fleet?.tasks || []), ...Object.values(state.tasks)];
+  const allTasks = [...fleetTaskValues(), ...taskValues()];
   const enrichedAgents = allAgents.map(a => {
     const agentTasks = allTasks.filter(t =>
       (t.checkout_agent_id && t.checkout_agent_id === a.id) ||
@@ -3072,10 +3129,10 @@ function populateRecentTasksOrgFilter() {
   for (const org of (state.fleet?.organizations || [])) {
     if (org.name) orgNames.add(org.name);
   }
-  for (const t of Object.values(state.tasks)) {
+  for (const t of taskValues(showHiddenOn('recent-tasks'))) {
     if (t.organization) orgNames.add(t.organization);
   }
-  for (const t of (state.fleet?.tasks || [])) {
+  for (const t of fleetTaskValues(showHiddenOn('recent-tasks'))) {
     if (t.organization) orgNames.add(t.organization);
   }
   for (const s of Object.values(state.sessions)) {
@@ -3132,7 +3189,7 @@ function populateRecentTasksPriorityFilter() {
   const standardPriorities = ['critical', 'urgent', 'high', 'medium', 'low'];
   const knownPriorities = new Set(standardPriorities);
 
-  const allTasks = [...(state.fleet?.tasks || []), ...Object.values(state.tasks)];
+  const allTasks = [...fleetTaskValues(showHiddenOn('recent-tasks')), ...taskValues(showHiddenOn('recent-tasks'))];
   for (const t of allTasks) {
     if (t.priority && typeof t.priority === 'string') {
       const p = t.priority.toLowerCase().trim();
@@ -3344,7 +3401,7 @@ function renderRecentTasks() {
     populateRecentTasksFilters();
   }
 
-  const allTasks = [...(state.fleet?.tasks || []), ...Object.values(state.tasks)];
+  const allTasks = [...fleetTaskValues(showHiddenOn('recent-tasks')), ...taskValues(showHiddenOn('recent-tasks'))];
   const seenIds = new Set();
   const dedupTasks = [];
   for (const t of allTasks) {
@@ -3470,6 +3527,8 @@ function renderRecentTasks() {
     titleEl.style.cursor = 'pointer';
     titleEl.addEventListener('click', () => openDetail(t.id));
     titleRow.appendChild(titleEl);
+    const hiddenBadge = originBadge(t);
+    if (hiddenBadge) titleRow.appendChild(hiddenBadge);
 
     // Expandable subtask toggle & child count badge
     const rawChildren = [
@@ -3560,7 +3619,7 @@ function renderTaskStatusPage() {
 
   tbody.innerHTML = '';
 
-  const allTasks = [...(state.fleet?.tasks || []), ...Object.values(state.tasks)];
+  const allTasks = [...fleetTaskValues(showHiddenOn('task-status')), ...taskValues(showHiddenOn('task-status'))];
   const seenIds = new Set();
   const dedupTasks = [];
   for (const t of allTasks) {
@@ -3593,6 +3652,8 @@ function renderTaskStatusPage() {
 
     const tdTitle = el('td');
     const titleSpan = el('div', 'task-table-title', t.title || t.name || '(untitled)');
+    const hiddenBadge = originBadge(t);
+    if (hiddenBadge) { titleSpan.appendChild(document.createTextNode(' ')); titleSpan.appendChild(hiddenBadge); }
     tdTitle.appendChild(titleSpan);
 
     if (t._searchSnippet) {
@@ -3632,6 +3693,108 @@ function renderTaskStatusPage() {
     tr.addEventListener('click', () => openDetail(t.id));
     tbody.appendChild(tr);
   }
+}
+
+// originBadge is the "legacy" / "archive" chip shown wherever a hidden task
+// is listed (toggle pages, All Tasks) and on its own task page; null for a
+// current task.
+function originBadge(task) {
+  const v = taskVisibility(task);
+  if (v === 'current') return null;
+  const b = el('span', 'card-origin-badge', v === 'legacy' ? 'legacy' : 'archive');
+  b.title = v === 'legacy'
+    ? 'Legacy task (created before task origins were tracked)'
+    : 'Archived Paperclip import (done or cancelled)';
+  return b;
+}
+
+// ── All Tasks page ────────────────────────────────────────
+// The one page that lists every task by default, legacy tasks and archived
+// imports included; filters narrow it by org, origin, stage and visibility.
+state.allTasksFilter = state.allTasksFilter || { q: '', org: 'all', origin: 'all', stage: 'all', visibility: 'all' };
+const ALL_TASKS_ROW_LIMIT = 500;
+
+function populateAllTasksOrgFilter() {
+  const sel = document.getElementById('all-tasks-org-filter');
+  if (!sel) return;
+  const current = state.allTasksFilter.org || 'all';
+  const names = new Set();
+  for (const t of taskValues(includeHiddenFor(ALL_TASKS_PAGE))) names.add(companyOf(t));
+  sel.innerHTML = '<option value="all">All Organizations</option>';
+  for (const n of [...names].sort((a, b) => a.localeCompare(b))) {
+    const opt = document.createElement('option');
+    opt.value = n;
+    opt.textContent = n;
+    sel.appendChild(opt);
+  }
+  sel.value = names.has(current) ? current : 'all';
+  state.allTasksFilter.org = sel.value;
+}
+
+function renderAllTasksPage() {
+  const tbody = document.getElementById('all-tasks-tbody');
+  if (!tbody) return;
+  const all = [...fleetTaskValues(true), ...taskValues(includeHiddenFor(ALL_TASKS_PAGE))];
+  const seen = new Set();
+  const tasks = [];
+  for (const t of all) {
+    if (!t || !t.id || seen.has(t.id)) continue;
+    seen.add(t.id);
+    tasks.push(state.tasks[t.id] ? { ...t, ...state.tasks[t.id] } : t);
+  }
+  const rows = filterAllTasks(tasks, state.allTasksFilter);
+  tbody.innerHTML = '';
+  if (!rows.length) {
+    const tr = document.createElement('tr');
+    const td = el('td', null, 'No tasks match these filters.');
+    td.colSpan = 7;
+    td.style.cssText = 'text-align:center;color:var(--muted);padding:24px;';
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  }
+  for (const t of rows.slice(0, ALL_TASKS_ROW_LIMIT)) {
+    const tr = document.createElement('tr');
+    tr.dataset.id = t.id;
+    const tdId = el('td', null, t.source_ref || t.identifier || `#${t.id.slice(0, 8)}`);
+    tdId.style.cssText = 'font-family:monospace;font-weight:600;';
+    const tdTitle = el('td');
+    tdTitle.appendChild(el('span', 'task-table-title', t.title || t.name || '(untitled)'));
+    const badge = originBadge(t);
+    if (badge) { tdTitle.appendChild(document.createTextNode(' ')); tdTitle.appendChild(badge); }
+    const tdOrg = el('td', null, companyOf(t));
+    const tdProj = el('td', null, t.project || '—');
+    const tdOrigin = el('td', null, t.origin || '—');
+    const tdStage = el('td', null, taskStageOf(t) || '—');
+    const tdUp = el('td', null, fmtRelTime(t.updated_at));
+    for (const td of [tdId, tdTitle, tdOrg, tdProj, tdOrigin, tdStage, tdUp]) tr.appendChild(td);
+    tr.addEventListener('click', () => openDetail(t.id));
+    tbody.appendChild(tr);
+  }
+  const footer = document.getElementById('all-tasks-footer');
+  if (footer) {
+    const shown = Math.min(rows.length, ALL_TASKS_ROW_LIMIT);
+    footer.textContent = rows.length > ALL_TASKS_ROW_LIMIT
+      ? `Showing ${shown} of ${rows.length} matching tasks (${tasks.length} total). Narrow the filters to see the rest.`
+      : `Showing ${rows.length} of ${tasks.length} tasks`;
+  }
+}
+
+function wireAllTasksControls() {
+  const bind = (id, key, evt) => {
+    const node = document.getElementById(id);
+    if (!node || node.dataset.wired) return;
+    node.dataset.wired = '1';
+    node.value = state.allTasksFilter[key] || (key === 'q' ? '' : 'all');
+    node.addEventListener(evt, () => {
+      state.allTasksFilter[key] = node.value;
+      renderAllTasksPage();
+    });
+  };
+  bind('all-tasks-search', 'q', 'input');
+  bind('all-tasks-org-filter', 'org', 'change');
+  bind('all-tasks-origin-filter', 'origin', 'change');
+  bind('all-tasks-stage-filter', 'stage', 'change');
+  bind('all-tasks-visibility-filter', 'visibility', 'change');
 }
 
 // ── Cost & Accounting Page ────────────────────────────────
@@ -4282,7 +4445,7 @@ function renderTopTasksSpendCard(f, grid) {
   const taskSpendCard = el('div', 'cost-card');
   taskSpendCard.appendChild(el('div', 'cost-card-title', 'Top Tasks by Spend'));
 
-  const allTasks = [...(f?.tasks || []), ...Object.values(state.tasks)]
+  const allTasks = [...visibleTasks(f?.tasks, false), ...taskValues()]
     .filter(t => t.spent_usd > 0)
     .sort((a, b) => b.spent_usd - a.spent_usd)
     .slice(0, 10);
@@ -5020,10 +5183,10 @@ const fleetModalState = {
 
 function getFleetTasks() {
   const taskMap = new Map();
-  for (const t of (state.fleet?.tasks || [])) {
+  for (const t of fleetTaskValues()) {
     if (t && t.id) taskMap.set(t.id, t);
   }
-  for (const t of Object.values(state.tasks || {})) {
+  for (const t of taskValues()) {
     if (t && t.id) {
       if (!taskMap.has(t.id)) taskMap.set(t.id, t);
       else Object.assign(taskMap.get(t.id), t);
@@ -5756,8 +5919,8 @@ function renderOrgDetailView(org) {
   }
 
   // Tasks section
-  const orgTasks = (org.tasks || []).concat(
-    Object.values(state.tasks).filter(t =>
+  const orgTasks = visibleTasks(org.tasks, false).concat(
+    taskValues().filter(t =>
       t.organization === org.name && !(org.tasks || []).find(ot => ot.id === t.id)
     )
   );
@@ -5968,7 +6131,7 @@ function renderBoss() {
   const container = document.getElementById('boss-container');
   if (!container) return;
 
-  const tasks   = Object.values(state.tasks);
+  const tasks   = taskValues();
   const todo    = tasks.filter(t => t.status === 'todo').length;
   const inProg  = tasks.filter(t => t.status === 'in_progress').length;
   const blocked = tasks.filter(t => t.status === 'blocked').length;
@@ -10163,6 +10326,12 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   const pillsRow = el('div', 'task-page-pills');
   if (task.status) pillsRow.appendChild(statusPill(task.status));
   if (task.priority) pillsRow.appendChild(statusPill(task.priority));
+  const hiddenBadge = originBadge(task);
+  if (hiddenBadge) {
+    hiddenBadge.textContent = isLegacy(task) ? 'Legacy' : 'Archived';
+    hiddenBadge.classList.add('task-page-origin-badge');
+    pillsRow.appendChild(hiddenBadge);
+  }
   titleRow.appendChild(pillsRow);
   headerMain.appendChild(titleRow);
   headerRow.appendChild(headerMain);
@@ -10735,7 +10904,10 @@ function renderAll() {
   if (document.getElementById('view-agents')?.classList.contains('active'))   renderAgentsPage();
   if (document.getElementById('view-recent-tasks')?.classList.contains('active')) renderRecentTasks();
   if (document.getElementById('view-task-status')?.classList.contains('active'))  renderTaskStatusPage();
+  if (document.getElementById('view-all-tasks')?.classList.contains('active'))    { populateAllTasksOrgFilter(); renderAllTasksPage(); }
   if (document.getElementById('view-cost')?.classList.contains('active'))         renderCostPage();
+  wireShowHiddenToggles();
+  updateShowHiddenCounts();
 }
 
 // ── Filter listeners (overview) ───────────────────────────
@@ -11656,6 +11828,9 @@ function resolveItemTarget(item) {
   }
   if (text.includes('/recent-tasks') || text.includes('recent tasks') || text.includes('activity feed') || text.includes('subtask tree')) {
     return { view: 'recent-tasks', label: 'Recent Tasks' };
+  }
+  if (text.includes('/all-tasks') || text.includes('all tasks page')) {
+    return { view: 'all-tasks', label: 'All Tasks' };
   }
   if (text.includes('/task-status') || text.includes('task status') || text.includes('9-column table') || text.includes('global task')) {
     return { view: 'task-status', label: 'Global Task Status' };

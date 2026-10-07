@@ -48,6 +48,9 @@
       <button class="sidebar-item" data-view="task-status">
         <span class="sidebar-icon">&#9776;</span>Task Status
       </button>
+      <button class="sidebar-item" data-view="all-tasks">
+        <span class="sidebar-icon">&#9783;</span>All Tasks
+      </button>
       <button class="sidebar-item" data-view="cost">
         <span class="sidebar-icon">&#9670;</span>Cost &amp; Accounting
       </button>
@@ -375,6 +378,7 @@
             <option value="medium">Medium</option>
             <option value="low">Low</option>
           </select>
+          <label class="kanban-toggle"><input type="checkbox" id="recent-tasks-show-legacy"> Show archive &amp; legacy <span id="recent-tasks-legacy-count" class="muted-text"></span></label>
         </div>
       </div>
       <div class="dashboard-section">
@@ -488,6 +492,7 @@
             <option value="errored">Errored</option>
             <option value="done">Done</option>
           </select>
+          <label class="kanban-toggle"><input type="checkbox" id="ts-show-legacy"> Show archive &amp; legacy <span id="ts-legacy-count" class="muted-text"></span></label>
           <button id="open-create-task-btn" class="btn btn-primary" style="margin-left:8px;">+ New Task</button>
         </div>
       </div>
@@ -510,6 +515,64 @@
             <tbody id="ts-task-tbody"></tbody>
           </table>
         </div>
+      </div>
+    </section>
+
+    <!-- All Tasks: every task, legacy and archive included by default -->
+    <section id="view-all-tasks" class="view">
+      <div class="view-header">
+        <div class="view-title-group">
+          <h1 class="view-title">All Tasks</h1>
+          <span class="refresh-indicator">Every task, including legacy and archived imports</span>
+        </div>
+        <div class="table-controls">
+          <input type="text" id="all-tasks-search" placeholder="Search title, identifier, org, project…" class="search-input">
+          <select id="all-tasks-org-filter" class="select-filter" aria-label="Organization">
+            <option value="all">All Organizations</option>
+          </select>
+          <select id="all-tasks-origin-filter" class="select-filter" aria-label="Origin">
+            <option value="all">All Origins</option>
+            <option value="native">Native</option>
+            <option value="paperclip_import">Paperclip import</option>
+            <option value="legacy">Legacy</option>
+          </select>
+          <select id="all-tasks-stage-filter" class="select-filter" aria-label="Stage">
+            <option value="all">All Stages</option>
+            <option value="backlog">Backlog</option>
+            <option value="todo">Todo</option>
+            <option value="in_progress">In Progress</option>
+            <option value="in_review">In Review</option>
+            <option value="blocked">Blocked</option>
+            <option value="done">Done</option>
+            <option value="cancelled">Cancelled</option>
+          </select>
+          <select id="all-tasks-visibility-filter" class="select-filter" aria-label="Legacy and archive">
+            <option value="all">Current, legacy &amp; archive</option>
+            <option value="current">Current only</option>
+            <option value="hidden">Legacy &amp; archive only</option>
+            <option value="legacy">Legacy only</option>
+            <option value="archive">Archive only</option>
+          </select>
+        </div>
+      </div>
+      <div class="dashboard-section" style="padding:0">
+        <div class="task-table-wrapper" style="border:none;border-radius:0">
+          <table class="global-task-table" id="all-tasks-table">
+            <thead>
+              <tr>
+                <th>Identifier</th>
+                <th>Task</th>
+                <th>Organization</th>
+                <th>Project</th>
+                <th>Origin</th>
+                <th>Stage</th>
+                <th>Updated</th>
+              </tr>
+            </thead>
+            <tbody id="all-tasks-tbody"></tbody>
+          </table>
+        </div>
+        <div id="all-tasks-footer" class="muted-text" style="padding:8px 12px;"></div>
       </div>
     </section>
 
