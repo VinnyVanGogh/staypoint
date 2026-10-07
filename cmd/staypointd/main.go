@@ -250,14 +250,12 @@ func runDaemon(ctx context.Context) error {
 	var httpServer *server.Server
 	tokenPath := filepath.Join(cfg.DataDir, "auth_token")
 	boardTokenPath := filepath.Join(cfg.DataDir, "board_token")
-	// STA-868: Together advisory on each gate request (needs TOGETHER_API_KEY;
-	// without it requests show "no recommendation") and the Gemini batch review.
+	// STA-868: local-model advisory on each gate request (with no local model
+	// running, requests show "no recommendation") and the Gemini batch review.
 	var gateAdvisor gates.RequestAdvisor
-	if tc, err := decision.NewTogether(); err == nil {
-		gateAdvisor = gates.TogetherAdvisor{Client: tc}
-	} else {
-		gateAdvisor = gates.TogetherAdvisor{}
-	}
+	// Local model only (Board, 2026-10-07): never the paid Together API,
+	// even when TOGETHER_API_KEY is set in the environment.
+	gateAdvisor = gates.TogetherAdvisor{Client: decision.NewLocal()}
 	var gateReviewer gates.Reviewer
 	if gr := gates.NewGeminiReviewerFromEnv(); gr != nil {
 		gateReviewer = gr
