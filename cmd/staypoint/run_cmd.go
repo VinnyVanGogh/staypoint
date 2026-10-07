@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/adapter"
 	"github.com/VinnyVanGogh/staypoint/internal/config"
@@ -133,7 +132,7 @@ The harness:
 func init() {
 	runCmd.Flags().Int("max-turns", 50, "Maximum adapter turns before capping")
 	runCmd.Flags().Float64("max-budget", 0, "Maximum spend in USD before capping (0 = unlimited)")
-	runCmd.Flags().Duration("max-wallclock", 30*time.Minute, "Maximum wall-clock time before capping")
+	runCmd.Flags().Duration("max-wallclock", 0, "Maximum wall-clock time for the whole run before capping (0 = no limit)")
 	runCmd.Flags().Bool("skip-perms", false, "Opt-in: pass --dangerously-skip-permissions to the adapter")
 	runCmd.Flags().String("agent-id", "local", "Agent identifier for checkout audit")
 	runCmd.Flags().String("provider", "", "Adapter provider override (e.g. claude, gemini)")

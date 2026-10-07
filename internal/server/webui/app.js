@@ -596,6 +596,15 @@ function handleEvent(evt) {
     }
     return;
   }
+  if (type === 'run.turn' && evt.data) {
+    // Turn in flight (or null when it ends), for the stats strip turn timer.
+    const { task_id: tid, turn } = evt.data;
+    if (tid && state.tasks[tid]) {
+      state.tasks[tid].turn = turn || null;
+      if (tid === state.openDetailTaskId) refreshTaskStatsBar(tid);
+    }
+    return;
+  }
   if (type === 'run.queue' && evt.data) {
     const tid = state.openDetailTaskId;
     if (tid) {
@@ -7075,6 +7084,7 @@ async function fetchTaskViewData(resolvedId) {
   const task = taskResp.task || taskResp;
   if (taskResp.dependencies) task.dependencies = taskResp.dependencies;
   task.queue = taskResp.queue || null;
+  task.turn = taskResp.turn || null;
   const comments = (taskResp.comments && taskResp.comments.length)
     ? taskResp.comments
     : (commentsResp?.comments || (Array.isArray(commentsResp) ? commentsResp : []));
@@ -7846,6 +7856,17 @@ function buildTimelineStats(task, steps, elapsedMs, isStuck) {
   const currentStep  = runStepLabel(steps);
 
   add(stat('Elapsed', fmtDuration(elapsedMs)));
+  // How long the current turn has run. No fixed cap: only a turn with no
+  // activity for stall_timeout is stopped (shown in the tooltip).
+  const turnText = turnElapsedLabel(task.turn, Date.now());
+  if (turnText) {
+    const turnTile = stat('Turn', turnText, 'timeline-stat-turn');
+    const stallMin = Math.round((task.turn.stall_timeout_sec || 0) / 60);
+    turnTile.title = stallMin > 0
+      ? `Current turn. Stopped only if the agent shows no activity for ${stallMin}m.`
+      : 'Current turn. No stall limit.';
+    add(turnTile);
+  }
   const stepTile = stat('Step', currentStep, 'timeline-stat-step');
   stepTile.title = currentStep;
   add(stepTile);

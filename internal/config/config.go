@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -35,6 +36,13 @@ type Config struct {
 	// (STA-773). Each repo still runs one at a time. Zero or unset = 3.
 	// Top-level key: it must appear before any [table] in config.toml.
 	MaxConcurrentRuns int `json:"max_concurrent_runs" toml:"max_concurrent_runs"`
+	// TurnTimeout caps one agent turn's wall-clock time, as a Go duration
+	// ("2h"). Empty or "0" = no limit (the default). Top-level key.
+	TurnTimeout string `json:"turn_timeout" toml:"turn_timeout"`
+	// StallTimeout stops a turn after this long with no agent output or tool
+	// activity, as a Go duration. Empty = 20m; "0" turns the check off.
+	// Top-level key.
+	StallTimeout string `json:"stall_timeout" toml:"stall_timeout"`
 	// Use-it-or-lose-it routing (only active in the last UIOLIWindowHours before the weekly reset; zero = default).
 	UIOLIDisabled        bool    `json:"uioli_disabled" toml:"uioli_disabled"`
 	UIOLIWindowHours     float64 `json:"uioli_window_hours" toml:"uioli_window_hours"`
@@ -86,6 +94,51 @@ func (c *Config) MaxConcurrentRunsOrDefault() int {
 		return DefaultMaxConcurrentRuns
 	}
 	return c.MaxConcurrentRuns
+}
+
+// DefaultStallTimeout is the stall_timeout used when config.toml does not set it.
+const DefaultStallTimeout = 20 * time.Minute
+
+// TurnTimeoutOrDefault returns turn_timeout; 0 = no limit. An unparseable or
+// negative value is reported and treated as no limit.
+func (c *Config) TurnTimeoutOrDefault() (time.Duration, error) {
+	if c == nil {
+		return 0, nil
+	}
+	d, err := parseTimeout(c.TurnTimeout, 0)
+	if err != nil {
+		return 0, fmt.Errorf("turn_timeout: %w", err)
+	}
+	return d, nil
+}
+
+// StallTimeoutOrDefault returns stall_timeout: 20m when unset, 0 when off.
+// An unparseable or negative value is reported and the default is used.
+func (c *Config) StallTimeoutOrDefault() (time.Duration, error) {
+	if c == nil {
+		return DefaultStallTimeout, nil
+	}
+	d, err := parseTimeout(c.StallTimeout, DefaultStallTimeout)
+	if err != nil {
+		return DefaultStallTimeout, fmt.Errorf("stall_timeout: %w", err)
+	}
+	return d, nil
+}
+
+// parseTimeout parses a duration key; empty returns def.
+func parseTimeout(v string, def time.Duration) (time.Duration, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def, err
+	}
+	if d < 0 {
+		return def, fmt.Errorf("negative duration %q", v)
+	}
+	return d, nil
 }
 
 // MainMergeApprovalEnabled returns true unless explicitly disabled.

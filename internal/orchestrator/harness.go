@@ -78,8 +78,21 @@ type RunConfig struct {
 	MaxTurns int
 	// MaxBudgetUSD caps cumulative spend; 0 = unlimited.
 	MaxBudgetUSD float64
-	// MaxWallclock caps wall-clock duration; 0 defaults to 30 min.
+	// MaxWallclock caps the whole run's wall-clock duration; 0 = no limit.
+	// The daemon never sets it (Board: no fixed time cap); `staypoint run
+	// --max-wallclock` can.
 	MaxWallclock time.Duration
+	// TurnTimeout caps one adapter turn's wall-clock time; 0 = no limit
+	// (config.toml turn_timeout).
+	TurnTimeout time.Duration
+	// StallTimeout stops a turn after this long with no agent output or tool
+	// activity (config.toml stall_timeout). 0 = DefaultStallTimeout (20m);
+	// negative turns the check off.
+	StallTimeout time.Duration
+	// Clock, when set, replaces time.Now for the turn watch (tests).
+	Clock func() time.Time
+	// watchPoll is how often the turn watch checks; 0 = defaultWatchPoll.
+	watchPoll time.Duration
 	// SkipPermissions forwards --dangerously-skip-permissions to the adapter.
 	// Opt-in only; never set by default.
 	SkipPermissions bool
@@ -276,12 +289,12 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	if maxTurns <= 0 {
 		maxTurns = 50
 	}
-	maxWall := cfg.MaxWallclock
-	if maxWall <= 0 {
-		maxWall = 30 * time.Minute
+	// No fixed run-time cap by default: a stuck turn is caught by the turn
+	// watch's stall timeout instead (see turn_watch.go).
+	cancel := context.CancelFunc(func() {})
+	if cfg.MaxWallclock > 0 {
+		ctx, cancel = context.WithTimeout(ctx, cfg.MaxWallclock)
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, maxWall)
 	defer cancel()
 
 	var repoPath string
@@ -490,6 +503,9 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	for turn := 0; turn < maxTurns; turn++ {
 		if ctx.Err() != nil {
 			result.Disposition = "capped"
+			if sr != nil && cfg.MaxWallclock > 0 {
+				sr.EmitMessage("Stopped: run hit max wall-clock "+fmtWatchDuration(cfg.MaxWallclock), "", "error")
+			}
 			break
 		}
 
@@ -558,7 +574,18 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 				}()
 			}
 
-			turnErr := cfg.RunAdapter(turnCtx, wtPath, cfg.Provider, rawArgs, providerEnv, stdout, &stderrBuf)
+			// Turn watch: stop the turn if the agent goes quiet for the stall
+			// timeout (or passes turn_timeout, if set). Not a fixed cap.
+			watch := startTurnWatch(cfg, boardWaiting(h.DB, cfg.RunControl, taskID), turnCancel)
+			beginTurn(cfg, taskID, turn, sr)
+			var turnOut, turnErrOut io.Writer = stdout, &stderrBuf
+			if watch != nil {
+				turnOut = &activityWriter{dst: stdout, w: watch}
+				turnErrOut = &activityWriter{dst: &stderrBuf, w: watch}
+			}
+			turnErr := cfg.RunAdapter(turnCtx, wtPath, cfg.Provider, rawArgs, providerEnv, turnOut, turnErrOut)
+			watchStop := watch.Stop()
+			endTurn(taskID, sr)
 			turnCancel()
 			adapterRan = true
 			lastExitCode = exitCodeFrom(turnErr)
@@ -594,6 +621,13 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 						`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'gemini_code_blocked', ?)`,
 						taskID, gr.Title(),
 					)
+					break
+				}
+			}
+
+			if watchStop != "" {
+				if h.stopTurnForWatch(result, watch, watchStop, taskID, stdout, sr) {
+					sawOutput = true // the stop row explains the run
 					break
 				}
 			}

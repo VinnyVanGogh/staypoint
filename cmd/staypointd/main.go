@@ -296,6 +296,7 @@ func runDaemon(ctx context.Context) error {
 	// work_repo_root is intentionally NOT used here — it belongs to billing/bridge.
 	orchestrator.GlobalRunControl.SetDB(dbStore.DB())
 	wireRunQueue(ctx, cfg.MaxConcurrentRunsOrDefault(), httpServer)
+	setTurnLimits(cfg)
 
 	repoRoot := cfg.HarnessRepoRoot
 	if repoRoot == "" {
@@ -475,6 +476,8 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			GeminiDocsOnly:     geminiDocsOnly(route),
 			GeminiCodeApproved: route.GeminiCodeApprovalID != "",
 			TurnUsedGemini:     tracker.TakeGeminiSpawned,
+			TurnTimeout:        turnLimits.turn,
+			StallTimeout:       turnLimits.stall,
 		})
 		if runErr != nil {
 			if errors.Is(runErr, orchestrator.ErrConcurrencyCap) {
