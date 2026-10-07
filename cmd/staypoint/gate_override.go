@@ -123,13 +123,19 @@ var agentContextEnv = []string{
 // even file an override request through this command. The hard layer is the
 // passkey-gated approval.
 func refuseOverrideInAgentContext(getenv func(string) string, tty bool) error {
+	return refuseBoardOnlyInAgentContext("gate override", getenv, tty)
+}
+
+// refuseBoardOnlyInAgentContext refuses a Board-only CLI action (label names
+// it in the error) inside an agent session or without a terminal.
+func refuseBoardOnlyInAgentContext(label string, getenv func(string) string, tty bool) error {
 	for _, k := range agentContextEnv {
 		if strings.TrimSpace(getenv(k)) != "" {
-			return fmt.Errorf("gate override: refused inside an agent session (%s is set); the Board runs this from its own terminal", k)
+			return fmt.Errorf("%s: refused inside an agent session (%s is set); the Board runs this from its own terminal", label, k)
 		}
 	}
 	if !tty {
-		return fmt.Errorf("gate override: stdin/stdout is not a terminal; refusing (Board-only command)")
+		return fmt.Errorf("%s: stdin/stdout is not a terminal; refusing (Board-only command)", label)
 	}
 	return nil
 }

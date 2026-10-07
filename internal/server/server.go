@@ -136,6 +136,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Tasks REST API
 	if s.opts.DB != nil {
 		tasksH := NewTasksHandler(s.opts.DB, s.hub)
+		// STA-859: override / allow_deep are Board-only; they need the passkey gate.
+		tasksH.SetBoardGate(s.secMid.WrapBoardAction)
 		mux.HandleFunc("GET /api/tasks", tasksH.ListTasks)
 		mux.HandleFunc("POST /api/tasks", tasksH.CreateTask)
 		mux.HandleFunc("GET /api/tasks/{id}", tasksH.GetTask)

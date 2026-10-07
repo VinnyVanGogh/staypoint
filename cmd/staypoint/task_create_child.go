@@ -7,6 +7,7 @@ import (
 
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
@@ -23,7 +24,7 @@ func addChildCreateFlags(cmd *cobra.Command) {
 	cmd.Flags().String("kind", "", "Child work_kind: "+strings.Join(meshContext.ValidWorkKinds(), ", ")+" (default coding)")
 	cmd.Flags().String("handoff", "", "Plan text handed to the child (defaults to the parent's latest plan document)")
 	cmd.Flags().String("handoff-file", "", "Read the handoff plan from this file")
-	cmd.Flags().Bool("allow-deep", false, "Board override: allow nesting past the child depth cap")
+	cmd.Flags().Bool("allow-deep", false, "Board override: allow nesting past the child depth cap (Board terminal only; refused in agent sessions)")
 }
 
 // childCreateRequested reports whether runTaskCreate should take the local
@@ -42,6 +43,16 @@ func childTaskOptionsFromFlags(cmd *cobra.Command, args []string) (meshContext.C
 	allowDeep, _ := cmd.Flags().GetBool("allow-deep")
 	budget, _ := cmd.Flags().GetFloat64("budget")
 	maxTurns, _ := cmd.Flags().GetInt("max-turns")
+
+	if allowDeep {
+		// STA-859: --allow-deep is a Board override. This path writes the DB
+		// directly, so the daemon's passkey gate never sees it; refuse it in
+		// agent sessions and without a terminal, as `gate override` does.
+		tty := isatty.IsTerminal(os.Stdin.Fd()) && isatty.IsTerminal(os.Stdout.Fd())
+		if err := refuseBoardOnlyInAgentContext("--allow-deep", os.Getenv, tty); err != nil {
+			return meshContext.ChildTaskOptions{}, err
+		}
+	}
 
 	title := strings.TrimSpace(strings.Join(args, " "))
 	if title == "" {

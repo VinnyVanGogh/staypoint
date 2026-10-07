@@ -117,3 +117,46 @@ func TestWorkKindsMatchRouter(t *testing.T) {
 		t.Errorf("context kind %q is not a router kind (internal/router/kinds.go)", k)
 	}
 }
+
+// STA-859: the MCP tool has no depth override. An agent that smuggles
+// allow_deep / override / board_override into the arguments still hits the cap.
+func TestToolCallTaskCreateChild_CannotDeepCreate(t *testing.T) {
+	_, database := setupTestDB(t)
+	s := NewServer(WithDB(database))
+	defer s.Close()
+
+	if err := meshContext.SetChildTaskLimits(database, 5, 1); err != nil {
+		t.Fatal(err)
+	}
+	root, err := meshContext.CreateTaskWithOptions(database, meshContext.TaskCreateOptions{
+		Name: "root", RepoPath: "/tmp/repo", GitBranch: "main", AccountRole: "personal", WorkKind: "planning",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := meshContext.CreateChildTask(database, meshContext.ChildTaskOptions{ParentID: root.ID, Name: "d1", WorkKind: "coding"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, prop := range []string{"allow_deep", "override", "board_override"} {
+		if _, ok := taskCreateChildTool().InputSchema.Properties[prop]; ok {
+			t.Errorf("MCP child tool must not expose %q", prop)
+		}
+	}
+
+	res := callChildTool(t, s, "staypoint_task_create_child", map[string]any{
+		"title": "d2", "work_kind": "coding", "parent_id": leaf.ID,
+		"allow_deep": true, "override": true, "board_override": true, "BoardOverride": true,
+	})
+	if !res.IsError {
+		t.Fatalf("MCP deep create past the cap must fail, got: %s", res.Content[0].Text)
+	}
+	if !strings.Contains(strings.ToLower(res.Content[0].Text), "depth") {
+		t.Errorf("want a depth-cap error, got: %s", res.Content[0].Text)
+	}
+	var n int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM tasks WHERE parent_id = ?`, leaf.ID).Scan(&n); err != nil || n != 0 {
+		t.Errorf("deep child created via MCP: n=%d err=%v", n, err)
+	}
+}

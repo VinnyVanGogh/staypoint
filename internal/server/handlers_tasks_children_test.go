@@ -132,7 +132,9 @@ func TestMarkDone_ParentWithOpenChildrenNeedsOverride(t *testing.T) {
 	if code, body := postJSON(t, base+"/api/tasks/"+parentID+"/stage", token, map[string]any{"stage": "done"}); code != http.StatusConflict {
 		t.Errorf("stage done with open child: want 409, got %d %v", code, body)
 	}
-	if code, body := postJSON(t, base+"/api/tasks/"+parentID+"/done", token, map[string]any{"override": true}); code != http.StatusOK {
-		t.Errorf("board override: want 200, got %d %v", code, body)
+	// STA-859: the override is Board-only; a token-only caller is refused.
+	// The Board-gated success path is in handlers_tasks_board_gate_test.go.
+	if code, body := postJSON(t, base+"/api/tasks/"+parentID+"/done", token, map[string]any{"override": true}); code != http.StatusForbidden || body["error"] != "board_session_required" {
+		t.Errorf("token-only override: want 403 board_session_required, got %d %v", code, body)
 	}
 }

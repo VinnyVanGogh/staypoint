@@ -34,6 +34,8 @@ func isNotFound(err error) bool {
 type TasksHandler struct {
 	db  *sql.DB
 	hub *EventHub
+	// boardGate guards the Board override flags (STA-859); see SetBoardGate.
+	boardGate func(http.Handler) http.Handler
 }
 
 func NewTasksHandler(db *sql.DB, hub *EventHub) *TasksHandler {
@@ -175,6 +177,9 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if strings.TrimSpace(req.ParentID) != "" {
+		if req.AllowDeep && !h.requireBoardForOverride(w, r, "allow_deep") {
+			return
+		}
 		h.createChildTask(w, req.ParentID, req.Name, req.WorkKind, req.Handoff, req.Description, req.MaxBudgetUSD, req.MaxTurns, req.AllowDeep)
 		return
 	}
@@ -315,7 +320,8 @@ func (h *TasksHandler) AddComment(w http.ResponseWriter, r *http.Request) {
 }
 
 // MarkDone handles POST /api/tasks/{id}/done. A parent with open child tasks
-// is refused with 409 unless the Board passes {"override": true}.
+// is refused with 409 unless the Board passes {"override": true}; the
+// override is honored only through the Board gate (STA-859).
 func (h *TasksHandler) MarkDone(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -326,6 +332,9 @@ func (h *TasksHandler) MarkDone(w http.ResponseWriter, r *http.Request) {
 		Override bool `json:"override"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req) // body is optional
+	if req.Override && !h.requireBoardForOverride(w, r, "override") {
+		return
+	}
 
 	if err := context.MarkTaskDoneWithOptions(h.db, id, context.DoneOptions{BoardOverride: req.Override}); err != nil {
 		if isNotFound(err) {
@@ -680,6 +689,9 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 	case "todo", "in_progress", "in_review", "done":
 	default:
 		writeError(w, http.StatusBadRequest, "invalid stage: must be todo, in_progress, in_review, or done")
+		return
+	}
+	if req.Override && !h.requireBoardForOverride(w, r, "override") {
 		return
 	}
 
