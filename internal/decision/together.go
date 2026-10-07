@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -114,6 +116,41 @@ func NewTogether() (*TogetherDecisionClient, error) {
 		httpClient: &http.Client{Timeout: 15 * time.Second},
 	}, nil
 }
+
+// NewLocal returns a client for the local model only (Board rule, 2026-10-07:
+// decision traffic stays on this machine and is never billed). It ignores
+// TOGETHER_API_KEY / TOGETHER_BASE_URL, sends no API key, and accepts
+// DECISION_LOCAL_URL only when it points at a loopback host; anything else
+// falls back to the default Ollama endpoint.
+func NewLocal() *TogetherDecisionClient {
+	baseURL := defaultLocalURL
+	if u := os.Getenv("DECISION_LOCAL_URL"); u != "" && isLoopbackURL(u) {
+		baseURL = u
+	}
+	return &TogetherDecisionClient{
+		baseURL:    baseURL,
+		model:      firstNonEmpty(os.Getenv("DECISION_LOCAL_MODEL"), defaultLocalModel),
+		httpClient: &http.Client{Timeout: 15 * time.Second},
+	}
+}
+
+// isLoopbackURL reports whether raw is an http(s) URL whose host is
+// localhost or a loopback IP.
+func isLoopbackURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	h := u.Hostname()
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
+}
+
+// BaseURL returns the endpoint the client calls.
+func (c *TogetherDecisionClient) BaseURL() string { return c.baseURL }
 
 // NewWithEndpoint returns a client for an explicit endpoint (tests, fakes).
 func NewWithEndpoint(baseURL, apiKey, model string, hc *http.Client) *TogetherDecisionClient {
