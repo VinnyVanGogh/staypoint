@@ -90,26 +90,40 @@ ai() {
 
   if [[ "${STAYPOINT_ROUTE_TARGET:-$MESH_ROUTE_TARGET}" == "remote-claude" ]]; then
     staypoint bridge launch "$PWD" "$@"
+  elif [[ "${STAYPOINT_ROUTE_TARGET:-$MESH_ROUTE_TARGET}" == "local-claude-work" ]]; then
+    CLAUDE_CONFIG_DIR="$HOME/.claude-work" command claude "$@"
   elif [[ "$TARGET_CMD" == "claude" ]]; then
-    command claude "$@"
+    env -u CLAUDE_CONFIG_DIR claude "$@"
   else
     command agy --model "$TARGET_MODEL" "$@"
   fi
 }
 
+# claude [--work|--personal] [--force] ...
+#   --work      work seat, isolated in ~/.claude-work
+#   --personal  personal seat, the shared default profile (~/.claude.json)
+#   neither     staypoint picks by repo (work repos -> work); with --force, personal
+#   --force     skip staypoint and run Claude Code directly
 claude() {
-  local force=false
+  local force=false account=""
   local clean_args=()
   for arg in "$@"; do
-    if [[ "$arg" == "--force" ]]; then
-      force=true
-    else
-      clean_args+=("$arg")
-    fi
+    case "$arg" in
+      --force) force=true ;;
+      --work) account=work ;;
+      --personal) account=personal ;;
+      *) clean_args+=("$arg") ;;
+    esac
   done
 
   if [[ "$force" == true ]]; then
-    command claude "${clean_args[@]}"
+    if [[ "$account" == work ]]; then
+      CLAUDE_CONFIG_DIR="$HOME/.claude-work" command claude "${clean_args[@]}"
+    else
+      env -u CLAUDE_CONFIG_DIR claude "${clean_args[@]}"
+    fi
+  elif [[ -n "$account" ]]; then
+    staypoint --claude "--$account" "${clean_args[@]}"
   else
     staypoint --claude "${clean_args[@]}"
   fi
