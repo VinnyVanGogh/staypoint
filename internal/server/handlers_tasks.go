@@ -129,6 +129,7 @@ func (h *TasksHandler) GetTask(w http.ResponseWriter, r *http.Request) {
 // validWorkKinds is the set of accepted work_kind values.
 var validWorkKinds = map[string]bool{
 	"coding":       true,
+	"review":       true,
 	"architecture": true,
 	"planning":     true,
 	"qa":           true,
@@ -161,7 +162,7 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.WorkKind != "" && !validWorkKinds[req.WorkKind] {
-		writeError(w, http.StatusBadRequest, "invalid work_kind: must be one of coding, architecture, planning, qa")
+		writeError(w, http.StatusBadRequest, "invalid work_kind: must be one of coding, review, architecture, planning, qa")
 		return
 	}
 

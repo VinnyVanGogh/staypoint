@@ -904,7 +904,7 @@ func TestWebUI_CreateTaskKindOfWork(t *testing.T) {
 	if !strings.Contains(js, "'Kind of work'") {
 		t.Error("app.js missing 'Kind of work' detail panel field")
 	}
-	for _, label := range []string{"Coding & review", "Architecture", "Planning & docs", "QA & testing"} {
+	for _, label := range []string{"Coding —", "Code review —", "Architecture", "Planning & docs", "QA & testing"} {
 		if !strings.Contains(js, label) {
 			t.Errorf("app.js missing work_kind label %q", label)
 		}

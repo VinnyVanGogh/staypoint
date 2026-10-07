@@ -59,7 +59,7 @@ func TestCreateTask_ExplicitWorkKindStored(t *testing.T) {
 	srv, token := startTestServer(t, database)
 	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
 
-	for _, kind := range []string{"coding", "architecture", "planning", "qa"} {
+	for _, kind := range []string{"coding", "review", "architecture", "planning", "qa"} {
 		t.Run(kind, func(t *testing.T) {
 			resp, body := postTask(t, base, token, map[string]any{
 				"name":      "task-" + kind,
@@ -81,7 +81,7 @@ func TestCreateTask_UnknownWorkKindRejected(t *testing.T) {
 	srv, token := startTestServer(t, database)
 	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
 
-	for _, bad := range []string{"review", "security", "CODING", "Code", "debug", ""} {
+	for _, bad := range []string{"security", "CODING", "Code", "debug", ""} {
 		if bad == "" {
 			// empty is OK — defaults to "coding"
 			continue

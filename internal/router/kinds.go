@@ -10,6 +10,7 @@ type WorkKind string
 
 const (
 	WorkKindCoding       WorkKind = "coding"
+	WorkKindReview       WorkKind = "review"
 	WorkKindArchitecture WorkKind = "architecture"
 	WorkKindPlanning     WorkKind = "planning"
 	WorkKindQA           WorkKind = "qa"
@@ -18,6 +19,7 @@ const (
 // ValidWorkKinds is the complete set of accepted WorkKind values.
 var ValidWorkKinds = []WorkKind{
 	WorkKindCoding,
+	WorkKindReview,
 	WorkKindArchitecture,
 	WorkKindPlanning,
 	WorkKindQA,
@@ -42,19 +44,25 @@ type KindSlot struct {
 }
 
 // DefaultKindChains returns the built-in routing table when no [routing] section
-// is present in config.toml.
+// is present in config.toml. Claude slots carry PoolPersonalClaude as a
+// placeholder; ChainsForRepo / ResolveRoute bind them to the repo's seat.
 //
 // Routing table (source of truth):
 //
 //	coding       : Claude Opus → Gemini 3.1 Pro
+//	review       : Claude Opus → Gemini 3.1 Pro (code review always on Opus)
 //	architecture : Gemini 3.1 Pro → Claude Cloud (Opus) [off] → Claude Opus
 //	planning     : Gemini 3.8 Flash → Claude Cloud [off] → Claude Sonnet
 //	qa           : Gemini 3.8 Flash → Claude Sonnet
+//
+// Empty or unknown work_kind routes as coding (see NormalizeWorkKind).
 func DefaultKindChains() map[WorkKind][]KindSlot {
-	disabled := false
-	_ = disabled
 	return map[WorkKind][]KindSlot{
 		WorkKindCoding: {
+			{Provider: "claude-opus", Model: "opus", PoolID: PoolPersonalClaude, Enabled: true},
+			{Provider: "gemini-3.1-pro", Model: "gemini-3.1-pro-high", PoolID: PoolGeminiNative, Enabled: true},
+		},
+		WorkKindReview: {
 			{Provider: "claude-opus", Model: "opus", PoolID: PoolPersonalClaude, Enabled: true},
 			{Provider: "gemini-3.1-pro", Model: "gemini-3.1-pro-high", PoolID: PoolGeminiNative, Enabled: true},
 		},
@@ -103,14 +111,8 @@ func ResolveKindChain(kind WorkKind, chains map[WorkKind][]KindSlot, pacer *Pace
 			return s
 		}
 		if pacer != nil {
-			if pool, ok := pacer.Pools[s.PoolID]; ok && pool.IsLocked {
+			if locked, _ := PoolLockReason(pacer.Pools[s.PoolID], now); locked {
 				continue
-			}
-			// Also check work-claude pool for claude slots: work seat → personal seat ordering.
-			if s.PoolID == PoolPersonalClaude {
-				if work, ok := pacer.Pools[PoolWorkClaude]; ok && !work.IsLocked {
-					// work seat available; still pick this slot (personal) per the chain order
-				}
 			}
 		}
 		return s
