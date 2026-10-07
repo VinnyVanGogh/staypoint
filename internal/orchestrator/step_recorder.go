@@ -112,6 +112,10 @@ type StepRecorder struct {
 	pending      *openStep            // non-tool step being assembled (think, text)
 	pendingTools map[string]*openStep // parallel tool steps keyed by tool_use_id
 	worktreeRoot string               // set by harness after worktree creation; relativizes file paths
+	// outputEvents counts deltas that show the agent did something: text,
+	// thinking, a tool call, or a result carrying a response. The harness
+	// compares it across a turn to spot a turn that produced nothing (STA-775).
+	outputEvents int
 
 	// Two-tier token accounting: pending (MAX within current API call) +
 	// committed (SUM across completed API calls). Published SpentUSD always
@@ -228,6 +232,37 @@ func (r *StepRecorder) EmitCheckpoint(sha, msg string) {
 	r.publish("run.step", step)
 }
 
+// OutputEvents returns how many output-bearing deltas the recorder has seen
+// this run. See outputEvents.
+func (r *StepRecorder) OutputEvents() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.outputEvents
+}
+
+// EmitMessage emits a message step: the run's final answer, or the reason a
+// run ended without one (status "error").
+func (r *StepRecorder) EmitMessage(title, body, status string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.drainAllLocked()
+	r.seq++
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	step := RunStep{
+		RunID:     r.runID,
+		TaskID:    r.taskID,
+		Seq:       r.seq,
+		Kind:      StepMessage,
+		Title:     title,
+		Body:      body,
+		Status:    status,
+		StartedAt: now,
+		EndedAt:   &now,
+	}
+	r.persist(step)
+	r.publish("run.step", step)
+}
+
 // EmitRunState broadcasts a run.state SSE event without persisting a step row.
 // Use for transient states like "paused" / "in_progress" that don't mark the run terminal.
 func (r *StepRecorder) EmitRunState(disposition string) {
@@ -274,6 +309,15 @@ func (r *StepRecorder) EmitState(disposition string) {
 func (r *StepRecorder) Feed(d StepDelta) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	switch d.Kind {
+	case StepDeltaThinking, StepDeltaText, StepDeltaResult:
+		if strings.TrimSpace(d.Text) != "" {
+			r.outputEvents++
+		}
+	case StepDeltaToolUse:
+		r.outputEvents++
+	}
 
 	switch d.Kind {
 	case StepDeltaThinking:

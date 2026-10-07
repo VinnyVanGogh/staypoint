@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/context"
@@ -762,9 +763,12 @@ func (h *TasksHandler) GetTaskDiff(w http.ResponseWriter, r *http.Request) {
 	// "Whole run" (empty checkpoint) should diff against the task's pre-run
 	// baseline, not refs/staypoint/checkpoints/latest (which is the newest
 	// turn checkpoint and shows "No changes" after a run completes).
+	// target is what git diffs against: the pre-run checkpoint's full ref when
+	// known (no ref lookup needed), else the ID the caller asked for.
+	target := cpID
 	if cpID == "" {
-		if preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID); preRunID != "" {
-			cpID = preRunID
+		if preRunID, preRunRef, _ := checkpoint.FindPreRunCheckpointRef(ctx, task.RepoPath, task.ID); preRunID != "" {
+			cpID, target = preRunID, preRunRef
 		}
 	}
 
@@ -772,15 +776,26 @@ func (h *TasksHandler) GetTaskDiff(w http.ResponseWriter, r *http.Request) {
 	var stat string
 	var fileStats []checkpoint.FileDiffStat
 	var statErr, filesErr error
+	// The stat and numstat diffs are independent git processes; run them side
+	// by side so the task page waits for one, not both (STA-775).
+	var wg sync.WaitGroup
+	wg.Add(1)
 	if hasWorktree {
-		stat, statErr = checkpoint.DiffCheckpoint(ctx, workDir, cpID)
-		fileStats, filesErr = checkpoint.DiffCheckpointFiles(ctx, workDir, cpID)
+		go func() {
+			defer wg.Done()
+			stat, statErr = checkpoint.DiffCheckpoint(ctx, workDir, target)
+		}()
+		fileStats, filesErr = checkpoint.DiffCheckpointFiles(ctx, workDir, target)
 	} else {
 		// Worktree pruned — compare checkpoint against the task branch tip.
 		branch := "staypoint/" + task.ID
-		stat, statErr = checkpoint.DiffCheckpointAgainstRef(ctx, task.RepoPath, cpID, branch)
-		fileStats, filesErr = checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, cpID, branch)
+		go func() {
+			defer wg.Done()
+			stat, statErr = checkpoint.DiffCheckpointAgainstRef(ctx, task.RepoPath, target, branch)
+		}()
+		fileStats, filesErr = checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, target, branch)
 	}
+	wg.Wait()
 	// A timeout is not "no changes": say so instead of showing an empty diff.
 	for _, e := range []error{statErr, filesErr} {
 		if gitexec.IsTimeout(e) {
@@ -1065,10 +1080,7 @@ func (h *TasksHandler) GetTaskMigrations(w http.ResponseWriter, r *http.Request)
 	// Get the full diff file list.
 	ctx, cancel := gitRequestContext(r)
 	defer cancel()
-	cpID := ""
-	if preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID); preRunID != "" {
-		cpID = preRunID
-	}
+	_, cpID, _ := checkpoint.FindPreRunCheckpointRef(ctx, task.RepoPath, task.ID)
 	workDir, hasWorktree := taskCheckpointWorkDir(task)
 	var fileStats []checkpoint.FileDiffStat
 	var diffErr error
@@ -1093,9 +1105,13 @@ func (h *TasksHandler) GetTaskMigrations(w http.ResponseWriter, r *http.Request)
 	migPaths := migration.Detect(filePaths, globs)
 
 	// Determine if a read-only DB connection is configured for auto-verify.
+	// The Keychain lookup spawns `security`, so skip it when there is nothing
+	// to verify (STA-775).
 	hasAutoConn := false
-	if dsn, _ := migration.GetProjectDSN(task.RepoPath); dsn != "" {
-		hasAutoConn = true
+	if len(migPaths) > 0 {
+		if dsn, _ := migration.GetProjectDSN(task.RepoPath); dsn != "" {
+			hasAutoConn = true
+		}
 	}
 
 	// Read SQL content and check risk for each detected migration file.

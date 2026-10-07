@@ -366,11 +366,14 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 		// Claim() succeeds, so refused runs (ErrConcurrencyCap) never write steps.
 
 		parseDelta := func(line []byte) ([]orchestrator.StepDelta, error) {
-			prov := resolvedProv
-			if prov == "" {
-				prov = "claude"
+			parse := adapter.ParseChainStreamDelta
+			switch resolvedProv {
+			case "", "claude", "gemini":
+				// The failover chain may answer with either CLI.
+			default:
+				parse = adapter.AdapterFor(resolvedProv).ParseStreamDelta
 			}
-			raw, err := adapter.AdapterFor(prov).ParseStreamDelta(line)
+			raw, err := parse(line)
 			if err != nil {
 				return nil, err
 			}
@@ -426,7 +429,7 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			sr.EmitState("error")
 			return
 		}
-		sr.EmitState(result.Disposition)
+		// Harness.Run already emitted the final state step.
 		slog.Info("harness run complete",
 			slog.String("task", taskID),
 			slog.String("disposition", result.Disposition),

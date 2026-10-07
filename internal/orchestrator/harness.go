@@ -407,9 +407,9 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	var consecutiveAdapterErrors int
 	var lastTurnWasAdapterError bool
 
-	// lastTurnOutput preserves the raw stream-json bytes from the final adapter
-	// turn so extractFinalResponse can find the agent's last assistant message.
-	var lastTurnOutput []byte
+	// lastFinalText is the agent's most recent final response across turns. A
+	// later turn that is interrupted or answers nothing must not erase it.
+	var lastFinalText string
 
 	// workProductRegistered tracks whether the branch work product was inserted
 	// during an inline interceptor call so the post-loop path doesn't duplicate it.
@@ -449,12 +449,16 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		rawArgs := buildRawArgs(taskID, turn, cfg, brief, newComments)
 
 		var stdout io.Writer = tw
+		// outputBefore is the recorder's output count before this turn; an
+		// unchanged count after a clean exit means the turn produced nothing.
+		outputBefore := -1
 		if sr != nil && cfg.ParseDelta != nil {
 			stdout = &stepTeeWriter{dst: tw, rec: sr, parse: cfg.ParseDelta}
+			outputBefore = sr.OutputEvents()
 		}
 
+		var stderrBuf limitedWriter
 		if cfg.RunAdapter != nil {
-			var stderrBuf limitedWriter
 			turnStart := time.Now()
 
 			// Watch for stop signal during this turn: if stop is requested,
@@ -523,10 +527,32 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		// not provider-internal tool-use rounds (STA-466).
 		result.Turns++
 
-		// Preserve this turn's raw output for the run-summary comment posted at end of run.
-		if n := outBuf.Len(); n > 0 {
-			lastTurnOutput = make([]byte, n)
-			copy(lastTurnOutput, outBuf.Bytes())
+		// Keep the agent's latest answer for the run-summary comment and the
+		// final message step posted at end of run.
+		if text := extractFinalResponse(outBuf.Bytes()); text != "" {
+			lastFinalText = text
+		}
+
+		// A turn that exited cleanly without a single answer, thought or tool
+		// call ends the run rather than spending more turns on a silent agent.
+		// With no answer from any turn, the run failed; it is not idle (STA-775).
+		if cfg.RunAdapter != nil && !lastTurnWasAdapterError && outputBefore >= 0 &&
+			sr.OutputEvents() == outputBefore &&
+			(cfg.RunControl == nil || !cfg.RunControl.IsStopRequested(taskID)) {
+			stderrTail := stderrBuf.String()
+			runLog.Warn("adapter turn produced no output", slog.Int("turn", turn),
+				slog.String("stderr_tail", truncate(stderrTail, 500)))
+			if lastFinalText == "" {
+				result.Disposition = "failed"
+				result.DiagnosticMsg = noOutputMessage(0, stderrTail, outBuf.Len())
+				_, _ = h.DB.ExecContext(ctx,
+					`INSERT INTO run_errors (id, run_id, task_id, turn, exit_code, stderr_tail, duration_ms, model, adapter)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					uuid.NewString(), runID, taskID, turn, 0,
+					truncate(stderrTail, 4096), 0, cfg.Provider, cfg.Provider,
+				)
+			}
+			break
 		}
 
 		// Prefer text-only detection when the stream parser is active; fall back
@@ -714,6 +740,13 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	}
 
 	if sr != nil {
+		// Put the run's answer (or why there is none) on the timeline, not
+		// only in the chat thread.
+		if result.Disposition == "failed" {
+			sr.EmitMessage("Run ended with no output", result.DiagnosticMsg, "error")
+		} else if lastFinalText != "" {
+			sr.EmitMessage("Final message", lastFinalText, "done")
+		}
 		sr.EmitState(result.Disposition)
 	}
 
@@ -740,7 +773,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// Author 'agent-summary' is excluded from fetchUserComments so this comment
 	// is never re-injected into the agent's prompt as user input.
 	{
-		agentText := extractFinalResponse(lastTurnOutput)
+		agentText := lastFinalText
 		footer := buildRunFooter(result, wtPath)
 		var summaryBody string
 		if agentText != "" {
@@ -971,9 +1004,11 @@ func (w *stepTeeWriter) checkTextMarker(line []byte) {
 		return
 	}
 	line = bytes.TrimSpace(line)
-	// Quick guard: only assistant events can contain the agent's own text output.
+	// Quick guard: only assistant events (Claude) and the result event (agy,
+	// whose final answer arrives only there) carry the agent's own text.
 	// User-turn events carry echoed prompts, tool_result blocks, etc. — never agent output.
-	if !bytes.Contains(line, []byte(`"type":"assistant"`)) {
+	agyResult := bytes.Contains(line, []byte(`"event":"result"`))
+	if !agyResult && !bytes.Contains(line, []byte(`"type":"assistant"`)) {
 		return
 	}
 	deltas, err := w.parse(line)
@@ -981,7 +1016,8 @@ func (w *stepTeeWriter) checkTextMarker(line []byte) {
 		return
 	}
 	for _, d := range deltas {
-		if d.Kind == StepDeltaText && markerOnOwnLine(d.Text) {
+		text := d.Kind == StepDeltaText || (agyResult && d.Kind == StepDeltaResult)
+		if text && markerOnOwnLine(d.Text) {
 			w.textDetected = true
 			return
 		}

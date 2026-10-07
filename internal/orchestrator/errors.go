@@ -75,3 +75,25 @@ func lastLine(s string) string {
 	}
 	return ""
 }
+
+// noOutputMessage explains a run whose adapter exited without producing any
+// answer, thought or tool call. unparsedBytes is the stdout the stream parser
+// could not read, which points at a provider/parser mismatch.
+func noOutputMessage(exitCode int, stderrTail string, unparsedBytes int) string {
+	stderrTail = strings.TrimSpace(stderrTail)
+	if len(stderrTail) > 500 {
+		t := stderrTail[len(stderrTail)-500:]
+		for !utf8.ValidString(t) && len(t) > 0 {
+			t = t[1:]
+		}
+		stderrTail = "…" + t
+	}
+	if stderrTail == "" {
+		stderrTail = "empty"
+	}
+	msg := fmt.Sprintf("Run ended with no output (exit %d, stderr: %s)", exitCode, stderrTail)
+	if unparsedBytes > 0 {
+		msg += fmt.Sprintf(". The agent wrote %d bytes to stdout that StayPoint could not read as a stream event.", unparsedBytes)
+	}
+	return msg
+}
