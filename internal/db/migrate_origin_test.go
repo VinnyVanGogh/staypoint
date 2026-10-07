@@ -22,6 +22,7 @@ func openPre33(t *testing.T) (string, *sql.DB) {
 		`DROP INDEX IF EXISTS idx_tasks_origin`,
 		`ALTER TABLE tasks DROP COLUMN origin`,
 		`DELETE FROM schema_versions WHERE version = 33`,
+		`DELETE FROM schema_migrations WHERE version = 33`,
 	} {
 		if _, err := conn.Exec(stmt); err != nil {
 			t.Fatalf("undo 33 (%s): %v", stmt, err)
@@ -157,8 +158,13 @@ func TestMigration33_RerunKeepsNativeOrigins(t *testing.T) {
 	}
 	conn := store.DB()
 	seedTask(t, conn, "task-native", "Native", "STA", "2026-03-01T00:00:00Z")
-	if _, err := conn.Exec(`DELETE FROM schema_versions WHERE version = 33`); err != nil {
-		t.Fatal(err)
+	for _, stmt := range []string{
+		`DELETE FROM schema_versions WHERE version = 33`,
+		`DELETE FROM schema_migrations WHERE version = 33`,
+	} {
+		if _, err := conn.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
 	}
 	store.Close()
 
