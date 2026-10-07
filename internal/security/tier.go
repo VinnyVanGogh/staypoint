@@ -61,6 +61,10 @@ func (t Tier) String() string {
 type Verdict struct {
 	Tier    Tier
 	Reasons []string
+	// Scripts were judged by their contents (STA-868). A verdict below Red
+	// that lists scripts holds only if the command is rewritten to run
+	// exactly these bytes (PinCommand); otherwise treat it as Red.
+	Scripts []JudgedScript
 }
 
 func (v *Verdict) raise(t Tier, reason string) {
@@ -77,6 +81,7 @@ func (v *Verdict) merge(o Verdict) {
 		v.Tier = o.Tier
 	}
 	v.Reasons = append(v.Reasons, o.Reasons...)
+	v.Scripts = append(v.Scripts, o.Scripts...)
 }
 
 // Classifier assigns tiers. Worktree, when non-nil, additionally makes any
@@ -88,6 +93,17 @@ type Classifier struct {
 	// classifyGit uses it for bare-push branch resolution. If empty the
 	// bare-push check is fail-closed (returns Red when no explicit refspec).
 	CWD string
+	// ReadFile, when set, lets the classifier judge a script that a shell is
+	// asked to run (bash x.sh, ./x.sh) by its contents when the script lives in
+	// a scratch dir (STA-868). Nil keeps such calls Red ("runs an opaque script").
+	ReadFile func(path string) ([]byte, error)
+	// ScratchDirs are where an agent's throwaway files live: the run's scratch
+	// dir and the system temp dirs. Nil means DefaultScratchDirs().
+	ScratchDirs []string
+
+	line    *lineCtx // facts about the whole command line being classified
+	baseCWD string   // CWD before any `cd` in the line
+	inner   bool     // classifying a wrapper's inner command (env/xargs/find -exec ...)
 }
 
 // Classify classifies a shell command line. Unparseable input is Red (fail closed).
@@ -118,8 +134,16 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 	for _, s := range subs {
 		v.merge(c.classifyLine(s, depth+1))
 	}
+	lc := c.lineContext(line, segs, subs, depth)
+	dir := c.CWD
 	for i, s := range segs {
-		c.classifySegment(s, &v, depth)
+		cc := *c
+		cc.CWD, cc.line = dir, lc
+		if cc.baseCWD == "" {
+			cc.baseCWD = c.CWD
+		}
+		cc.classifySegment(s, &v, depth)
+		dir = c.nextDir(s, dir)
 		// remote-shell pipe: anything | sh
 		if i > 0 && segs[i-1].piped {
 			if name := baseCmd(stripPrefixes(s.argv)); shells[name] {
@@ -133,6 +157,7 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 var shells = map[string]bool{"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true, "fish": true}
 
 var greenCmds = map[string]bool{
+	"comm": true, "join": true, "paste": true, "tac": true, "rev": true, "fold": true,
 	"ls": true, "cat": true, "head": true, "tail": true, "wc": true, "grep": true, "egrep": true,
 	"fgrep": true, "rg": true, "pwd": true, "echo": true, "printf": true, "which": true, "type": true,
 	"file": true, "stat": true, "du": true, "df": true, "tree": true, "sort": true, "uniq": true,
@@ -147,6 +172,8 @@ var greenGit = map[string]bool{
 	"status": true, "log": true, "diff": true, "show": true, "rev-parse": true, "ls-files": true,
 	"blame": true, "describe": true, "shortlog": true, "grep": true, "ls-tree": true, "cat-file": true,
 	"rev-list": true, "remote": true, "branch": true, "tag": true, "config": true, "fetch": true,
+	"ls-remote": true, "for-each-ref": true, "merge-base": true, "name-rev": true, "count-objects": true,
+	"cherry": true, "symbolic-ref": true,
 }
 
 var greenGo = map[string]bool{"version": true, "list": true, "vet": true, "env": true, "doc": true}
@@ -204,6 +231,9 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 	argv := stripPrefixes(s.argv)
 
 	for _, r := range s.redirects {
+		if r.heredoc {
+			continue // target is the delimiter word, not a path
+		}
 		if r.target != "" && !strings.HasPrefix(r.op, "<") && !strings.HasPrefix(r.op, ">&") {
 			if r.target != "/dev/null" {
 				v.raise(Yellow, "")
@@ -216,6 +246,7 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 	}
 	name := baseCmd(argv)
 	args := argv[1:]
+	shellFedByHeredoc := c.classifyHeredocs(s, name, args, v, depth)
 
 	if why, ok := alwaysRed[name]; ok {
 		v.raise(Red, name+": "+why)
@@ -242,10 +273,21 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 				return
 			}
 		}
-		if len(args) == 0 || strings.HasPrefix(args[0], "-") {
-			v.raise(Red, name+": interactive or opaque shell")
-		} else {
+		idx, ok := shellScriptIndex(args)
+		off := len(s.argv) - len(argv)
+		call := scriptCall{name: name, prefixed: off > 0}
+		if ok {
+			call.token, call.flags = args[idx], args[:idx]
+			call.tokenDyn = segDyn(s, off+1+idx) || segMeta(s, off+1+idx)
+		}
+		switch {
+		case ok && c.scriptVerdict(call, v, depth):
+		case ok:
 			v.raise(Red, name+": runs an opaque script")
+		case shellFedByHeredoc && !shellReadsInput(args):
+			// body already classified as the script
+		default:
+			v.raise(Red, name+": interactive or opaque shell")
 		}
 		return
 	case name == "eval":
@@ -299,6 +341,12 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 	case greenCmds[name]:
 		// green unless redirected (handled above)
 	default:
+		off := len(s.argv) - len(argv)
+		call := scriptCall{name: name, token: argv[0], direct: true, prefixed: off > 0,
+			tokenDyn: segDyn(s, off) || segMeta(s, off)}
+		if strings.Contains(argv[0], "/") && c.scriptVerdict(call, v, depth) {
+			return
+		}
 		v.raise(Yellow, "")
 	}
 }
@@ -308,7 +356,9 @@ func (c *Classifier) classifyInner(argv []string, v *Verdict, depth int) {
 		v.raise(Red, "command nesting too deep to analyse")
 		return
 	}
-	c.classifySegment(segment{argv: argv}, v, depth+1)
+	ic := *c
+	ic.inner = true
+	ic.classifySegment(segment{argv: argv}, v, depth+1)
 }
 
 func trimUntil(a []string, stops ...string) []string {
@@ -435,6 +485,10 @@ func (c *Classifier) classifyGit(args []string, v *Verdict) {
 		}
 		if barePushTargetsMain(effectiveDir, rest) {
 			v.raise(Red, "git push targets main/master; Board approval required")
+		} else if c.baseCWD != "" && c.baseCWD != c.CWD && barePushTargetsMain(rebaseGitDir(effectiveDir, c.CWD, c.baseCWD), rest) {
+			// A `cd` earlier in the line may sit in a subshell we cannot see, so
+			// the push is checked from the original directory too.
+			v.raise(Red, "git push targets main/master; Board approval required")
 		}
 		v.raise(Yellow, "")
 	case "config":
@@ -456,6 +510,10 @@ func (c *Classifier) classifyGit(args []string, v *Verdict) {
 		}
 	case "fetch":
 		// network read, updates refs only
+	case "worktree":
+		if len(rest) == 0 || rest[0] != "list" {
+			v.raise(Yellow, "")
+		}
 	default:
 		if !greenGit[sub] {
 			v.raise(Yellow, "")
@@ -826,8 +884,9 @@ func (c *Classifier) checkPath(tok string, v *Verdict) {
 			continue
 		}
 		clean := filepath.Clean(exp)
+		// The run's own scratch dir may sit under ~/.staypoint/scratch.
 		for _, d := range c.sensitiveDirs() {
-			if clean == d || strings.HasPrefix(clean, d+string(filepath.Separator)) {
+			if (clean == d || strings.HasPrefix(clean, d+string(filepath.Separator))) && !c.inScratchUnder(d, clean) {
 				v.raise(Red, "touches sensitive path "+d)
 			}
 		}

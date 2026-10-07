@@ -13,6 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/VinnyVanGogh/staypoint/internal/gates"
 )
 
 const sessionCookieName = "staypoint_session"
@@ -40,7 +43,19 @@ type SecurityMiddleware struct {
 	db         *sql.DB    // used by WrapBoardAction to count registered passkeys
 	verifierMu sync.RWMutex
 	webAuthnVerifier func(r *http.Request, assertion string) error // injectable for tests
+
+	// Passkey grace (STA-868): a verified assertion opens a short server-side
+	// window, bound to an HttpOnly cookie, in which gate actions need no new
+	// Touch ID. Using the window never extends it.
+	graceMu sync.Mutex
+	graces  map[string]graceWindow
+	now     func() time.Time // test seam
 }
+
+// boardGraceCookieName carries the passkey grace token.
+const boardGraceCookieName = "staypoint_board_grace"
+
+type graceWindow struct{ start, end time.Time }
 
 // NewSecurityMiddleware creates a new SecurityMiddleware.
 func NewSecurityMiddleware(token string, port int) *SecurityMiddleware {
@@ -159,6 +174,102 @@ func (sm *SecurityMiddleware) WrapBoardSession(next http.Handler) http.Handler {
 //   - Passkey enrolled, no assertion     → 403 board_passkey_assertion_required
 //   - Passkey enrolled, bad assertion    → 403 board_passkey_assertion_invalid
 func (sm *SecurityMiddleware) WrapBoardAction(next http.Handler) http.Handler {
+	return sm.boardAction(next, false)
+}
+
+// WrapBoardGateAction is WrapBoardAction for security-gate decisions and
+// allow rules: within the passkey grace window (gates.passkey_grace_minutes)
+// a request without an assertion is accepted (STA-868).
+func (sm *SecurityMiddleware) WrapBoardGateAction(next http.Handler) http.Handler {
+	return sm.boardAction(next, true)
+}
+
+func (sm *SecurityMiddleware) clock() time.Time {
+	if sm.now != nil {
+		return sm.now()
+	}
+	return time.Now()
+}
+
+func (sm *SecurityMiddleware) graceMinutes() int {
+	if sm.db == nil {
+		return 0
+	}
+	return gates.GraceMinutes(sm.db)
+}
+
+// graceRemaining returns how long the request's grace window has left. The
+// end is the earlier of the window's own end and start+current setting, so
+// shortening or disabling the setting takes effect at once.
+func (sm *SecurityMiddleware) graceRemaining(r *http.Request) time.Duration {
+	c, err := r.Cookie(boardGraceCookieName)
+	if err != nil || c.Value == "" {
+		return 0
+	}
+	mins := sm.graceMinutes()
+	if mins <= 0 {
+		return 0
+	}
+	sm.graceMu.Lock()
+	g, ok := sm.graces[c.Value]
+	sm.graceMu.Unlock()
+	if !ok {
+		return 0
+	}
+	end := g.end
+	if capEnd := g.start.Add(time.Duration(mins) * time.Minute); capEnd.Before(end) {
+		end = capEnd
+	}
+	left := end.Sub(sm.clock())
+	if left <= 0 {
+		return 0
+	}
+	return left
+}
+
+// openGrace starts a new grace window after a verified assertion, replacing
+// the request's previous one.
+func (sm *SecurityMiddleware) openGrace(w http.ResponseWriter, r *http.Request) {
+	mins := sm.graceMinutes()
+	if mins <= 0 {
+		return
+	}
+	tok, err := GenerateAuthToken()
+	if err != nil {
+		return
+	}
+	now := sm.clock()
+	sm.graceMu.Lock()
+	if sm.graces == nil {
+		sm.graces = map[string]graceWindow{}
+	}
+	if c, err := r.Cookie(boardGraceCookieName); err == nil {
+		delete(sm.graces, c.Value)
+	}
+	for k, g := range sm.graces {
+		if !g.end.After(now) {
+			delete(sm.graces, k)
+		}
+	}
+	sm.graces[tok] = graceWindow{start: now, end: now.Add(time.Duration(mins) * time.Minute)}
+	sm.graceMu.Unlock()
+	http.SetCookie(w, &http.Cookie{
+		Name: boardGraceCookieName, Value: tok, Path: "/", HttpOnly: true,
+		SameSite: http.SameSiteStrictMode, MaxAge: mins * 60,
+	})
+	w.Header().Set("X-Board-Grace-Seconds", strconv.Itoa(mins*60))
+}
+
+// GraceStatus handles GET /api/board/passkey-grace (Board session).
+func (sm *SecurityMiddleware) GraceStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"minutes":           sm.graceMinutes(),
+		"remaining_seconds": int(sm.graceRemaining(r).Seconds()),
+	})
+}
+
+func (sm *SecurityMiddleware) boardAction(next http.Handler, allowGrace bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !sm.hasBoardCookie(r) {
 			writeBoardError(w, "board_session_required", "forbidden: board action requires a Board session (agent auth token is not sufficient)")
@@ -173,6 +284,13 @@ func (sm *SecurityMiddleware) WrapBoardAction(next http.Handler) http.Handler {
 
 		assertion := r.Header.Get("X-WebAuthn-Assertion")
 		if assertion == "" {
+			if allowGrace {
+				if left := sm.graceRemaining(r); left > 0 {
+					w.Header().Set("X-Board-Grace-Seconds", strconv.Itoa(int(left.Seconds())))
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
 			writeBoardError(w, "board_passkey_assertion_required", "forbidden: Board action requires a WebAuthn assertion")
 			return
 		}
@@ -194,6 +312,7 @@ func (sm *SecurityMiddleware) WrapBoardAction(next http.Handler) http.Handler {
 			return
 		}
 
+		sm.openGrace(w, r)
 		next.ServeHTTP(w, r)
 	})
 }

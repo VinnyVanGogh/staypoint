@@ -21,6 +21,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
 	"github.com/VinnyVanGogh/staypoint/internal/trackgate"
 	"github.com/VinnyVanGogh/staypoint/internal/wire"
+	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 	"github.com/spf13/cobra"
 )
 
@@ -406,6 +407,63 @@ var hookPreToolCmd = &cobra.Command{
 // preToolAllow is the response that lets the tool call proceed.
 func preToolAllow() { fmt.Println("{}") }
 
+// preToolAllowPinned lets the tool call proceed with its command replaced by
+// pinned (STA-868): scripts judged or approved by content run from the exact
+// bytes that were judged, not from a file that may have changed since. No
+// permissionDecision: Claude Code's normal permission flow still applies.
+func preToolAllowPinned(toolInput json.RawMessage, pinned string) {
+	fmt.Println(pinnedHookOutput(toolInput, pinned))
+}
+
+func pinnedHookOutput(toolInput json.RawMessage, pinned string) string {
+	in := map[string]any{}
+	_ = json.Unmarshal(toolInput, &in)
+	in["command"] = pinned
+	out, _ := json.Marshal(map[string]any{
+		"hookSpecificOutput": map[string]any{"hookEventName": "PreToolUse", "updatedInput": in},
+	})
+	return string(out)
+}
+
+// pinJudged returns the command to run for a verdict below Red. A verdict
+// that rests on script contents holds only when the command can be pinned to
+// those bytes; otherwise it is raised to Red.
+func pinJudged(cmd string, v *security.Verdict) string {
+	if v.Tier >= security.Red || len(v.Scripts) == 0 {
+		return ""
+	}
+	pinned, err := security.PinCommand(cmd, security.PinsFromVerdict(*v))
+	if err != nil {
+		v.Tier = security.Red
+		v.Reasons = append(v.Reasons, "script judged by its contents, but the command cannot be pinned to those bytes: "+err.Error())
+		return ""
+	}
+	return pinned
+}
+
+// snapshotScripts reads the scripts a held command runs, once, and returns
+// them for the gate request plus the command pinned to those bytes ("" when
+// it cannot be pinned; such a request is never auto-approved by a rule).
+func snapshotScripts(cmd, cwd string) ([]hookScript, string) {
+	refs := security.ScriptRefs(cmd, cwd, os.ReadFile, 0)
+	if len(refs) == 0 {
+		return nil, ""
+	}
+	scripts := make([]hookScript, 0, len(refs))
+	for _, r := range refs {
+		scripts = append(scripts, hookScript{Path: r.Path, Content: string(r.Full)})
+	}
+	pins, err := security.PinsFromRefs(refs)
+	if err != nil {
+		return scripts, ""
+	}
+	pinned, err := security.PinCommand(cmd, pins)
+	if err != nil {
+		return scripts, ""
+	}
+	return scripts, pinned
+}
+
 // preToolBlock writes a block decision back to Claude Code.
 func preToolBlock(reason string) {
 	fmt.Println(claudeBlockJSON(reason))
@@ -482,9 +540,15 @@ func handleHookPreTool() {
 
 	// CWD enables bare-push branch resolution inside the classifier so the
 	// same parsed argv handles `git -C /dir push` correctly.
-	c := &security.Classifier{CWD: cwd}
+	// ReadFile + ScratchDirs let a script in /tmp or the run's scratch dir be
+	// judged by its contents instead of held as opaque (STA-868).
+	c := &security.Classifier{CWD: cwd, ReadFile: os.ReadFile, ScratchDirs: hookScratchDirs(os.Getenv("STAYPOINT_TASK_ID"))}
 	verdict := c.Classify(bashInput.Command)
 
+	if pinned := pinJudged(bashInput.Command, &verdict); pinned != "" {
+		preToolAllowPinned(payload.ToolInput, pinned)
+		return
+	}
 	if verdict.Tier < security.Red {
 		preToolAllow()
 		return
@@ -506,10 +570,29 @@ func handleHookPreTool() {
 		return
 	}
 
+	// Snapshot the scripts the command runs: what the Board, advisors and
+	// rules see is what runs, when the command can be pinned.
+	scripts, pinned := snapshotScripts(bashInput.Command, cwd)
+	allow := func() {
+		if pinned != "" {
+			preToolAllowPinned(payload.ToolInput, pinned)
+			return
+		}
+		preToolAllow()
+	}
+
 	// Create a pending gate request in the daemon.
-	gr := createGateRequest(daemonURL, token, bashInput.Command, verdict.Reasons, payload.SessionID)
+	gr := createGateRequest(daemonURL, token, gateRequestBody{
+		Cmdline: bashInput.Command, Reasons: verdict.Reasons, RunID: payload.SessionID,
+		TaskID: os.Getenv("STAYPOINT_TASK_ID"), CWD: cwd, Scripts: scripts, Pinned: pinned != "",
+	})
 	if gr == nil {
 		preToolBlock(fmt.Sprintf("could not register gate request; command blocked (%s)", strings.Join(verdict.Reasons, "; ")))
+		return
+	}
+	if gr.Status == "approved" {
+		// A Board allow rule matched (STA-868); the daemon logged it.
+		allow()
 		return
 	}
 
@@ -519,7 +602,7 @@ func handleHookPreTool() {
 		status := pollGateRequest(daemonURL, token, gr.ID)
 		switch status {
 		case "approved":
-			preToolAllow()
+			allow()
 			return
 		case "denied":
 			preToolBlock(fmt.Sprintf("Board denied: %s", strings.Join(verdict.Reasons, "; ")))
@@ -547,15 +630,42 @@ func resolveDaemonConn() (daemonURL, token string) {
 }
 
 type gateRequestRef struct {
-	ID string `json:"id"`
+	ID     string `json:"id"`
+	Status string `json:"status"`
 }
 
-func createGateRequest(daemonURL, token, cmdline string, reasons []string, runID string) *gateRequestRef {
-	body, _ := json.Marshal(map[string]any{
-		"cmdline": cmdline,
-		"reasons": reasons,
-		"run_id":  runID,
-	})
+// gateRequestBody is POST /api/security/gate-requests. TaskID and CWD let the
+// daemon match Board allow rules scoped to a task, repo or organization.
+type gateRequestBody struct {
+	Cmdline string   `json:"cmdline"`
+	Reasons []string `json:"reasons"`
+	RunID   string   `json:"run_id"`
+	TaskID  string   `json:"task_id,omitempty"`
+	CWD     string   `json:"cwd,omitempty"`
+	// Scripts are snapshots of the scripts the command runs; Pinned says the
+	// hook will run exactly those bytes when approved.
+	Scripts []hookScript `json:"scripts,omitempty"`
+	Pinned  bool         `json:"pinned,omitempty"`
+}
+
+type hookScript struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+// hookScratchDirs are the system temp dirs plus the task's scratch dir.
+func hookScratchDirs(taskID string) []string {
+	dirs := security.DefaultScratchDirs()
+	if taskID != "" {
+		if d, err := workspace.ScratchDir(taskID); err == nil {
+			dirs = append(dirs, d)
+		}
+	}
+	return dirs
+}
+
+func createGateRequest(daemonURL, token string, in gateRequestBody) *gateRequestRef {
+	body, _ := json.Marshal(in)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
 		daemonURL+"/api/security/gate-requests", bytes.NewReader(body))
 	if err != nil {

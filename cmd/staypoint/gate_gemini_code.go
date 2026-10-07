@@ -51,7 +51,7 @@ func requestGeminiCode(out io.Writer, daemonURL, token, session, repo string, wa
 		return fmt.Errorf("gate gemini-code: %w", err)
 	}
 	reasons := []string{scope.Title(), "Board rule: Gemini never writes code; personal repos may allow it per agy session with Touch ID. Work repos: never."}
-	gr := createGateRequest(daemonURL, token, scope.Cmdline(), reasons, geminiapproval.RunID)
+	gr := createGateRequest(daemonURL, token, gateRequestBody{Cmdline: scope.Cmdline(), Reasons: reasons, RunID: geminiapproval.RunID})
 	if gr == nil {
 		return fmt.Errorf("gate gemini-code: could not file the request with staypointd at %s (is it running?)", daemonURL)
 	}

@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/VinnyVanGogh/staypoint/internal/gates"
 )
 
 var (
@@ -92,6 +94,16 @@ type Options struct {
 	// TestMode enables test-only routes (e.g. ship-review seed endpoint).
 	// Must never be set in production.
 	TestMode bool
+
+	// GateAdvisor gives a per-request advisory recommendation on every new
+	// security gate request (Together, STA-868). Nil disables it.
+	GateAdvisor gates.RequestAdvisor
+	// GateReviewer reviews all pending gate requests on demand (Gemini).
+	// Nil makes "Review with AI" report that it is not configured.
+	GateReviewer gates.Reviewer
+	// GateResolver overrides how requests get task/repo/org and script
+	// hashes (tests). Nil uses the real filesystem and git.
+	GateResolver *gates.Resolver
 }
 
 // GenerateAuthToken generates a 32-byte (64-character hex) cryptographically secure random token.

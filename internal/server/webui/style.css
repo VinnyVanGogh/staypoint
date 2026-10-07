@@ -4929,3 +4929,30 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 
 /* Legacy / archived badge on a task page header (direct links to hidden tasks). */
 .card-origin-badge.task-page-origin-badge { margin-left: 0; font-size: 11px; padding: 2px 6px; align-self: center; }
+
+/* Security Gates: tabs, batch toolbar, advisor lines, AI review, rules (STA-868) */
+.gates-tabs { display: inline-flex; gap: 4px; }
+.gates-tab.active { background: var(--accent, #7c3aed); color: #fff; }
+.gates-grace { font-size: 12px; color: var(--green, #3fb950); font-weight: 600; margin-right: 8px; }
+.gates-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border, #30363d); }
+.gates-toolbar .gate-btn:disabled { opacity: .5; cursor: default; }
+.gate-batch-approve, .gate-batch-approve-all { background: rgba(63,185,80,.1); border-color: rgba(63,185,80,.4); color: var(--green, #3fb950); }
+.gate-batch-deny { background: rgba(248,81,73,.1); border-color: rgba(248,81,73,.4); color: var(--red, #f85149); }
+.gate-review-btn, .gate-review-apply, .gate-remember-btn, .gate-remember-confirm { background: rgba(124,58,237,.12); border-color: rgba(124,58,237,.4); color: var(--accent-light, #a78bfa); }
+.gate-advice { margin-top: 4px; display: flex; flex-direction: column; gap: 2px; }
+.gate-advice-line { font-size: 11px; }
+.gate-advice-approve { color: var(--green, #3fb950); }
+.gate-advice-deny { color: var(--red, #f85149); }
+.gate-advice-none, .gate-advice-wait { color: var(--muted, #8b949e); font-style: italic; }
+.gate-context { font-size: 11px; color: var(--muted, #8b949e); margin-top: 2px; word-break: break-all; }
+.gate-remember-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
+.gate-remember-note { font-size: 11px; color: var(--muted, #8b949e); flex-basis: 100%; }
+.gate-row-ai-approved td:first-child { box-shadow: inset 3px 0 0 var(--green, #3fb950); }
+.gate-row-ai-denied td:first-child { box-shadow: inset 3px 0 0 var(--red, #f85149); }
+.gates-review-panel { margin: 10px 12px; padding: 10px 12px; border: 1px solid rgba(124,58,237,.4); border-radius: 6px; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.gates-review-error { border-color: rgba(248,81,73,.5); color: var(--red, #f85149); }
+.gates-review-title { font-weight: 600; }
+.gates-review-summary { font-size: 13px; }
+.gates-stats, .gates-settings { padding: 12px; border-bottom: 1px solid var(--border, #30363d); display: flex; flex-direction: column; gap: 6px; }
+.gates-stats-title { font-weight: 600; font-size: 13px; }
+.gates-stat-line, .gates-setting-row { font-size: 13px; }

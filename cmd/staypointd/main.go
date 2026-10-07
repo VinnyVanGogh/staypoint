@@ -20,6 +20,8 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/adapter"
 	"github.com/VinnyVanGogh/staypoint/internal/config"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
+	"github.com/VinnyVanGogh/staypoint/internal/decision"
+	"github.com/VinnyVanGogh/staypoint/internal/gates"
 	"github.com/VinnyVanGogh/staypoint/internal/ipc"
 	"github.com/VinnyVanGogh/staypoint/internal/logging"
 	"github.com/VinnyVanGogh/staypoint/internal/mcp"
@@ -248,7 +250,21 @@ func runDaemon(ctx context.Context) error {
 	var httpServer *server.Server
 	tokenPath := filepath.Join(cfg.DataDir, "auth_token")
 	boardTokenPath := filepath.Join(cfg.DataDir, "board_token")
+	// STA-868: Together advisory on each gate request (needs TOGETHER_API_KEY;
+	// without it requests show "no recommendation") and the Gemini batch review.
+	var gateAdvisor gates.RequestAdvisor
+	if tc, err := decision.NewTogether(); err == nil {
+		gateAdvisor = gates.TogetherAdvisor{Client: tc}
+	} else {
+		gateAdvisor = gates.TogetherAdvisor{}
+	}
+	var gateReviewer gates.Reviewer
+	if gr := gates.NewGeminiReviewerFromEnv(); gr != nil {
+		gateReviewer = gr
+	}
 	if s, err := server.New(server.Options{
+		GateAdvisor:    gateAdvisor,
+		GateReviewer:   gateReviewer,
 		BindHost:       "127.0.0.1",
 		Port:           41421,
 		TokenPath:      tokenPath,
