@@ -435,14 +435,26 @@ async function apiFetch(path, options = {}) {
   return r.json();
 }
 
+async function fetchAllTasks() {
+  const tasks = [];
+  for (let offset = 0; offset < 20000; offset += 1000) {
+    const page = await apiFetch(`/api/tasks?status=all&include_legacy=1&limit=1000&offset=${offset}`);
+    tasks.push(...(page.tasks || []));
+    if (!page.has_more) break;
+  }
+  return { tasks };
+}
+
 // ── Initial data load ─────────────────────────────────────
 async function loadAll() {
   try {
     const [fleetResp, tasksResp, sessionsResp] = await Promise.all([
       apiFetch('/api/fleet/overview').catch(() => null),
-      // include_legacy: the board and lists hide legacy tasks behind their own
-      // toggle; task detail and history views still need them.
-      apiFetch('/api/tasks?status=all&include_legacy=1&limit=1000').catch(() => ({ tasks: [] })),
+      // include_legacy: the board and lists hide legacy tasks and archived
+      // imports behind their own toggle; task detail and history views still
+      // need them. Paged: the API caps a page at 1000 and an import alone
+      // can exceed that.
+      fetchAllTasks().catch(() => ({ tasks: [] })),
       apiFetch('/api/sessions').catch(() => ({ sessions: [] })),
     ]);
 
@@ -5927,6 +5939,7 @@ function makeTaskCard(task) {
   meta.appendChild(el('span', `card-status-dot dot-${boardColumnFor(task) || task.status}`));
   meta.appendChild(el('span', 'card-id', task.source_ref || task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : '')));
   if (isLegacy(task)) meta.appendChild(el('span', 'card-origin-badge', 'legacy'));
+  else if (isArchived(task)) meta.appendChild(el('span', 'card-origin-badge', 'archive'));
   card.appendChild(meta);
   card.addEventListener('click', () => openDetail(task.id));
   return card;

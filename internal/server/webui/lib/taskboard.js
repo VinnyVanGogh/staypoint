@@ -52,6 +52,19 @@
     return !!task && task.origin === 'legacy';
   }
 
+  // isArchived: a finished Paperclip import (done or cancelled), including
+  // the "Paperclip archive — <Company>" parents.
+  function isArchived(task) {
+    if (!task || task.origin !== 'paperclip_import') return false;
+    const stage = String(task.execution_stage || '').toLowerCase();
+    return stage === 'done' || stage === 'cancelled';
+  }
+
+  // isHiddenByDefault: behind the one "Show archive & legacy" toggle.
+  function isHiddenByDefault(task) {
+    return isLegacy(task) || isArchived(task);
+  }
+
   function companyOf(task) {
     const org = String((task && (task.organization || task.org)) || '').trim();
     return org || NO_COMPANY;
@@ -75,7 +88,7 @@
     const o = opts || {};
     const groups = new Map();
     for (const t of tasks || []) {
-      if (!o.showLegacy && isLegacy(t)) continue;
+      if (!o.showLegacy && isHiddenByDefault(t)) continue;
       const col = boardColumnFor(t);
       if (!col) continue;
       const key = o.groupByCompany ? companyOf(t) : null;
@@ -100,14 +113,15 @@
     return out;
   }
 
-  // countLegacy is the number of legacy tasks the toggle would reveal.
+  // countLegacy is the number of board tasks the archive & legacy toggle
+  // would reveal.
   function countLegacy(tasks) {
     let n = 0;
-    for (const t of tasks || []) if (isLegacy(t) && boardColumnFor(t)) n++;
+    for (const t of tasks || []) if (isHiddenByDefault(t) && boardColumnFor(t)) n++;
     return n;
   }
 
-  const api = { BOARD_COLUMNS, BOARD_COLUMN_TITLES, NO_COMPANY, boardColumnFor, isLegacy, companyOf, buildBoard, countLegacy };
+  const api = { BOARD_COLUMNS, BOARD_COLUMN_TITLES, NO_COMPANY, boardColumnFor, isLegacy, isArchived, isHiddenByDefault, companyOf, buildBoard, countLegacy };
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;

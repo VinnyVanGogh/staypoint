@@ -122,3 +122,23 @@ func TestListTasks_HidesLegacyByDefault(t *testing.T) {
 		t.Errorf("origin=bogus: want 400, got %d", code)
 	}
 }
+
+func TestListTasks_HidesArchivedImports(t *testing.T) {
+	database := setupTestDB(t)
+	srv, token := startTestServer(t, database)
+	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
+	arch, err := meshContext.CreateTaskWithOptions(database, meshContext.TaskCreateOptions{Name: "[STA-5] old", NoRepo: true,
+		ExecutionStage: "done", Origin: meshContext.OriginPaperclipImport, SourceID: "u5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ids := listTaskIDs(t, base, token, "?status=all")
+	if ids[arch.ID] {
+		t.Errorf("archived import visible by default: %v", ids)
+	}
+	for _, q := range []string{"?status=all&include_archive=1", "?status=all&include_legacy=1"} {
+		if _, ids := listTaskIDs(t, base, token, q); !ids[arch.ID] {
+			t.Errorf("%s: archived import missing", q)
+		}
+	}
+}

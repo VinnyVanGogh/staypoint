@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/bridge"
 	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
@@ -139,6 +140,10 @@ type TaskCreateOptions struct {
 	// the working directory. The task cannot leave backlog until the Board
 	// sets a repo (SetTaskRepo).
 	NoRepo bool
+	// ClosedAt (RFC 3339) is when a task created already done or cancelled
+	// was closed at its source (Paperclip completedAt / cancelledAt). It
+	// becomes updated_at (and deleted_at for cancelled). Empty means now.
+	ClosedAt string
 }
 
 // GetCurrentGitBranch returns the current active git branch for a directory.
@@ -233,10 +238,29 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 			id, name, repo_path, git_branch, status, account_role,
 			max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 			organization, project, parent_id, assignee_agent_id, work_kind,
-			execution_stage, origin, priority, source_ref, source_id, provider, model_override, created_at, updated_at
+			execution_stage, origin, priority, source_ref, source_id, provider, model_override, created_at, updated_at, deleted_at
 		)
-		VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+		        COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?)
 	`
+	// status follows the stage, as in writeStage: a task created closed
+	// (an imported done/cancelled issue) is never active.
+	status := "active"
+	var closedAt, deletedAt interface{}
+	if c := strings.TrimSpace(opts.ClosedAt); c != "" && (stage == governance.StageDone || stage == governance.StageCancelled) {
+		closedAt = c
+	}
+	switch stage {
+	case governance.StageDone:
+		status = "done"
+	case governance.StageCancelled:
+		status = "soft_deleted"
+		if closedAt != nil {
+			deletedAt = closedAt
+		} else {
+			deletedAt = time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+		}
+	}
 
 	var parentID interface{}
 	if opts.ParentID != "" {
@@ -248,7 +272,7 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 		assigneeAgentID = opts.AssigneeAgentID
 	}
 
-	if _, err := db.Exec(query, taskID, name, repoPath, gitBranch, role, opts.MaxBudgetUSD, opts.MaxTurns, opts.Organization, opts.Project, parentID, assigneeAgentID, workKind, stage, origin, priority, opts.SourceRef, opts.SourceID, opts.Provider, opts.ModelOverride); err != nil {
+	if _, err := db.Exec(query, taskID, name, repoPath, gitBranch, status, role, opts.MaxBudgetUSD, opts.MaxTurns, opts.Organization, opts.Project, parentID, assigneeAgentID, workKind, stage, origin, priority, opts.SourceRef, opts.SourceID, opts.Provider, opts.ModelOverride, closedAt, deletedAt); err != nil {
 		return nil, fmt.Errorf("failed to insert task: %w", err)
 	}
 

@@ -39,8 +39,8 @@ blocked is set with 'staypoint task block' because it needs a reason.`,
 	},
 }
 
-// filterTaskList applies the task list flags: legacy tasks are hidden unless
-// includeLegacy, and stage (when set) keeps only that execution stage.
+// filterTaskList applies the task list flags: legacy tasks and archived
+// imports are hidden unless includeLegacy, and stage (when set) keeps only that execution stage.
 func filterTaskList(tasks []meshContext.Task, includeLegacy bool, stage string) []meshContext.Task {
 	tasks = meshContext.FilterLegacy(tasks, includeLegacy)
 	stage = strings.ToLower(strings.TrimSpace(stage))

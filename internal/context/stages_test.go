@@ -140,3 +140,48 @@ func TestGetActiveTaskForRepo_SkipsBacklogAndRepoless(t *testing.T) {
 		}
 	}
 }
+
+// An imported finished issue is created closed: status follows the stage,
+// the Paperclip completion time becomes updated_at (and deleted_at for
+// cancelled), the daemon is not woken, and lists hide it by default.
+func TestCreateTask_ClosedImportIsArchived(t *testing.T) {
+	database := setupTestDB(t)
+	done, err := CreateTaskWithOptions(database, TaskCreateOptions{Name: "[STA-5] done", NoRepo: true, ExecutionStage: "done",
+		Origin: OriginPaperclipImport, SourceRef: "STA-5", SourceID: "u5", ClosedAt: "2026-09-01T10:00:00.000Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.Status != "done" || done.UpdatedAt != "2026-09-01T10:00:00.000Z" || done.DeletedAt != nil {
+		t.Fatalf("done: %+v", done)
+	}
+	cancelled, err := CreateTaskWithOptions(database, TaskCreateOptions{Name: "[STA-7] gone", NoRepo: true, ExecutionStage: "cancelled",
+		Origin: OriginPaperclipImport, SourceID: "u7", ClosedAt: "2026-09-02T11:30:00.000Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled.Status != "soft_deleted" || cancelled.DeletedAt == nil || *cancelled.DeletedAt != "2026-09-02T11:30:00.000Z" {
+		t.Fatalf("cancelled: %+v", cancelled)
+	}
+	open, err := CreateTaskWithOptions(database, TaskCreateOptions{Name: "open", NoRepo: true, ExecutionStage: "backlog", Origin: OriginPaperclipImport, SourceID: "u1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	native, err := CreateTaskWithOptions(database, TaskCreateOptions{Name: "native done", RepoPath: "/r", GitBranch: "main", ExecutionStage: "done"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsArchived(*done) || !IsArchived(*cancelled) || IsArchived(*open) || IsArchived(*native) {
+		t.Fatal("IsArchived must be exactly the finished imports")
+	}
+	all, _ := ListTasks(database, true)
+	visible := map[string]bool{}
+	for _, tk := range FilterLegacy(all, false) {
+		visible[tk.ID] = true
+	}
+	if visible[done.ID] || !visible[open.ID] || !visible[native.ID] {
+		t.Fatalf("default visibility: %v", visible)
+	}
+	if len(FilterLegacy(all, true)) != len(all) {
+		t.Fatal("include switch must show everything")
+	}
+}

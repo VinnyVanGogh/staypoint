@@ -28,15 +28,30 @@ func IsValidOrigin(origin string) bool {
 	return false
 }
 
-// FilterLegacy drops legacy tasks unless includeLegacy is set. Every list
-// surface (API, CLI, MCP, board) hides legacy tasks by default.
-func FilterLegacy(tasks []Task, includeLegacy bool) []Task {
-	if includeLegacy {
+// IsArchived reports whether t is a finished imported task: origin
+// paperclip_import and stage done or cancelled (the "Paperclip archive"
+// parents and their children).
+func IsArchived(t Task) bool {
+	return t.Origin == OriginPaperclipImport &&
+		(t.ExecutionStage == "done" || t.ExecutionStage == "cancelled")
+}
+
+// IsHiddenByDefault reports whether list surfaces hide t unless asked:
+// legacy tasks and archived imports.
+func IsHiddenByDefault(t Task) bool {
+	return t.Origin == OriginLegacy || IsArchived(t)
+}
+
+// FilterLegacy drops legacy tasks and archived imports unless includeHidden
+// is set. Every list surface (API, CLI, MCP, board) hides them by default
+// behind one "archive & legacy" switch.
+func FilterLegacy(tasks []Task, includeHidden bool) []Task {
+	if includeHidden {
 		return tasks
 	}
 	out := tasks[:0:0]
 	for _, t := range tasks {
-		if t.Origin != OriginLegacy {
+		if !IsHiddenByDefault(t) {
 			out = append(out, t)
 		}
 	}

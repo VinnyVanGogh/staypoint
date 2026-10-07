@@ -23,6 +23,7 @@ func newImportTestCmd(t *testing.T, args ...string) (*cobra.Command, *bytes.Buff
 	cmd.Flags().String("url", "", "")
 	cmd.Flags().Duration("timeout", 0, "")
 	cmd.Flags().Int("sample", 5, "")
+	cmd.Flags().Bool("full-archive-descriptions", false, "")
 	if err := cmd.Flags().Parse(args); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +71,7 @@ func TestImportPaperclip_DryRunWritesNothing(t *testing.T) {
 	if err := cmd.RunE(cmd, nil); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"dry run", `Research & Intelligence (RES) -> organization "Research"`, "to import 1", "[RES-1] Read the paper", "Total to import: 1"} {
+	for _, want := range []string{"dry run", `Research & Intelligence (RES) -> organization "Research"`, "to import 1", "archived 1 [done 1]", "to archive 1", "[RES-1] Read the paper", "Total to import: 1 open + 1 archived = 2 tasks"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("dry-run output missing %q:\n%s", want, out.String())
 		}
@@ -105,7 +106,7 @@ func TestImportPaperclip_RequiresConfirmation(t *testing.T) {
 	if err := cmd.RunE(cmd, nil); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "Imported 1 tasks (1 parent tasks created") {
+	if !strings.Contains(out.String(), "Imported 1 open and 1 archived tasks (2 parent tasks created") {
 		t.Errorf("output: %s", out.String())
 	}
 	store, err := db.Open(cfg.DBPath)
@@ -115,7 +116,7 @@ func TestImportPaperclip_RequiresConfirmation(t *testing.T) {
 	defer store.Close()
 	tasks, _ := meshContext.ListTasks(store.DB(), false)
 	if len(tasks) != 2 {
-		t.Fatalf("tasks = %d, want parent + RES-1", len(tasks))
+		t.Fatalf("active tasks = %d, want parent + RES-1 (the archive is done)", len(tasks))
 	}
 	for _, tk := range tasks {
 		if tk.Organization != "Research" || tk.ExecutionStage != "backlog" || tk.Origin != meshContext.OriginPaperclipImport {

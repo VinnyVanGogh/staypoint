@@ -64,6 +64,9 @@ var taskListCmd = &cobra.Command{
 		defer store.Close()
 		all, _ := cmd.Flags().GetBool("all")
 		includeLegacy, _ := cmd.Flags().GetBool("legacy")
+		if archive, _ := cmd.Flags().GetBool("archive"); archive {
+			includeLegacy = true
+		}
 		stageFilter, _ := cmd.Flags().GetString("stage")
 		tasks, err := meshContext.ListTasks(store.DB(), all)
 		if err != nil {
@@ -397,7 +400,8 @@ func init() {
 	taskBlockCmd.Flags().String("reason", "", "Reason for blocking the task")
 
 	taskListCmd.Flags().BoolP("all", "a", false, "Include done and soft-deleted tasks")
-	taskListCmd.Flags().Bool("legacy", false, "Include legacy tasks (created before task origins were tracked)")
+	taskListCmd.Flags().Bool("legacy", false, "Include legacy tasks and archived Paperclip imports")
+	taskListCmd.Flags().Bool("archive", false, "Same as --legacy (archived imports are done/cancelled; combine with --all)")
 	taskListCmd.Flags().String("stage", "", "Only tasks in this execution stage (backlog, todo, in_progress, in_review, blocked, done, cancelled)")
 	taskAddCmd.Flags().Float64("budget", 0.0, "Maximum budget limit in USD")
 	taskAddCmd.Flags().Int("max-turns", 0, "Maximum allowed turns")

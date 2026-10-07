@@ -405,8 +405,9 @@ func (m *Model) rebuildColumns() {
 	}
 
 	for _, t := range m.allTasks {
-		if t.Origin == meshContext.OriginLegacy {
-			// Legacy tasks stay off the board; 'staypoint task list --legacy' shows them.
+		if meshContext.IsHiddenByDefault(t) {
+			// Legacy tasks and archived imports stay off the board;
+			// 'staypoint task list --legacy' shows them.
 			continue
 		}
 		col := MapTaskToColumn(t)

@@ -11,6 +11,7 @@ import (
 
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
+	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/paperclip"
 	"github.com/VinnyVanGogh/staypoint/internal/paperclip/paperclipfake"
 )
@@ -47,17 +48,25 @@ func seed(t *testing.T) *paperclipfake.Server {
 	fake.AddProject(manID, "p-man", "Platform", "", "/repos/mansol")
 
 	add := func(company, prefix string, n int, status, parent, project, desc string) {
-		fake.AddIssue(paperclip.ImportIssue{
+		iss := paperclip.ImportIssue{
 			ID: fmt.Sprintf("%s-%d", prefix, n), Identifier: fmt.Sprintf("%s-%d", prefix, n), IssueNumber: n,
 			Title: fmt.Sprintf("Issue %d", n), Description: desc, Status: status, Priority: "high",
 			CompanyID: company, ProjectID: project, ParentID: parent,
-		})
+		}
+		switch status {
+		case "done":
+			iss.CompletedAt = "2026-09-01T10:00:00Z"
+		case "cancelled":
+			iss.CancelledAt = "2026-09-02T11:30:00.000Z"
+		}
+		fake.AddIssue(iss)
 	}
 	add(staID, "STA", 1, "todo", "", "p-ws", "root")
 	add(staID, "STA", 2, "in_progress", "STA-1", "p-ws", "child")
 	add(staID, "STA", 3, "blocked", "STA-2", "p-ws", "grandchild")
 	add(staID, "STA", 4, "in_review", "STA-3", "p-ws", "great-grandchild")
 	add(staID, "STA", 5, "done", "", "p-ws", "closed parent")
+	add(staID, "STA", 8, "done", "STA-1", "p-ws", strings.Repeat("y", 2000))
 	add(staID, "STA", 6, "backlog", "STA-5", "p-none", strings.Repeat("x", 3000))
 	add(staID, "STA", 7, "cancelled", "", "p-none", "gone")
 	for n := 100; n < 330; n++ {
@@ -113,11 +122,12 @@ func TestImport_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.ParentsCreated != 2 || res.TasksCreated["StayPoint"] != 235 || res.TasksCreated["Managed Solution"] != 2 {
+	// Parents: STA backlog + STA archive + MAN backlog (MAN has nothing finished).
+	if res.ParentsCreated != 3 || res.TasksCreated["StayPoint"] != 235 || res.TasksCreated["Managed Solution"] != 2 || res.Archived["StayPoint"] != 3 {
 		t.Fatalf("result: %+v", res)
 	}
 	if fake.DetailCalls != 1 {
-		t.Errorf("detail calls = %d, want 1 (only the truncated description)", fake.DetailCalls)
+		t.Errorf("detail calls = %d, want 1 (only the open truncated description; archived ones keep a note)", fake.DetailCalls)
 	}
 
 	parent := taskBySource(t, conn, staID)
@@ -161,11 +171,32 @@ func TestImport_EndToEnd(t *testing.T) {
 	if m1.RepoPath != "/repos/mansol" || m1.AccountRole != "work" || m1.Organization != "Managed Solution" {
 		t.Errorf("MAN-1: %+v", m1)
 	}
-	for _, closed := range []string{"STA-5", "STA-7"} {
-		var n int
-		_ = conn.QueryRow(`SELECT COUNT(*) FROM tasks WHERE source_id = ?`, closed).Scan(&n)
-		if n != 0 {
-			t.Errorf("%s (done/cancelled) was imported", closed)
+	// Finished issues land flat in the archive: done/cancelled, closed at
+	// their Paperclip time, hidden by default, never runnable.
+	archive := taskBySource(t, conn, "archive:"+staID)
+	if archive.Name != "Paperclip archive — StayPoint" || archive.ExecutionStage != "done" || archive.Status != "done" || archive.ParentID != "" {
+		t.Fatalf("archive parent: %+v", archive)
+	}
+	s5, s7, s8 := taskBySource(t, conn, "STA-5"), taskBySource(t, conn, "STA-7"), taskBySource(t, conn, "STA-8")
+	if s5.ParentID != archive.ID || s5.ExecutionStage != "done" || s5.Status != "done" || s5.UpdatedAt != "2026-09-01T10:00:00.000Z" {
+		t.Errorf("STA-5: %+v", s5)
+	}
+	if s7.ParentID != archive.ID || s7.ExecutionStage != "cancelled" || s7.Status != "soft_deleted" || s7.DeletedAt == nil || *s7.DeletedAt != "2026-09-02T11:30:00.000Z" {
+		t.Errorf("STA-7: %+v", s7)
+	}
+	// Flat: STA-8's Paperclip parent is open STA-1, but it is archived.
+	if s8.ParentID != archive.ID || !strings.Contains(s8.Description, "truncated at import") || s8.SourceRef != "STA-8" {
+		t.Errorf("STA-8: parent %s, description %q", s8.ParentID, s8.Description[len(s8.Description)-90:])
+	}
+	for _, task := range []*meshContext.Task{archive, s5, s7, s8} {
+		if !meshContext.IsArchived(*task) || governance.IsRunnableStage(task.ExecutionStage) {
+			t.Errorf("%s must be archived and not runnable", task.Name)
+		}
+	}
+	all, _ := meshContext.ListTasks(conn, true)
+	for _, task := range meshContext.FilterLegacy(all, false) {
+		if meshContext.IsArchived(task) {
+			t.Errorf("archived %s visible by default", task.Name)
 		}
 	}
 
@@ -187,8 +218,8 @@ func TestImport_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan2.ToImport() != 0 {
-		t.Fatalf("re-run plans %d imports, want 0", plan2.ToImport())
+	if plan2.Total() != 0 || plan2.Companies[1].ArchivedImported != 3 {
+		t.Fatalf("re-run plans %d imports, want 0 (%+v)", plan2.Total(), plan2.Companies[1])
 	}
 	res2, err := Apply(ctx, client, conn, plan2, time.Now())
 	if err != nil {
@@ -280,5 +311,34 @@ func TestListIssues_FailsWhenServerIgnoresOffset(t *testing.T) {
 	_, err := paperclip.NewClient(fake.URL, "").ListIssues(context.Background(), staID, paperclip.OpenIssueStatuses)
 	if err == nil || !strings.Contains(err.Error(), "not paging") {
 		t.Fatalf("err = %v, want a paging error instead of an endless loop", err)
+	}
+}
+
+// STA alone has 845+ issues: the import must page past 1000 rows, and the
+// server's 500-row default must never cap it.
+func TestListIssues_PagesPastAThousand(t *testing.T) {
+	fake := paperclipfake.New(t)
+	fake.AddCompany("big", "Big", "BIG")
+	for n := 1; n <= 1234; n++ {
+		status := "done"
+		if n%3 == 0 {
+			status = "todo"
+		}
+		fake.AddIssue(paperclip.ImportIssue{ID: fmt.Sprintf("b-%d", n), Identifier: fmt.Sprintf("BIG-%d", n), IssueNumber: n, Title: "t", Status: status, CompanyID: "big"})
+	}
+	got, err := paperclip.NewClient(fake.URL, "").ListIssues(context.Background(), "big", paperclip.AllIssueStatuses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1234 || fake.ListCalls != 7 {
+		t.Fatalf("got %d issues in %d calls, want 1234 in 7", len(got), fake.ListCalls)
+	}
+	plan, err := BuildPlan(context.Background(), paperclip.NewClient(fake.URL, ""), openDB(t), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := plan.Companies[0]
+	if c.Open != 411 || c.Closed != 823 || len(c.ToArchive) != 823 || plan.Total() != 1234 {
+		t.Fatalf("open %d closed %d archive %d total %d", c.Open, c.Closed, len(c.ToArchive), plan.Total())
 	}
 }

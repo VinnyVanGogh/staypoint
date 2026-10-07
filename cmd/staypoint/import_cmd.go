@@ -23,12 +23,17 @@ var importCmd = &cobra.Command{
 
 var importPaperclipCmd = &cobra.Command{
 	Use:   "paperclip",
-	Short: "Import open Paperclip issues as backlog tasks (Board only)",
-	Long: `Import every open Paperclip issue (backlog, todo, in_progress, in_review,
-blocked) from every company into StayPoint.
+	Short: "Import all Paperclip issues: open as backlog, finished as archive (Board only)",
+	Long: `Import every Paperclip issue from every company into StayPoint.
 
-Each company gets one parent task, "Paperclip backlog — <Company>", in the
-matching organization (STA -> StayPoint, MAN -> Managed Solution, RES ->
+Open issues (backlog, todo, in_progress, in_review, blocked) go under one
+parent per company, "Paperclip backlog — <Company>". Finished issues (done,
+cancelled) go flat under "Paperclip archive — <Company>" (itself done) as done
+or cancelled tasks closed at their Paperclip completion time. The archive is
+hidden by default like legacy tasks (board "Show archive & legacy", API
+include_legacy/include_archive, 'task list --all --archive') and never runs.
+
+Both parents use the matching organization (STA -> StayPoint, MAN -> Managed Solution, RES ->
 Research, PER -> Maintenance, RUN -> RuneLite). Its issues become backlog
 children, unassigned, origin paperclip_import, titled "[STA-772] ...".
 Paperclip parent/child links are kept up to tasks.max_child_depth; deeper
@@ -53,6 +58,7 @@ func init() {
 	importPaperclipCmd.Flags().String("url", "", "Paperclip API base URL (default PAPERCLIP_API_URL or http://127.0.0.1:3100)")
 	importPaperclipCmd.Flags().Duration("timeout", 3*time.Minute, "Per-request Paperclip timeout (the API is slow)")
 	importPaperclipCmd.Flags().Int("sample", 5, "Titles shown per company in the dry run")
+	importPaperclipCmd.Flags().Bool("full-archive-descriptions", false, "Also fetch full text for truncated archived descriptions (one slow Paperclip request each)")
 }
 
 // importConfirm reads the confirmation; tests replace it.
@@ -76,6 +82,8 @@ func runImportPaperclip(cmd *cobra.Command, _ []string) error {
 	baseURL, _ := cmd.Flags().GetString("url")
 	timeout, _ := cmd.Flags().GetDuration("timeout")
 	sample, _ := cmd.Flags().GetInt("sample")
+	fullArchive, _ := cmd.Flags().GetBool("full-archive-descriptions")
+	opts := paperclipimport.Options{Companies: companies, FullArchiveDescriptions: fullArchive}
 	out := cmd.OutOrStdout()
 
 	client := paperclip.NewClient(baseURL, "")
@@ -88,7 +96,7 @@ func runImportPaperclip(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 		defer conn.Close()
-		plan, err := paperclipimport.BuildPlan(ctx, client, conn, paperclipimport.Options{Companies: companies})
+		plan, err := paperclipimport.BuildPlan(ctx, client, conn, opts)
 		if err != nil {
 			return err
 		}
@@ -101,31 +109,38 @@ func runImportPaperclip(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("open db: %w", err)
 	}
 	defer store.Close()
-	plan, err := paperclipimport.BuildPlan(ctx, client, store.DB(), paperclipimport.Options{Companies: companies})
+	plan, err := paperclipimport.BuildPlan(ctx, client, store.DB(), opts)
 	if err != nil {
 		return err
 	}
 	printImportPlan(out, plan, sample, false)
-	if plan.ToImport() == 0 {
+	if plan.Total() == 0 {
 		fmt.Fprintln(out, "Nothing to import.")
 		return nil
 	}
-	if !importConfirm(cmd.InOrStdin(), out, plan.ToImport()) {
+	if !importConfirm(cmd.InOrStdin(), out, plan.Total()) {
 		return fmt.Errorf("import paperclip: not confirmed; nothing written")
 	}
 	res, err := paperclipimport.Apply(ctx, client, store.DB(), plan, time.Now())
 	if res != nil {
-		orgs := make([]string, 0, len(res.TasksCreated))
-		total := 0
-		for org, n := range res.TasksCreated {
-			orgs = append(orgs, org)
-			total += n
+		seen := map[string]bool{}
+		var orgs []string
+		total, archived := 0, 0
+		for _, m := range []map[string]int{res.TasksCreated, res.Archived} {
+			for org := range m {
+				if !seen[org] {
+					seen[org] = true
+					orgs = append(orgs, org)
+				}
+			}
 		}
 		sort.Strings(orgs)
 		for _, org := range orgs {
-			fmt.Fprintf(out, "  %s: %d tasks\n", org, res.TasksCreated[org])
+			fmt.Fprintf(out, "  %s: %d open, %d archived\n", org, res.TasksCreated[org], res.Archived[org])
+			total += res.TasksCreated[org]
+			archived += res.Archived[org]
 		}
-		fmt.Fprintf(out, "Imported %d tasks (%d parent tasks created, %d skipped as already imported).\n", total, res.ParentsCreated, res.Skipped)
+		fmt.Fprintf(out, "Imported %d open and %d archived tasks (%d parent tasks created, %d skipped as already imported).\n", total, archived, res.ParentsCreated, res.Skipped)
 	}
 	return err
 }
@@ -141,13 +156,16 @@ func printImportPlan(out io.Writer, plan *paperclipimport.Plan, sample int, dryR
 			statuses = append(statuses, fmt.Sprintf("%s %d", s, n))
 		}
 		sort.Strings(statuses)
-		parent := "new parent"
-		if c.ParentTaskID != "" {
-			parent = "parent " + c.ParentTaskID
+		fmt.Fprintf(out, "%s (%s) -> organization %q\n", c.Company.Name, c.Company.IssuePrefix, c.Organization)
+		fmt.Fprintf(out, "  open %d [%s]; already imported %d; to import %d under %s (flattened %d, repo inferred %d)\n",
+			c.Open, strings.Join(statuses, ", "), c.AlreadyImported, len(c.ToImport), parentLabel(c.ParentTaskID), c.Flattened, c.WithRepo)
+		closed := make([]string, 0, len(c.ClosedByStatus))
+		for s, n := range c.ClosedByStatus {
+			closed = append(closed, fmt.Sprintf("%s %d", s, n))
 		}
-		fmt.Fprintf(out, "%s (%s) -> organization %q, %s\n", c.Company.Name, c.Company.IssuePrefix, c.Organization, parent)
-		fmt.Fprintf(out, "  open %d [%s]; already imported %d; to import %d (flattened %d, repo inferred %d)\n",
-			c.Open, strings.Join(statuses, ", "), c.AlreadyImported, len(c.ToImport), c.Flattened, c.WithRepo)
+		sort.Strings(closed)
+		fmt.Fprintf(out, "  archived %d [%s]; already imported %d; to archive %d under %s\n",
+			c.Closed, strings.Join(closed, ", "), c.ArchivedImported, len(c.ToArchive), parentLabel(c.ArchiveTaskID))
 		for i, pi := range c.ToImport {
 			if i >= sample {
 				fmt.Fprintf(out, "    ... %d more\n", len(c.ToImport)-sample)
@@ -160,5 +178,12 @@ func printImportPlan(out io.Writer, plan *paperclipimport.Plan, sample int, dryR
 			fmt.Fprintf(out, "    %s\n", title)
 		}
 	}
-	fmt.Fprintf(out, "\nTotal to import: %d tasks across %d companies\n", plan.ToImport(), len(plan.Companies))
+	fmt.Fprintf(out, "\nTotal to import: %d open + %d archived = %d tasks across %d companies\n", plan.ToImport(), plan.ToArchive(), plan.Total(), len(plan.Companies))
+}
+
+func parentLabel(id string) string {
+	if id == "" {
+		return "a new parent"
+	}
+	return id
 }
