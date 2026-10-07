@@ -237,20 +237,16 @@ type providerCandidate struct {
 	PoolID   router.PoolID // for quota lock check
 	Adapter  ProviderAdapter
 	ExtraEnv []string // e.g. CLAUDE_CONFIG_DIR for work claude
+	// Slot is set for route-pinned candidates (RunRoute). Its Model, when
+	// non-empty, overrides any --model in rawArgs for this candidate.
+	Slot *router.RouteSlot
 }
 
-// isPoolLocked returns true if the quota pool is hard-locked or has zero 5-hour headroom.
+// isPoolLocked returns true if the quota pool cannot take work right now
+// (hard lock, or spent 5h/weekly window). See router.PoolLockReason.
 func isPoolLocked(pool *router.QuotaPool) bool {
-	if pool == nil {
-		return false
-	}
-	if pool.IsLocked {
-		return true
-	}
-	if pool.FiveHour.ResetsAt.After(time.Now()) && pool.FiveHour.RemainingPct <= 0.0 {
-		return true
-	}
-	return false
+	locked, _ := router.PoolLockReason(pool, time.Now())
+	return locked
 }
 
 // BuildProviderChain constructs the ordered failover chain based on repo type and starting provider.
@@ -331,6 +327,132 @@ func RunAdapter(ctx context.Context, cwd string, pacerState *router.PacerState, 
 }
 
 func runWithFailover(ctx context.Context, cwd string, pacerState *router.PacerState, provider string, rawArgs []string, stdin io.Reader, stdout io.Writer, stderr io.Writer, resolve func(ProviderAdapter) (string, error)) error {
+	// Detect work vs personal repo
+	isWork, workSrc, _ := router.IsWorkRepo(cwd)
+
+	// Build the provider chain
+	chain := BuildProviderChain(isWork, provider)
+
+	if isWork && workSrc != "" {
+		fmt.Fprintf(stderr, "[staypoint-adapter] work repo detected (%s), chain: ", workSrc)
+	} else {
+		fmt.Fprintf(stderr, "[staypoint-adapter] personal repo, chain: ")
+	}
+	return runChain(ctx, cwd, pacerState, chain, rawArgs, stdin, stdout, stderr, resolve)
+}
+
+// AttemptInfo describes one provider spawn inside a run, reported to the
+// observer registered with WithAttemptObserver before the CLI starts.
+type AttemptInfo struct {
+	// Name is the candidate name ("personal-claude", "work-claude", "gemini").
+	Name string
+	// Provider is the adapter/stream-parser key ("claude", "gemini", "cloud_session").
+	Provider string
+	// Slot is the routed slot for RunRoute candidates; zero for legacy chains.
+	Slot router.RouteSlot
+	// FallbackReason is non-empty when an earlier planned candidate was skipped
+	// or failed before this one: "work seat locked (5h limit)".
+	FallbackReason string
+}
+
+type ctxAttemptObserverKey struct{}
+
+// WithAttemptObserver registers fn to be called (synchronously, on the calling
+// goroutine) before each provider spawn, so callers can label the run with the
+// provider that actually runs and pick the matching stream parser.
+func WithAttemptObserver(ctx context.Context, fn func(AttemptInfo)) context.Context {
+	return context.WithValue(ctx, ctxAttemptObserverKey{}, fn)
+}
+
+func candidateProvider(c providerCandidate) string {
+	switch c.Adapter.(type) {
+	case ClaudeAdapter:
+		return "claude"
+	case CloudSessionAdapter:
+		return "cloud_session"
+	default:
+		return "gemini"
+	}
+}
+
+// candidateLabel is the human label used in fallback reasons.
+func candidateLabel(c providerCandidate) string {
+	if c.Slot != nil {
+		return c.Slot.Label()
+	}
+	return candidateDisplayName(c.Name)
+}
+
+// candidateLockReason renders "work seat locked (5h limit)" for a locked candidate.
+func candidateLockReason(c providerCandidate, why string) string {
+	if c.Slot != nil {
+		return c.Slot.LockedReason(why)
+	}
+	return candidateDisplayName(c.Name) + " locked (" + why + ")"
+}
+
+// splitModelEffort splits a routed model like "gemini-3.1-pro-high" into the
+// CLI model and effort ("gemini-3.1-pro", "high"); Claude models pass through.
+func splitModelEffort(model string) (string, string) {
+	if m := modelEffortRe.FindStringSubmatch(model); m != nil {
+		return m[1], m[2]
+	}
+	return model, ""
+}
+
+var modelEffortRe = regexp.MustCompile(`^(.*)-(low|medium|high)$`)
+
+// CandidatesForRoute turns a resolved kind route into the pinned spawn chain:
+// one candidate per viable slot, in route order, with the seat's env (work
+// Claude gets CLAUDE_CONFIG_DIR=~/.claude-work) and the slot's model.
+func CandidatesForRoute(r router.KindRoute) []providerCandidate {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "~"
+	}
+	out := make([]providerCandidate, 0, len(r.Candidates))
+	for i := range r.Candidates {
+		slot := r.Candidates[i]
+		c := providerCandidate{PoolID: slot.PoolID, Slot: &slot}
+		switch slot.Family {
+		case router.FamilyClaude:
+			c.Adapter = ClaudeAdapter{}
+			if slot.Seat == router.SeatWork {
+				c.Name = "work-claude"
+				c.ExtraEnv = []string{"CLAUDE_CONFIG_DIR=" + home + "/.claude-work"}
+			} else {
+				c.Name = "personal-claude"
+			}
+		case router.FamilyCloud:
+			c.Name = "cloud_session"
+			c.Adapter = CloudSessionAdapter{}
+		default:
+			c.Name = "gemini"
+			c.Adapter = AgyAdapter{}
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// RunRoute runs one turn on the chain pinned by a resolved kind route. Quota is
+// re-checked against pacer at spawn time; a slot that locked since the route
+// was resolved is skipped, and the switch is reported via WithAttemptObserver.
+func RunRoute(ctx context.Context, cwd string, pacer *router.PacerState, route router.KindRoute, rawArgs []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
+	if route.AllLocked() {
+		return fmt.Errorf("[staypoint-adapter] all providers locked: %s", route.Body())
+	}
+	var resolve func(ProviderAdapter) (string, error)
+	if testBin, ok := ctx.Value(testBinKey).(string); ok && testBin != "" {
+		resolve = func(ProviderAdapter) (string, error) { return testBin, nil }
+	} else {
+		resolve = NewDefaultResolver().Resolve
+	}
+	fmt.Fprintf(stderr, "[staypoint-adapter] routed (%s, work=%v), chain: ", route.Kind, route.IsWork)
+	return runChain(ctx, cwd, pacer, CandidatesForRoute(route), rawArgs, stdin, stdout, stderr, resolve)
+}
+
+func runChain(ctx context.Context, cwd string, pacerState *router.PacerState, chain []providerCandidate, rawArgs []string, stdin io.Reader, stdout io.Writer, stderr io.Writer, resolve func(ProviderAdapter) (string, error)) error {
 	opts := parseRawArgs(rawArgs)
 
 	// Buffer stdin once so the fallback CLI receives the same input as the primary.
@@ -345,22 +467,17 @@ func runWithFailover(ctx context.Context, cwd string, pacerState *router.PacerSt
 		}
 	}
 
-	// Detect work vs personal repo
-	isWork, workSrc, _ := router.IsWorkRepo(cwd)
-
-	// Build the provider chain
-	chain := BuildProviderChain(isWork, provider)
-
-	if isWork && workSrc != "" {
-		fmt.Fprintf(stderr, "[staypoint-adapter] work repo detected (%s), chain: ", workSrc)
-	} else {
-		fmt.Fprintf(stderr, "[staypoint-adapter] personal repo, chain: ")
-	}
 	names := make([]string, len(chain))
 	for i, c := range chain {
 		names[i] = c.Name
+		if c.Slot != nil && c.Slot.Model != "" {
+			names[i] += "(" + c.Slot.Model + ")"
+		}
 	}
 	fmt.Fprintf(stderr, "%s\n", strings.Join(names, " > "))
+
+	observe, _ := ctx.Value(ctxAttemptObserverKey{}).(func(AttemptInfo))
+	var fallbackReasons []string
 
 	if pacerState == nil {
 		pacerState = &router.PacerState{
@@ -378,8 +495,9 @@ func runWithFailover(ctx context.Context, cwd string, pacerState *router.PacerSt
 	firstAttempt := true
 	for _, candidate := range chain {
 		pool := pacerState.Pools[candidate.PoolID]
-		if isPoolLocked(pool) {
-			fmt.Fprintf(stderr, "[staypoint-adapter] skipping %s (quota locked)\n", candidate.Name)
+		if locked, why := router.PoolLockReason(pool, time.Now()); locked {
+			fmt.Fprintf(stderr, "[staypoint-adapter] skipping %s (quota locked: %s)\n", candidate.Name, why)
+			fallbackReasons = append(fallbackReasons, candidateLockReason(candidate, why))
 			continue
 		}
 
@@ -390,17 +508,35 @@ func runWithFailover(ctx context.Context, cwd string, pacerState *router.PacerSt
 			candidateOpts.ConversationID = ""
 		}
 		firstAttempt = false
+		if candidate.Slot != nil && candidate.Slot.Model != "" {
+			candidateOpts.Model, candidateOpts.Effort = splitModelEffort(candidate.Slot.Model)
+		}
 
 		fmt.Fprintf(stderr, "[staypoint-adapter] trying %s...\n", candidate.Name)
 
 		bin, err := resolve(candidate.Adapter)
 		if err != nil {
 			fmt.Fprintf(stderr, "[staypoint-adapter] %s failed to resolve (%v), trying next provider...\n", candidate.Name, err)
+			fallbackReasons = append(fallbackReasons, candidateLabel(candidate)+" unavailable ("+err.Error()+")")
 			lastErr = err
 			continue
 		}
 
-		extraEnv := append(ctxEnv, candidate.ExtraEnv...)
+		if observe != nil {
+			info := AttemptInfo{
+				Name:           candidate.Name,
+				Provider:       candidateProvider(candidate),
+				FallbackReason: strings.Join(fallbackReasons, "; "),
+			}
+			if candidate.Slot != nil {
+				info.Slot = *candidate.Slot
+			}
+			observe(info)
+		}
+
+		extraEnv := make([]string, 0, len(ctxEnv)+len(candidate.ExtraEnv))
+		extraEnv = append(extraEnv, ctxEnv...)
+		extraEnv = append(extraEnv, candidate.ExtraEnv...)
 
 		// Run the candidate with a pipe so we can stream to stdout as the
 		// provider emits events. We commit (start forwarding) on the first
@@ -443,6 +579,7 @@ func runWithFailover(ctx context.Context, cwd string, pacerState *router.PacerSt
 
 		// Provider failed before committing: safe to fall back.
 		fmt.Fprintf(stderr, "[staypoint-adapter] %s failed (%v), trying next provider...\n", candidate.Name, execErr)
+		fallbackReasons = append(fallbackReasons, candidateLabel(candidate)+" failed ("+execErr.Error()+")")
 		lastErr = execErr
 	}
 
