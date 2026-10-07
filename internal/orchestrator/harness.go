@@ -534,6 +534,9 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// "marker-sent-then-turns-exhausted" (→ capped) from "no marker at all"
 	// (→ post-loop interceptor run, old behaviour).
 	var completionRejected bool
+	// completionRejections counts rejections in this run; at
+	// maxCompletionRejections the run ends and the task is parked.
+	var completionRejections int
 
 	// Silent-run detection (STA-775): whether any adapter turn ran, whether
 	// the agent produced any output, and the last turn's exit code and stderr
@@ -822,8 +825,23 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 				taskID, rejMsg,
 			)
 			completionRejected = true
+			completionRejections++
+			if completionRejections >= maxCompletionRejections {
+				// The agent cannot clear the checks on its own (2026-10-07: five
+				// planning runs looped ~9h on the same rejection). Park the task
+				// on the Board instead of re-prompting forever.
+				result.Disposition = "backlog"
+				result.DiagnosticMsg = fmt.Sprintf(
+					"Completion was rejected %d times in this run, so the run was stopped and the task parked in backlog for the Board.\n\nLast rejection:\n%s",
+					completionRejections, rejMsg)
+				_, _ = h.DB.ExecContext(ctx,
+					`UPDATE tasks SET is_blocked=1, block_reason=? WHERE id=?`,
+					fmt.Sprintf("completion rejected %d times; needs the Board", completionRejections), taskID)
+				runLog.Warn("interceptor rejected completion repeatedly; parking task", slog.Int("rejections", completionRejections))
+				break
+			}
 			runLog.Info("interceptor rejected completion; continuing run", slog.Int("turn", turn))
-			// Don't break — consume remaining turns so the agent can self-correct.
+			// Don't break — let the agent self-correct, up to maxCompletionRejections.
 		}
 
 		if cfg.MaxBudgetUSD > 0 && result.SpentUSD >= cfg.MaxBudgetUSD {

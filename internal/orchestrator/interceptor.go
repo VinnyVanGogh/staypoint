@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -35,6 +36,24 @@ type GuardFunc func(ctx context.Context, taskID, wtPath, repoRoot string) (failR
 type Interceptor struct {
 	DB     *sql.DB
 	Guards []GuardFunc
+}
+
+// maxCompletionRejections is how many times one run may have its completion
+// rejected before the harness stops it and parks the task for the Board.
+const maxCompletionRejections = 3
+
+// nonCodeKinds produce documents, not commits: they need no Ship Review card,
+// and a stored task document counts as their work product.
+var nonCodeKinds = map[string]bool{"planning": true, "review": true, "architecture": true, "docs": true}
+
+// isNonCode reports whether the task's work kind is non-code.
+func (ic *Interceptor) isNonCode(taskID string) bool {
+	if ic.DB == nil {
+		return false
+	}
+	var kind sql.NullString
+	_ = ic.DB.QueryRow(`SELECT work_kind FROM tasks WHERE id=?`, taskID).Scan(&kind)
+	return nonCodeKinds[kind.String]
 }
 
 // NewInterceptor returns an Interceptor wired with the default verification suite.
@@ -105,10 +124,20 @@ func (ic *Interceptor) checkWorkProducts(_ context.Context, taskID, _, _ string)
 	if err != nil {
 		return "", err
 	}
-	if n == 0 {
-		return "No work product registered for this task. Commit and push your changes so a branch work product is created before marking done.", nil
+	if n > 0 {
+		return "", nil
 	}
-	return "", nil
+	if ic.isNonCode(taskID) {
+		var docs int
+		if err := ic.DB.QueryRow(`SELECT COUNT(1) FROM task_documents WHERE task_id=? AND doc_key != 'description'`, taskID).Scan(&docs); err != nil {
+			return "", err
+		}
+		if docs > 0 {
+			return "", nil
+		}
+		return "No work product registered for this task. Store your deliverable as a task document (`staypoint task doc add " + taskID + " plan \"$(cat <path>)\"`) before marking done.", nil
+	}
+	return "No work product registered for this task. Commit and push your changes so a branch work product is created before marking done.", nil
 }
 
 // checkGitSync verifies:
@@ -160,8 +189,16 @@ func (ic *Interceptor) checkGitSync(ctx context.Context, _, wtPath, _ string) (s
 // Worktree sub-paths (repo_path LIKE repoRoot+'/.worktrees/%') are excluded so
 // that rig/dogfood tasks running in a .worktrees/ branch do not block the parent
 // checkout from completing.
-func (ic *Interceptor) checkMutexLease(_ context.Context, taskID, _, repoRoot string) (string, error) {
+//
+// A task running in its own worktree (wtPath set and not the repo root, as
+// every STA-774 task does) shares no checkout with its siblings, so it is not
+// blocked: parallel tasks on one repo used to deadlock here, each waiting for
+// the others to finish.
+func (ic *Interceptor) checkMutexLease(_ context.Context, taskID, wtPath, repoRoot string) (string, error) {
 	if ic.DB == nil {
+		return "", nil
+	}
+	if wtPath != "" && filepath.Clean(wtPath) != filepath.Clean(repoRoot) {
 		return "", nil
 	}
 	var identifier string
@@ -201,20 +238,31 @@ func (ic *Interceptor) checkShipReviewCard(ctx context.Context, taskID, wtPath, 
 	if gateVal == "false" {
 		return "", nil
 	}
+	// Non-code work ships documents, not a branch.
+	if ic.isNonCode(taskID) {
+		return "", nil
+	}
 
 	// Skip if the worktree has no commits ahead of main (nothing shipped).
+	// origin/main first: task worktrees start from it, and the local main
+	// may be stale, which made a clean worktree look ahead.
 	if wtPath != "" {
 		if _, err := os.Stat(wtPath); err == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			cmd := gitexec.Command(ctx, "rev-list", "--count", "main..HEAD")
-			cmd.Dir = wtPath
-			cmd.Env = security.ChildEnv()
-			if out, err := cmd.Output(); err == nil {
+			for _, base := range []string{"origin/main", "main"} {
+				cmd := gitexec.Command(ctx, "rev-list", "--count", base+"..HEAD")
+				cmd.Dir = wtPath
+				cmd.Env = security.ChildEnv()
+				out, err := cmd.Output()
+				if err != nil {
+					continue // base ref missing: try the next one
+				}
 				ahead := strings.TrimSpace(string(out))
 				if ahead == "" || ahead == "0" {
 					return "", nil
 				}
+				break
 			}
 		}
 	}
@@ -266,6 +314,8 @@ func plainEnglishCheck(reason string) string {
 	switch {
 	case strings.HasPrefix(reason, "task ") && strings.Contains(reason, "still in_progress"):
 		return reason + "."
+	case strings.Contains(reason, "task document"):
+		return reason // non-code hint: keep the exact command
 	case strings.HasPrefix(reason, "no work product") || strings.HasPrefix(reason, "No work product"):
 		return "No work product registered. Register at least one (PR link, commit, or file) before marking done."
 	case strings.Contains(reason, "uncommitted change"):
