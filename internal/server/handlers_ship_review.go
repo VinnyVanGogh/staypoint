@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	gocontext "context"
 	"database/sql"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/context"
@@ -19,6 +21,8 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/migration"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
+	"github.com/VinnyVanGogh/staypoint/internal/testgate"
+	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 	"github.com/google/uuid"
 )
 
@@ -69,6 +73,21 @@ func (h *ShipReviewHandler) GetCard(w http.ResponseWriter, r *http.Request) {
 		if jsonErr := json.Unmarshal(cardBytes, &merged); jsonErr == nil {
 			merged["unverified_migrations"] = unverified
 			merged["repo_name"] = filepath.Base(task.RepoPath)
+			// STA-727: the card shows the LIVE banner and confirm from these.
+			// live_gate/live_gate_reason (STA-799): start-dev needs the Board
+			// gate, either because the project is live_credentials or because
+			// the repo path could not be verified against the live projects.
+			// dev_configured: start-dev has something to run (a saved
+			// dev_command, or a Supabase project it will auto-configure).
+			if cfg, reason, cfgErr := shipreview.LiveGate(h.db, task.RepoPath); cfgErr == nil {
+				isWork := shipreview.IsWorkRepo(task.RepoPath)
+				merged["is_work_repo"] = isWork
+				merged["effective_merge_mode"] = shipreview.EffectiveMergeMode(cfg, isWork)
+				merged["live_credentials"] = cfg.LiveCredentials
+				merged["live_gate"] = reason != ""
+				merged["live_gate_reason"] = reason
+				merged["dev_configured"] = cfg.DevCommand != "" || shipreview.HasSupabaseConfig(task.RepoPath)
+			}
 			if gitErr != nil {
 				// The card itself is DB-only; return it and say why the
 				// migration check is missing rather than hanging or erroring.
@@ -127,6 +146,9 @@ func (h *ShipReviewHandler) UpsertCard(w http.ResponseWriter, r *http.Request) {
 
 	card, err := shipreview.BuildAndStartCard(r.Context(), h.db, task.ID, task.RepoPath, req.TestSteps, req.DevURL, req.CheckRuns)
 	if err != nil {
+		if writeTaskBaseError(w, err) {
+			return
+		}
 		code := http.StatusInternalServerError
 		if errors.Is(err, shipreview.ErrTestStepsRequired) || errors.Is(err, shipreview.ErrInvalidBranch) || errors.Is(err, shipreview.ErrInvalidDevURL) {
 			code = http.StatusBadRequest
@@ -149,8 +171,144 @@ func (h *ShipReviewHandler) UpsertCard(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(card)
 }
 
+// writeTaskBaseError answers a card or Approve request whose task base could
+// not be verified (STA-774) and reports whether err was such an error. The
+// caller refuses the request either way when err is non-nil.
+func writeTaskBaseError(w http.ResponseWriter, err error) bool {
+	var code string
+	switch {
+	case errors.Is(err, shipreview.ErrNoChanges):
+		code = "no_changes"
+	case errors.Is(err, workspace.ErrTaskBaseTampered):
+		code = "base_tampered"
+	case errors.Is(err, workspace.ErrNoTaskBase):
+		code = "base_unverified"
+	default:
+		return false
+	}
+	writeErrorJSON(w, http.StatusConflict, map[string]any{
+		"error":   code,
+		"message": err.Error(),
+	})
+	return true
+}
+
+// verifyCardBase runs shipreview.VerifyCardChanges for Approve and writes
+// the refusal when it fails. Any failure, including a git or DB error, blocks.
+func (h *ShipReviewHandler) verifyCardBase(w http.ResponseWriter, r *http.Request, card *shipreview.Card, task *context.Task) bool {
+	ctx, cancel := gitRequestContext(r)
+	defer cancel()
+	if _, err := shipreview.VerifyCardChanges(ctx, h.db, card, task.RepoPath); err != nil {
+		if !writeTaskBaseError(w, err) {
+			writeErrorJSON(w, gitErrorStatus(err), map[string]any{
+				"error":   "base_unverified",
+				"message": "could not verify the task base: " + err.Error(),
+			})
+		}
+		return false
+	}
+	return true
+}
+
+// liveDevWarning is the warning the Board confirms before starting a dev
+// server for a live_credentials project (STA-727). The UI shows the same text.
+const liveDevWarning = "LIVE PRODUCTION DATA. Actions in this preview are real."
+
+// unverifiedDevWarning is the warning the Board confirms when start-dev is
+// gated because the repo path could not be verified against the
+// live_credentials projects (STA-799). The UI shows the same text.
+const unverifiedDevWarning = "UNVERIFIED REPO PATH. This repo could not be verified as separate from a live_credentials project, so treat this preview as live."
+
+// liveGateWarning returns the warning for a shipreview.LiveGate reason.
+func liveGateWarning(reason string) string {
+	if reason == shipreview.LiveGateUnverifiedPath {
+		return unverifiedDevWarning
+	}
+	return liveDevWarning
+}
+
+// liveGateRefusal returns the 403 message for a gated start-dev that did not
+// pass the Board gate.
+func liveGateRefusal(reason string) string {
+	if reason == shipreview.LiveGateUnverifiedPath {
+		return "forbidden: this repo path could not be verified as separate from a live_credentials project, so starting its dev server requires a Board session and passkey"
+	}
+	return "forbidden: starting a live_credentials dev server requires a Board session and passkey"
+}
+
+type liveBoardGateKey struct{}
+
+// StartDevGated routes POST start-dev. Ungated projects go straight to
+// StartDev, agent-callable as before. A gated project (shipreview.LiveGate)
+// must first pass boardGate (WrapBoardAction: Board session + passkey
+// assertion); StartDev then also requires {"confirm_live": true} and audits
+// the confirmation. A refusal from boardGate keeps its error code and gains
+// live_gate_reason and a message saying why the start is gated.
+func (h *ShipReviewHandler) StartDevGated(boardGate func(http.Handler) http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, task, ok := h.requireCard(w, r.PathValue("id"))
+		if !ok {
+			return
+		}
+		// STA-767: LiveGate matches the live row by directory, so a task
+		// repo_path aliasing a live repo is gated too.
+		_, reason, err := shipreview.LiveGate(h.db, task.RepoPath)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
+			return
+		}
+		if reason == "" {
+			h.StartDev(w, r)
+			return
+		}
+		var passed *http.Request
+		refusal := &boardGateRefusal{header: http.Header{}, status: http.StatusOK}
+		boardGate(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			passed = r
+		})).ServeHTTP(refusal, r)
+		if passed == nil {
+			refusal.writeTo(w, reason)
+			return
+		}
+		h.StartDev(w, passed.WithContext(gocontext.WithValue(passed.Context(), liveBoardGateKey{}, true)))
+	})
+}
+
+// boardGateRefusal records the response boardGate writes when it refuses a
+// request, so StartDevGated can add why the start is gated.
+type boardGateRefusal struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (b *boardGateRefusal) Header() http.Header         { return b.header }
+func (b *boardGateRefusal) WriteHeader(status int)      { b.status = status }
+func (b *boardGateRefusal) Write(p []byte) (int, error) { return b.body.Write(p) }
+
+func (b *boardGateRefusal) writeTo(w http.ResponseWriter, reason string) {
+	var payload map[string]any
+	if err := json.Unmarshal(b.body.Bytes(), &payload); err != nil {
+		for k, v := range b.header {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(b.status)
+		_, _ = w.Write(b.body.Bytes())
+		return
+	}
+	msg := liveGateRefusal(reason)
+	if gateMsg, _ := payload["message"].(string); gateMsg != "" {
+		msg += " (" + strings.TrimPrefix(gateMsg, "forbidden: ") + ")"
+	}
+	payload["message"] = msg
+	payload["live_gate_reason"] = reason
+	writeErrorJSON(w, b.status, payload)
+}
+
 // StartDev handles POST /api/tasks/{id}/ship-review/start-dev
 // Returns 202 immediately; setup runs async and streams progress via SSE.
+// Mount it through StartDevGated: on a gated project (shipreview.LiveGate) it refuses any
+// request that did not pass the Board gate.
 func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
 	card, task, ok := h.requireCard(w, taskID)
@@ -166,15 +324,61 @@ func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, err := shipreview.GetProjectDevConfig(h.db, task.RepoPath)
+	cfg, reason, err := shipreview.LiveGate(h.db, task.RepoPath)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
 		return
 	}
 
+	// STA-727: every gate check happens before any side effect (config
+	// proposal, worktree, process), so a refused live start leaves no trace.
+	if reason != "" {
+		if passed, _ := r.Context().Value(liveBoardGateKey{}).(bool); !passed {
+			writeErrorJSON(w, http.StatusForbidden, map[string]any{
+				"error":            "board_session_required",
+				"message":          liveGateRefusal(reason),
+				"live_gate_reason": reason,
+			})
+			return
+		}
+		var body struct {
+			ConfirmLive bool `json:"confirm_live"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		warning := liveGateWarning(reason)
+		if !body.ConfirmLive {
+			writeErrorJSON(w, http.StatusConflict, map[string]any{
+				"error":            "live_confirmation_required",
+				"message":          warning + " Confirm to start the dev server.",
+				"warning":          warning,
+				"live_gate_reason": reason,
+			})
+			return
+		}
+		if err := governance.LogBoardEvent(h.db, "board", governance.AuditBoardAction, map[string]any{
+			"action":           "live_dev_start_confirmed",
+			"task_id":          taskID,
+			"repo_path":        task.RepoPath,
+			"warning":          warning,
+			"live_gate_reason": reason,
+			"ip":               r.RemoteAddr,
+			"user_agent":       r.UserAgent(),
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "audit log write failed: "+err.Error())
+			return
+		}
+	}
+
 	// Auto-detect Supabase project if no config exists yet.
 	if cfg.DevCommand == "" && shipreview.HasSupabaseConfig(task.RepoPath) {
 		proposed := shipreview.ProposeSupabaseDevConfig(task.RepoPath)
+		// The proposal replaces the whole row; keep the Board's settings, and
+		// write the row already matched for this repo rather than an alias
+		// row keyed by task.RepoPath (STA-767).
+		proposed.RepoPath = cfg.RepoPath
+		proposed.LiveCredentials = cfg.LiveCredentials
+		proposed.MergeMode = cfg.MergeMode
+		proposed.GHConfigDir = cfg.GHConfigDir
 		if uErr := shipreview.UpsertProjectDevConfig(h.db, proposed); uErr == nil {
 			cfg = proposed
 			h.hub.Publish("ship_review_dev_config_proposed", map[string]any{
@@ -234,32 +438,58 @@ var errRepoUnreadable = errors.New("cannot read task repo")
 // unverifiedMigrations returns migration file paths that appear in the task diff
 // but have not been marked applied (with successful verification) in the activity log.
 //
+// The diff compares against the latest checkpoint or, when the repo has none,
+// the commit where the task left main (see migrationBaseline).
+//
 // It fails closed: a diff error is returned (wrapping errRepoUnreadable) unless
 // nothingToDiff confirms there was nothing to compare, so a repo git cannot
 // read is never taken to have no migrations.
 func unverifiedMigrations(ctx gocontext.Context, db *sql.DB, task *context.Task) ([]string, error) {
 	// Detect migration files in the task diff.
 	workDir, hasWorktree := taskCheckpointWorkDir(task)
-	cpID := ""
-	refs := []string{checkpoint.LatestRef}
+	branch := "staypoint/" + task.ID
 	var fileStats []checkpoint.FileDiffStat
-	var diffErr error
-	if hasWorktree {
-		fileStats, diffErr = checkpoint.DiffCheckpointFiles(ctx, workDir, cpID)
-	} else {
-		branch := "staypoint/" + task.ID
-		refs = append(refs, branch)
-		fileStats, diffErr = checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, cpID, branch)
+	base, err := migrationBaseline(ctx, task.RepoPath, branch)
+	if err != nil {
+		return nil, err
 	}
-	if diffErr != nil {
-		if gitexec.IsTimeout(diffErr) || !nothingToDiff(ctx, workDir, refs...) {
-			return nil, fmt.Errorf("%w: %w", errRepoUnreadable, diffErr)
+	if base != "" {
+		stats, diffErr := checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, base, branch)
+		if diffErr != nil {
+			// base is not among the refs checked: it either exists or could not
+			// be looked up, and neither means there is nothing to compare.
+			if gitexec.IsTimeout(diffErr) || !nothingToDiff(ctx, task.RepoPath, branch) {
+				return nil, fmt.Errorf("%w: %w", errRepoUnreadable, diffErr)
+			}
 		}
-		return nil, nil
+		fileStats = stats
 	}
-	filePaths := make([]string, len(fileStats))
-	for i, s := range fileStats {
-		filePaths[i] = s.Path
+	if hasWorktree {
+		// The worktree's HEAD can sit on a different commit than the branch,
+		// so it gets its own baseline.
+		wtBase, err := migrationBaseline(ctx, workDir, "HEAD")
+		if err != nil {
+			return nil, err
+		}
+		if wtBase != "" {
+			wtStats, wtErr := checkpoint.DiffCheckpointFiles(ctx, workDir, wtBase)
+			if wtErr != nil {
+				if gitexec.IsTimeout(wtErr) || !nothingToDiff(ctx, workDir) {
+					return nil, fmt.Errorf("%w: %w", errRepoUnreadable, wtErr)
+				}
+			} else {
+				fileStats = append(fileStats, wtStats...)
+			}
+		}
+	}
+
+	seen := make(map[string]bool, len(fileStats))
+	var filePaths []string
+	for _, s := range fileStats {
+		if !seen[s.Path] {
+			seen[s.Path] = true
+			filePaths = append(filePaths, s.Path)
+		}
 	}
 	migPaths := migration.Detect(filePaths, migration.DefaultGlobs)
 	if len(migPaths) == 0 {
@@ -286,41 +516,164 @@ func unverifiedMigrations(ctx gocontext.Context, db *sql.DB, task *context.Task)
 
 	var unverified []string
 	for _, p := range migPaths {
-		if !appliedPaths[p] {
-			unverified = append(unverified, p)
+		if appliedPaths[p] {
+			continue
 		}
+		exists, existsErr := migrationFileExistsAtTask(ctx, task, workDir, hasWorktree, p)
+		if existsErr != nil {
+			return nil, fmt.Errorf("%w: %w", errRepoUnreadable, existsErr)
+		}
+		if !exists {
+			// Deleted migration files do not count as unverified migrations.
+			continue
+		}
+		unverified = append(unverified, p)
 	}
 	return unverified, nil
 }
 
+// migrationFileExistsAtTask checks whether the migration file exists at the task branch
+// tip or in the task's current working tree (if present). Deleted migrations
+// return false so they do not count as unverified migrations. If git or filesystem
+// inspection encounters an error (e.g. timeout, EPERM), it returns the error so the
+// caller fails closed.
+func migrationFileExistsAtTask(ctx gocontext.Context, task *context.Task, workDir string, hasWorktree bool, relPath string) (bool, error) {
+	// First check the task branch tip, which is what ApproveAndMerge ships.
+	// An uncommitted deletion in the worktree must not hide a migration that
+	// the branch still ships.
+	branch := "staypoint/" + task.ID
+	cmd := gitexec.Command(ctx, "ls-tree", "--full-tree", "-z", "--name-only", branch, "--", filepath.ToSlash(relPath))
+	cmd.Dir = task.RepoPath
+	cmd.Env = security.ChildEnv()
+	out, err := cmd.Output()
+	if err == nil {
+		if len(strings.TrimRight(string(out), "\x00")) > 0 {
+			return true, nil
+		}
+	} else {
+		// If the branch doesn't exist at all, and there is a worktree, we fall through
+		// only if we can verify the branch ref simply does not exist (rev-parse exit 1).
+		// Any timeout or git read error must fail closed.
+		if hasWorktree && isRefMissing(ctx, task.RepoPath, branch) {
+			// branch ref is missing; fall through to worktree check
+		} else {
+			return false, err
+		}
+	}
+
+	// If absent from the branch tip, check the worktree (if present) for uncommitted files.
+	if hasWorktree {
+		_, statErr := os.Lstat(filepath.Join(workDir, relPath))
+		if statErr == nil {
+			return true, nil
+		}
+		if !errors.Is(statErr, fs.ErrNotExist) {
+			return false, statErr
+		}
+	}
+
+	return false, nil
+}
+
+func isRefMissing(ctx gocontext.Context, repoDir, ref string) bool {
+	cmd := gitexec.Command(ctx, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+	cmd.Dir = repoDir
+	cmd.Env = security.ChildEnv()
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == 1
+}
+
+// migrationBaseline returns the commit the migration diff compares head
+// against: the latest checkpoint or, when the repo has none, the merge-base of
+// main and head, so migrations committed on a task that never checkpointed are
+// still found (STA-718). It returns "" when there is nothing to compare
+// because main or head does not exist. Any other merge-base failure is
+// returned wrapping errRepoUnreadable.
+func migrationBaseline(ctx gocontext.Context, dir, head string) (string, error) {
+	found, err := refExists(ctx, dir, checkpoint.LatestRef)
+	if err != nil || found {
+		// When git cannot look the ref up, the diff fails the same way and
+		// reports git's error, so leave the verdict to it.
+		return checkpoint.LatestRef, nil
+	}
+	cmd := gitexec.Command(ctx, "merge-base", "main", head)
+	cmd.Dir = dir
+	cmd.Env = security.ChildEnv()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err == nil {
+		return strings.TrimSpace(string(out)), nil
+	}
+	if !gitexec.IsTimeout(err) && nothingToDiff(ctx, dir, "main", head) {
+		return "", nil
+	}
+	return "", fmt.Errorf("%w: git merge-base main %s failed: %w (stderr: %s)", errRepoUnreadable, head, err, strings.TrimSpace(stderr.String()))
+}
+
 // nothingToDiff reports whether a failed migration diff failed only because
 // there was nothing to compare: dir is not a git repo, or one of refs (the
-// checkpoint baseline, the task branch) does not exist yet. It decides from the
-// filesystem and git's exit status, never from the text of git's error, so a
-// repo git was refused (EPERM) or timed out on is never mistaken for one with
-// nothing in it.
+// task branch, main) does not exist yet. It decides from the filesystem and
+// git's exit status, never from the text of git's error, so a repo git was
+// refused (EPERM) or timed out on is never mistaken for one with nothing in it.
 func nothingToDiff(ctx gocontext.Context, dir string, refs ...string) bool {
-	if _, err := os.Stat(filepath.Join(dir, ".git")); errors.Is(err, fs.ErrNotExist) {
-		return true
-	} else if err != nil {
+	if inRepo, err := insideGitRepo(dir); err != nil {
 		return false
+	} else if !inRepo {
+		return true
 	}
 	for _, ref := range refs {
-		// --verify --quiet exits 1 when the ref does not exist and 128 when git
-		// cannot read the repo.
-		cmd := gitexec.Command(ctx, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
-		cmd.Dir = dir
-		cmd.Env = security.ChildEnv()
-		err := cmd.Run()
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			return true
-		}
+		found, err := refExists(ctx, dir, ref)
 		if err != nil {
 			return false
 		}
+		if !found {
+			return true
+		}
 	}
 	return false
+}
+
+// insideGitRepo reports whether dir or any of its ancestors holds a .git, the
+// way git itself discovers a repo, since a task's repo_path can be a
+// subdirectory of the repo. Any stat error other than "does not exist" (EPERM
+// from a refused folder) is returned so the caller fails closed.
+func insideGitRepo(dir string) (bool, error) {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return false, err
+	}
+	for {
+		_, err := os.Stat(filepath.Join(dir, ".git"))
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return false, err
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return false, nil
+		}
+		dir = parent
+	}
+}
+
+// refExists reports whether ref names a commit in dir. A ref git cannot look
+// up, as opposed to one that does not exist, is an error.
+func refExists(ctx gocontext.Context, dir, ref string) (bool, error) {
+	// --verify --quiet exits 1 when the ref does not exist and 128 when git
+	// cannot read the repo.
+	cmd := gitexec.Command(ctx, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+	cmd.Dir = dir
+	cmd.Env = security.ChildEnv()
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // Approve handles POST /api/tasks/{id}/ship-review/approve (Board action)
@@ -338,8 +691,21 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 	// Parse optional override reason from request body.
 	var req struct {
 		MigrationOverrideReason string `json:"migration_override_reason"`
+		// HeadSHA, when sent, is the head the Board was shown (STA-717).
+		HeadSHA string `json:"head_sha"`
+		testGateBypass
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.HeadSHA != "" && req.HeadSHA != card.HeadSHA {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":        "head_moved",
+			"message":      "the card was re-pinned to a new head since you opened it",
+			"new_head_sha": card.HeadSHA,
+		})
+		return
+	}
 
 	// Block if any migration has not been verified, unless override supplied.
 	// Fail-closed: if we can't determine unverified migrations, block approval.
@@ -369,6 +735,35 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 		_ = context.LogActivity(h.db, taskID, "migration_override", string(logPayload))
 	}
 
+	// STA-774: re-verify the pinned head against the task's recorded base,
+	// before any merge mode, test gate or merge runs. Fail closed: a base
+	// that is missing or was moved by the agent, a git error, or a head with
+	// nothing to merge is never approved.
+	if !h.verifyCardBase(w, r, card, task) {
+		return
+	}
+
+	// STA-717: projects in a PR mode land through GitHub instead.
+	cfg, err := shipreview.GetProjectDevConfig(h.db, task.RepoPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
+		return
+	}
+	mode := shipreview.EffectiveMergeMode(cfg, shipreview.IsWorkRepo(task.RepoPath))
+
+	// STA-734: direct and open_pr Approve hand the change to main, so the
+	// test gate runs here; pr_merge only opens the PR and is gated at Merge.
+	var gate *gateOutcome
+	if mode != shipreview.MergeModePRMerge {
+		if gate, ok = h.enforceTestGate(w, r, card, task, "approve", req.HeadSHA, req.testGateBypass); !ok {
+			return
+		}
+	}
+	if mode != shipreview.MergeModeDirect {
+		h.approvePR(w, r, card, task, cfg, mode, gate)
+		return
+	}
+
 	// Always merge from the repo root (on main), never from a task worktree which
 	// may be gone or have main checked out elsewhere (causing checkout conflicts).
 	mainSHA, err := shipreview.ApproveAndMerge(r.Context(), h.db, card, task.RepoPath, "main")
@@ -396,7 +791,7 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 	// STA-637: the task branch is kept while the review is open and deleted
 	// once merged. A failed delete never undoes the merge; the Board retries
 	// from the final card via POST .../ship-review/delete-branch.
-	deleteErr := h.cleanupMergedBranch(r, card, task, mainSHA)
+	deleteErr := h.cleanupMergedBranch(r.Context(), card, task, mainSHA)
 
 	_ = governance.LogEvent(h.db, taskID, "board", governance.AuditBoardAction, nil, nil,
 		map[string]any{"action": "approve", "ip": r.RemoteAddr, "user_agent": r.UserAgent(),
@@ -413,6 +808,7 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 
 	refreshed, _ := shipreview.GetCard(h.db, taskID)
 	resp := map[string]any{"card": refreshed, "main_sha": mainSHA, "branch_deleted": deleteErr == ""}
+	h.addGateResult(resp, card, task, gate, 0, "", mainSHA)
 	if deleteErr != "" {
 		resp["branch_delete_error"] = deleteErr
 		resp["warning"] = "merged; branch delete failed: " + deleteErr
@@ -438,7 +834,16 @@ func (h *ShipReviewHandler) DeleteMergedBranch(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	deleteErr := h.cleanupMergedBranch(r, card, task, card.MainSHA)
+	ctx := r.Context()
+	if card.PRNumber > 0 {
+		// Merged through GitHub: delete with the repo's own gh identity.
+		auth, ok := h.requireGHAuth(w, task)
+		if !ok {
+			return
+		}
+		ctx = auth.WithAuth(ctx)
+	}
+	deleteErr := h.cleanupMergedBranch(ctx, card, task, card.MainSHA)
 	_ = governance.LogBoardEvent(h.db, "board", governance.AuditBoardAction,
 		branchAuditPayload(r, "delete_branch_retry", taskID, card.Branch, card.MainSHA, deleteErr))
 	h.hub.Publish("ship_review_branch_cleanup", map[string]any{
@@ -462,10 +867,10 @@ func (h *ShipReviewHandler) DeleteMergedBranch(w http.ResponseWriter, r *http.Re
 
 // cleanupMergedBranch deletes the merged task branch and records the outcome
 // on the card. Returns the failure message, or "" when the branch is gone.
-func (h *ShipReviewHandler) cleanupMergedBranch(r *http.Request, card *shipreview.Card, task *context.Task, mainSHA string) string {
+func (h *ShipReviewHandler) cleanupMergedBranch(reqCtx gocontext.Context, card *shipreview.Card, task *context.Task, mainSHA string) string {
 	// Detach from the request so a closed browser tab can't abort the git
 	// commands halfway through.
-	ctx := gocontext.WithoutCancel(r.Context())
+	ctx := gocontext.WithoutCancel(reqCtx)
 	errMsg := ""
 	if err := shipreview.CleanupMergedBranch(ctx, task.RepoPath, card, mainSHA); err != nil {
 		errMsg = err.Error()
@@ -496,6 +901,9 @@ func (h *ShipReviewHandler) SendBack(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Comment string `json:"comment"`
+		// CIFailures marks a "Send failures to agent": the agent's resubmitted
+		// card is pushed to the PR and its checks re-run (STA-717).
+		CIFailures bool `json:"ci_failures"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.Comment == "" {
@@ -507,11 +915,18 @@ func (h *ShipReviewHandler) SendBack(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	ciFix := req.CIFailures && card.MergeMode == shipreview.MergeModePRMerge && card.PRNumber > 0
+	if ciFix {
+		if err := shipreview.SetCIFixRequested(h.db, card.ID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 
 	shipreview.StopDevServer(h.db, card)
 	_ = context.AddTaskComment(h.db, taskID, "board", req.Comment)
 	_ = governance.LogEvent(h.db, taskID, "board", governance.AuditBoardAction, nil, nil,
-		map[string]string{"action": "send_back", "ip": r.RemoteAddr, "user_agent": r.UserAgent()})
+		map[string]any{"action": "send_back", "ci_failures": ciFix, "ip": r.RemoteAddr, "user_agent": r.UserAgent()})
 
 	h.hub.Publish("ship_review_sent_back", map[string]any{
 		"task_id": taskID,
@@ -541,7 +956,15 @@ func (h *ShipReviewHandler) Reject(w http.ResponseWriter, r *http.Request) {
 	shipreview.StopDevServer(h.db, card)
 
 	if req.DeleteBranch {
-		if err := shipreview.DeleteBranch(r.Context(), task.RepoPath, card.Branch); err != nil {
+		ctx := r.Context()
+		if card.PRNumber > 0 {
+			auth, ok := h.requireGHAuth(w, task)
+			if !ok {
+				return
+			}
+			ctx = auth.WithAuth(ctx)
+		}
+		if err := shipreview.DeleteBranch(ctx, task.RepoPath, card.Branch); err != nil {
 			writeError(w, http.StatusConflict, "delete branch failed: "+err.Error())
 			return
 		}
@@ -598,10 +1021,22 @@ func (h *ShipReviewHandler) ListProjectDevConfigs(w http.ResponseWriter, r *http
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if cfgs == nil {
-		cfgs = []*shipreview.ProjectDevConfig{}
+	type configView struct {
+		*shipreview.ProjectDevConfig
+		IsWorkRepo         bool   `json:"is_work_repo"`
+		EffectiveMergeMode string `json:"effective_merge_mode"`
+		// TestExemptGlobs are the project's own test-gate exempt paths;
+		// DefaultTestExemptGlobs always apply on top (STA-734).
+		TestExemptGlobs        []string `json:"test_exempt_globs"`
+		DefaultTestExemptGlobs []string `json:"default_test_exempt_globs"`
 	}
-	writeJSON(w, map[string]any{"configs": cfgs})
+	views := make([]configView, 0, len(cfgs))
+	for _, c := range cfgs {
+		isWork := shipreview.IsWorkRepo(c.RepoPath)
+		exempt, _ := shipreview.GetTestExemptGlobs(h.db, c.RepoPath)
+		views = append(views, configView{c, isWork, shipreview.EffectiveMergeMode(c, isWork), exempt, testgate.DefaultExemptGlobs})
+	}
+	writeJSON(w, map[string]any{"configs": views})
 }
 
 // devConfigUpdateReq is the partial-update request body for PUT /api/project-dev-configs.
@@ -616,6 +1051,11 @@ type devConfigUpdateReq struct {
 	SQLEditorURL    *string   `json:"sql_editor_url"`
 	SupabaseEnabled *bool     `json:"supabase_enabled"`
 	SupabaseKeepUp  *bool     `json:"supabase_keep_up"`
+	MergeMode       *string   `json:"merge_mode"`
+	GHConfigDir     *string   `json:"gh_config_dir"`
+	LiveCredentials *bool     `json:"live_credentials"`
+	// TestExemptGlobs are the project's own test-gate exempt paths (STA-734).
+	TestExemptGlobs *[]string `json:"test_exempt_globs"`
 }
 
 // UpsertProjectDevConfig handles PUT /api/project-dev-configs.
@@ -642,6 +1082,14 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+	}
+	if req.MergeMode != nil && !shipreview.ValidMergeMode(*req.MergeMode) {
+		writeError(w, http.StatusBadRequest, shipreview.ErrInvalidMergeMode.Error())
+		return
+	}
+	if req.GHConfigDir != nil && *req.GHConfigDir != "" && !filepath.IsAbs(*req.GHConfigDir) {
+		writeError(w, http.StatusBadRequest, "gh_config_dir must be an absolute path")
+		return
 	}
 
 	old, err := shipreview.GetProjectDevConfig(h.db, req.RepoPath)
@@ -672,6 +1120,22 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 	if req.SupabaseKeepUp != nil {
 		cfg.SupabaseKeepUp = *req.SupabaseKeepUp
 	}
+	if req.MergeMode != nil {
+		cfg.MergeMode = *req.MergeMode
+	}
+	if req.GHConfigDir != nil {
+		cfg.GHConfigDir = *req.GHConfigDir
+	}
+	if req.LiveCredentials != nil {
+		cfg.LiveCredentials = *req.LiveCredentials
+	}
+
+	// Read before the transaction: SQLite may have only the one connection.
+	oldExempt, err := shipreview.GetTestExemptGlobs(h.db, req.RepoPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load test exempt globs: "+err.Error())
+		return
+	}
 
 	// Audit failure must roll back the config write; both go in one transaction.
 	tx, txErr := h.db.Begin()
@@ -685,6 +1149,14 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	newExempt := oldExempt
+	if req.TestExemptGlobs != nil {
+		if err := shipreview.SetTestExemptGlobsTx(tx, req.RepoPath, *req.TestExemptGlobs); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		newExempt = *req.TestExemptGlobs
+	}
 
 	if err := governance.LogBoardEventTx(tx, "board", "dev_config_change", map[string]any{
 		"repo_path":       cfg.RepoPath,
@@ -692,6 +1164,17 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 		"new_dev_command": cfg.DevCommand,
 		"old_setup_steps": old.SetupSteps,
 		"new_setup_steps": cfg.SetupSteps,
+
+		"old_merge_mode":    old.MergeMode,
+		"new_merge_mode":    cfg.MergeMode,
+		"old_gh_config_dir": old.GHConfigDir,
+		"new_gh_config_dir": cfg.GHConfigDir,
+		// STA-727: the live flag is only ever changed here, so this row is
+		// its full history.
+		"old_live_credentials":  old.LiveCredentials,
+		"new_live_credentials":  cfg.LiveCredentials,
+		"old_test_exempt_globs": oldExempt,
+		"new_test_exempt_globs": newExempt,
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "audit log write failed: "+err.Error())
 		return

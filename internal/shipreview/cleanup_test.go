@@ -50,6 +50,7 @@ func mergedCard(t *testing.T, taskID string) (repoDir string, card *shipreview.C
 		t.Fatal(err)
 	}
 	repoDir, branch, featureSHA := setupGitRepo(t)
+	recordMainBase(t, db, repoDir, taskID)
 	card, err := shipreview.CreateCard(db, taskID, branch, featureSHA, []string{"1. Verify"}, "", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -277,6 +278,7 @@ func TestCleanupMergedBranchCancelsInFlightDevSetup(t *testing.T) {
 		t.Fatal(err)
 	}
 	repoDir, branch, featureSHA := setupGitRepo(t)
+	recordMainBase(t, db, repoDir, taskID)
 	card, err := shipreview.CreateCard(db, taskID, branch, featureSHA, []string{"1. Verify"}, "", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -397,6 +399,7 @@ func TestStopDevServerCancelsInFlightDevSetup(t *testing.T) {
 		t.Fatal(err)
 	}
 	repoDir, branch, featureSHA := setupGitRepo(t)
+	recordMainBase(t, db, repoDir, taskID)
 	card, err := shipreview.CreateCard(db, taskID, branch, featureSHA, []string{"1. Verify"}, "", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)

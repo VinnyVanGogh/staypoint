@@ -1052,6 +1052,183 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		// Board-assigned numbers: 26/27 #193, 28 this (#196), 29 #195, 30 #192.
+		Version: 28,
+		Name:    "project_dev_configs_live_credentials",
+		Up: func(conn *sql.DB) error {
+			// STA-727: previews of this project run against production credentials.
+			_, err := conn.Exec(`ALTER TABLE project_dev_configs ADD COLUMN live_credentials INTEGER NOT NULL DEFAULT 0;`)
+			if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+				return err
+			}
+			return nil
+		},
+	},
+	{
+		Version: 29,
+		Name:    "ship_review_merge_modes",
+		Up: func(conn *sql.DB) error {
+			// STA-717: per-project merge mode (direct / open_pr / pr_merge) and
+			// the GitHub PR + CI checks a PR-mode card is pinned to.
+			// 29 is the Board's assignment (2026-10-05): #193 = 27,
+			// #196 = 28, #195 = 29, #192 = 30.
+			for _, stmt := range []string{
+				`ALTER TABLE project_dev_configs ADD COLUMN merge_mode    TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE project_dev_configs ADD COLUMN gh_config_dir TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN merge_mode       TEXT    NOT NULL DEFAULT '';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN pr_number        INTEGER NOT NULL DEFAULT 0;`,
+				`ALTER TABLE ship_review_cards ADD COLUMN pr_url           TEXT    NOT NULL DEFAULT '';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN pr_checks_json   TEXT    NOT NULL DEFAULT '[]';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN pr_checks_sha    TEXT    NOT NULL DEFAULT '';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN pr_checks_at     TEXT    NOT NULL DEFAULT '';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN pr_merge_error   TEXT    NOT NULL DEFAULT '';`,
+				`ALTER TABLE ship_review_cards ADD COLUMN ci_fix_requested INTEGER NOT NULL DEFAULT 0;`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
+	{
+		Version: 31,
+		Name:    "ship_review_test_gate",
+		Up: func(conn *sql.DB) error {
+			// 31: the Board fixed 26-30 for the open PRs (#193 26/27,
+			// #196 28, #195 29, #192 30).
+			// STA-734: the card's last "Test coverage" report, the project's
+			// own test-exempt globs, and one "Add tests" backlog task per PR
+			// merged without tests.
+			for _, stmt := range []string{
+				`ALTER TABLE ship_review_cards ADD COLUMN test_gate_json TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE project_dev_configs ADD COLUMN test_exempt_globs_json TEXT NOT NULL DEFAULT '[]';`,
+				`CREATE TABLE IF NOT EXISTS ship_review_test_tasks (
+					dedupe_key     TEXT PRIMARY KEY,
+					task_id        TEXT NOT NULL DEFAULT '',
+					source_task_id TEXT NOT NULL,
+					card_id        TEXT NOT NULL,
+					pr_number      INTEGER NOT NULL DEFAULT 0,
+					head_sha       TEXT NOT NULL DEFAULT '',
+					created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+				);`,
+				`CREATE INDEX IF NOT EXISTS idx_ship_review_test_tasks_source ON ship_review_test_tasks (source_task_id);`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
+	{
+		Version: 32,
+		Name:    "task_worktree_bases",
+		Up: func(conn *sql.DB) error {
+			// STA-774: the commit each task worktree branched from, recorded
+			// by the daemon. Git refs are writable by the agent in the
+			// worktree; this row is what ship review and the Diff tab trust.
+			_, err := conn.Exec(`CREATE TABLE IF NOT EXISTS task_worktree_bases (
+				task_id    TEXT PRIMARY KEY,
+				repo_path  TEXT NOT NULL DEFAULT '',
+				base_sha   TEXT NOT NULL,
+				created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+				updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			);`)
+			return err
+		},
+	},
+	{
+		Version: 33,
+		Name:    "task_origin_and_legacy_cleanup",
+		Up: func(conn *sql.DB) error {
+			// Backlog stage + task origins: tasks.origin, every existing task
+			// marked legacy, organization 'STA' -> 'StayPoint', and exact
+			// duplicate legacy titles merged. See migrate_origin.go.
+			return migrateTaskOrigins(conn)
+		},
+	},
+	{
+		// 34, not 33: 33 is left for the concurrent backlog-stage branch.
+		Version: 34,
+		Name:    "task_session_attachments",
+		Up: func(conn *sql.DB) error {
+			// STA-854: interactive agent sessions (Claude session_id, agy
+			// conversationId) attached to a task with `staypoint task attach`.
+			// The PreToolUse tracking gate allows writes in work repos only
+			// for sessions with a row here (or a daemon run's STAYPOINT_TASK_ID).
+			_, err := conn.Exec(`CREATE TABLE IF NOT EXISTS task_session_attachments (
+				session_id  TEXT PRIMARY KEY,
+				task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+				client      TEXT NOT NULL DEFAULT 'claude',
+				repo_path   TEXT NOT NULL DEFAULT '',
+				attached_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			);`)
+			return err
+		},
+	},
+	{
+		// 35: 33 is backlog-stage (task origins), 34 is STA-854 on main.
+		Version: 35,
+		Name:    "task_source_ref",
+		Up: func(conn *sql.DB) error {
+			// staypoint import paperclip: where an imported task came from.
+			// source_ref is the human identifier (STA-772), source_id the
+			// Paperclip uuid; the unique index makes re-imports skip.
+			// The live DB already has tasks.priority (added outside the
+			// ledger); fresh DBs get it here, the duplicate is ignored.
+			for _, stmt := range []string{
+				`ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium';`,
+				`ALTER TABLE tasks ADD COLUMN source_ref TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE tasks ADD COLUMN source_id  TEXT NOT NULL DEFAULT '';`,
+				`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_source_id ON tasks (source_id) WHERE source_id != '';`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
+	{
+		// 36: 35 is task_source_ref on main (e9d8685).
+		Version: 36,
+		Name:    "task_provider_choice",
+		Up: func(conn *sql.DB) error {
+			// Board rule GeminiRequiresExplicitChoice (STA-838): a task's
+			// explicit provider ("" = default Claude, "claude", "gemini") and
+			// model ("opus", "sonnet", "gemini-3.1-pro-high", ...). Gemini
+			// runs only when provider is 'gemini'.
+			for _, stmt := range []string{
+				`ALTER TABLE tasks ADD COLUMN provider       TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE tasks ADD COLUMN model_override TEXT NOT NULL DEFAULT '';`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
+	{
+		Version: 37,
+		Name:    "gemini_code_grant_uses",
+		Up: func(conn *sql.DB) error {
+			// Board rule (2026-10-06): a Board-approved "Gemini code" gate
+			// request (security_gate_requests.run_id = 'gemini-code') covers
+			// one daemon run in a personal repo. The run that consumes it (or
+			// the refusal that consumes a denial) is recorded here, so the
+			// next run needs a new approval.
+			_, err := conn.Exec(`CREATE TABLE IF NOT EXISTS gemini_code_grant_uses (
+				gate_request_id TEXT PRIMARY KEY,
+				task_id         TEXT NOT NULL DEFAULT '',
+				run_id          TEXT NOT NULL DEFAULT '',
+				used_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			);`)
+			return err
+		},
+	},
 }
 
 func copyFile(src, dst string) error {
@@ -1246,6 +1423,9 @@ func backfillSchemaMigrations(conn *sql.DB, ms []Migration) error {
 }
 
 func Open(dbPath string) (*Store, error) {
+	if err := refuseLiveDBUnderTest(dbPath); err != nil {
+		return nil, err
+	}
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create db dir: %w", err)
@@ -1259,7 +1439,16 @@ func Open(dbPath string) (*Store, error) {
 
 	conn.SetMaxOpenConns(1)
 
-	if err := applyMigrations(dbPath, conn); err != nil {
+	// applyMigrations reads the ledger only after the lock is held, so an
+	// opener that waited sees the winner's migrations as applied and runs none.
+	unlock, err := lockMigrations(dbPath)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	err = applyMigrations(dbPath, conn)
+	unlock()
+	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to migrate schema: %w", err)
 	}

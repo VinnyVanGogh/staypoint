@@ -10,7 +10,8 @@ import (
 )
 
 var liveProviders = []struct{ key, name string }{
-	{"claude", "Claude"},
+	{"claude_personal", "Claude (Personal)"},
+	{"claude_work", "Claude (Work)"},
 	{"codex", "Codex"},
 	{"cursor", "Cursor"},
 	{"gemini", "Gemini"},

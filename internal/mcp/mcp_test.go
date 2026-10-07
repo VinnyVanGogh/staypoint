@@ -13,6 +13,7 @@ import (
 
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
+	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 )
 
 func setupTestGitRepo(t *testing.T) string {
@@ -535,6 +536,14 @@ func TestToolCallShipReview(t *testing.T) {
 
 	// Create the harness branch staypoint/<taskID> so BuildAndStartCard can resolve HEAD.
 	// git_branch="feature/mcp-test" stays in the DB to confirm BuildAndStartCard ignores it.
+	// The daemon records the task's base when it makes the worktree (STA-774).
+	baseOut, err := exec.Command("git", "-C", repoDir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	if err := workspace.RecordTaskBase(context.Background(), database, repoDir, "sr-mcp-task", strings.TrimSpace(string(baseOut))); err != nil {
+		t.Fatalf("RecordTaskBase: %v", err)
+	}
 	runCmd(t, repoDir, "git", "checkout", "-b", "staypoint/sr-mcp-task")
 	featureFile := filepath.Join(repoDir, "feature.txt")
 	if err := os.WriteFile(featureFile, []byte("feature\n"), 0644); err != nil {

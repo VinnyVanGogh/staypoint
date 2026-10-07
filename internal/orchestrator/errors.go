@@ -34,7 +34,31 @@ func exitCodeFrom(err error) int {
 	if errors.As(err, &exitErr) {
 		return exitErr.ExitCode()
 	}
+	var coder interface{ ExitCode() int }
+	if errors.As(err, &coder) {
+		return coder.ExitCode()
+	}
 	return 1
+}
+
+// noOutputTailBytes caps the stderr tail quoted in a no-output message.
+const noOutputTailBytes = 300
+
+// noOutputMessage explains a run whose agent printed nothing (STA-775):
+// "Run ended with no output (exit N, stderr: …tail)."
+func noOutputMessage(exitCode int, stderr string) string {
+	tail := strings.TrimSpace(stderr)
+	if tail == "" {
+		return fmt.Sprintf("Run ended with no output (exit %d, no stderr).", exitCode)
+	}
+	if len(tail) > noOutputTailBytes {
+		cut := len(tail) - noOutputTailBytes
+		for cut < len(tail) && !utf8.RuneStart(tail[cut]) {
+			cut++
+		}
+		tail = "…" + strings.TrimSpace(tail[cut:])
+	}
+	return fmt.Sprintf("Run ended with no output (exit %d, stderr: %s).", exitCode, tail)
 }
 
 // truncate returns s truncated to at most n bytes, preserving valid UTF-8.

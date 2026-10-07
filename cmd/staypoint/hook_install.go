@@ -43,6 +43,8 @@ func installHooks() {
 				"timeout": 10,
 			},
 		},
+		// STA-854: tracking gate for agy tool calls.
+		"PreToolUse": agyPreToolHookGroups(staypointBin),
 	}
 
 	if out, err := json.MarshalIndent(hooksMap, "", "  "); err == nil {
@@ -108,6 +110,15 @@ func installHooks() {
 		}
 	} else {
 		fmt.Printf("\033[1;32m✔ Claude Code UserPromptSubmit hook already active:\033[0m %s\n", claudeSettingsPath)
+	}
+
+	// 2b. Claude Code PreToolUse tracking gate (STA-854)
+	if changed, err := installClaudePreToolHook(claudeSettingsPath, staypointBin); err != nil {
+		fmt.Fprintf(os.Stderr, "Error installing Claude Code PreToolUse hook: %v\n", err)
+	} else if changed {
+		fmt.Printf("\033[1;32m✔ Claude Code PreToolUse tracking gate configured:\033[0m %s\n", claudeSettingsPath)
+	} else {
+		fmt.Printf("\033[1;32m✔ Claude Code PreToolUse tracking gate already active:\033[0m %s\n", claudeSettingsPath)
 	}
 
 	// 3. Global Git Post-Commit Hook (~/.config/git/hooks/post-commit)

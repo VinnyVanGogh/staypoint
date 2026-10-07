@@ -76,11 +76,12 @@ func TestUIOLIRoutingPrefersPersonalClaudeOverGemini(t *testing.T) {
 	ctx := context.Background()
 	repo := "/Users/vincevasile/Documents/dev/personal-app"
 
-	// Gemini has far more headroom: balanced pacing alone would pick Antigravity.
+	// Gemini has far more headroom, but the router never picks agy
+	// (GeminiCodeForbidden): even with UIOLI off it is personal Claude.
 	st := uioliState(38, 7*time.Hour, 80)
 	base, _ := Route(ctx, repo, st, RouteOptions{Now: uioliNow, UIOLI: UIOLIConfig{Disabled: true}})
-	if base.Tool != "agy" {
-		t.Fatalf("baseline should favor gemini, got %s (%s)", base.Tool, base.Reason)
+	if base.Tool != "claude" || base.Target != TargetClaudePersonal {
+		t.Fatalf("baseline must be personal Claude, got %s (%s)", base.Tool, base.Reason)
 	}
 
 	dec, _ := Route(ctx, repo, st, RouteOptions{Now: uioliNow})
@@ -103,20 +104,21 @@ func TestUIOLIRoutingPrefersPersonalClaudeOverGemini(t *testing.T) {
 		t.Errorf("explicit model must win, got %s", pinned.Model)
 	}
 
-	// Outside the end-of-window case behavior is unchanged (default off).
+	// Mid-week: no UIOLI, still Claude (the router never picks agy).
 	mid := uioliState(38, 4*24*time.Hour, 80)
-	if d, _ := Route(ctx, repo, mid, RouteOptions{Now: uioliNow}); d.Tool != "agy" {
-		t.Errorf("mid-week must not trigger UIOLI, got %s (%s)", d.Tool, d.Reason)
+	if d, _ := Route(ctx, repo, mid, RouteOptions{Now: uioliNow}); d.Tool != "claude" || strings.Contains(d.Reason, "use-it-or-lose-it") {
+		t.Errorf("mid-week must be plain Claude without UIOLI, got %s (%s)", d.Tool, d.Reason)
 	}
 
-	// Explicit Antigravity preference still wins; a locked Claude pool is never forced.
-	if d, _ := Route(ctx, repo, st, RouteOptions{Now: uioliNow, PreferredPersonalTool: "agy"}); d.Tool != "agy" {
-		t.Errorf("explicit agy preference must win, got %s", d.Tool)
+	// A configured agy preference no longer picks agy; a locked Claude pool
+	// waits instead of falling back to Gemini.
+	if d, _ := Route(ctx, repo, st, RouteOptions{Now: uioliNow, PreferredPersonalTool: "agy"}); d.Tool != "claude" {
+		t.Errorf("agy preference must not pick agy, got %s", d.Tool)
 	}
 	locked := uioliState(38, 7*time.Hour, 80)
 	locked.Pools[PoolPersonalClaude].IsLocked = true
-	if d, _ := Route(ctx, repo, locked, RouteOptions{Now: uioliNow}); d.Tool != "agy" {
-		t.Errorf("locked Claude must not be chosen, got %s", d.Tool)
+	if d, _ := Route(ctx, repo, locked, RouteOptions{Now: uioliNow}); d.Tool != "claude" || !d.Waiting || strings.Contains(d.Reason, "use-it-or-lose-it") {
+		t.Errorf("locked Claude must wait, got %s waiting=%v (%s)", d.Tool, d.Waiting, d.Reason)
 	}
 }
 

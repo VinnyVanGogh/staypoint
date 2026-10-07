@@ -52,6 +52,22 @@ func init() {
 }
 
 func runTaskCreate(cmd *cobra.Command, args []string) error {
+	if childCreateRequested(cmd) {
+		return runTaskCreateChild(cmd, args) // STA-820
+	}
+	if localOrgCreateRequested(cmd) {
+		return runTaskCreateLocalOrg(cmd, args) // STA-854
+	}
+	// STA-838: validate --kind/--provider/--model before any inference or
+	// dispatch, so a refused choice (gemini on a code kind) costs nothing.
+	kindFlag, _ := cmd.Flags().GetString("kind")
+	if kindFlag != "" && !meshContext.IsValidWorkKind(kindFlag) {
+		return fmt.Errorf("invalid --kind %q: must be one of %s", kindFlag, strings.Join(meshContext.ValidWorkKinds(), ", "))
+	}
+	choice, err := taskChoiceFromFlags(cmd, kindFlag, "")
+	if err != nil {
+		return err
+	}
 	out := cmd.OutOrStdout()
 	tuiFlag, _ := cmd.Flags().GetBool("tui")
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
@@ -394,14 +410,17 @@ func runTaskCreate(cmd *cobra.Command, args []string) error {
 			budget, _ := cmd.Flags().GetFloat64("budget")
 			maxTurns, _ := cmd.Flags().GetInt("max-turns")
 			_, _ = meshContext.CreateTaskWithOptions(store.DB(), meshContext.TaskCreateOptions{
-				Name:         genResult.Task.Title,
-				RepoPath:     cwd,
-				GitBranch:    branch,
-				AccountRole:  role,
-				MaxBudgetUSD: budget,
-				MaxTurns:     maxTurns,
-				Organization: genResult.Task.Organization,
-				Project:      genResult.Task.Project,
+				Name:          genResult.Task.Title,
+				RepoPath:      cwd,
+				GitBranch:     branch,
+				AccountRole:   role,
+				MaxBudgetUSD:  budget,
+				MaxTurns:      maxTurns,
+				Organization:  genResult.Task.Organization,
+				Project:       genResult.Task.Project,
+				WorkKind:      kindFlag,
+				Provider:      choice.Provider,
+				ModelOverride: choice.Model,
 			})
 		}
 	}

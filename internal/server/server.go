@@ -113,13 +113,16 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
 		snap := s.repoAccessSnapshot()
 		writeJSONUnescaped(w, struct {
-			Status     string           `json:"status"`
-			Version    string           `json:"version"`
-			GitCommit  string           `json:"git_commit"`
-			Commit     string           `json:"commit"`
-			RepoAccess healthRepoAccess `json:"repo_access"`
+			Status         string           `json:"status"`
+			Version        string           `json:"version"`
+			GitCommit      string           `json:"git_commit"`
+			Commit         string           `json:"commit"`
+			DevBuild       bool             `json:"dev_build"`
+			DevBuildReason string           `json:"dev_build_reason,omitempty"`
+			RepoAccess     healthRepoAccess `json:"repo_access"`
 		}{
 			Status: "ok", Version: "1.0", GitCommit: s.opts.GitCommit, Commit: s.opts.GitCommit,
+			DevBuild: s.opts.DevBuildReason != "", DevBuildReason: s.opts.DevBuildReason,
 			RepoAccess: healthRepoAccess{snap.Checked, snap.CheckedAt, snap.Failing()},
 		})
 	})
@@ -133,6 +136,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Tasks REST API
 	if s.opts.DB != nil {
 		tasksH := NewTasksHandler(s.opts.DB, s.hub)
+		// STA-859: override / allow_deep are Board-only; they need the passkey gate.
+		tasksH.SetBoardGate(s.secMid.WrapBoardAction)
 		mux.HandleFunc("GET /api/tasks", tasksH.ListTasks)
 		mux.HandleFunc("POST /api/tasks", tasksH.CreateTask)
 		mux.HandleFunc("GET /api/tasks/{id}", tasksH.GetTask)
@@ -146,6 +151,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("POST /api/tasks/{id}/blockers", tasksH.AddBlocker)
 		mux.HandleFunc("DELETE /api/tasks/{id}/blockers/{bid}", tasksH.RemoveBlocker)
 		mux.HandleFunc("POST /api/tasks/{id}/stage", tasksH.SetStage)
+		mux.HandleFunc("PUT /api/tasks/{id}/repo", tasksH.SetRepo)
+		mux.HandleFunc("PUT /api/tasks/{id}/provider", tasksH.SetProvider)
 		mux.HandleFunc("GET /api/tasks/{id}/run-steps", tasksH.GetRunSteps)
 		mux.HandleFunc("GET /api/tasks/{id}/run-errors", tasksH.GetRunErrors)
 		mux.HandleFunc("GET /api/run-errors", tasksH.GetAllRunErrors)
@@ -222,18 +229,27 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("GET /api/settings/security-gate", gateH.GetSecurityGateSettings)
 		// Board-only: toggling the gate itself requires the board token.
 		mux.Handle("POST /api/settings/security-gate", s.secMid.WrapBoardAction(http.HandlerFunc(gateH.UpdateSecurityGateSettings)))
+		// STA-854: per-company tracking gate; toggling is Board-only.
+		mux.HandleFunc("GET /api/settings/tracking-gate", gateH.GetTrackingGateSettings)
+		mux.Handle("POST /api/settings/tracking-gate", s.secMid.WrapBoardAction(http.HandlerFunc(gateH.UpdateTrackingGateSettings)))
 
 		// Ship Review REST API (Board-approval gate for agent branch merges)
 		shipH := NewShipReviewHandler(s.opts.DB, s.hub)
 		mux.HandleFunc("GET /api/tasks/{id}/ship-review", shipH.GetCard)
 		mux.HandleFunc("PUT /api/tasks/{id}/ship-review", shipH.UpsertCard)
-		mux.HandleFunc("POST /api/tasks/{id}/ship-review/start-dev", shipH.StartDev)
+		// live_credentials projects need the Board session + passkey (STA-727); others stay agent-callable.
+		mux.Handle("POST /api/tasks/{id}/ship-review/start-dev", shipH.StartDevGated(s.secMid.WrapBoardAction))
 		mux.HandleFunc("POST /api/tasks/{id}/ship-review/stop-dev", shipH.StopDev)
 		// Board-only: these three actions merge / reject / revise the branch — agents cannot call them.
 		mux.Handle("POST /api/tasks/{id}/ship-review/approve", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.Approve)))
 		mux.Handle("POST /api/tasks/{id}/ship-review/send-back", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.SendBack)))
 		mux.Handle("POST /api/tasks/{id}/ship-review/reject", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.Reject)))
 		mux.Handle("POST /api/tasks/{id}/ship-review/delete-branch", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.DeleteMergedBranch)))
+		// STA-717: PR-mode checks are read-only polls; merging the PR is a Board action.
+		mux.HandleFunc("GET /api/tasks/{id}/ship-review/checks", shipH.Checks)
+		mux.HandleFunc("GET /api/tasks/{id}/ship-review/check-failures", shipH.CheckFailures)
+		mux.HandleFunc("GET /api/tasks/{id}/ship-review/test-coverage", shipH.TestCoverage)
+		mux.Handle("POST /api/tasks/{id}/ship-review/merge", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.MergePR)))
 		mux.HandleFunc("GET /api/settings/ship-review", shipH.GetSettings)
 		// Board-only: disabling ship review is a Board action.
 		mux.Handle("POST /api/settings/ship-review", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.SetSettings)))

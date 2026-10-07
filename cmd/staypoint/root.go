@@ -67,6 +67,13 @@ func runSmartLaunch(cmd *cobra.Command, args []string) {
 	forceGemini, _ := cmd.Flags().GetBool("gemini")
 	force, _ := cmd.Flags().GetBool("force")
 	noSSH, _ := cmd.Flags().GetBool("no-ssh")
+	forceWork, _ := cmd.Flags().GetBool("work")
+	forcePersonal, _ := cmd.Flags().GetBool("personal")
+	if forceWork || forcePersonal {
+		// Picking an account only makes sense for Claude.
+		forceClaude = true
+		forceGemini = false
+	}
 
 	if force && !forceClaude && !forceGemini {
 		if strings.Contains(os.Args[0], "claude") {
@@ -125,6 +132,9 @@ func runSmartLaunch(cmd *cobra.Command, args []string) {
 		}
 		targetTool = decision.Tool
 		targetModel = decision.Model
+		if decision.Waiting {
+			fmt.Fprintf(os.Stderr, "[staypoint] %s\n", decision.Reason)
+		}
 		if decision.Target == router.TargetRemoteClaude {
 			isRemoteWork = true
 		}
@@ -146,11 +156,21 @@ func runSmartLaunch(cmd *cobra.Command, args []string) {
 		_ = router.RenderStatusline(os.Stdout, nil)
 	}
 
+	home, _ := os.UserHomeDir()
+	isWorkRepo, _, _ := router.IsWorkRepo(cwd)
+	account := resolveClaudeAccount(forceWork, forcePersonal, isWorkRepo)
+
 	if dryRun {
 		fmt.Printf("\n\033[1;36m[Staypoint :: Dry Run]\033[0m\n")
+		if targetTool == "agy" && isWorkRepo {
+			fmt.Printf("  • REFUSED:     agy is not allowed in work repos (use claude --work)\n")
+		}
 		fmt.Printf("  • Tool:        %s\n", targetTool)
 		fmt.Printf("  • Model:       %s\n", targetModel)
 		fmt.Printf("  • Remote Work: %t\n", isRemoteWork)
+		if targetTool == "claude" {
+			fmt.Printf("  • Account:     %s %s\n", account, describeClaudeConfigDir(account, home))
+		}
 		fmt.Printf("  • Arguments:   %v\n", passthroughArgs)
 		return
 	}
@@ -170,34 +190,42 @@ func runSmartLaunch(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	// Local session execution
-	binName := targetTool
-	if binName == "" {
-		binName = "agy"
-	}
-
+	// Local session execution. Board rule (router.GeminiCodeForbidden): agy is
+	// launched only when chosen explicitly (--gemini, the agy wrapper, agy
+	// --force); a missing claude binary is an error, never a switch to agy.
+	binName := smartLaunchBinary(targetTool)
 	binPath, err := exec.LookPath(binName)
 	if err != nil {
-		altBin := "claude"
-		if binName == "claude" {
-			altBin = "agy"
-		}
-		binPath, err = exec.LookPath(altBin)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: neither '%s' nor '%s' found in PATH.\n", binName, altBin)
+		if binName != "agy" {
+			fmt.Fprintf(os.Stderr, "Error: '%s' not found in PATH (staypoint never falls back to agy; use --gemini to launch it explicitly).\n", binName)
 			os.Exit(1)
 		}
-		binName = altBin
+		binPath, err = exec.LookPath("claude")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: neither 'agy' nor 'claude' found in PATH.\n")
+			os.Exit(1)
+		}
+		binName = "claude"
+	}
+
+	exitIfAgyInWorkRepo(binName, cwd) // STA-854: never agy in a work repo
+
+	env := os.Environ()
+	if binName == "claude" {
+		env = claudeAccountEnv(env, account, home)
+		if isTerminal && !isHeadlessStream(passthroughArgs) {
+			fmt.Fprintf(os.Stderr, "Claude account: %s %s\n", account, describeClaudeConfigDir(account, home))
+		}
 	}
 
 	execArgs := append([]string{binName}, passthroughArgs...)
-	if err := syscall.Exec(binPath, execArgs, os.Environ()); err != nil {
+	if err := syscall.Exec(binPath, execArgs, env); err != nil {
 		// Fallback to exec.Command if syscall.Exec fails (e.g. on non-Unix)
 		subCmd := exec.Command(binPath, passthroughArgs...)
 		subCmd.Stdin = os.Stdin
 		subCmd.Stdout = os.Stdout
 		subCmd.Stderr = os.Stderr
-		subCmd.Env = os.Environ()
+		subCmd.Env = env
 
 		if err := subCmd.Run(); err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok {
@@ -206,6 +234,16 @@ func runSmartLaunch(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 	}
+}
+
+// smartLaunchBinary is the CLI the smart launch execs for a routed tool. An
+// empty or unrecognised tool is Claude: agy only runs when the route (an
+// explicit --gemini) named it.
+func smartLaunchBinary(tool string) string {
+	if tool == "agy" {
+		return "agy"
+	}
+	return "claude"
 }
 
 func extractPassthroughArgs(rawArgs []string) []string {
@@ -220,6 +258,7 @@ func extractPassthroughArgs(rawArgs []string) []string {
 		"--status": true, "-s": true,
 		"--dry-run": true, "-n": true,
 		"--no-ssh": true,
+		"--work":   true, "--personal": true,
 	}
 	for _, arg := range rawArgs {
 		if staypointFlags[arg] {
@@ -261,4 +300,6 @@ func init() {
 	rootCmd.Flags().BoolP("status", "s", false, "Display fleet status & quota table")
 	rootCmd.Flags().BoolP("dry-run", "n", false, "Preview routed target without executing")
 	rootCmd.Flags().Bool("no-ssh", false, "Bypass remote SSH probe")
+	rootCmd.Flags().Bool("work", false, "Launch Claude on the work account (CLAUDE_CONFIG_DIR=~/.claude-work)")
+	rootCmd.Flags().Bool("personal", false, "Launch Claude on the personal account (shared default profile)")
 }

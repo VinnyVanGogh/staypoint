@@ -182,19 +182,28 @@ func TestWebUI_DetailPanelPolishAndDismiss(t *testing.T) {
 		t.Error("app.js missing lastDetailOpenTime guard against bubbling click dismissal")
 	}
 
-	// 2. Field label polish: Priority, Org, Stage, Identifier
-	for _, label := range []string{"Priority", "Org", "Stage", "Identifier"} {
-		if !strings.Contains(appJS, label) {
-			t.Errorf("app.js missing explicit field label %q", label)
+	// 2. The drawer renders the task page layout (STA-700): renderTaskPage in
+	// drawer mode, stacked by the .task-page-drawer class and sized by a
+	// container query on the drawer, not the viewport. A sequence guard keeps
+	// a slow drawer load from rendering after a newer open.
+	for _, pattern := range []string{
+		"renderTaskPage(content, task, comments, interactions, task._diffData, task._checkpoints, task.runErrors, shipCard, { drawer: true })",
+		"let taskViewSeq",
+		"if (seq !== taskViewSeq) return;",
+		"classList.add('task-page-drawer')",
+	} {
+		if !strings.Contains(appJS, pattern) {
+			t.Errorf("app.js missing drawer layout pattern %q", pattern)
+		}
+	}
+	// The old one-column drawer layout is gone.
+	for _, gone := range []string{"function renderDetailContent", "function buildChatSection", "panel-chat-messages"} {
+		if strings.Contains(appJS, gone) {
+			t.Errorf("app.js still contains the old drawer layout: %q", gone)
 		}
 	}
 
-	// 3. Fallback to rendering first comment when description is blank
-	if !strings.Contains(appJS, "task.comments") {
-		t.Error("app.js missing comment inspection for description fallback")
-	}
-
-	// Verify style.css serves required typography classes
+	// Verify style.css serves the drawer layout rules
 	reqCSS := httptest.NewRequest("GET", "/ui/style.css", nil)
 	wCSS := httptest.NewRecorder()
 	mux.ServeHTTP(wCSS, reqCSS)
@@ -203,11 +212,14 @@ func TestWebUI_DetailPanelPolishAndDismiss(t *testing.T) {
 	}
 	styleCSS := wCSS.Body.String()
 
-	if !strings.Contains(styleCSS, ".panel-meta-tag-label") {
-		t.Error("style.css missing .panel-meta-tag-label typography rule")
-	}
-	if !strings.Contains(styleCSS, ".panel-meta-item") {
-		t.Error("style.css missing .panel-meta-item rule")
+	for _, rule := range []string{
+		"#panel-content.task-page-drawer",
+		"container: task-drawer / inline-size",
+		"@container task-drawer (min-width: 900px)",
+	} {
+		if !strings.Contains(styleCSS, rule) {
+			t.Errorf("style.css missing drawer layout rule %q", rule)
+		}
 	}
 }
 
@@ -859,7 +871,7 @@ func TestWebUI_CreateTaskKindOfWork(t *testing.T) {
 	if !strings.Contains(html, `id="ct-work-kind"`) {
 		t.Error("index.html missing ct-work-kind select")
 	}
-	for _, kind := range []string{"coding", "architecture", "planning", "qa"} {
+	for _, kind := range []string{"coding", "review", "architecture", "planning", "qa", "docs"} {
 		if !strings.Contains(html, `value="`+kind+`"`) {
 			t.Errorf("index.html missing work_kind option %q", kind)
 		}
@@ -883,6 +895,16 @@ func TestWebUI_CreateTaskKindOfWork(t *testing.T) {
 	if !strings.Contains(js, "work_kind:") {
 		t.Error("app.js must send work_kind in create-task body")
 	}
+	// STA-838: provider select on create and on the task page; Gemini options
+	// gated off for code kinds.
+	if !strings.Contains(html, `id="ct-provider"`) {
+		t.Error("index.html missing ct-provider select")
+	}
+	for _, want := range []string{"splitProviderChoice(providerSel", "buildProviderField(task)", "gateGeminiOptions", "/provider`", "NON_CODE_KINDS"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js missing %q", want)
+		}
+	}
 	if !strings.Contains(js, "WORK_KIND_LABELS") {
 		t.Error("app.js missing WORK_KIND_LABELS map")
 	}
@@ -892,7 +914,7 @@ func TestWebUI_CreateTaskKindOfWork(t *testing.T) {
 	if !strings.Contains(js, "'Kind of work'") {
 		t.Error("app.js missing 'Kind of work' detail panel field")
 	}
-	for _, label := range []string{"Coding & review", "Architecture", "Planning & docs", "QA & testing"} {
+	for _, label := range []string{"Coding —", "Review —", "Architecture", "Planning —", "Docs —", "QA & testing"} {
 		if !strings.Contains(js, label) {
 			t.Errorf("app.js missing work_kind label %q", label)
 		}

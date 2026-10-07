@@ -16,7 +16,7 @@ import (
 )
 
 // openTestDB creates an in-memory SQLite DB with the ship_review schema applied.
-func openTestDB(t *testing.T) *sql.DB {
+func openTestDB(t testing.TB) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -64,6 +64,14 @@ func openTestDB(t *testing.T) *sql.DB {
 			check_runs_json TEXT NOT NULL DEFAULT '[]',
 			branch_deleted INTEGER NOT NULL DEFAULT 0,
 			branch_delete_error TEXT NOT NULL DEFAULT '',
+			merge_mode TEXT NOT NULL DEFAULT '',
+			pr_number INTEGER NOT NULL DEFAULT 0,
+			pr_url TEXT NOT NULL DEFAULT '',
+			pr_checks_json TEXT NOT NULL DEFAULT '[]',
+			pr_checks_sha TEXT NOT NULL DEFAULT '',
+			pr_checks_at TEXT NOT NULL DEFAULT '',
+			pr_merge_error TEXT NOT NULL DEFAULT '',
+			ci_fix_requested INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 			updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		);
@@ -76,6 +84,9 @@ func openTestDB(t *testing.T) *sql.DB {
 			sql_editor_url TEXT NOT NULL DEFAULT '',
 			supabase_enabled INTEGER NOT NULL DEFAULT 0,
 			supabase_keep_up INTEGER NOT NULL DEFAULT 0,
+			merge_mode TEXT NOT NULL DEFAULT '',
+			gh_config_dir TEXT NOT NULL DEFAULT '',
+			live_credentials INTEGER NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		);
 		CREATE TABLE IF NOT EXISTS task_comments (
@@ -228,6 +239,7 @@ func TestApproveAndMergeHashPin(t *testing.T) {
 
 	repoDir, branch, featureSHA := setupGitRepo(t)
 
+	recordMainBase(t, db, repoDir, "t4")
 	card, err := shipreview.CreateCard(db, "t4", branch, featureSHA, []string{"1. Verify"}, "", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -276,6 +288,7 @@ func TestFilesChangedPopulated(t *testing.T) {
 
 	repoDir, branch, featureSHA := setupGitRepo(t)
 
+	recordMainBase(t, db, repoDir, "t6")
 	card, err := shipreview.CreateCard(db, "t6", branch, featureSHA, []string{"1. Verify feature.txt exists"}, "", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -471,6 +484,7 @@ func TestApproveAndMergeFromRepoRoot(t *testing.T) {
 
 	repoDir, branch, featureSHA := setupGitRepo(t)
 	// Repo root is on main after setupGitRepo — this is the condition we test.
+	recordMainBase(t, db, repoDir, "t6")
 	card, err := shipreview.CreateCard(db, "t6", branch, featureSHA, []string{"1. Verify"}, "", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -499,6 +513,7 @@ func TestStartDevServerCreatesWorktreeAtPinnedSHA(t *testing.T) {
 
 	repoDir, branch, featureSHA := setupGitRepo(t)
 
+	recordMainBase(t, db, repoDir, "t7")
 	card, err := shipreview.CreateCard(db, "t7", branch, featureSHA, []string{"1. Check"}, "http://127.0.0.1:9999", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -583,6 +598,7 @@ func TestApproveAndMerge_MainSHAStored(t *testing.T) {
 
 	repoDir, branch, featureSHA := setupGitRepo(t)
 
+	recordMainBase(t, db, repoDir, "t9")
 	card, err := shipreview.CreateCard(db, "t9", branch, featureSHA, []string{"1. Verify"}, "", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -817,6 +833,7 @@ func TestBuildAndStartCard_IgnoresGitBranch(t *testing.T) {
 		t.Fatalf("insert task: %v", err)
 	}
 
+	recordMainBase(t, db, repoDir, taskID)
 	card, err := shipreview.BuildAndStartCard(
 		context.Background(), db,
 		taskID, repoDir,
@@ -892,6 +909,7 @@ func TestStartDevServerRecoversStalWorktree(t *testing.T) {
 	// Create the card using the feature branch and call StartDevServer.
 	// Without the fix this fails:
 	//   fatal: '<path>' is a missing but already registered worktree
+	recordMainBase(t, db, repoDir, taskID)
 	card, err := shipreview.CreateCard(db, taskID, featureBranch, featureSHA, []string{"1. Check"}, "http://127.0.0.1:9997", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -932,6 +950,7 @@ func TestStartDevServerReusesSameWorktree(t *testing.T) {
 		t.Fatalf("insert task: %v", err)
 	}
 
+	recordMainBase(t, db, repoDir, taskID)
 	card, err := shipreview.CreateCard(db, taskID, featureBranch, featureSHA, []string{"1. Check"}, "http://127.0.0.1:9996", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -986,6 +1005,7 @@ func TestBuildAndStartCard_AutoStartsDevServer(t *testing.T) {
 		t.Fatalf("UpsertProjectDevConfig: %v", err)
 	}
 
+	recordMainBase(t, db, repoDir, taskID)
 	card, err := shipreview.BuildAndStartCard(
 		context.Background(), db,
 		taskID, repoDir,

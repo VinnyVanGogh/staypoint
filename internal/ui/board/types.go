@@ -6,10 +6,11 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/context"
 )
 
-// ColumnType identifies the 4 Kanban columns.
+// ColumnType identifies the Kanban columns.
 type ColumnType string
 
 const (
+	ColBacklog    ColumnType = "backlog"
 	ColTodo       ColumnType = "todo"
 	ColInProgress ColumnType = "in_progress"
 	ColInReview   ColumnType = "in_review"
@@ -17,11 +18,13 @@ const (
 )
 
 // AllColumns defines the fixed order of columns in the Kanban board.
-var AllColumns = []ColumnType{ColTodo, ColInProgress, ColInReview, ColDone}
+var AllColumns = [...]ColumnType{ColBacklog, ColTodo, ColInProgress, ColInReview, ColDone}
 
 // ColumnTitle returns a human-friendly uppercase label for a column.
 func ColumnTitle(col ColumnType) string {
 	switch col {
+	case ColBacklog:
+		return "BACKLOG"
 	case ColTodo:
 		return "TODO"
 	case ColInProgress:
@@ -47,6 +50,8 @@ func MapTaskToColumn(t context.Task) ColumnType {
 		return ColInProgress
 	case "todo":
 		return ColTodo
+	case "backlog":
+		return ColBacklog
 	default:
 		// Default unrecognized active stages (e.g. capped, soft_deleted check)
 		if strings.EqualFold(t.Status, "active") {

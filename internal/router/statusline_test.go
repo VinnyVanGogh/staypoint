@@ -142,10 +142,10 @@ func TestGetPendingReviewFromDir(t *testing.T) {
 }
 
 func TestRenderStatuslineWithReviewBadge(t *testing.T) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Skip("skipping without home dir")
-	}
+	// RenderStatusline opens config.DefaultConfig().DBPath; without a temp
+	// HOME that is the live ~/.staypoint/staypoint.db, which it migrates.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	pendingDir := filepath.Join(home, ".claude", "reviews", "pending")
 	_ = os.MkdirAll(pendingDir, 0755)
 
@@ -158,8 +158,7 @@ func TestRenderStatuslineWithReviewBadge(t *testing.T) {
 
 	var buf bytes.Buffer
 	input := `{"cwd": "/Users/vincevasile/Documents/dev/agent-mesh", "vim_mode": "NORMAL"}`
-	err = RenderStatusline(&buf, strings.NewReader(input))
-	if err != nil {
+	if err := RenderStatusline(&buf, strings.NewReader(input)); err != nil {
 		t.Fatalf("RenderStatusline failed: %v", err)
 	}
 	out := buf.String()

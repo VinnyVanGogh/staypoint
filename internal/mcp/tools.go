@@ -12,6 +12,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/condenser"
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
+	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
@@ -127,13 +128,29 @@ func (s *Server) getToolsList() []Tool {
 		},
 		{
 			Name:        "staypoint_task_list",
-			Description: "list active tasks and budget spend meters",
+			Description: "list active tasks and budget spend meters. Legacy tasks (created before task origins were tracked) and archived Paperclip imports are hidden unless include_legacy is set. Stages: backlog (parked, never run), todo, in_progress (running; paused/capped/stopped are run sub-states), in_review, blocked, done, cancelled",
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]Property{
 					"all": {
 						Type:        "boolean",
 						Description: "Include completed and soft-deleted tasks",
+					},
+					"include_legacy": {
+						Type:        "boolean",
+						Description: "Include legacy tasks and archived Paperclip imports (done/cancelled)",
+					},
+					"include_archive": {
+						Type:        "boolean",
+						Description: "Same switch as include_legacy",
+					},
+					"stage": {
+						Type:        "string",
+						Description: "Only tasks in this execution stage (e.g. backlog, todo, in_review)",
+					},
+					"origin": {
+						Type:        "string",
+						Description: "Only tasks with this origin: native, paperclip_import, legacy",
 					},
 				},
 			},
@@ -255,6 +272,7 @@ func (s *Server) getToolsList() []Tool {
 				Required: []string{"test_steps"},
 			},
 		},
+		taskCreateChildTool(),
 	}
 }
 
@@ -282,6 +300,8 @@ func (s *Server) handleCallTool(ctx context.Context, params CallToolParams) *Too
 		return s.handleTaskGet(ctx, params.Arguments)
 	case "staypoint_ship_review":
 		return s.handleShipReview(ctx, params.Arguments)
+	case "staypoint_task_create_child":
+		return s.handleTaskCreateChild(ctx, params.Arguments)
 	default:
 		return toolError(fmt.Sprintf("unknown tool: %s", params.Name))
 	}
@@ -443,10 +463,18 @@ func (s *Server) handleWireList(ctx context.Context, rawArgs json.RawMessage) *T
 
 func (s *Server) handleTaskList(ctx context.Context, rawArgs json.RawMessage) *ToolCallResult {
 	var args struct {
-		All bool `json:"all"`
+		All           bool   `json:"all"`
+		IncludeLegacy bool   `json:"include_legacy"`
+		IncludeArch   bool   `json:"include_archive"`
+		Stage         string `json:"stage"`
+		Origin        string `json:"origin"`
 	}
 	if len(rawArgs) > 0 {
 		_ = json.Unmarshal(rawArgs, &args)
+	}
+	args.Origin = strings.TrimSpace(args.Origin)
+	if args.Origin != "" && !meshContext.IsValidOrigin(args.Origin) {
+		return toolError("origin must be one of native, paperclip_import, legacy")
 	}
 
 	dbConn, err := s.getDB()
@@ -454,12 +482,20 @@ func (s *Server) handleTaskList(ctx context.Context, rawArgs json.RawMessage) *T
 		return toolError(fmt.Sprintf("database error: %v", err))
 	}
 
-	tasks, err := meshContext.ListTasks(dbConn, args.All)
+	all, err := meshContext.ListTasks(dbConn, args.All)
 	if err != nil {
 		return toolError(fmt.Sprintf("task list error: %v", err))
 	}
-	if tasks == nil {
-		tasks = []meshContext.Task{}
+	all = meshContext.FilterLegacy(all, args.IncludeLegacy || args.IncludeArch || args.Origin == meshContext.OriginLegacy)
+	tasks := []meshContext.Task{}
+	for _, t := range all {
+		if args.Stage != "" && !strings.EqualFold(t.ExecutionStage, strings.TrimSpace(args.Stage)) {
+			continue
+		}
+		if args.Origin != "" && t.Origin != args.Origin {
+			continue
+		}
+		tasks = append(tasks, t)
 	}
 
 	data, err := json.MarshalIndent(tasks, "", "  ")
@@ -551,6 +587,14 @@ func (s *Server) handleWake(ctx context.Context, rawArgs json.RawMessage) *ToolC
 
 	if args.TaskID == "" || args.Reason == "" {
 		return toolError("task_id and reason are required")
+	}
+
+	// Parked (backlog) and closed tasks are never woken; the Board moves a
+	// backlog task to todo (or presses Run Now) to run it.
+	if dbConn, err := s.getDB(); err == nil {
+		if task, err := meshContext.GetTask(dbConn, args.TaskID); err == nil && !governance.IsRunnableStage(task.ExecutionStage) {
+			return toolError(fmt.Sprintf("task %s is %s and cannot be woken; move it to todo first", task.ID, task.ExecutionStage))
+		}
 	}
 
 	orchestrator.GlobalDispatcher.Wake(args.TaskID, args.Reason, args.IdempotencyKey)

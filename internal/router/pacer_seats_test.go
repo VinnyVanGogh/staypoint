@@ -59,15 +59,16 @@ func TestApplyStateJSON_GenericClaudeKeyBackfillsPersonal(t *testing.T) {
 	}
 }
 
-// The live "claude" rows come from the Keychain account, which does not change
-// when a statusline sample from the other seat lands. Interleaved samples used
+// The live claude_personal rows come from the personal seat's own Keychain
+// item, which does not change when a statusline sample from the other seat
+// lands. Interleaved samples used
 // to move those rows between pools on alternate loads (STA-283).
 func TestLoadPacerState_LiveClaudeRowsStableAcrossInterleavedSamples(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	now := time.Now()
 	seedQuota(t, &quota.Snapshot{
-		Provider:  "claude",
+		Provider:  "claude_personal",
 		FetchedAt: now.Add(-time.Minute),
 		FiveHour:  &quota.Window{Utilization: 61, ResetsAt: now.Add(2 * time.Hour)},
 		Weekly:    &quota.Window{Utilization: 41, ResetsAt: now.Add(72 * time.Hour)},

@@ -63,6 +63,9 @@ type StepDelta struct {
 	ToolInput string // raw JSON input for tool_use deltas
 	IsError   bool
 	Usage     *StepUsage
+	// FromUser marks text from an input event (an echoed prompt), not the
+	// agent's own output. Completion detection ignores it.
+	FromUser bool
 }
 
 // RunStep is one timeline entry, stored in run_steps and broadcast as run.step SSE.
@@ -126,6 +129,9 @@ type StepRecorder struct {
 	committedOutput    int64
 	committedCacheRead int64
 	committedCacheCreate int64
+	// contentSeen is set once the agent produced any thinking, text or tool
+	// call, so the harness can tell a silent run from a quiet one (STA-775).
+	contentSeen bool
 }
 
 // openStep is a step that has been started but not yet closed.
@@ -228,6 +234,37 @@ func (r *StepRecorder) EmitCheckpoint(sha, msg string) {
 	r.publish("run.step", step)
 }
 
+// EmitMessage records a message row in the timeline (status "done" or
+// "error"), e.g. why a run that printed nothing ended (STA-775).
+func (r *StepRecorder) EmitMessage(title, body, status string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.drainAllLocked()
+	r.seq++
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	step := RunStep{
+		RunID:     r.runID,
+		TaskID:    r.taskID,
+		Seq:       r.seq,
+		Kind:      StepMessage,
+		Title:     title,
+		Body:      body,
+		Status:    status,
+		StartedAt: now,
+		EndedAt:   &now,
+	}
+	r.persist(step)
+	r.publish("run.step", step)
+}
+
+// SawContent reports whether the agent produced any thinking, text or tool
+// call during this run.
+func (r *StepRecorder) SawContent() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.contentSeen
+}
+
 // EmitRunState broadcasts a run.state SSE event without persisting a step row.
 // Use for transient states like "paused" / "in_progress" that don't mark the run terminal.
 func (r *StepRecorder) EmitRunState(disposition string) {
@@ -274,6 +311,15 @@ func (r *StepRecorder) EmitState(disposition string) {
 func (r *StepRecorder) Feed(d StepDelta) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	switch d.Kind {
+	case StepDeltaThinking, StepDeltaText:
+		if strings.TrimSpace(d.Text) != "" {
+			r.contentSeen = true
+		}
+	case StepDeltaToolUse:
+		r.contentSeen = true
+	}
 
 	switch d.Kind {
 	case StepDeltaThinking:

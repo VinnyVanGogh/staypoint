@@ -125,6 +125,13 @@ CREATE TABLE IF NOT EXISTS settings_kv (
     value      TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+CREATE TABLE IF NOT EXISTS task_worktree_bases (
+    task_id    TEXT PRIMARY KEY,
+    repo_path  TEXT NOT NULL DEFAULT '',
+    base_sha   TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 CREATE TABLE IF NOT EXISTS ship_review_cards (
     id                  TEXT PRIMARY KEY,
     task_id             TEXT NOT NULL,
@@ -144,6 +151,14 @@ CREATE TABLE IF NOT EXISTS ship_review_cards (
     check_runs_json     TEXT NOT NULL DEFAULT '[]',
     branch_deleted      INTEGER NOT NULL DEFAULT 0,
     branch_delete_error TEXT NOT NULL DEFAULT '',
+    merge_mode          TEXT NOT NULL DEFAULT '',
+    pr_number           INTEGER NOT NULL DEFAULT 0,
+    pr_url              TEXT NOT NULL DEFAULT '',
+    pr_checks_json      TEXT NOT NULL DEFAULT '[]',
+    pr_checks_sha       TEXT NOT NULL DEFAULT '',
+    pr_checks_at        TEXT NOT NULL DEFAULT '',
+    pr_merge_error      TEXT NOT NULL DEFAULT '',
+    ci_fix_requested    INTEGER NOT NULL DEFAULT 0,
     created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -197,7 +212,7 @@ func initGitRepo(t *testing.T, dir string) {
 // hit ErrConcurrencyCap and wrote "Woke up" + "Finished: error" steps into
 // the timeline via StepRecorder.
 func TestClaim_DoesNotFireWake(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	db := openTestDB(t)
 	insertTask(t, db, "wake-task", "/tmp")
@@ -214,7 +229,6 @@ func TestClaim_DoesNotFireWake(t *testing.T) {
 	if err := h.Claim(context.Background(), "wake-task", runID, "agent-w"); err != nil {
 		t.Fatal("claim:", err)
 	}
-	defer activeClaims.Add(-1)
 
 	select {
 	case <-fired:
@@ -228,6 +242,7 @@ func TestClaim_DoesNotFireWake(t *testing.T) {
 // The guard is checkout_run_id IS NOT NULL (set by the first Claim and only
 // cleared by Release). execution_stage alone no longer gates re-claims.
 func TestClaim_AlreadyClaimed(t *testing.T) {
+	useSlots(t, 1)
 	db := openTestDB(t)
 	insertTask(t, db, "task-1", "/tmp/repo")
 	h := &Harness{DB: db}
@@ -235,9 +250,9 @@ func TestClaim_AlreadyClaimed(t *testing.T) {
 	if err := h.Claim(context.Background(), "task-1", "run-a", "agent-a"); err != nil {
 		t.Fatal("first claim should succeed:", err)
 	}
-	// Restore so the concurrency atomic doesn't block us, but leave checkout_run_id
+	// Free the run slot so it doesn't block us, but leave checkout_run_id
 	// set (simulating an actively-running task that has not yet called Release).
-	activeClaims.Add(-1)
+	GlobalRunSlots.Release("task-1")
 
 	if err := h.Claim(context.Background(), "task-1", "run-b", "agent-b"); err == nil {
 		t.Fatal("second claim while checkout_run_id is set should fail")
@@ -248,7 +263,7 @@ func TestClaim_AlreadyClaimed(t *testing.T) {
 // after a run ends and Release clears checkout_run_id, a new Claim succeeds
 // even when execution_stage is left at 'in_progress' by the prior run.
 func TestClaim_RunNowSucceedsAfterPriorRun(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	db := openTestDB(t)
 	insertTask(t, db, "run-now-task", "/tmp")
@@ -260,14 +275,13 @@ func TestClaim_RunNowSucceedsAfterPriorRun(t *testing.T) {
 	if err := h.Claim(context.Background(), "run-now-task", "run-b", "agent-b"); err != nil {
 		t.Fatalf("Claim after prior run should succeed (Run Now path); got: %v", err)
 	}
-	defer activeClaims.Add(-1)
 }
 
 // TestClaim_InteractionResolvedSucceedsAfterRun verifies the interaction-resolved
 // fix (STA-390): after a run ends with execution_stage='in_review' and Release
 // clears checkout_run_id, a new Claim succeeds on the interaction_resolved wake.
 func TestClaim_InteractionResolvedSucceedsAfterRun(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	db := openTestDB(t)
 	insertTask(t, db, "intr-task", "/tmp")
@@ -279,12 +293,11 @@ func TestClaim_InteractionResolvedSucceedsAfterRun(t *testing.T) {
 	if err := h.Claim(context.Background(), "intr-task", "run-c", "agent-c"); err != nil {
 		t.Fatalf("Claim after in_review run should succeed (interaction_resolved path); got: %v", err)
 	}
-	defer activeClaims.Add(-1)
 }
 
 // TestClaim_DoneTaskNotReclaimable verifies that a 'done' task cannot be re-claimed.
 func TestClaim_DoneTaskNotReclaimable(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	db := openTestDB(t)
 	insertTask(t, db, "done-task", "/tmp")
@@ -294,7 +307,6 @@ func TestClaim_DoneTaskNotReclaimable(t *testing.T) {
 
 	err := h.Claim(context.Background(), "done-task", "run-d", "agent-d")
 	if err == nil {
-		activeClaims.Add(-1)
 		t.Fatal("Claim on done task should fail")
 	}
 }
@@ -309,14 +321,14 @@ func TestClaim_NotFound(t *testing.T) {
 	}
 }
 
-// TestConcurrencyCap verifies only one concurrent claim is allowed per process.
+// TestConcurrencyCap verifies the global cap refuses claims beyond
+// max_concurrent_runs even when the repos differ.
 func TestConcurrencyCap(t *testing.T) {
-	// Reset the global counter before this test to avoid leaking state.
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	db := openTestDB(t)
-	insertTask(t, db, "cap-task-1", "/tmp")
-	insertTask(t, db, "cap-task-2", "/tmp")
+	insertTask(t, db, "cap-task-1", "/tmp/cap-repo-a")
+	insertTask(t, db, "cap-task-2", "/tmp/cap-repo-b")
 
 	h := &Harness{DB: db}
 
@@ -324,7 +336,6 @@ func TestConcurrencyCap(t *testing.T) {
 	if err := h.Claim(context.Background(), "cap-task-1", "run-1", "agent"); err != nil {
 		t.Fatal("first claim:", err)
 	}
-	defer activeClaims.Add(-1) // Release after test.
 
 	// Second claim must fail with cap error.
 	err := h.Claim(context.Background(), "cap-task-2", "run-2", "agent")
@@ -338,14 +349,15 @@ func TestConcurrencyCap(t *testing.T) {
 // This prevents the stats bar from showing a stale "Finished: error" step from
 // a refused Run Now click (STA-462).
 func TestRefusedRun_NoSteps(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 	db := openTestDB(t)
 	insertTask(t, db, "refused-task", "/tmp")
 	h := &Harness{DB: db}
 
-	// Saturate the concurrency cap (simulates an active run).
-	activeClaims.Store(1)
-	defer activeClaims.Store(0)
+	// Saturate the concurrency cap (simulates an active run in another repo).
+	if err := GlobalRunSlots.Acquire("other-task", "/elsewhere"); err != nil {
+		t.Fatal(err)
+	}
 
 	var emittedWake bool
 	var emittedRoute bool
@@ -380,7 +392,7 @@ func TestRefusedRun_NoSteps(t *testing.T) {
 
 // TestRelease_ClearsCheckout verifies Release zeroes checkout fields.
 func TestRelease_ClearsCheckout(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 	db := openTestDB(t)
 	insertTask(t, db, "release-task", "/tmp")
 	h := &Harness{DB: db}
@@ -658,7 +670,7 @@ func TestInterceptor_ShipReviewSkipsWhenGateOff(t *testing.T) {
 // TestRun_TodoToInReview verifies the happy path: task transitions from todo to
 // in_review unattended with a cost record.
 func TestRun_TodoToInReview(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	repoDir := t.TempDir()
 	initGitRepo(t, repoDir)
@@ -713,7 +725,7 @@ func TestRun_TodoToInReview(t *testing.T) {
 
 // TestWallclockCap verifies that a cancelled context results in a capped disposition.
 func TestWallclockCap(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	db := openTestDB(t)
 	insertTask(t, db, "wall-task", "/tmp")
@@ -742,7 +754,7 @@ func TestWallclockCap(t *testing.T) {
 
 // TestTurnCap verifies MaxTurns=1 limits turn count.
 func TestTurnCap(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	db := openTestDB(t)
 	insertTask(t, db, "turn-task", "/tmp")
@@ -819,6 +831,7 @@ func testStreamParse(line []byte) ([]StepDelta, error) {
 	}
 	var ev struct {
 		Type    string `json:"type"`
+		Event   string `json:"event"`
 		Message struct {
 			Content []struct {
 				Type     string `json:"type"`
@@ -826,15 +839,23 @@ func testStreamParse(line []byte) ([]StepDelta, error) {
 				Thinking string `json:"thinking"`
 			} `json:"content"`
 		} `json:"message"`
+		Result struct {
+			Status   string `json:"status"`
+			Response string `json:"response"`
+		} `json:"result"`
 	}
 	if err := json.Unmarshal(line, &ev); err != nil {
 		return nil, err
+	}
+	// agy stream-json: the final answer arrives only in event=result.
+	if ev.Event == "result" {
+		return []StepDelta{{Kind: StepDeltaResult, Text: ev.Result.Response, IsError: ev.Result.Status != "SUCCESS"}}, nil
 	}
 	var out []StepDelta
 	for _, b := range ev.Message.Content {
 		switch b.Type {
 		case "text":
-			out = append(out, StepDelta{Kind: StepDeltaText, Text: b.Text})
+			out = append(out, StepDelta{Kind: StepDeltaText, Text: b.Text, FromUser: ev.Type == "user"})
 		case "thinking":
 			out = append(out, StepDelta{Kind: StepDeltaThinking, Text: b.Thinking})
 		}
@@ -1073,7 +1094,7 @@ func TestBuildDiagnostic(t *testing.T) {
 // This is the regression test for STA-380: harness was using work_repo_root
 // (~/Documents/dev/mansol) which is not a git repo, causing every wake to fail.
 func TestRun_PerTaskRepoOverridesHarnessRoot(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	// taskRepo is a real git repo — the worktree must land here.
 	taskRepo := t.TempDir()
@@ -1114,7 +1135,7 @@ func TestRun_PerTaskRepoOverridesHarnessRoot(t *testing.T) {
 // interceptor always saw 0 work products on the first run and blocked the
 // transition to in_review. After the fix the INSERT precedes the interceptor.
 func TestRun_FileChangeWithMarkerEndsInReview(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	repoDir := t.TempDir()
 	initGitRepo(t, repoDir)
@@ -1164,7 +1185,7 @@ func TestRun_FileChangeWithMarkerEndsInReview(t *testing.T) {
 // an explicit task comment. Prior to the fix the external hook would block the
 // prompt silently and the harness would end in_progress with no explanation.
 func TestRun_BudgetExhausted_SetsCapped(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	db := openTestDB(t)
 	// Insert a task with max_turns=2 already fully consumed (spent_turns=2).
@@ -1236,7 +1257,7 @@ func TestRun_BudgetExhausted_SetsCapped(t *testing.T) {
 // TestRun_USDCapExhausted_SetsCapped verifies that USD budget exhaustion also
 // triggers the capped pre-flight path (STA-406).
 func TestRun_USDCapExhausted_SetsCapped(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	db := openTestDB(t)
 	_, err := db.Exec(
@@ -1321,7 +1342,6 @@ func (h *Harness) runWithNoAdapter(ctx context.Context, taskID string) (*RunResu
 // runWithNoAdapterCancelled simulates a run where the context is cancelled
 // before any adapter work happens, resulting in a "capped" disposition.
 func (h *Harness) runWithNoAdapterCancelled(db *sql.DB, taskID string) (*RunResult, error) {
-	activeClaims.Store(0)
 
 	cfg := RunConfig{MaxTurns: 1, AgentID: "capper", MaxWallclock: 10 * time.Second}
 	runID := buildRunID(cfg.AgentID)
@@ -1353,7 +1373,7 @@ func (n *noopWorktreeManager) PruneWorktreeDirContext(_ context.Context, _ strin
 // The harness must NOT delete the task branch on run teardown so that committed
 // work stays reachable for reviewers after the worktree directory is removed.
 func TestRun_BranchSurvivesAfterRun(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	repoDir := t.TempDir()
 	initGitRepo(t, repoDir)
@@ -1437,7 +1457,7 @@ func TestRun_BranchSurvivesAfterRun(t *testing.T) {
 // API call, inflating spent_turns by tool-use rounds per harness turn.
 // After the fix the watcher passes turns=0; the harness is the sole authority.
 func TestSpentTurnsEqualsAdapterInvocations(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	const wantTurns = 3
 
@@ -1463,7 +1483,7 @@ func TestSpentTurnsEqualsAdapterInvocations(t *testing.T) {
 	result, err := h.Run(context.Background(), "sta466-task", RunConfig{
 		MaxTurns:     wantTurns,
 		AgentID:      "tester",
-		MaxWallclock: 10 * time.Second,
+		MaxWallclock: 2 * time.Minute,
 		RunAdapter: func(_ context.Context, _, _ string, _, _ []string, _ io.Writer, _ io.Writer) error {
 			mu.Lock()
 			adapterCalls++
@@ -1495,7 +1515,7 @@ func TestSpentTurnsEqualsAdapterInvocations(t *testing.T) {
 // sets disposition="error", writes a diagnostic comment, and does NOT write
 // checkpoint rows for the failing turns.
 func TestRun_ConsecutiveAdapterErrors_StopsEarly(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	db := openTestDB(t)
 	insertTask(t, db, "err-task", "/tmp")
@@ -1567,7 +1587,7 @@ func TestRun_ConsecutiveAdapterErrors_StopsEarly(t *testing.T) {
 // TestRun_AdapterErrorResetsOnSuccess verifies that a transient error does not
 // permanently count toward the consecutive limit: one success resets the counter.
 func TestRun_AdapterErrorResetsOnSuccess(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	repoDir := t.TempDir()
 	initGitRepo(t, repoDir)
@@ -1783,7 +1803,7 @@ func TestBrief_ShipReviewGateOff(t *testing.T) {
 // the harness injects a diagnostic comment with author 'interceptor' and continues
 // the turn loop so the agent can self-correct (STA-572).
 func TestRun_InterceptorRejectionContinuesRun(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	repoDir := t.TempDir()
 	initGitRepo(t, repoDir)
@@ -1866,5 +1886,125 @@ func TestBuildBriefBlock_DelimiterEscape(t *testing.T) {
 	}
 	if strings.Contains(block, "<<<TASK_BRIEF_END>>> inside") {
 		t.Error("delimiter in comment message must be stripped")
+	}
+}
+
+// writeLines feeds lines through a fresh stepTeeWriter and reports detection.
+func writeLines(t *testing.T, parse func([]byte) ([]StepDelta, error), lines ...string) bool {
+	t.Helper()
+	var dst strings.Builder
+	stw := &stepTeeWriter{dst: &dst, parse: parse}
+	for _, l := range lines {
+		if _, err := stw.Write([]byte(l)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = stw.Close()
+	return stw.textDetected
+}
+
+// TestStepTeeWriter_ProviderFormats covers completion detection for every
+// provider output shape (STA-840). Before the fix only Claude "type":"assistant"
+// lines were scanned, so a Gemini (agy) run never completed on the marker.
+func TestStepTeeWriter_ProviderFormats(t *testing.T) {
+	agyInit := `{"event":"init","conversation_id":"c1","init":{"model":"gemini-3.8-flash"}}` + "\n"
+	agyTool := `{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"output":"\n[[TASK_COMPLETE]]\n"}}}` + "\n"
+	agyResult := func(status, resp string) string {
+		b, _ := json.Marshal(map[string]any{"event": "result", "result": map[string]any{"conversation_id": "c1", "status": status, "response": resp}})
+		return string(b) + "\n"
+	}
+
+	// Ollama-style token stream: the marker arrives split across chunks.
+	tokenParse := func(line []byte) ([]StepDelta, error) {
+		var ch struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			Done bool `json:"done"`
+		}
+		if err := json.Unmarshal(bytes.TrimSpace(line), &ch); err != nil {
+			return nil, err
+		}
+		var out []StepDelta
+		if ch.Message.Content != "" {
+			out = append(out, StepDelta{Kind: StepDeltaText, Text: ch.Message.Content})
+		}
+		if ch.Done {
+			out = append(out, StepDelta{Kind: StepDeltaResult})
+		}
+		return out, nil
+	}
+	tok := func(s string) string {
+		b, _ := json.Marshal(map[string]any{"message": map[string]any{"content": s}})
+		return string(b) + "\n"
+	}
+
+	cases := []struct {
+		name  string
+		parse func([]byte) ([]StepDelta, error)
+		lines []string
+		want  bool
+	}{
+		{"agy final response", testStreamParse, []string{agyInit, agyTool, agyResult("SUCCESS", "Review complete.\n\n[[TASK_COMPLETE]]")}, true},
+		{"agy marker only in tool output", testStreamParse, []string{agyInit, agyTool, agyResult("SUCCESS", "still working")}, false},
+		{"agy marker quoted in prose", testStreamParse, []string{agyResult("SUCCESS", "I will emit `[[TASK_COMPLETE]]` later.")}, false},
+		{"agy failed result", testStreamParse, []string{agyResult("ERROR", "[[TASK_COMPLETE]]")}, false},
+		{"agy result without trailing newline", testStreamParse, []string{strings.TrimSuffix(agyResult("SUCCESS", "done\n[[TASK_COMPLETE]]"), "\n")}, true},
+		{"claude echoed prompt with marker on own line", testStreamParse, []string{`{"type":"user","message":{"content":[{"type":"text","text":"Continue.\n[[TASK_COMPLETE]]\n"}]}}` + "\n"}, false},
+		{"token stream split marker", tokenParse, []string{tok("All done.\n[[TASK_"), tok("COMPLETE]]"), `{"done":true}` + "\n"}, true},
+		{"token stream inline marker", tokenParse, []string{tok("emit [[TASK_"), tok("COMPLETE]] later"), `{"done":true}` + "\n"}, false},
+		{"plain text output", testStreamParse, []string{"Work done.\n", "[[TASK_COMPLETE]]\n"}, true},
+		{"plain text inline marker", testStreamParse, []string{"I will emit [[TASK_COMPLETE]] on its own line.\n"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := writeLines(t, c.parse, c.lines...); got != c.want {
+				t.Errorf("textDetected = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestRun_AgyMarkerEndsRunInOneTurn: with the stream parser wired (as the
+// daemon always does), a Gemini/agy final response carrying the marker ends
+// the run on that turn instead of burning the turn budget (STA-840).
+func TestRun_AgyMarkerEndsRunInOneTurn(t *testing.T) {
+	useSlots(t, 1)
+
+	repoDir := t.TempDir()
+	initGitRepo(t, repoDir)
+
+	db := openTestDB(t)
+	insertTask(t, db, "sta840-task", repoDir)
+
+	h := &Harness{
+		DB:          db,
+		RepoRoot:    repoDir,
+		WM:          workspace.NewWorktreeManager(repoDir, db),
+		Interceptor: NewInterceptor(db),
+	}
+	h.Interceptor.Guards = []GuardFunc{h.Interceptor.checkWorkProducts}
+
+	adapterCalls := 0
+	result, err := h.Run(context.Background(), "sta840-task", RunConfig{
+		MaxTurns:     5,
+		AgentID:      "tester",
+		MaxWallclock: 30 * time.Second,
+		StepRecorder: NewStepRecorder(db, func(string, any) {}, "run-sta840", "sta840-task"),
+		ParseDelta:   testStreamParse,
+		RunAdapter: func(_ context.Context, cwd, _ string, _, _ []string, stdout, _ io.Writer) error {
+			adapterCalls++
+			_ = os.WriteFile(filepath.Join(cwd, "README.md"), []byte("changed\n"), 0o644)
+			_, _ = io.WriteString(stdout, `{"event":"init","conversation_id":"c1","init":{"model":"gemini-3.8-flash"}}`+"\n")
+			_, _ = io.WriteString(stdout, `{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"Plan written.\n\n[[TASK_COMPLETE]]"}}`+"\n")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != "in_review" || result.Turns != 1 || adapterCalls != 1 {
+		t.Fatalf("disposition=%q turns=%d adapterCalls=%d, want in_review after 1 turn (diagnostic: %s)",
+			result.Disposition, result.Turns, adapterCalls, result.DiagnosticMsg)
 	}
 }

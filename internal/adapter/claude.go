@@ -159,6 +159,7 @@ func (ClaudeAdapter) ParseStreamDelta(line []byte) ([]StreamDelta, error) {
 			switch b.Type {
 			case "text":
 				d.Kind, d.Text = DeltaText, b.Text
+				d.FromUser = ev.Type == "user"
 			case "thinking":
 				d.Kind, d.Text = DeltaThinking, b.Thinking
 			case "tool_use":

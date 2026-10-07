@@ -326,6 +326,19 @@ async function refreshBoardPasskeyStatus() {
   return boardPasskeyState;
 }
 
+// refreshDevBuildBadge shows the header's DEV BUILD badge when /api/health
+// says the daemon is not a reviewed main build (STA-805).
+async function refreshDevBuildBadge() {
+  let health = null;
+  try { health = await apiFetch('/api/health'); } catch { return; }
+  const badge = document.getElementById('dev-build-badge');
+  if (!badge) return;
+  badge.hidden = !health.dev_build;
+  badge.title = health.dev_build
+    ? `Not a reviewed main build: ${health.dev_build_reason || 'unknown reason'} (commit ${health.git_commit || 'none'})`
+    : '';
+}
+
 // enrollBoardPasskey runs boardEnrollPasskey for an explicit "Enroll passkey"
 // click. A second passkey needs an assertion from an existing one, so that is
 // collected first when one is believed enrolled; if the server says none is
@@ -422,12 +435,26 @@ async function apiFetch(path, options = {}) {
   return r.json();
 }
 
+async function fetchAllTasks() {
+  const tasks = [];
+  for (let offset = 0; offset < 20000; offset += 1000) {
+    const page = await apiFetch(`/api/tasks?status=all&include_legacy=1&limit=1000&offset=${offset}`);
+    tasks.push(...(page.tasks || []));
+    if (!page.has_more) break;
+  }
+  return { tasks };
+}
+
 // ── Initial data load ─────────────────────────────────────
 async function loadAll() {
   try {
     const [fleetResp, tasksResp, sessionsResp] = await Promise.all([
       apiFetch('/api/fleet/overview').catch(() => null),
-      apiFetch('/api/tasks?status=all').catch(() => ({ tasks: [] })),
+      // include_legacy: the board and lists hide legacy tasks and archived
+      // imports behind their own toggle; task detail and history views still
+      // need them. Paged: the API caps a page at 1000 and an import alone
+      // can exceed that.
+      fetchAllTasks().catch(() => ({ tasks: [] })),
       apiFetch('/api/sessions').catch(() => ({ sessions: [] })),
     ]);
 
@@ -569,6 +596,24 @@ function handleEvent(evt) {
     }
     return;
   }
+  if (type === 'run.turn' && evt.data) {
+    // Turn in flight (or null when it ends), for the stats strip turn timer.
+    const { task_id: tid, turn } = evt.data;
+    if (tid && state.tasks[tid]) {
+      state.tasks[tid].turn = turn || null;
+      if (tid === state.openDetailTaskId) refreshTaskStatsBar(tid);
+    }
+    return;
+  }
+  if (type === 'run.queue' && evt.data) {
+    const tid = state.openDetailTaskId;
+    if (tid) {
+      const pos = queuePositionIn(evt.data.queue, tid);
+      if (state.tasks[tid]) state.tasks[tid].queue = pos;
+      setRunQueueLine(document.getElementById(`run-queue-line-${tid}`), pos);
+    }
+    return;
+  }
   if (type === 'run_control' && evt.data) {
     const { task_id: tid, action } = evt.data;
     if (tid && (action === 'pause' || action === 'resume') && tid === state.openDetailTaskId) {
@@ -619,8 +664,8 @@ function handleEvent(evt) {
     const d = evt.data;
     const tid = d.task_id;
     if (tid && state.openDetailTaskId === tid) {
-      // Reload the task page so the ship review card updates.
-      const slot = document.querySelector('#task-page-content .task-page-review-card-slot');
+      // Reload the ship review card in the task page or the drawer.
+      const slot = document.querySelector('#task-page-content .task-page-review-card-slot, #panel-content .task-page-review-card-slot');
       if (slot) {
         const existing = document.getElementById(`ship-review-${tid}`);
         if (existing) existing.remove();
@@ -1271,21 +1316,13 @@ function buildGaugeCard(key, q) {
   const hdr = el('div', 'gauge-card-header');
   hdr.appendChild(el('span', 'gauge-provider-name', q.display_name || key));
 
-  let sCls = 'pill-green', sTxt = '✔ On Track';
-  if (q.is_locked || q.projection_status === 'locked_out') { sCls = 'pill-red'; sTxt = '✖ Locked Out'; }
-  else if (q.projection_status === 'overpaced') { sCls = 'pill-amber'; sTxt = '⚠ Overpaced'; }
-  hdr.appendChild(el('span', `pill ${sCls}`, sTxt));
+  const pill = quotaStatusPill(q);
+  hdr.appendChild(el('span', `pill ${pill.cls}`, pill.text));
   card.appendChild(hdr);
 
-  // 5-Hour Rolling
-  let remaining5h = q.five_hour_remaining_pct;
-  let used5h = q.five_hour_used_pct;
-  if (remaining5h == null && used5h != null) remaining5h = Math.max(0, 100 - used5h);
-  if (used5h == null && remaining5h != null) used5h = Math.max(0, 100 - remaining5h);
-  if (remaining5h == null && used5h == null) { remaining5h = 100; used5h = 0; }
-  if (remaining5h === 100 && used5h > 0) remaining5h = Math.max(0, 100 - used5h);
-  remaining5h = Math.max(0, Math.min(100, remaining5h));
-  used5h = Math.max(0, Math.min(100, used5h));
+  // 5-Hour Rolling. An unmeasured window renders "No data", never 0% used.
+  const v5h = quotaWindowView(q, 'five_hour');
+  const used5h = v5h.measured ? v5h.used : 0;
 
   const bar5hOuter = el('div', 'gauge-bar-outer');
   const bar5hInner = el('div', 'gauge-bar-inner');
@@ -1299,10 +1336,10 @@ function buildGaugeCard(key, q) {
   card.appendChild(bar5hOuter);
 
   const m5Row = el('div', 'gauge-metrics-row');
-  m5Row.appendChild(el('span', null, `${used5h.toFixed(1)}% used · ${remaining5h.toFixed(1)}% left`));
-  const count5h = formatCountdown(q.five_hour_resets_at);
-  const time5h = formatResetTime(q.five_hour_resets_at, false);
-  m5Row.appendChild(el('span', 'gauge-metric-val', count5h ? `resets ${count5h}` : 'rolling'));
+  m5Row.appendChild(el('span', null, v5h.text));
+  const count5h = v5h.measured ? formatCountdown(q.five_hour_resets_at) : '';
+  const time5h = v5h.measured ? formatResetTime(q.five_hour_resets_at, false) : '';
+  m5Row.appendChild(el('span', 'gauge-metric-val', count5h ? `resets ${count5h}` : (v5h.measured ? 'rolling' : 'not measured')));
   card.appendChild(m5Row);
   if (time5h) {
     const t5Row = el('div', 'gauge-metrics-row');
@@ -1317,14 +1354,8 @@ function buildGaugeCard(key, q) {
   card.appendChild(b5Row);
 
   // Weekly Budget
-  let remainingWk = q.weekly_remaining_pct;
-  let usedWk = q.weekly_used_pct;
-  if (remainingWk == null && usedWk != null) remainingWk = Math.max(0, 100 - usedWk);
-  if (usedWk == null && remainingWk != null) usedWk = Math.max(0, 100 - remainingWk);
-  if (remainingWk == null && usedWk == null) { remainingWk = 100; usedWk = 0; }
-  if (remainingWk === 100 && usedWk > 0) remainingWk = Math.max(0, 100 - usedWk);
-  remainingWk = Math.max(0, Math.min(100, remainingWk));
-  usedWk = Math.max(0, Math.min(100, usedWk));
+  const vWk = quotaWindowView(q, 'weekly');
+  const usedWk = vWk.measured ? vWk.used : 0;
 
   const labelWk = el('div', 'gauge-window-label', 'Weekly Budget');
   labelWk.style.marginTop = '10px';
@@ -1341,11 +1372,11 @@ function buildGaugeCard(key, q) {
   card.appendChild(barWkOuter);
 
   const mWkRow = el('div', 'gauge-metrics-row');
-  mWkRow.appendChild(el('span', null, `${usedWk.toFixed(1)}% used · ${remainingWk.toFixed(1)}% left`));
-  const countWk = formatCountdown(q.weekly_resets_at);
+  mWkRow.appendChild(el('span', null, vWk.text));
+  const countWk = vWk.measured ? formatCountdown(q.weekly_resets_at) : '';
   if (countWk) mWkRow.appendChild(el('span', 'gauge-metric-val', `resets ${countWk}`));
   card.appendChild(mWkRow);
-  const timeWk = formatResetTime(q.weekly_resets_at, true);
+  const timeWk = vWk.measured ? formatResetTime(q.weekly_resets_at, true) : '';
   if (timeWk) {
     const tWkRow = el('div', 'gauge-metrics-row');
     tWkRow.appendChild(el('span', null, ''));
@@ -1450,7 +1481,8 @@ function renderOrganizationsGrid(orgs) {
           const qRow = el('div');
           qRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;font-size:0.72rem;color:var(--muted);';
           qRow.appendChild(el('span', null, q.display_name));
-          qRow.appendChild(el('span', 'gauge-metric-val', `${q.five_hour_used_pct}% 5h`));
+          const v = quotaWindowView(q, 'five_hour');
+          qRow.appendChild(el('span', 'gauge-metric-val', v.measured ? `${v.used.toFixed(1)}% 5h` : 'No data'));
           qWrap.appendChild(qRow);
         }
         card.appendChild(qWrap);
@@ -2998,7 +3030,7 @@ function renderAgentsPage() {
 
     // ── Quota Consumption Headroom Gauge ──────────────────
     const quota = a.quota || getAgentQuota(f?.provider_quotas, a.provider, a.org || a.organization);
-    if (quota) {
+    if (quota && quotaWindowMeasured(quota, 'five_hour')) {
       const remaining = quota.five_hour_remaining_pct ?? (100 - (quota.five_hour_used_pct ?? 0));
       const used = 100 - remaining;
       const qSection = el('div', 'agent-quota-section');
@@ -4542,7 +4574,10 @@ function renderSettings() {
       cardHdr.appendChild(titleWrap);
 
       let sCls = 'pill-green', sTxt = '✔ Active · On Track';
-      if (q.is_locked || q.projection_status === 'locked_out') {
+      if (!(q.is_locked || q.projection_status === 'locked_out') && quotaStatusPill(q).text === 'No data') {
+        sCls = 'pill-stopped';
+        sTxt = 'No data';
+      } else if (q.is_locked || q.projection_status === 'locked_out') {
         sCls = 'pill-red';
         sTxt = '🔒 Locked Out';
       } else if (q.projection_status === 'overpaced') {
@@ -4568,23 +4603,19 @@ function renderSettings() {
       const body = el('div', 'settings-provider-body');
 
       // ── 5-Hour Rolling Pool ──
-      let rem5h = q.five_hour_remaining_pct;
-      let used5h = q.five_hour_used_pct;
-      if (rem5h == null && used5h != null) rem5h = Math.max(0, 100 - used5h);
-      if (used5h == null && rem5h != null) used5h = Math.max(0, 100 - rem5h);
-      if (rem5h == null && used5h == null) { rem5h = 100; used5h = 0; }
-      if (rem5h === 100 && used5h > 0) rem5h = Math.max(0, 100 - used5h);
-      rem5h = Math.max(0, Math.min(100, rem5h));
-      used5h = Math.max(0, Math.min(100, used5h));
-      const count5h = formatCountdown(q.five_hour_resets_at);
-      const time5h = formatResetTime(q.five_hour_resets_at, false);
+      const v5h = quotaWindowView(q, 'five_hour');
+      const rem5h = v5h.measured ? v5h.remaining : 100;
+      const used5h = v5h.measured ? v5h.used : 0;
+      const count5h = v5h.measured ? formatCountdown(q.five_hour_resets_at) : '';
+      const time5h = v5h.measured ? formatResetTime(q.five_hour_resets_at, false) : '';
       const limit5h = q.lockout_threshold_pct || 100;
 
       const pool5h = el('div', 'settings-pool-box');
       const pool5hHdr = el('div', 'settings-pool-hdr');
       pool5hHdr.appendChild(el('span', 'settings-pool-title', '5-Hour Rolling Window'));
-      const badge5h = el('span', `headroom-badge ${rem5h <= 10 ? 'badge-red' : rem5h <= 25 ? 'badge-amber' : 'badge-green'}`,
-        `${rem5h.toFixed(1)}% Headroom`);
+      const badge5h = v5h.measured
+        ? el('span', `headroom-badge ${rem5h <= 10 ? 'badge-red' : rem5h <= 25 ? 'badge-amber' : 'badge-green'}`, `${rem5h.toFixed(1)}% Headroom`)
+        : el('span', 'headroom-badge', 'No data');
       pool5hHdr.appendChild(badge5h);
       pool5h.appendChild(pool5hHdr);
 
@@ -4599,12 +4630,12 @@ function renderSettings() {
 
       const m5hHeadroom = el('div', 'settings-metric-item');
       m5hHeadroom.appendChild(el('span', 'settings-metric-lbl', 'Pool Headroom'));
-      m5hHeadroom.appendChild(el('span', 'settings-metric-val', `${rem5h.toFixed(1)}% remaining (${used5h.toFixed(1)}% used)`));
+      m5hHeadroom.appendChild(el('span', 'settings-metric-val', v5h.measured ? `${rem5h.toFixed(1)}% remaining (${used5h.toFixed(1)}% used)` : 'No data'));
       metrics5h.appendChild(m5hHeadroom);
 
       const m5hReset = el('div', 'settings-metric-item');
       m5hReset.appendChild(el('span', 'settings-metric-lbl', 'Reset Time'));
-      const resetText5h = count5h ? `${count5h}${time5h ? ' · ' + time5h : ''}` : 'Rolling window';
+      const resetText5h = count5h ? `${count5h}${time5h ? ' · ' + time5h : ''}` : (v5h.measured ? 'Rolling window' : '—');
       m5hReset.appendChild(el('span', 'settings-metric-val', resetText5h));
       metrics5h.appendChild(m5hReset);
 
@@ -4622,22 +4653,18 @@ function renderSettings() {
       body.appendChild(pool5h);
 
       // ── Weekly Budget Pool ──
-      let remWk = q.weekly_remaining_pct;
-      let usedWk = q.weekly_used_pct;
-      if (remWk == null && usedWk != null) remWk = Math.max(0, 100 - usedWk);
-      if (usedWk == null && remWk != null) usedWk = Math.max(0, 100 - remWk);
-      if (remWk == null && usedWk == null) { remWk = 100; usedWk = 0; }
-      if (remWk === 100 && usedWk > 0) remWk = Math.max(0, 100 - usedWk);
-      remWk = Math.max(0, Math.min(100, remWk));
-      usedWk = Math.max(0, Math.min(100, usedWk));
-      const countWk = formatCountdown(q.weekly_resets_at);
-      const timeWk = formatResetTime(q.weekly_resets_at, true);
+      const vWk = quotaWindowView(q, 'weekly');
+      const remWk = vWk.measured ? vWk.remaining : 100;
+      const usedWk = vWk.measured ? vWk.used : 0;
+      const countWk = vWk.measured ? formatCountdown(q.weekly_resets_at) : '';
+      const timeWk = vWk.measured ? formatResetTime(q.weekly_resets_at, true) : '';
 
       const poolWk = el('div', 'settings-pool-box');
       const poolWkHdr = el('div', 'settings-pool-hdr');
       poolWkHdr.appendChild(el('span', 'settings-pool-title', 'Weekly Budget Window'));
-      const badgeWk = el('span', `headroom-badge ${remWk <= 15 ? 'badge-red' : remWk <= 30 ? 'badge-amber' : 'badge-green'}`,
-        `${remWk.toFixed(1)}% Headroom`);
+      const badgeWk = vWk.measured
+        ? el('span', `headroom-badge ${remWk <= 15 ? 'badge-red' : remWk <= 30 ? 'badge-amber' : 'badge-green'}`, `${remWk.toFixed(1)}% Headroom`)
+        : el('span', 'headroom-badge', 'No data');
       poolWkHdr.appendChild(badgeWk);
       poolWk.appendChild(poolWkHdr);
 
@@ -4652,7 +4679,7 @@ function renderSettings() {
 
       const mWkHeadroom = el('div', 'settings-metric-item');
       mWkHeadroom.appendChild(el('span', 'settings-metric-lbl', 'Weekly Headroom'));
-      mWkHeadroom.appendChild(el('span', 'settings-metric-val', `${remWk.toFixed(1)}% remaining (${usedWk.toFixed(1)}% used)`));
+      mWkHeadroom.appendChild(el('span', 'settings-metric-val', vWk.measured ? `${remWk.toFixed(1)}% remaining (${usedWk.toFixed(1)}% used)` : 'No data'));
       metricsWk.appendChild(mWkHeadroom);
 
       const mWkReset = el('div', 'settings-metric-item');
@@ -4880,6 +4907,19 @@ function renderSettings() {
       const row = el('div', 'settings-dev-config-row');
       row.appendChild(el('code', 'settings-dev-config-repo', c.repo_path));
       row.appendChild(el('span', 'settings-dev-config-cmd', c.dev_command || '—'));
+      const mode = c.effective_merge_mode || 'direct';
+      row.appendChild(el('span', 'settings-dev-config-merge-mode',
+        `${MERGE_MODE_LABELS[mode] || mode}${c.merge_mode ? '' : ' (default)'}${c.is_work_repo ? ' · work repo' : ''}`));
+      row.title = 'Click to edit';
+      row.style.cursor = 'pointer';
+      // Load the saved values so a save never blanks fields it did not show.
+      row.addEventListener('click', () => {
+        repoInput.value = c.repo_path || '';
+        cmdInput.value = c.dev_command || '';
+        stepsInput.value = (c.setup_steps || []).join('\n');
+        mergeModeSelect.value = c.merge_mode || '';
+        ghDirInput.value = c.gh_config_dir || '';
+      });
       devConfigList.appendChild(row);
     }
   }
@@ -4906,6 +4946,19 @@ function renderSettings() {
   stepsInput.className = 'settings-dev-config-input';
   stepsInput.placeholder = 'Setup steps, one per line (e.g. npm ci)';
   stepsInput.rows = 3;
+  // STA-717: how Approve lands the branch for this repo.
+  const mergeModeSelect = el('select', 'settings-dev-config-input settings-dev-config-merge-mode-select');
+  for (const [value, label] of [['', 'Default (work repo: Open PR; otherwise Merge to main)'],
+    ['direct', MERGE_MODE_LABELS.direct], ['open_pr', MERGE_MODE_LABELS.open_pr], ['pr_merge', MERGE_MODE_LABELS.pr_merge]]) {
+    const o = document.createElement('option');
+    o.value = value;
+    o.textContent = label;
+    mergeModeSelect.appendChild(o);
+  }
+  const ghDirInput = el('input');
+  ghDirInput.type = 'text';
+  ghDirInput.className = 'settings-dev-config-input settings-dev-config-gh-dir';
+  ghDirInput.placeholder = 'Optional GH_CONFIG_DIR override (blank: the repo\'s normal gh login)';
   const saveBtn = el('button', 'settings-dev-config-save', 'Save config');
   const saveStatus = el('span', 'settings-dev-config-status', '');
   devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Repo path'));
@@ -4914,6 +4967,10 @@ function renderSettings() {
   devForm.appendChild(cmdInput);
   devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Setup steps'));
   devForm.appendChild(stepsInput);
+  devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Merge mode'));
+  devForm.appendChild(mergeModeSelect);
+  devForm.appendChild(el('div', 'settings-dev-config-field-label', 'gh config dir'));
+  devForm.appendChild(ghDirInput);
   devForm.appendChild(saveBtn);
   devForm.appendChild(saveStatus);
   devSec.appendChild(devForm);
@@ -4928,6 +4985,8 @@ function renderSettings() {
       repo_path: repoPath,
       dev_command: devCommand,
       setup_steps: stepsInput.value.split('\n').map(s => s.trim()).filter(Boolean),
+      merge_mode: mergeModeSelect.value,
+      gh_config_dir: ghDirInput.value.trim(),
     };
     const r = await withBoardWebAuthn((sessionToken, assertion) =>
       fetch('/api/project-dev-configs', {
@@ -5812,20 +5871,72 @@ function renderOrgDetailView(org) {
 }
 
 // ── Render: Kanban ────────────────────────────────────────
-const KANBAN_COLS = ['todo', 'in_progress', 'blocked', 'done'];
+// Columns and grouping come from lib/taskboard.js. Board preferences (group by
+// company, show legacy) are per-viewer conveniences kept in localStorage.
+const STORAGE_KANBAN_GROUP_KEY = 'staypoint_kanban_group_company';
+const STORAGE_KANBAN_LEGACY_KEY = 'staypoint_kanban_show_legacy';
+
+function kanbanPref(key) {
+  try { return localStorage.getItem(key) === '1'; } catch { return false; }
+}
+
+function setKanbanPref(key, on) {
+  try { localStorage.setItem(key, on ? '1' : '0'); } catch { /* ignore */ }
+}
+
+function wireKanbanControls() {
+  for (const [id, key] of [['kanban-group-company', STORAGE_KANBAN_GROUP_KEY], ['kanban-show-legacy', STORAGE_KANBAN_LEGACY_KEY]]) {
+    const box = document.getElementById(id);
+    if (!box || box.dataset.wired) continue;
+    box.dataset.wired = '1';
+    box.checked = kanbanPref(key);
+    box.addEventListener('change', () => {
+      setKanbanPref(key, box.checked);
+      renderKanban();
+    });
+  }
+}
+
+function renderKanbanColumns(columns) {
+  const row = el('div', 'kanban-board');
+  for (const status of BOARD_COLUMNS) {
+    const col = el('div', 'kanban-col');
+    col.dataset.status = status;
+    const tasks = columns[status] || [];
+    col.appendChild(el('h2', 'col-title', `${BOARD_COLUMN_TITLES[status]} · ${tasks.length}`));
+    const list = el('div', 'card-list');
+    list.id = `col-${status}`;
+    for (const t of tasks) list.appendChild(makeTaskCard(t));
+    col.appendChild(list);
+    row.appendChild(col);
+  }
+  return row;
+}
 
 function renderKanban() {
-  const groups = { todo: [], in_progress: [], blocked: [], done: [] };
-  for (const t of Object.values(state.tasks)) {
-    const col = groups[t.status];
-    if (col) col.push(t);
+  const board = document.getElementById('kanban-board');
+  if (!board) return;
+  wireKanbanControls();
+  const groupByCompany = !!document.getElementById('kanban-group-company')?.checked;
+  const showLegacy = !!document.getElementById('kanban-show-legacy')?.checked;
+  const tasks = Object.values(state.tasks);
+  const legacyCount = document.getElementById('kanban-legacy-count');
+  if (legacyCount) legacyCount.textContent = `(${countLegacy(tasks)})`;
+
+  board.innerHTML = '';
+  const groups = buildBoard(tasks, { groupByCompany, showLegacy });
+  for (const g of groups) {
+    if (!groupByCompany) {
+      board.appendChild(renderKanbanColumns(g.columns));
+      continue;
+    }
+    const lane = el('section', 'kanban-lane');
+    lane.appendChild(el('h2', 'kanban-lane-title', `${g.company} · ${g.total}`));
+    lane.appendChild(renderKanbanColumns(g.columns));
+    board.appendChild(lane);
   }
-  for (const status of KANBAN_COLS) {
-    const list = document.getElementById(`col-${status}`);
-    if (!list) continue;
-    list.innerHTML = '';
-    const tasks = groups[status].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));
-    for (const t of tasks) list.appendChild(makeTaskCard(t));
+  if (groupByCompany && groups.length === 0) {
+    board.appendChild(el('div', 'muted-text', 'No tasks on the board.'));
   }
 }
 
@@ -5834,8 +5945,10 @@ function makeTaskCard(task) {
   card.dataset.id = task.id;
   card.appendChild(el('div', 'card-title', task.title || task.name || '(untitled)'));
   const meta = el('div', 'card-meta');
-  meta.appendChild(el('span', `card-status-dot dot-${task.status}`));
-  meta.appendChild(el('span', 'card-id', task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : '')));
+  meta.appendChild(el('span', `card-status-dot dot-${boardColumnFor(task) || task.status}`));
+  meta.appendChild(el('span', 'card-id', task.source_ref || task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : '')));
+  if (isLegacy(task)) meta.appendChild(el('span', 'card-origin-badge', 'legacy'));
+  else if (isArchived(task)) meta.appendChild(el('span', 'card-origin-badge', 'archive'));
   card.appendChild(meta);
   card.addEventListener('click', () => openDetail(task.id));
   return card;
@@ -6444,13 +6557,11 @@ async function refreshChatMessages(taskId) {
     const comments = cr.comments || (Array.isArray(cr) ? cr : []);
     state.taskComments[taskId] = comments;
     if (state.tasks[taskId]) state.tasks[taskId].comments = comments;
-    const messagesDiv = document.getElementById('panel-chat-messages') || document.getElementById('page-chat-messages');
-    const titleEl = document.querySelector('#panel-chat-section .panel-section-title') || document.querySelector('#page-chat-section .panel-section-title');
+    const messagesDiv = document.getElementById('page-chat-messages');
     if (!messagesDiv) return;
     const atBottom = messagesDiv.scrollHeight - messagesDiv.scrollTop <= messagesDiv.clientHeight + 30;
     renderChatMessages(messagesDiv, comments);
     if (atBottom) messagesDiv.scrollTop = messagesDiv.scrollHeight;
-    if (titleEl) titleEl.textContent = `Chat (${comments.length})`;
     const pageToggle = document.getElementById('page-chat-toggle');
     if (pageToggle) pageToggle.textContent = chatToggleLabel(comments.length);
   } catch { /* silent */ }
@@ -6483,57 +6594,6 @@ function renderChatMessages(container, comments) {
   }
 }
 
-function buildChatSection(container, taskId, comments) {
-  const section = el('div', 'chat-section');
-  section.id = 'panel-chat-section';
-  section.appendChild(el('div', 'panel-section-title', `Chat (${comments.length})`));
-
-  const messagesDiv = el('div', 'chat-messages');
-  messagesDiv.id = 'panel-chat-messages';
-  renderChatMessages(messagesDiv, comments);
-  section.appendChild(messagesDiv);
-
-  const compose = el('div', 'chat-compose');
-  const textarea = document.createElement('textarea');
-  textarea.className = 'chat-textarea';
-  textarea.placeholder = 'Message the agent… (⌘↵ to send)';
-  textarea.rows = 2;
-  const autoResizeChat = () => {
-    textarea.style.height = 'auto';
-    textarea.style.height = Math.max(38, Math.min(220, textarea.scrollHeight)) + 'px';
-  };
-  textarea.addEventListener('input', autoResizeChat);
-  const sendBtn = el('button', 'chat-send-btn', 'Send');
-  sendBtn.type = 'button';
-
-  const doSend = async () => {
-    const body = textarea.value.trim();
-    if (!body) return;
-    textarea.value = '';
-    textarea.style.height = '';
-    sendBtn.disabled = true;
-    try {
-      await sendComment(taskId, body);
-      await refreshChatMessages(taskId);
-    } catch { /* ignore send error visually */ } finally {
-      sendBtn.disabled = false;
-      textarea.focus();
-    }
-  };
-
-  sendBtn.addEventListener('click', doSend);
-  textarea.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); doSend(); }
-  });
-
-  compose.appendChild(textarea);
-  compose.appendChild(sendBtn);
-  section.appendChild(compose);
-  container.appendChild(section);
-
-  messagesDiv.scrollTop = messagesDiv.scrollHeight;
-}
-
 async function sendComment(taskId, body) {
   const isFleet = isFleetTaskId(taskId);
   const endpoint = isFleet ? `/api/fleet/tasks/${taskId}/comments` : `/api/tasks/${taskId}/comments`;
@@ -6548,14 +6608,110 @@ async function sendComment(taskId, body) {
 
 // ── Detail panel (Right sidebar / Properties) ─────────────
 const WORK_KIND_LABELS = {
-  coding:       'Coding & review — Claude Opus, backup Gemini 3.1 Pro',
+  coding:       'Coding — Claude Opus only (Gemini never writes code)',
+  qa:           'QA & testing — Claude Opus only (writes tests)',
+  review:       'Review — Gemini 3.1 Pro, backup Claude Opus (advisory)',
   architecture: 'Architecture — Gemini 3.1 Pro, backup Claude Opus',
-  planning:     'Planning & docs — Gemini Flash, backup Claude Sonnet',
-  qa:           'QA & testing — Gemini Flash, backup Claude Sonnet',
+  planning:     'Planning — Gemini Flash, backup Claude Sonnet',
+  docs:         'Docs — Gemini Flash, backup Claude Sonnet',
 };
 
 function workKindLabel(kind) {
   return WORK_KIND_LABELS[kind] || kind || null;
+}
+
+// Board rule (router.GeminiCodeForbidden): Gemini never writes code. Code
+// kinds (and unknown kinds, which route as coding) cannot pick Gemini.
+const NON_CODE_KINDS = new Set(['planning', 'architecture', 'review', 'docs']);
+function kindAllowsGemini(kind) { return NON_CODE_KINDS.has(kind); }
+
+// Provider choices (STA-838): value is "provider" or "provider:model".
+const PROVIDER_CHOICES = [
+  { value: '',                              label: 'Default for the kind of work' },
+  { value: 'claude',                        label: 'Claude (Opus)' },
+  { value: 'claude:sonnet',                 label: 'Claude Sonnet' },
+  { value: 'gemini',                        label: 'Gemini 3.1 Pro', gemini: true },
+  { value: 'gemini:gemini-3.8-flash-high',  label: 'Gemini 3.8 Flash', gemini: true },
+];
+
+function splitProviderChoice(v) {
+  const [provider, model] = String(v || '').split(':');
+  return { provider: provider || '', model_override: model || '' };
+}
+
+function providerChoiceValue(task) {
+  const p = task.provider || '';
+  const m = task.model_override || '';
+  if (!p) return '';
+  if (p === 'claude') return m === 'sonnet' ? 'claude:sonnet' : 'claude';
+  if (p === 'gemini') return m === 'gemini-3.8-flash-high' ? 'gemini:gemini-3.8-flash-high' : 'gemini';
+  return '';
+}
+
+// gateGeminiOptions applies the Gemini rule to a provider select. Non-code
+// kinds: Gemini allowed. Code kinds: refused in a work repo (isWork true),
+// and in a personal repo every run waits for a Board Touch ID approval.
+// isWork null = unknown (create form): the server decides from the repo.
+function gateGeminiOptions(select, kind, hintEl, isWork = null) {
+  const nonCode = kindAllowsGemini(kind);
+  const allowed = nonCode || isWork !== true;
+  for (const opt of select.options) {
+    if (opt.dataset.gemini === '1') opt.disabled = !allowed;
+  }
+  if (!allowed && select.selectedOptions[0] && select.selectedOptions[0].dataset.gemini === '1') select.value = '';
+  let hint = '';
+  if (!allowed) hint = 'Gemini never writes code in a work repo, even with Board approval.';
+  else if (!nonCode) hint = 'Gemini on a code task: personal repos only, and every run waits for your Touch ID approval. Refused in work repos.';
+  if (hintEl) hintEl.textContent = hint;
+}
+
+async function putTaskProvider(taskId, choiceValue) {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/provider`, {
+    method: 'PUT',
+    headers: { ...authHeader(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(splitProviderChoice(choiceValue)),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `${r.status} ${r.statusText}`);
+  return data;
+}
+
+// buildProviderField is the task page's provider select (Details).
+function buildProviderField(task) {
+  const wrap = el('div', 'task-provider-field');
+  const select = document.createElement('select');
+  select.className = 'task-provider-select';
+  select.setAttribute('aria-label', 'Provider');
+  for (const c of PROVIDER_CHOICES) {
+    const opt = document.createElement('option');
+    opt.value = c.value;
+    opt.textContent = c.label;
+    if (c.gemini) opt.dataset.gemini = '1';
+    select.appendChild(opt);
+  }
+  select.value = providerChoiceValue(task);
+  const hint = el('div', 'form-hint');
+  const gate = () => gateGeminiOptions(select, task.work_kind || 'coding', hint, task.account_role === 'work');
+  gate();
+  select.addEventListener('change', async () => {
+    const prev = providerChoiceValue(task);
+    select.disabled = true;
+    try {
+      const updated = await putTaskProvider(task.id, select.value);
+      Object.assign(task, { provider: updated.provider || '', model_override: updated.model_override || '' });
+      if (state.tasks[task.id]) Object.assign(state.tasks[task.id], { provider: task.provider, model_override: task.model_override });
+      gate();
+      hint.textContent = (hint.textContent ? hint.textContent + ' ' : '') + 'Saved. The next run uses this provider.';
+    } catch (err) {
+      select.value = prev;
+      hint.textContent = err.message || 'Failed to set provider.';
+    } finally {
+      select.disabled = false;
+    }
+  });
+  wrap.appendChild(select);
+  wrap.appendChild(hint);
+  return wrap;
 }
 
 function addPanelField(content, label, value) {
@@ -6570,110 +6726,11 @@ function addPanelField(content, label, value) {
   content.appendChild(field);
 }
 
-function renderDetailContent(content, task) {
-  content.innerHTML = '';
-
-  // Title
-  const title = task.title || task.name || '(untitled)';
-  content.appendChild(el('h2', 'panel-title', title));
-
-  // Meta row: explicitly labeled fields for Status, Identifier, Priority, Org, Stage
-  const metaRow = el('div', 'panel-meta-row');
-
-  const ident = task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : null);
-  if (ident) {
-    const idWrap = el('div', 'panel-meta-item');
-    idWrap.innerHTML = `<span class="panel-meta-tag-label">Identifier</span><span class="card-id panel-meta-value">${escapeHtml(ident)}</span>`;
-    metaRow.appendChild(idWrap);
-  }
-
-  const statusWrap = el('div', 'panel-meta-item');
-  statusWrap.innerHTML = `<span class="panel-meta-tag-label">Status</span>`;
-  statusWrap.appendChild(statusPill(task.status || 'unknown'));
-  metaRow.appendChild(statusWrap);
-
-  if (task.priority) {
-    const prioWrap = el('div', 'panel-meta-item');
-    prioWrap.innerHTML = `<span class="panel-meta-tag-label">Priority</span>`;
-    prioWrap.appendChild(statusPill(task.priority));
-    metaRow.appendChild(prioWrap);
-  }
-
-  if (task.organization) {
-    const orgWrap = el('div', 'panel-meta-item');
-    orgWrap.innerHTML = `<span class="panel-meta-tag-label">Org</span>`;
-    orgWrap.appendChild(el('span', 'pill', task.organization));
-    metaRow.appendChild(orgWrap);
-  }
-
-  const stage = task.execution_stage || task.status;
-  if (stage) {
-    const stageWrap = el('div', 'panel-meta-item');
-    stageWrap.innerHTML = `<span class="panel-meta-tag-label">Stage</span><span class="pill stage-pill">${escapeHtml(stage)}</span>`;
-    metaRow.appendChild(stageWrap);
-  }
-
-  content.appendChild(metaRow);
-
-  // Description (with fallback to first comment)
-  let desc = (task.description || '').trim();
-  if (!desc && task.comments && task.comments.length) {
-    for (const c of task.comments) {
-      const commentBody = (c.body || c.message || c.content || '').trim();
-      if (commentBody) {
-        desc = commentBody;
-        break;
-      }
-    }
-  }
-  const descField = el('div', 'panel-field');
-  descField.appendChild(el('div', 'panel-field-label', 'Description'));
-  if (desc) {
-    descField.appendChild(mdEl(desc));
-  } else {
-    descField.appendChild(el('div', 'panel-field-muted', 'No description provided.'));
-  }
-  content.appendChild(descField);
-
-  // Properties grid with explicit typography labels
-  if (ident)                         addPanelField(content, 'Identifier', ident);
-  if (task.priority)                 addPanelField(content, 'Priority',   task.priority);
-  if (task.organization)             addPanelField(content, 'Org',        task.organization);
-  addPanelField(content, 'Stage',    task.execution_stage || task.status);
-  addPanelField(content, 'Assignee',     task.assignee_name || task.checkout_agent_id || null);
-  addPanelField(content, 'Kind of work', workKindLabel(task.work_kind));
-  addPanelField(content, 'Project',      task.project || null);
-  addPanelField(content, 'Goal',     task.goal_title || task.goal_id ? (task.goal_title || task.goal_id?.slice(0, 12)) : null);
-  addPanelField(content, 'Repo',     task.repo_path ? `${task.repo_path} (${task.git_branch || 'main'})` : null);
-
-  // Labels rendering as colorful badges
-  let labels = task.labels;
-  if (typeof labels === 'string') {
-    try { labels = JSON.parse(labels); } catch { labels = labels ? [labels] : []; }
-  }
-  if (Array.isArray(labels) && labels.length) {
-    const lblWrap = el('div', 'panel-field');
-    lblWrap.appendChild(el('div', 'panel-field-label', 'Labels'));
-    const badgeContainer = el('div', 'panel-labels-container');
-    badgeContainer.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;';
-    for (const l of labels) {
-      const name = typeof l === 'object' ? l.name : l;
-      const color = typeof l === 'object' && l.color ? l.color : '#38bdf8';
-      const badge = el('span', 'task-label-badge', name);
-      badge.style.cssText = `font-size:0.75rem;padding:2px 8px;border-radius:12px;font-weight:600;background:${color}22;border:1px solid ${color};color:${color};`;
-      badgeContainer.appendChild(badge);
-    }
-    lblWrap.appendChild(badgeContainer);
-    content.appendChild(lblWrap);
-  }
-
-  // Spend (always displayed so user sees tracking status)
-  addPanelField(content, 'Spend',
-    `${fmtCurrency(task.spent_usd || 0)} · ${fmtCompactNum(task.spent_tokens || 0)} tokens`);
-
-  // Budget
-  addPanelField(content, 'Budget', `${fmtCurrency(task.max_budget_usd || 0)} · ${task.max_turns || 50} runs max`);
-
+// Governance, blockers, dependency tree, parent and timestamps for the task
+// page Details section. These lived only in the old one-column drawer; the
+// drawer now renders the task page layout (STA-700), so both views show them.
+// openTask opens a linked task in the same view the user is in.
+function appendTaskRelations(target, task, openTask) {
   // Governance Section: Reviewers, Approvers, Quality Gates
   const gov = task.governance;
   if (gov || task.reviewers?.length || task.approvers?.length) {
@@ -6743,7 +6800,7 @@ function renderDetailContent(content, task) {
     gateInfo.appendChild(el('div', 'panel-field-value', `Review: ${reqReview} · Approval Threshold: ${thresh}`));
     govSection.appendChild(gateInfo);
 
-    content.appendChild(govSection);
+    target.appendChild(govSection);
   }
 
   // Blocker Status & Upstream Dependencies
@@ -6771,7 +6828,7 @@ function renderDetailContent(content, task) {
 
     const tag = el('span', 'panel-blocker-tag', blockerSummary);
     blockerWrap.appendChild(tag);
-    content.appendChild(blockerWrap);
+    target.appendChild(blockerWrap);
   }
 
   // Clickable Upstream Blockers ("Blocked By")
@@ -6787,7 +6844,7 @@ function renderDetailContent(content, task) {
       card.style.cssText = 'padding:8px 10px;background:rgba(255,255,255,0.04);border:1px solid rgba(248,81,73,0.3);border-radius:6px;cursor:pointer;transition:all 0.15s ease;display:flex;flex-direction:column;gap:3px;';
       card.addEventListener('mouseenter', () => { card.style.background = 'rgba(248,81,73,0.1)'; card.style.borderColor = 'var(--red)'; });
       card.addEventListener('mouseleave', () => { card.style.background = 'rgba(255,255,255,0.04)'; card.style.borderColor = 'rgba(248,81,73,0.3)'; });
-      card.addEventListener('click', () => openDetail(bb.id));
+      card.addEventListener('click', () => openTask(bb.id));
 
       const headerRow = el('div', null);
       headerRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:0.8rem;';
@@ -6820,7 +6877,7 @@ function renderDetailContent(content, task) {
       bbList.appendChild(card);
     }
     bbSection.appendChild(bbList);
-    content.appendChild(bbSection);
+    target.appendChild(bbSection);
   }
 
   // Clickable Downstream Tasks ("Blocks")
@@ -6836,7 +6893,7 @@ function renderDetailContent(content, task) {
       card.style.cssText = 'padding:8px 10px;background:rgba(255,255,255,0.04);border:1px solid rgba(56,189,248,0.3);border-radius:6px;cursor:pointer;transition:all 0.15s ease;display:flex;flex-direction:column;gap:3px;';
       card.addEventListener('mouseenter', () => { card.style.background = 'rgba(56,189,248,0.1)'; card.style.borderColor = 'var(--accent, #38bdf8)'; });
       card.addEventListener('mouseleave', () => { card.style.background = 'rgba(255,255,255,0.04)'; card.style.borderColor = 'rgba(56,189,248,0.3)'; });
-      card.addEventListener('click', () => openDetail(b.id));
+      card.addEventListener('click', () => openTask(b.id));
 
       const headerRow = el('div', null);
       headerRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:0.8rem;';
@@ -6869,7 +6926,7 @@ function renderDetailContent(content, task) {
       blocksList.appendChild(card);
     }
     blocksSection.appendChild(blocksList);
-    content.appendChild(blocksSection);
+    target.appendChild(blocksSection);
   }
 
   // Dependency Hierarchy Visualization Section
@@ -6888,7 +6945,7 @@ function renderDetailContent(content, task) {
       const pLine = el('div', null);
       pLine.style.cssText = 'color:var(--muted);margin-bottom:4px;cursor:pointer;';
       pLine.innerHTML = `◆ Parent: <span style="color:var(--accent,#38bdf8);text-decoration:underline;">#${p.identifier || p.id?.slice(0, 10)}</span> ${escapeHtml(p.title || p.name || '')}`;
-      pLine.addEventListener('click', () => openDetail(p.id));
+      pLine.addEventListener('click', () => openTask(p.id));
       treeBox.appendChild(pLine);
     }
 
@@ -6904,7 +6961,7 @@ function renderDetailContent(content, task) {
         const row = el('div', null);
         row.style.cssText = 'cursor:pointer;padding:2px 0;transition:color 0.15s;';
         row.innerHTML = `${prefix}<span style="color:var(--accent,#38bdf8);text-decoration:underline;font-weight:600;">#${bb.identifier || bb.id?.slice(0, 10)}</span> <span style="color:var(--fg);">${escapeHtml(bb.title || bb.name || '')}</span> <span style="font-size:0.7rem;padding:0 4px;border-radius:3px;background:rgba(255,255,255,0.08);">${bb.execution_stage || bb.status || 'todo'}</span>`;
-        row.addEventListener('click', () => openDetail(bb.id));
+        row.addEventListener('click', () => openTask(bb.id));
         treeBox.appendChild(row);
 
         if (bb.rationale) {
@@ -6935,7 +6992,7 @@ function renderDetailContent(content, task) {
         const row = el('div', null);
         row.style.cssText = 'cursor:pointer;padding:2px 0;transition:color 0.15s;';
         row.innerHTML = `${prefix}<span style="color:var(--accent,#38bdf8);text-decoration:underline;font-weight:600;">#${b.identifier || b.id?.slice(0, 10)}</span> <span style="color:var(--fg);">${escapeHtml(b.title || b.name || '')}</span> <span style="font-size:0.7rem;padding:0 4px;border-radius:3px;background:rgba(255,255,255,0.08);">${b.execution_stage || b.status || 'todo'}</span>`;
-        row.addEventListener('click', () => openDetail(b.id));
+        row.addEventListener('click', () => openTask(b.id));
         treeBox.appendChild(row);
 
         if (b.rationale) {
@@ -6960,18 +7017,18 @@ function renderDetailContent(content, task) {
         const row = el('div', null);
         row.style.cssText = 'cursor:pointer;padding:2px 0;';
         row.innerHTML = `${prefix}<span style="color:var(--accent,#38bdf8);text-decoration:underline;">#${st.identifier || st.id?.slice(0, 10)}</span> ${escapeHtml(st.title || st.name || '')}`;
-        row.addEventListener('click', () => openDetail(st.id));
+        row.addEventListener('click', () => openTask(st.id));
         treeBox.appendChild(row);
       });
     }
 
     depSection.appendChild(treeBox);
-    content.appendChild(depSection);
+    target.appendChild(depSection);
   }
 
   // Parent task
   if (task.parent_id || task.parent_identifier) {
-    addPanelField(content, 'Parent Task',
+    addPanelField(target, 'Parent Task',
       task.parent_identifier || `#${task.parent_id?.slice(0, 12)}`);
   }
 
@@ -6985,14 +7042,9 @@ function renderDetailContent(content, task) {
     if (task.updated_at) parts.push(`Updated: ${fmtRelTime(task.updated_at)}`);
     tsVal.textContent = parts.join('  ·  ');
     tsField.appendChild(tsVal);
-    content.appendChild(tsField);
+    target.appendChild(tsField);
   }
 
-  // Raw ID
-  const idField = el('div', 'panel-field');
-  idField.appendChild(el('div', 'panel-field-label', 'Internal ID'));
-  idField.appendChild(el('div', 'panel-field-muted', task.id || '—'));
-  content.appendChild(idField);
 }
 
 function isFleetTaskId(id) {
@@ -7004,14 +7056,96 @@ function isFleetTaskId(id) {
 }
 
 let lastDetailOpenTime = 0;
+// The click that opened the drawer. It bubbles on to the document
+// click-outside handler, which must never close what it just opened: the
+// 150ms clock check alone fails when the open stalls the main thread (STA-700).
+let detailOpenEvent = null;
 
+// Bumped by every openDetail / openTaskPage call. Their fetches can resolve out
+// of order (a second click, or ↗ while the drawer is still loading). Only the
+// newest call renders, so a stale response neither paints over it nor leaves a
+// second copy of the task layout's element ids in the DOM (STA-700).
+let taskViewSeq = 0;
+
+// Fetches everything the task layout renders, for the full page and the drawer.
+async function fetchTaskViewData(resolvedId) {
+  const isFleet = isFleetTaskId(resolvedId);
+  const apiBase = isFleet ? '/api/fleet/tasks' : '/api/tasks';
+  const [taskResp, commentsResp, stepsResp, interactionsResp, diffResp, checkpointsResp, runErrorsResp, shipCardResp] = await Promise.all([
+    apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}`),
+    apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}/comments`).catch(() => ({ comments: [] })),
+    (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/run-steps`).catch(() => ({ steps: [] })) : Promise.resolve({ steps: [] })),
+    (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/interactions`).catch(() => ({ interactions: [] })) : Promise.resolve({ interactions: [] })),
+    (!isFleet ? fetchTaskDiff(resolvedId, '') : Promise.resolve({ diff: '', files: [], checkpoint_id: '' })),
+    (!isFleet ? fetchTaskCheckpoints(resolvedId) : Promise.resolve([])),
+    (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/run-errors?limit=20`).catch(() => ({ errors: [] })) : Promise.resolve({ errors: [] })),
+    (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/ship-review`).catch(() => null) : Promise.resolve(null)),
+  ]);
+  const task = taskResp.task || taskResp;
+  if (taskResp.dependencies) task.dependencies = taskResp.dependencies;
+  task.queue = taskResp.queue || null;
+  task.turn = taskResp.turn || null;
+  task.workspace = taskResp.workspace || null;
+  const comments = (taskResp.comments && taskResp.comments.length)
+    ? taskResp.comments
+    : (commentsResp?.comments || (Array.isArray(commentsResp) ? commentsResp : []));
+  task.comments = comments;
+  task.runSteps = stepsResp?.steps || [];
+  task.runErrors = runErrorsResp?.errors || [];
+  task._diffData = diffResp;
+  task._checkpoints = checkpointsResp;
+  const interactions = interactionsResp?.interactions || [];
+  const shipCard = (shipCardResp && !shipCardResp.error) ? shipCardResp : null;
+
+  try {
+    const govResp = await apiFetch(`/api/tasks/${encodeURIComponent(task.id || resolvedId)}/governance`);
+    if (govResp && !govResp.error) task.governance = govResp;
+  } catch { /* governance optional */ }
+
+  return { task, comments, interactions, shipCard };
+}
+
+function cacheTaskView(task, comments, fallbackId) {
+  const key = task.id || fallbackId;
+  state.tasks[key] = { ...(state.tasks[key] || {}), ...task };
+  if (task.description) state.taskDescriptions[key] = task.description;
+  state.taskComments[key] = comments;
+  return key;
+}
+
+// Renders a cached copy of the task when the daemon can't be reached, with
+// every action disabled.
+function renderCachedTaskView(container, cached, opts) {
+  renderTaskPage(container, cached, cached.comments || [], [], cached._diffData || null, cached._checkpoints || [], undefined, undefined, opts);
+  const banner = document.createElement('div');
+  banner.style.cssText = 'background:var(--red,#c0392b);color:#fff;padding:.5rem 1rem;font-size:.85rem;font-weight:600;';
+  banner.textContent = 'Daemon unreachable — showing cached copy. Actions are disabled.';
+  container.prepend(banner);
+  container.querySelectorAll('button,input,textarea').forEach(el => { el.disabled = true; });
+}
+
+function isTaskPageShowing() {
+  return Boolean(document.getElementById('view-task-page')?.classList.contains('active'));
+}
+
+// The drawer ("peek") renders the task page layout (STA-700), stacked to fit
+// its width; see .task-page-drawer in style.css.
 async function openDetail(target, pushHistory = true, orgHint = null, projectHint = null, fromRouteMiss = false) {
+  // One copy of the layout at a time: its element ids are global. On the full
+  // page a task link therefore opens that task's page instead of a drawer.
+  if (isTaskPageShowing()) {
+    const t = (typeof target === 'object' && target !== null) ? target : { id: target, org: orgHint, project: projectHint };
+    return openTaskPage(t, pushHistory);
+  }
+
   const panel   = document.getElementById('detail-panel');
   const content = document.getElementById('panel-content');
+  const seq = ++taskViewSeq;
 
   stopChatPoll();
   stopElapsedTicker();
   lastDetailOpenTime = Date.now();
+  detailOpenEvent = window.event || null;
   if (panel) {
     panel.classList.remove('hidden');
     panel.classList.toggle('full-page', Boolean(state.taskDetailFullPage));
@@ -7025,7 +7159,13 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
     expandBtn.innerHTML = state.taskDetailFullPage ? '🗗' : '&#x26F6;';
     expandBtn.setAttribute('aria-pressed', String(Boolean(state.taskDetailFullPage)));
   }
-  if (content) content.innerHTML = '<p style="color:var(--muted)">Loading…</p>';
+  // The full page isn't showing (checked above): drop its stale copy.
+  const pageContent = document.getElementById('task-page-content');
+  if (pageContent) pageContent.innerHTML = '';
+  if (content) {
+    content.classList.add('task-page-drawer');
+    content.innerHTML = '<p style="color:var(--muted);padding:20px">Loading…</p>';
+  }
 
   let targetId = target;
   if (typeof target === 'object' && target !== null) {
@@ -7050,22 +7190,9 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
     history.replaceState({ taskId: resolvedId, canonicalPath, taskPage: false }, '', canonicalPath);
   }
 
-  const isFleet = isFleetTaskId(resolvedId);
-  const apiBase = isFleet ? '/api/fleet/tasks' : '/api/tasks';
-
   try {
-    const [taskResp, commentsResp] = await Promise.all([
-      apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}`),
-      apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}/comments`).catch(() => ({ comments: [] }))
-    ]);
-    const task = taskResp.task || taskResp;
-    if (taskResp.dependencies) {
-      task.dependencies = taskResp.dependencies;
-    }
-    const comments = (taskResp.comments && taskResp.comments.length)
-      ? taskResp.comments
-      : (commentsResp?.comments || (Array.isArray(commentsResp) ? commentsResp : []));
-    task.comments = comments;
+    const { task, comments, interactions, shipCard } = await fetchTaskViewData(resolvedId);
+    if (seq !== taskViewSeq) return;
 
     // Use robust UUID for internal state
     if (task.id) {
@@ -7078,38 +7205,25 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
       history.replaceState({ taskId: task.id, canonicalPath: finalCanonicalPath, taskPage: false }, '', finalCanonicalPath);
     }
 
-    // Also fetch native StayPoint governance snapshot if available
-    try {
-      const govResp = await apiFetch(`/api/tasks/${encodeURIComponent(task.id || resolvedId)}/governance`);
-      if (govResp && !govResp.error) {
-        task.governance = govResp;
-      }
-    } catch { /* governance optional */ }
-
-    renderDetailContent(content, task);
-    const detailKey = task.id || resolvedId;
-    if (task.description) state.taskDescriptions[detailKey] = task.description;
-    state.taskComments[detailKey] = comments;
-    state.tasks[detailKey] = { ...(state.tasks[detailKey] || {}), ...task };
-
-    buildChatSection(content, task.id || resolvedId, comments);
-    startChatPoll(task.id || resolvedId);
+    const detailKey = cacheTaskView(task, comments, resolvedId);
+    renderTaskPage(content, task, comments, interactions, task._diffData, task._checkpoints, task.runErrors, shipCard, { drawer: true });
+    startChatPoll(detailKey);
   } catch (err) {
+    if (seq !== taskViewSeq) return;
     if (!fromRouteMiss && err && /^404\b/.test(err.message)) {
       const fallbackId = await resolveTaskRouteMiss(targetId, orgHint, projectHint);
+      if (seq !== taskViewSeq) return;
       if (fallbackId && fallbackId !== resolvedId) {
         return openDetail(fallbackId, false, orgHint, projectHint, true);
       }
     }
     const cached = matchedTask || state.tasks[resolvedId] || state.tasks[targetId];
-    if (cached) {
+    if (cached && content) {
       if (cached.id) state.openDetailTaskId = cached.id;
-      renderDetailContent(content, cached);
-      buildChatSection(content, cached.id || resolvedId, cached.comments || []);
-      startChatPoll(cached.id || resolvedId);
+      renderCachedTaskView(content, cached, { drawer: true });
     } else {
       const p = el('p', null, 'Task not found or failed to load.');
-      p.style.color = 'var(--red)';
+      p.style.cssText = 'color:var(--red);padding:20px;';
       if (content) {
         content.innerHTML = '';
         content.appendChild(p);
@@ -7190,9 +7304,16 @@ document.getElementById('panel-open')?.addEventListener('click', () => {
 async function fetchTaskDiff(taskId, checkpointId) {
   const qs = checkpointId ? `?checkpoint=${encodeURIComponent(checkpointId)}` : '';
   try {
-    return await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/diff${qs}`);
+    const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/diff${qs}`, { headers: authHeader() });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // STA-774: a base that failed verification (e.g. moved by the agent)
+      // must read as an error, never as "No changes".
+      return { diff: '', files: [], checkpoint_id: checkpointId || '', error: body.message || body.error || `${r.status} ${r.statusText}` };
+    }
+    return body;
   } catch {
-    return { diff: '', files: [], checkpoint_id: checkpointId || '' };
+    return { diff: '', files: [], checkpoint_id: checkpointId || '', error: 'Could not load the diff.' };
   }
 }
 
@@ -7367,10 +7488,18 @@ function openFileDiffModal(task, filePath, checkpointId) {
 
   // Dismiss on backdrop click
   overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
-  // Dismiss on Escape
-  const escHandler = e => { if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', escHandler); } };
-  document.addEventListener('keydown', escHandler);
-  overlay.addEventListener('remove', () => document.removeEventListener('keydown', escHandler));
+  // Dismiss on Escape. Capture phase + stopPropagation: Escape closes only the
+  // diff, not the drawer behind it (STA-700). A modal already closed another
+  // way just unhooks the listener on the next Escape.
+  const escHandler = e => {
+    if (e.key !== 'Escape') return;
+    document.removeEventListener('keydown', escHandler, true);
+    if (!overlay.isConnected) return;
+    e.preventDefault();
+    e.stopPropagation();
+    overlay.remove();
+  };
+  document.addEventListener('keydown', escHandler, true);
 
   // Fetch and render
   fetchFileDiff(task.id, filePath, checkpointId).then(data => {
@@ -7430,6 +7559,11 @@ function renderDiffPane(container, task, checkpoints, diffData) {
   const fileStats = diffData.file_stats || (diffData.files || []).map(f => ({ path: f, added: 0, removed: 0 }));
 
   const fileList = el('ul', 'diff-file-list');
+  if (diffData.error) {
+    container.appendChild(el('div', 'diff-pane-error', diffData.error));
+  } else if (diffData.base_verified === false) {
+    container.appendChild(el('div', 'diff-pane-error', 'This task has no recorded base: the whole-run diff cannot be verified.'));
+  }
 
   const renderFiles = (statsArr, cpId) => {
     fileList.innerHTML = '';
@@ -7532,6 +7666,7 @@ const STEP_KIND_ICON = {
   edit:       '✏️',
   checkpoint: '📌',
   state:      '💾',
+  message:    '💬',
   tool:       '🔧',
   error:      '❌',
   result:     '✅',
@@ -7656,6 +7791,14 @@ async function syncRunControlBar(taskId) {
   }
 }
 
+// Show or hide the task page run-queue line for a queue position.
+function setRunQueueLine(line, pos) {
+  if (!line) return;
+  const text = queueLabel(pos);
+  line.textContent = text;
+  line.classList.toggle('hidden', !text);
+}
+
 // ── Timeline stats helpers ─────────────────────────────────
 // groupStepsByRun, isRealRunGroup, latestRunSteps, currentRunSteps,
 // runElapsedMs, and isStuck live in lib/runsteps.js (loaded before this
@@ -7711,10 +7854,20 @@ function buildTimelineStats(task, steps, elapsedMs, isStuck) {
   const filesEdited  = steps.filter(s => s && s.kind === 'edit'  && s.status === 'done').length;
   const commandsOk   = steps.filter(s => s && s.kind === 'run'   && s.status === 'done').length;
   const commandsFail = steps.filter(s => s && s.kind === 'run' && (s.status === 'error' || s.status === 'failed')).length;
-  const lastStep     = steps.length ? steps[steps.length - 1] : null;
-  const currentStep  = (lastStep && lastStep.title) ? lastStep.title : 'idle';
+  const currentStep  = runStepLabel(steps);
 
   add(stat('Elapsed', fmtDuration(elapsedMs)));
+  // How long the current turn has run. No fixed cap: only a turn with no
+  // activity for stall_timeout is stopped (shown in the tooltip).
+  const turnText = turnElapsedLabel(task.turn, Date.now());
+  if (turnText) {
+    const turnTile = stat('Turn', turnText, 'timeline-stat-turn');
+    const stallMin = Math.round((task.turn.stall_timeout_sec || 0) / 60);
+    turnTile.title = stallMin > 0
+      ? `Current turn. Stopped only if the agent shows no activity for ${stallMin}m.`
+      : 'Current turn. No stall limit.';
+    add(turnTile);
+  }
   const stepTile = stat('Step', currentStep, 'timeline-stat-step');
   stepTile.title = currentStep;
   add(stepTile);
@@ -7753,7 +7906,8 @@ function buildTimelineStats(task, steps, elapsedMs, isStuck) {
 
 function buildRunStepRow(s) {
   const isError = s.status === 'error';
-  const row = el('div', `timeline-row timeline-row-${s.kind || 'unknown'}${isError ? ' timeline-row-error' : ''}`);
+  const isWarn = !isError && s.kind === 'message' && /^Warning:/.test(s.title || '');
+  const row = el('div', `timeline-row timeline-row-${s.kind || 'unknown'}${isError ? ' timeline-row-error' : ''}${isWarn ? ' timeline-row-warn' : ''}`);
   row.setAttribute('data-step-id', s.id);
 
   // Route rows render as a compact banner: icon + plain text, no kind badge.
@@ -7982,11 +8136,18 @@ function appendRunStepToTimeline(taskId, step) {
 // fromRouteMiss: this call re-opens a task found by resolveTaskRouteMiss, so
 // the URL that missed is replaced with the canonical one.
 async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
-  // Close sidebar if open
+  // Close sidebar if open, and drop its copy of the task layout: the two
+  // share element ids (STA-700).
   const panel = document.getElementById('detail-panel');
   if (panel) panel.classList.add('hidden');
+  const panelContent = document.getElementById('panel-content');
+  if (panelContent) {
+    panelContent.innerHTML = '';
+    panelContent.classList.remove('task-page-drawer');
+  }
   stopChatPoll();
   stopElapsedTicker();
+  const seq = ++taskViewSeq;
 
   let targetId = target;
   let orgHint = null;
@@ -8014,31 +8175,9 @@ async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
   const pageContent = document.getElementById('task-page-content');
   if (pageContent) pageContent.innerHTML = '<p style="color:var(--muted);padding:2rem">Loading…</p>';
 
-  const isFleet = isFleetTaskId(resolvedId);
-  const apiBase = isFleet ? '/api/fleet/tasks' : '/api/tasks';
-
   try {
-    const [taskResp, commentsResp, stepsResp, interactionsResp, diffResp, checkpointsResp, runErrorsResp, shipCardResp] = await Promise.all([
-      apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}`),
-      apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}/comments`).catch(() => ({ comments: [] })),
-      (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/run-steps`).catch(() => ({ steps: [] })) : Promise.resolve({ steps: [] })),
-      (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/interactions`).catch(() => ({ interactions: [] })) : Promise.resolve({ interactions: [] })),
-      (!isFleet ? fetchTaskDiff(resolvedId, '') : Promise.resolve({ diff: '', files: [], checkpoint_id: '' })),
-      (!isFleet ? fetchTaskCheckpoints(resolvedId) : Promise.resolve([])),
-      (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/run-errors?limit=20`).catch(() => ({ errors: [] })) : Promise.resolve({ errors: [] })),
-      (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/ship-review`).catch(() => null) : Promise.resolve(null)),
-    ]);
-    const task = taskResp.task || taskResp;
-    const comments = (taskResp.comments && taskResp.comments.length)
-      ? taskResp.comments
-      : (commentsResp?.comments || (Array.isArray(commentsResp) ? commentsResp : []));
-    task.comments = comments;
-    task.runSteps = stepsResp?.steps || [];
-    task.runErrors = runErrorsResp?.errors || [];
-    const interactions = interactionsResp?.interactions || [];
-    task._diffData = diffResp;
-    task._checkpoints = checkpointsResp;
-    const shipCard = (shipCardResp && !shipCardResp.error) ? shipCardResp : null;
+    const { task, comments, interactions, shipCard } = await fetchTaskViewData(resolvedId);
+    if (seq !== taskViewSeq) return;
 
     if (task.id) state.openDetailTaskId = task.id;
 
@@ -8047,22 +8186,15 @@ async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
       history.replaceState({ taskId: task.id, canonicalPath: finalPath, taskPage: true }, '', finalPath);
     }
 
-    try {
-      const govResp = await apiFetch(`/api/tasks/${encodeURIComponent(task.id || resolvedId)}/governance`);
-      if (govResp && !govResp.error) task.governance = govResp;
-    } catch { /* governance optional */ }
-
-    const activeId = task.id || resolvedId;
-    state.tasks[activeId] = { ...(state.tasks[activeId] || {}), ...task };
-    if (task.description) state.taskDescriptions[activeId] = task.description;
-    state.taskComments[activeId] = comments;
-
+    const activeId = cacheTaskView(task, comments, resolvedId);
     renderTaskPage(pageContent, task, comments, interactions, task._diffData, task._checkpoints, task.runErrors, shipCard);
     startChatPoll(activeId);
   } catch (err) {
+    if (seq !== taskViewSeq) return;
     const is404 = err && /^404\b/.test(err.message);
     if (is404 && !fromRouteMiss) {
       const fallbackId = await resolveTaskRouteMiss(targetId, orgHint, projectHint);
+      if (seq !== taskViewSeq) return;
       if (fallbackId && fallbackId !== resolvedId) {
         return openTaskPage({ id: fallbackId, org: orgHint, project: projectHint }, false, true);
       }
@@ -8073,12 +8205,7 @@ async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
         pageContent.innerHTML = '<p style="color:var(--red);padding:2rem">Task not found.</p>';
       }
     } else if (cached && pageContent) {
-      renderTaskPage(pageContent, cached, cached.comments || [], [], cached._diffData || null, cached._checkpoints || []);
-      const banner = document.createElement('div');
-      banner.style.cssText = 'background:var(--red,#c0392b);color:#fff;padding:.5rem 1rem;font-size:.85rem;font-weight:600;';
-      banner.textContent = 'Daemon unreachable — showing cached copy. Actions are disabled.';
-      pageContent.prepend(banner);
-      pageContent.querySelectorAll('button,input,textarea').forEach(el => { el.disabled = true; });
+      renderCachedTaskView(pageContent, cached);
     } else if (pageContent) {
       pageContent.innerHTML = '<p style="color:var(--red);padding:2rem">Failed to load — daemon may be unreachable.</p>';
     }
@@ -8109,6 +8236,9 @@ function renderFinalShipReviewCard(taskId, headSHA, status, mainSHA, rejectComme
     shaRow.appendChild(el('code', 'ship-review-sha ship-review-sha--main', mainSHA.slice(0, 12)));
   }
   section.appendChild(shaRow);
+  if (status === 'approved' && cleanup && cleanup.pr_number > 0) {
+    section.appendChild(renderPRStatusSection(taskId, cleanup));
+  }
   if (status === 'approved' && cleanup) {
     if (cleanup.branch_deleted) {
       const brRow = el('div', 'ship-review-row');
@@ -8119,6 +8249,9 @@ function renderFinalShipReviewCard(taskId, headSHA, status, mainSHA, rejectComme
     } else if (cleanup.branch_delete_error) {
       section.appendChild(renderBranchDeleteWarning(taskId, headSHA, mainSHA, cleanup));
     }
+  }
+  if (status === 'approved' && cleanup && cleanup.test_task) {
+    section.appendChild(renderTestTaskRow(cleanup.test_task));
   }
   if (status === 'rejected' && rejectComment) {
     const fb = el('div', 'ship-review-feedback-box');
@@ -8165,6 +8298,85 @@ function renderBranchDeleteWarning(taskId, headSHA, mainSHA, cleanup) {
   return warn;
 }
 
+// SHIP_REVIEW_LIVE_WARNING matches liveDevWarning in handlers_ship_review.go.
+const SHIP_REVIEW_LIVE_WARNING = 'LIVE PRODUCTION DATA. Actions in this preview are real.';
+// SHIP_REVIEW_UNVERIFIED_WARNING matches unverifiedDevWarning in handlers_ship_review.go.
+const SHIP_REVIEW_UNVERIFIED_WARNING = 'UNVERIFIED REPO PATH. This repo could not be verified as separate from a live_credentials project, so treat this preview as live.';
+
+// shipReviewLiveGate returns why start-dev needs the Board gate
+// ('live_credentials' | 'unverified_path'), or '' when it does not (STA-799).
+function shipReviewLiveGate(card) {
+  if (card.live_gate_reason) return card.live_gate_reason;
+  return card.live_gate || card.live_credentials ? 'live_credentials' : '';
+}
+
+function shipReviewGateWarning(gate) {
+  return gate === 'unverified_path' ? SHIP_REVIEW_UNVERIFIED_WARNING : SHIP_REVIEW_LIVE_WARNING;
+}
+
+function markShipReviewLiveButton(btn, liveClass, gate) {
+  btn.classList.add(liveClass);
+  btn.appendChild(el('span', 'ship-review-live-tag', gate === 'unverified_path' ? 'UNVERIFIED' : 'LIVE'));
+}
+
+// showShipReviewLiveConfirm shows the inline confirm a gated dev server start
+// needs every time (STA-727; STA-799 for an unverified repo path). Confirm
+// sends start-dev with the Board passkey headers and {"confirm_live": true};
+// Cancel sends nothing.
+function showShipReviewLiveConfirm(section, afterRow, taskId, triggerBtn, gate) {
+  const existing = section.querySelector('.ship-review-live-confirm');
+  if (existing) existing.remove();
+  const unverified = gate === 'unverified_path';
+  const box = el('div', 'ship-review-live-confirm');
+  box.appendChild(el('div', 'ship-review-live-confirm-warning', shipReviewGateWarning(gate)));
+  box.appendChild(el('div', 'ship-review-live-confirm-text', unverified
+    ? 'A live_credentials project path could not be read, so StayPoint cannot rule out that this repo is that project. Start only if you are sure; anything you do in the preview may change real data.'
+    : 'This dev server runs with production credentials. Anything you do in the preview changes real data.'));
+  const err = el('div', 'ship-review-live-confirm-error');
+  err.hidden = true;
+  const actions = el('div', 'ship-review-live-confirm-actions');
+  const ok = el('button', 'ship-review-live-confirm-btn', unverified ? 'Start dev server' : 'Start LIVE dev server');
+  const cancel = el('button', 'ship-review-live-cancel-btn', 'Cancel');
+  const close = () => { box.remove(); triggerBtn.disabled = false; };
+  cancel.addEventListener('click', close);
+  ok.addEventListener('click', async () => {
+    ok.disabled = true;
+    cancel.disabled = true;
+    err.hidden = true;
+    try {
+      const r = await withBoardWebAuthn((sessionToken, assertion) =>
+        fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/start-dev`, {
+          method: 'POST',
+          headers: {
+            ...authHeader(),
+            'Content-Type': 'application/json',
+            'X-WebAuthn-Session': sessionToken,
+            'X-WebAuthn-Assertion': assertion,
+          },
+          body: JSON.stringify({ confirm_live: true }),
+        })
+      );
+      if (r === null) { ok.disabled = false; cancel.disabled = false; return; }
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        throw new Error(body.message || body.error || `${r.status} ${r.statusText}`);
+      }
+      close();
+    } catch (e) {
+      err.textContent = `Could not start the dev server: ${e.message || e}`;
+      err.hidden = false;
+      ok.disabled = false;
+      cancel.disabled = false;
+    }
+  });
+  actions.appendChild(ok);
+  actions.appendChild(cancel);
+  box.appendChild(err);
+  box.appendChild(actions);
+  triggerBtn.disabled = true;
+  afterRow.after(box);
+}
+
 // renderShipReviewCardFromData renders the ship review card synchronously from
 // updateDevProgressUI appends a progress line to the dev env log UI element
 // for a task that is in async setup. Called from the SSE ship_review_dev_progress handler.
@@ -8204,6 +8416,290 @@ function devLogTrigger(logEl) {
     () => el('pre', 'content-modal-pre', logEl.textContent));
 }
 
+// ── Ship review PR modes (STA-717) ───────────────────────────────────────────
+// A project's merge mode decides what Approve does: "direct" merges to main
+// as before, "open_pr" opens a GitHub PR and stops, "pr_merge" opens a PR,
+// waits for CI on the pinned head and merges through GitHub from the card.
+
+const MERGE_MODE_LABELS = {
+  direct: 'Merge to main',
+  open_pr: 'Open PR',
+  pr_merge: 'Open PR + merge after CI',
+};
+
+const PR_CHECK_ICONS = { pass: '✓', fail: '✗', pending: '⏳', skipping: '–', cancel: '⊘' };
+const PR_CHECKS_LABELS = {
+  running: 'Checks running',
+  passed: 'Checks passed',
+  failed: 'Checks failed',
+  none: 'Waiting for checks',
+};
+const PR_CHECKS_POLL_MS = 10_000;
+
+function fmtCheckDuration(sec) {
+  if (!sec || sec < 0) return '';
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return m ? `${m}m ${s}s` : `${s}s`;
+}
+
+// safeHttpURL returns url only when it is http(s), so a check link can never
+// become a javascript: href.
+function safeHttpURL(url) {
+  try {
+    const u = new URL(url);
+    return (u.protocol === 'https:' || u.protocol === 'http:') ? u.toString() : '';
+  } catch { return ''; }
+}
+
+function prLinkRow(card) {
+  const row = el('div', 'ship-review-row ship-review-pr-row');
+  row.appendChild(el('span', 'ship-review-row-label', 'Pull request'));
+  const href = safeHttpURL(card.pr_url || '');
+  if (href) {
+    const a = el('a', 'ship-review-pr-link', `PR #${card.pr_number}`);
+    a.href = href;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    row.appendChild(a);
+  } else {
+    row.appendChild(el('span', 'ship-review-pr-link', `PR #${card.pr_number}`));
+  }
+  return row;
+}
+
+// renderPRChecksTable lists each check: state, name, duration, log link.
+function renderPRChecksTable(checks) {
+  const list = el('ul', 'ship-review-pr-checks');
+  if (!checks || !checks.length) {
+    list.appendChild(el('li', 'ship-review-pr-check ship-review-pr-check--empty', 'No checks reported for this head yet.'));
+    return list;
+  }
+  for (const c of checks) {
+    const bucket = c.bucket || 'pending';
+    const li = el('li', `ship-review-pr-check ship-review-pr-check--${bucket}`);
+    li.dataset.bucket = bucket;
+    li.appendChild(el('span', 'ship-review-pr-check-icon', PR_CHECK_ICONS[bucket] || '?'));
+    li.appendChild(el('span', 'ship-review-pr-check-name', c.name || '(unnamed)'));
+    li.appendChild(el('span', 'ship-review-pr-check-state', (c.state || bucket).toLowerCase().replace(/_/g, ' ')));
+    const dur = fmtCheckDuration(c.duration_sec);
+    if (dur) li.appendChild(el('span', 'ship-review-pr-check-duration', dur));
+    const href = safeHttpURL(c.link || '');
+    if (href) {
+      const a = el('a', 'ship-review-pr-check-link', 'log');
+      a.href = href;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      li.appendChild(a);
+    }
+    list.appendChild(li);
+  }
+  return list;
+}
+
+// startPRChecksPoll polls the card's checks every PR_CHECKS_POLL_MS until the
+// summary settles or the card leaves the DOM. onResult gets each response.
+function startPRChecksPoll(taskId, anchor, onResult, { once = false } = {}) {
+  let stopped = false;
+  let attached = false;
+  let waits = 0;
+  const tick = async () => {
+    if (stopped) return;
+    // The card may be built before it is attached; wait for that, then stop
+    // for good once it leaves the DOM.
+    if (!anchor.isConnected) {
+      if (!attached && waits++ < 40) setTimeout(tick, 250);
+      return;
+    }
+    attached = true;
+    let res = null;
+    try {
+      res = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/checks`);
+    } catch { /* GitHub unreachable: keep the last snapshot */ }
+    if (stopped || !anchor.isConnected) return;
+    if (res) onResult(res);
+    const settled = res && !res.head_moved && (res.summary === 'passed' || res.summary === 'failed');
+    if (!once && !settled) setTimeout(tick, PR_CHECKS_POLL_MS);
+  };
+  setTimeout(tick, 0);
+  return () => { stopped = true; };
+}
+
+// renderPRStatusSection shows the PR link and checks on a closed open_pr card.
+function renderPRStatusSection(taskId, card) {
+  const wrap = el('div', 'ship-review-pr-section');
+  wrap.appendChild(prLinkRow(card));
+  if (!card.main_sha) {
+    wrap.appendChild(el('div', 'ship-review-pr-note', 'PR opened for review on GitHub. StayPoint does not merge it.'));
+  }
+  const title = el('div', 'ship-review-section-title', 'Checks');
+  const summary = el('span', 'ship-review-pr-summary', card.pr_checks_summary ? (PR_CHECKS_LABELS[card.pr_checks_summary] || '') : '');
+  title.appendChild(summary);
+  wrap.appendChild(title);
+  let table = renderPRChecksTable(card.pr_checks || []);
+  wrap.appendChild(table);
+  if (!card.main_sha) {
+    startPRChecksPoll(taskId, wrap, (res) => {
+      if (res.head_moved) return;
+      const next = renderPRChecksTable(res.checks || []);
+      table.replaceWith(next);
+      table = next;
+      summary.textContent = PR_CHECKS_LABELS[res.summary] || '';
+    });
+  }
+  return wrap;
+}
+
+// ── Merge test gate (STA-734) ──────────────────────────────────────────────
+// The "Test coverage" section: CI, test changes and coverage for the card's
+// head. A blocking warning keeps Merge disabled until the Board picks
+// "Merge without tests", which also files a backlog "Add tests" task.
+
+const TEST_GATE_ICONS = { no_ci: '⚠', no_tests: '⚠', uncovered: '⚠', untested_sources: 'ℹ', no_coverage_data: 'ℹ', coverage_ambiguous: 'ℹ' };
+
+// renderTestTaskRow links the backlog task a bypassed merge filed.
+function renderTestTaskRow(tt) {
+  const row = el('div', 'ship-review-row ship-review-test-task');
+  row.appendChild(el('span', 'ship-review-row-label', 'Tests task'));
+  const a = el('a', 'ship-review-test-task-link', tt.name || tt.id);
+  a.href = tt.url || '#';
+  a.addEventListener('click', (e) => { e.preventDefault(); openTaskPage(tt.id); });
+  row.appendChild(a);
+  row.appendChild(el('span', 'ship-review-test-task-note',
+    tt.created ? 'Merged without tests: backlog task created.' : 'Merged without tests: backlog task for this PR.'));
+  return row;
+}
+
+// fetchTestCoverage reads the card's test gate report. The error carries the
+// server's message (the gate fails closed when the change can't be read).
+async function fetchTestCoverage(taskId) {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/test-coverage`, { headers: authHeader() });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.message || body.error || `${r.status} ${r.statusText}`);
+  return body;
+}
+
+// renderTestCoverageSection returns the section and a handle. onState fires
+// with { loaded, blocking, missing, report, error } whenever the verdict
+// changes; apply(report) lets a 409 "untested" response update it in place.
+// opts.enforcedAt names a later step that enforces the gate (a pr_merge card
+// before its PR exists: Approve only opens the PR). The section then shows
+// the verdict without a bypass, which would do nothing at this step.
+function renderTestCoverageSection(taskId, onState, opts = {}) {
+  const sec = el('div', 'ship-review-test-coverage');
+  sec.dataset.state = 'loading';
+  const title = el('div', 'ship-review-section-title', 'Test coverage');
+  const status = el('span', 'ship-review-test-coverage-status', 'checking…');
+  title.appendChild(status);
+  sec.appendChild(title);
+  const body = el('div', 'ship-review-test-coverage-body');
+  body.appendChild(el('div', 'ship-review-test-coverage-note', 'Checking tests and CI for this head…'));
+  sec.appendChild(body);
+  const actions = el('div', 'ship-review-form-row ship-review-test-coverage-actions');
+  const bypassBtn = el('button', 'ship-review-merge-without-tests-btn', 'Merge without tests');
+  actions.appendChild(bypassBtn);
+  actions.style.display = 'none';
+  sec.appendChild(actions);
+  const enforcedNote = el('div', 'ship-review-test-coverage-note ship-review-test-coverage-enforced',
+    `Not enforced yet: ${opts.enforcedAt || ''} waits for this check, and Merge without tests is offered there.`);
+  enforcedNote.style.display = 'none';
+  sec.appendChild(enforcedNote);
+  const showActions = (blocking) => {
+    actions.style.display = blocking && !opts.enforcedAt ? '' : 'none';
+    enforcedNote.style.display = blocking && opts.enforcedAt ? '' : 'none';
+  };
+  const state = { loaded: false, blocking: true, missing: [], report: null, error: '' };
+  const emit = () => onState && onState(state);
+
+  const apply = (report) => {
+    state.loaded = true;
+    state.error = '';
+    state.report = report || null;
+    state.blocking = !!(report && report.blocking);
+    state.missing = (report && report.missing) || [];
+    const warnings = (report && report.warnings) || [];
+    const nodes = [];
+    if (!report) {
+      nodes.push(el('div', 'ship-review-test-coverage-note', 'No test coverage report for this card.'));
+    } else if (report.exempt_only) {
+      nodes.push(el('div', 'ship-review-test-ok', '✓ Docs, config or style only: no tests needed.'));
+    } else if (!warnings.length) {
+      nodes.push(el('div', 'ship-review-test-ok',
+        (report.sources || []).length ? '✓ Tests changed, and CI runs them.' : '✓ No source files changed.'));
+    }
+    for (const w of warnings) {
+      const box = el('div', `ship-review-test-warning ship-review-test-warning--${w.kind}${w.blocking ? ' ship-review-test-warning--blocking' : ''}`);
+      box.dataset.kind = w.kind;
+      box.appendChild(el('div', 'ship-review-test-warning-msg', `${TEST_GATE_ICONS[w.kind] || '⚠'} ${w.message}`));
+      if (w.items && w.items.length) {
+        const ul = el('ul', 'ship-review-test-warning-items');
+        for (const it of w.items) ul.appendChild(el('li', 'ship-review-test-warning-item', it));
+        box.appendChild(ul);
+      }
+      nodes.push(box);
+    }
+    if (report && report.coverage && report.coverage.available && !warnings.some((w) => w.kind === 'uncovered' || w.kind === 'coverage_ambiguous')) {
+      nodes.push(el('div', 'ship-review-test-coverage-note', `Coverage from ${report.coverage.source}: every changed line runs under a test.`));
+    }
+    body.replaceChildren(...nodes);
+    status.textContent = state.blocking ? `not tested: ${state.missing.join(', ')}` : 'ok';
+    sec.dataset.state = state.blocking ? 'blocking' : 'ok';
+    showActions(state.blocking);
+    emit();
+  };
+
+  const fail = (msg) => {
+    state.loaded = true;
+    state.error = msg;
+    state.blocking = true;
+    state.missing = ['test coverage unknown'];
+    const err = el('div', 'ship-review-test-warning ship-review-test-warning--blocking ship-review-test-warning--error', `⚠ Could not check test coverage: ${msg}`);
+    const retry = el('button', 'ship-review-repin-btn ship-review-test-coverage-retry', 'Retry');
+    retry.addEventListener('click', () => load());
+    err.appendChild(retry);
+    body.replaceChildren(err);
+    status.textContent = 'unknown';
+    sec.dataset.state = 'error';
+    showActions(true);
+    emit();
+  };
+
+  const load = () => {
+    status.textContent = 'checking…';
+    fetchTestCoverage(taskId).then((res) => apply(res.report)).catch((e) => fail(e.message || String(e)));
+  };
+  load();
+  return { el: sec, state, apply, bypassBtn, reload: load };
+}
+
+// renderAnswerOnlyPanel replaces the ship review card for a run with no
+// changes against its base (STA-774): the agent's final message, and the
+// files it read instead of "files changed".
+function renderAnswerOnlyPanel(comments, filesRead) {
+  const section = el('div', 'ship-review-card answer-only-panel task-page-section');
+  const hdr = el('div', 'ship-review-header');
+  hdr.appendChild(el('span', 'ship-review-badge', 'No changes: answer-only run'));
+  section.appendChild(hdr);
+  const summary = [...comments].reverse().find((c) => (c.author || '') === 'agent-summary');
+  const msg = summary ? (summary.message || summary.body || '') : '';
+  if (msg) {
+    const body = el('div', 'ship-review-summary-body md-content');
+    body.innerHTML = renderMarkdown(msg.replace(/^\s*\[\[TASK_COMPLETE\]\]\s*$/gm, '').trim());
+    section.appendChild(body);
+  } else {
+    section.appendChild(el('p', 'panel-field-muted', 'The run made no changes and left no final message.'));
+  }
+  const readRow = el('div', 'ship-review-row');
+  readRow.appendChild(el('span', 'ship-review-row-label', `Files read: ${filesRead.length}`));
+  section.appendChild(readRow);
+  if (filesRead.length) {
+    const list = el('ul', 'answer-only-files-read');
+    for (const f of filesRead) list.appendChild(el('li', '', f));
+    section.appendChild(list);
+  }
+  return section;
+}
+
 function renderShipReviewCardFromData(container, taskId, card) {
   if (!card || !taskId) return;
   clearShipReviewHeaderActions(taskId);
@@ -8214,6 +8710,14 @@ function renderShipReviewCardFromData(container, taskId, card) {
     const finalCard = renderFinalShipReviewCard(taskId, card.head_sha, card.status, card.main_sha, card.reject_comment, card);
     if (existing) existing.replaceWith(finalCard);
     else container.appendChild(finalCard);
+    // STA-734: link the "Add tests" task a bypassed merge filed.
+    if (card.status === 'approved') {
+      fetchTestCoverage(taskId).then((res) => {
+        if (res.test_task && finalCard.isConnected && !finalCard.querySelector('.ship-review-test-task')) {
+          finalCard.appendChild(renderTestTaskRow(res.test_task));
+        }
+      }).catch(() => {});
+    }
     return;
   }
 
@@ -8225,8 +8729,14 @@ function renderShipReviewCardFromData(container, taskId, card) {
   // Header
   const hdr = el('div', 'ship-review-header');
   const badge = el('span', 'ship-review-badge', 'Ship Review');
+  // STA-717: a pr_merge card whose head is on the PR waits for CI, then merges.
+  const prActive = card.status === 'pending' && card.merge_mode === 'pr_merge' && card.pr_number > 0 &&
+    !!card.pr_checks_sha && card.pr_checks_sha === card.head_sha;
+  const approveMode = card.effective_merge_mode || 'direct';
   const statusBadge = el('span', `ship-review-status-badge status-${card.status}`,
-    card.status === 'sent_back' ? 'Sent Back' : 'Pending Approval');
+    card.status === 'sent_back' ? 'Sent Back'
+      : prActive ? (PR_CHECKS_LABELS[card.pr_checks_summary] || PR_CHECKS_LABELS.running)
+      : 'Pending Approval');
   hdr.appendChild(badge);
   hdr.appendChild(statusBadge);
   section.appendChild(hdr);
@@ -8273,6 +8783,15 @@ function renderShipReviewCardFromData(container, taskId, card) {
     }).catch(() => {});
   }
 
+  // STA-727: previews of a live_credentials project hit production. The red
+  // banner sits above the dev env / Preview rows and the Start button.
+  // STA-799: a repo path the server could not verify is gated the same way.
+  const gate = shipReviewLiveGate(card);
+  const live = gate !== '';
+  if (live) {
+    section.appendChild(el('div', 'ship-review-live-banner', shipReviewGateWarning(gate)));
+  }
+
   // Dev env state (async setup progress).
   if (card.dev_state === 'starting' || card.dev_state === 'error' || (card.dev_log && card.dev_log.length > 0)) {
     const devEnvRow = el('div', 'ship-review-devenv-row');
@@ -8317,7 +8836,9 @@ function renderShipReviewCardFromData(container, taskId, card) {
     if (card.status === 'pending') {
       const restartBtn = el('button', 'ship-review-restart-btn', '↺ Restart');
       restartBtn.title = 'Restart dev server';
+      if (live) markShipReviewLiveButton(restartBtn, 'ship-review-restart-btn--live', gate);
       restartBtn.addEventListener('click', async () => {
+        if (live) { showShipReviewLiveConfirm(section, devRow, taskId, restartBtn, gate); return; }
         restartBtn.disabled = true;
         await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/start-dev`, { method: 'POST' }).catch(() => {});
         restartBtn.disabled = false;
@@ -8325,6 +8846,20 @@ function renderShipReviewCardFromData(container, taskId, card) {
       devRow.appendChild(restartBtn);
     }
     section.appendChild(devRow);
+  } else if (card.status === 'pending' && card.dev_configured !== false && card.dev_state !== 'starting') {
+    // No dev server yet: offer to start one (a live project never auto-starts).
+    const startRow = el('div', 'ship-review-row');
+    startRow.appendChild(el('span', 'ship-review-row-label', 'Preview'));
+    const startBtn = el('button', 'ship-review-start-dev-btn', '▶ Start dev server');
+    if (live) markShipReviewLiveButton(startBtn, 'ship-review-start-dev-btn--live', gate);
+    startBtn.addEventListener('click', async () => {
+      if (live) { showShipReviewLiveConfirm(section, startRow, taskId, startBtn, gate); return; }
+      startBtn.disabled = true;
+      await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/start-dev`, { method: 'POST' }).catch(() => {});
+      startBtn.disabled = false;
+    });
+    startRow.appendChild(startBtn);
+    section.appendChild(startRow);
   }
 
   // SHA pin
@@ -8333,6 +8868,75 @@ function renderShipReviewCardFromData(container, taskId, card) {
   shaRow.appendChild(el('code', 'ship-review-sha', card.head_sha ? card.head_sha.slice(0, 12) : '—'));
   shaRow.appendChild(el('span', 'ship-review-branch', card.branch || ''));
   section.appendChild(shaRow);
+
+  // PR + CI checks (STA-717). applyPRChecks is wired to the actions below.
+  let applyPRChecks = null;
+  const prWarning = el('div', 'ship-review-pr-warning');
+  prWarning.style.display = 'none';
+  const prWarningList = el('ul', 'ship-review-pr-warning-list');
+  if (card.pr_number > 0 && card.status === 'pending') {
+    const prSec = el('div', 'ship-review-pr-section');
+    prSec.appendChild(prLinkRow(card));
+    if (!prActive) {
+      prSec.appendChild(el('div', 'ship-review-pr-note',
+        `This head is not on PR #${card.pr_number} yet. Approve pushes it to the PR and re-runs the checks.`));
+    } else {
+      const title = el('div', 'ship-review-section-title', 'Checks');
+      const summaryEl = el('span', 'ship-review-pr-summary', '');
+      title.appendChild(summaryEl);
+      prSec.appendChild(title);
+      let table = renderPRChecksTable(card.pr_checks || []);
+      prSec.appendChild(table);
+      prWarning.appendChild(el('div', 'ship-review-pr-warning-title', ''));
+      prWarning.appendChild(prWarningList);
+      prSec.appendChild(prWarning);
+      if (card.pr_merge_error) {
+        const refusal = el('div', 'ship-review-github-refusal');
+        refusal.appendChild(el('span', 'ship-review-github-refusal-label', 'GitHub refused the last merge: '));
+        refusal.appendChild(el('span', 'ship-review-github-refusal-text', card.pr_merge_error));
+        prSec.appendChild(refusal);
+      }
+      applyPRChecks = (summary, checks) => {
+        const next = renderPRChecksTable(checks || []);
+        table.replaceWith(next);
+        table = next;
+        const label = PR_CHECKS_LABELS[summary] || PR_CHECKS_LABELS.running;
+        summaryEl.textContent = label;
+        statusBadge.textContent = label;
+        statusBadge.className = `ship-review-status-badge status-checks-${summary || 'running'}`;
+        const blocking = (checks || []).filter((c) => c.bucket !== 'pass' && c.bucket !== 'skipping');
+        const green = summary === 'passed';
+        prWarning.style.display = green ? 'none' : '';
+        prWarning.querySelector('.ship-review-pr-warning-title').textContent =
+          summary === 'failed' ? `⚠ ${blocking.length} check${blocking.length === 1 ? '' : 's'} not green. Merging now needs an override.`
+            : summary === 'none' ? '⚠ No checks reported for this head yet. Merging now needs an override.'
+            : `⚠ ${blocking.length} check${blocking.length === 1 ? '' : 's'} still running. Merging now needs an override.`;
+        prWarningList.replaceChildren(...blocking.map((c) => el('li', `ship-review-pr-warning-item ship-review-pr-check--${c.bucket || 'pending'}`,
+          `${PR_CHECK_ICONS[c.bucket] || '?'} ${c.name} (${(c.state || c.bucket || '').toLowerCase().replace(/_/g, ' ')})`)));
+        section.dataset.checks = summary || 'running';
+        section.dispatchEvent(new CustomEvent('pr-checks', { detail: { summary, blocking } }));
+      };
+      startPRChecksPoll(taskId, prSec, (res) => {
+        if (res.head_moved) {
+          section.dispatchEvent(new CustomEvent('pr-head-moved', { detail: { sha: res.pr_head_sha || '' } }));
+          return;
+        }
+        applyPRChecks(res.summary, res.checks);
+      });
+    }
+    section.appendChild(prSec);
+  }
+
+  // Test coverage (STA-734): Merge waits for this verdict.
+  let testGate = null;
+  if (card.status === 'pending') {
+    // A pr_merge card before its PR exists: Approve only opens the PR, and
+    // the server enforces the gate at Merge PR, so no bypass here.
+    const enforcedAt = approveMode !== 'pr_merge' || prActive ? ''
+      : card.pr_number > 0 ? `Merge PR #${card.pr_number}` : 'Merge PR, once the PR is open,';
+    testGate = renderTestCoverageSection(taskId, () => section.dispatchEvent(new CustomEvent('test-gate')), { enforcedAt });
+    section.appendChild(testGate.el);
+  }
 
   // What to test
   if (card.test_steps && card.test_steps.length > 0) {
@@ -8426,9 +9030,15 @@ function renderShipReviewCardFromData(container, taskId, card) {
   // ── Send-back inline form (hidden until "↩ Send Back" clicked) ──
   const sendBackForm = el('div', 'ship-review-inline-form');
   sendBackForm.style.display = 'none';
+  // Set by "Send failures to agent": the send-back carries ci_failures so the
+  // agent's fix is pushed to the PR and its checks re-run (STA-717).
+  let sendBackCI = false;
+  let sbTextareaRef = null;
+  const sbLabel = el('label', 'ship-review-form-label', 'Feedback for the agent (required):');
   {
-    sendBackForm.appendChild(el('label', 'ship-review-form-label', 'Feedback for the agent (required):'));
+    sendBackForm.appendChild(sbLabel);
     const sbTextarea = document.createElement('textarea');
+    sbTextareaRef = sbTextarea;
     sbTextarea.className = 'ship-review-form-textarea';
     sbTextarea.rows = 3;
     sbTextarea.placeholder = 'What should the agent fix or improve?';
@@ -8450,7 +9060,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
           fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/send-back`, {
             method: 'POST',
             headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-            body: JSON.stringify({ comment }),
+            body: JSON.stringify(sendBackCI ? { comment, ci_failures: true } : { comment }),
           }), 'sending the review back',
         );
         if (r === null) { sbSubmit.disabled = false; return; }
@@ -8523,28 +9133,43 @@ function renderShipReviewCardFromData(container, taskId, card) {
   {
     const shortSHA = card.head_sha ? card.head_sha.slice(0, 12) : '—';
     const repoName = card.repo_name || '';
+    const repoSuffix = repoName ? ` (${repoName})` : '';
+    const prTarget = card.pr_number > 0 ? `PR #${card.pr_number}` : 'a PR';
     approveConfirmForm.appendChild(el('div', 'ship-review-form-label',
-      repoName ? `Merge ${shortSHA} → main (${repoName})` : `Merge ${shortSHA} → main`));
+      approveMode === 'open_pr' ? `Push ${shortSHA} and open ${prTarget} → main${repoSuffix}. StayPoint will not merge it.`
+        : approveMode === 'pr_merge' ? `Push ${shortSHA} to ${prTarget} → main${repoSuffix} and run the checks. Merge comes after CI.`
+        : `Merge ${shortSHA} → main${repoSuffix}`));
     const acRow = el('div', 'ship-review-form-row');
-    const acMerge = el('button', 'ship-review-form-submit', 'Merge to main');
+    const acMerge = el('button', 'ship-review-form-submit',
+      approveMode === 'direct' ? 'Merge to main' : approveMode === 'open_pr' ? 'Open PR' : 'Push & run checks');
     const acCancel = el('button', 'ship-review-form-cancel', 'Cancel');
     acRow.appendChild(acMerge);
     acRow.appendChild(acCancel);
     approveConfirmForm.appendChild(acRow);
     acCancel.addEventListener('click', () => { approveConfirmForm.style.display = 'none'; clearErr(); });
-    acMerge.addEventListener('click', async () => {
+    acMerge.addEventListener('click', () => doApprove(acMerge, {}));
+  }
+  // doApprove posts Approve; extra carries the test-gate bypass (STA-734).
+  async function doApprove(acMerge, extra) {
       clearErr();
       acMerge.disabled = true;
       try {
         const r = await withBoardWebAuthn((sessionToken, assertion) =>
           fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/approve`, {
             method: 'POST',
-            headers: { ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-          }), 'merging to main',
+            headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+            body: JSON.stringify({ head_sha: card.head_sha, ...(extra || {}) }),
+          }), approveMode === 'direct' ? 'merging to main' : 'opening the PR',
         );
         if (r === null) { acMerge.disabled = false; return; }
         if (r.status === 409) {
           const body = await r.json().catch(() => ({}));
+          if (body.error === 'untested') {
+            if (testGate) testGate.apply(body.test_coverage);
+            acMerge.disabled = false;
+            showBypassConfirm(body.missing || []);
+            return;
+          }
           if (body.error === 'head_moved') {
             const newSHA = body.new_head_sha || '?';
             headMovedBanner.querySelector('.ship-review-head-moved-text').textContent =
@@ -8558,52 +9183,285 @@ function renderShipReviewCardFromData(container, taskId, card) {
         }
         if (!r.ok) throw await boardActionError(r);
         const result = await r.json();
+        if (result.merge_mode === 'open_pr' || result.merge_mode === 'pr_merge') {
+          clearShipReviewHeaderActions(taskId);
+          if (result.merge_mode === 'open_pr') {
+            section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', '', '', { ...(result.card || {}), test_task: result.test_task }));
+          } else {
+            section.remove();
+            renderShipReviewCardFromData(container, taskId, result.card);
+          }
+          return;
+        }
         const mainSHA = result.main_sha || (result.card && result.card.main_sha) || '';
         clearShipReviewHeaderActions(taskId);
         section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', mainSHA, '', {
           branch: card.branch,
           branch_deleted: !!result.branch_deleted,
           branch_delete_error: result.branch_delete_error || '',
+          test_task: result.test_task,
         }));
       } catch (e) {
         showErr('Approve failed: ' + (e.message || e));
         acMerge.disabled = false;
       }
-    });
   }
   actionsWrap.appendChild(approveConfirmForm);
+
+  // ── PR merge (pr_merge mode, STA-717) ──
+  const shortHead = card.head_sha ? card.head_sha.slice(0, 12) : '—';
+  const mergeConfirmForm = el('div', 'ship-review-inline-form ship-review-merge-confirm');
+  mergeConfirmForm.style.display = 'none';
+  const anywayConfirmForm = el('div', 'ship-review-inline-form ship-review-merge-anyway-confirm');
+  anywayConfirmForm.style.display = 'none';
+  const anywayLabel = el('div', 'ship-review-form-label', '');
+  // "Merge without tests" confirm (STA-734): names what is missing.
+  const bypassConfirmForm = el('div', 'ship-review-inline-form ship-review-merge-without-tests-confirm');
+  bypassConfirmForm.style.display = 'none';
+  const bypassLabel = el('div', 'ship-review-form-label', '');
+  const bypassMissing = el('ul', 'ship-review-merge-without-tests-missing');
+  const allForms = [sendBackForm, rejectForm, approveConfirmForm, mergeConfirmForm, anywayConfirmForm, bypassConfirmForm];
+  const showOnly = (form) => {
+    for (const f of allForms) f.style.display = (f === form && f.style.display === 'none') ? '' : 'none';
+    headMovedBanner.style.display = 'none';
+    clearErr();
+  };
+  const showGitHubRefusal = (msg) => {
+    errBanner.replaceChildren(el('span', 'ship-review-github-refusal-label', 'GitHub refused the merge: '),
+      el('span', 'ship-review-github-refusal-text', msg));
+    errBanner.style.display = '';
+  };
+  const doMerge = async (btn, override, reason, extra) => {
+    clearErr();
+    btn.disabled = true;
+    try {
+      const r = await withBoardWebAuthn((sessionToken, assertion) =>
+        fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/merge`, {
+          method: 'POST',
+          headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+          // head_sha pins the merge to the head on screen (STA-717).
+          body: JSON.stringify({
+            head_sha: card.head_sha,
+            ...(override ? { override: true, override_reason: reason || '' } : {}),
+            ...(extra || {}),
+          }),
+        }), override ? 'merging the PR anyway' : 'merging the PR',
+      );
+      if (r === null) { btn.disabled = false; return; }
+      const body = await r.json().catch(() => ({}));
+      if (r.ok) {
+        clearShipReviewHeaderActions(taskId);
+        section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', body.main_sha || '', '', {
+          ...(body.card || { branch: card.branch, branch_deleted: !!body.branch_deleted, branch_delete_error: body.branch_delete_error || '' }),
+          test_task: body.test_task,
+        }));
+        return;
+      }
+      btn.disabled = false;
+      mergeConfirmForm.style.display = 'none';
+      anywayConfirmForm.style.display = 'none';
+      bypassConfirmForm.style.display = 'none';
+      if (body.error === 'untested') {
+        if (testGate) testGate.apply(body.test_coverage);
+        showBypassConfirm(body.missing || []);
+        return;
+      }
+      if (body.error === 'head_moved') {
+        headMovedBanner.querySelector('.ship-review-head-moved-text').textContent =
+          `Branch moved to ${(body.new_head_sha || '?').slice(0, 12)} after the checks started. Merge blocked until the card is re-pinned and checks re-run. `;
+        headMovedBanner.style.display = '';
+        if (applyPRChecks) applyPRChecks('running', []);
+        return;
+      }
+      if (body.error === 'checks_not_green') {
+        if (applyPRChecks) applyPRChecks(body.not_green && body.not_green.some((c) => c.bucket === 'fail' || c.bucket === 'cancel') ? 'failed' : 'running', body.checks || []);
+        showErr('Checks are not all green: ' + (body.not_green || []).map((c) => c.name).join(', '));
+        return;
+      }
+      if (body.error === 'github_refused') { showGitHubRefusal(body.message || ''); return; }
+      if (body.error === 'unverified_migrations') {
+        showErr(`${body.message} (${(body.unverified_migrations || []).join(', ')})`);
+        return;
+      }
+      showErr('Merge failed: ' + (body.message || body.error || `${r.status} ${r.statusText}`));
+    } catch (e) {
+      btn.disabled = false;
+      showErr('Merge failed: ' + (e.message || e));
+    }
+  };
+  {
+    mergeConfirmForm.appendChild(el('div', 'ship-review-form-label', `Merge PR #${card.pr_number} ${shortHead} → main`));
+    const row = el('div', 'ship-review-form-row');
+    const go = el('button', 'ship-review-form-submit ship-review-merge-submit', 'Merge PR');
+    const cancel = el('button', 'ship-review-form-cancel', 'Cancel');
+    row.appendChild(go);
+    row.appendChild(cancel);
+    mergeConfirmForm.appendChild(row);
+    cancel.addEventListener('click', () => { mergeConfirmForm.style.display = 'none'; clearErr(); });
+    go.addEventListener('click', () => doMerge(go, false));
+  }
+  {
+    anywayConfirmForm.appendChild(anywayLabel);
+    const reason = document.createElement('input');
+    reason.type = 'text';
+    reason.className = 'ship-review-form-input ship-review-override-reason';
+    reason.placeholder = 'Why merge anyway? (logged)';
+    anywayConfirmForm.appendChild(reason);
+    const row = el('div', 'ship-review-form-row');
+    const go = el('button', 'ship-review-reject-submit-btn ship-review-merge-anyway-submit', 'Merge anyway');
+    const cancel = el('button', 'ship-review-form-cancel', 'Cancel');
+    row.appendChild(go);
+    row.appendChild(cancel);
+    anywayConfirmForm.appendChild(row);
+    cancel.addEventListener('click', () => { anywayConfirmForm.style.display = 'none'; clearErr(); });
+    go.addEventListener('click', () => doMerge(go, true, reason.value.trim()));
+  }
+  // Only PR-mode cards get the merge forms, so every other card keeps its
+  // existing form order.
+  if (prActive) {
+    actionsWrap.appendChild(mergeConfirmForm);
+    actionsWrap.appendChild(anywayConfirmForm);
+  }
+
+  // checksGreen tracks the PR checks (pr_merge); the test gate is separate.
+  let checksGreen = card.pr_checks_summary === 'passed';
+  function showBypassConfirm(missing) {
+    const list = (missing && missing.length) ? missing : ((testGate && testGate.state.missing) || []);
+    const target = prActive ? `PR #${card.pr_number} ${shortHead}` : shortHead;
+    bypassLabel.textContent = `Merge ${target} → main without tests? Missing:`;
+    bypassMissing.replaceChildren(...list.map((m) => el('li', 'ship-review-merge-without-tests-missing-item', m)));
+    bypassNote.textContent = (prActive && !checksGreen)
+      ? 'Checks are not all green either, so this also overrides them. Both are logged, and a backlog task to add the tests is created.'
+      : 'This is logged, and a backlog task to add the tests is created.';
+    for (const f of allForms) f.style.display = f === bypassConfirmForm ? '' : 'none';
+    headMovedBanner.style.display = 'none';
+    clearErr();
+  }
+  const bypassNote = el('div', 'ship-review-merge-without-tests-note', '');
+  {
+    bypassConfirmForm.appendChild(bypassLabel);
+    bypassConfirmForm.appendChild(bypassMissing);
+    bypassConfirmForm.appendChild(bypassNote);
+    const reason = document.createElement('input');
+    reason.type = 'text';
+    reason.className = 'ship-review-form-input ship-review-merge-without-tests-reason';
+    reason.placeholder = 'Why merge without tests? (logged)';
+    bypassConfirmForm.appendChild(reason);
+    const row = el('div', 'ship-review-form-row');
+    const go = el('button', 'ship-review-reject-submit-btn ship-review-merge-without-tests-submit', 'Merge without tests');
+    const cancel = el('button', 'ship-review-form-cancel', 'Cancel');
+    row.appendChild(go);
+    row.appendChild(cancel);
+    bypassConfirmForm.appendChild(row);
+    cancel.addEventListener('click', () => { bypassConfirmForm.style.display = 'none'; clearErr(); });
+    go.addEventListener('click', () => {
+      const extra = { merge_without_tests: true, merge_without_tests_reason: reason.value.trim() };
+      if (prActive) doMerge(go, !checksGreen, reason.value.trim(), extra);
+      else doApprove(go, extra);
+    });
+  }
+  // Before the reject form: specs and the tray expect Reject's form last.
+  actionsWrap.insertBefore(bypassConfirmForm, rejectForm);
+  if (testGate) testGate.bypassBtn.addEventListener('click', () => showBypassConfirm());
+
+  // Warning buttons: Merge anyway / Send failures to agent.
+  if (prActive) {
+    const warnRow = el('div', 'ship-review-form-row ship-review-pr-warning-actions');
+    const anywayBtn = el('button', 'ship-review-merge-anyway-btn', 'Merge anyway');
+    const failuresBtn = el('button', 'ship-review-send-failures-btn', '↩ Send failures to agent');
+    warnRow.appendChild(anywayBtn);
+    warnRow.appendChild(failuresBtn);
+    prWarning.appendChild(warnRow);
+    anywayBtn.addEventListener('click', () => {
+      const n = prWarningList.children.length;
+      anywayLabel.textContent = `Merge PR #${card.pr_number} ${shortHead} → main with ${n} check${n === 1 ? '' : 's'} not green? This is logged as an override.`;
+      showOnly(anywayConfirmForm);
+    });
+    failuresBtn.addEventListener('click', async () => {
+      failuresBtn.disabled = true;
+      clearErr();
+      try {
+        const f = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/check-failures`);
+        for (const x of allForms) x.style.display = 'none';
+        sendBackCI = true;
+        sbLabel.textContent = 'CI failures for the agent (edit before sending):';
+        sbTextareaRef.value = f.comment || '';
+        sbTextareaRef.rows = 10;
+        sendBackForm.style.display = '';
+      } catch (e) {
+        showErr('Could not read the failing checks: ' + (e.message || e));
+      }
+      failuresBtn.disabled = false;
+    });
+  }
 
   // ── Primary action buttons ──
   const actions = el('div', 'ship-review-actions');
 
-  const approveBtn = el('button', 'ship-review-approve-btn', '✓ Approve & Merge');
-  approveBtn.addEventListener('click', () => {
-    sendBackForm.style.display = 'none';
-    rejectForm.style.display = 'none';
-    approveConfirmForm.style.display = approveConfirmForm.style.display === 'none' ? '' : 'none';
-    headMovedBanner.style.display = 'none';
-    clearErr();
-  });
-  actions.appendChild(approveBtn);
+  if (prActive) {
+    const mergeBtn = el('button', 'ship-review-merge-btn', `✓ Merge PR #${card.pr_number}`);
+    mergeBtn.disabled = true;
+    mergeBtn.title = 'Enabled when all checks are green';
+    mergeBtn.addEventListener('click', () => showOnly(mergeConfirmForm));
+    actions.appendChild(mergeBtn);
+    // Merge needs green checks and a passing test gate (STA-734).
+    const updateMergeBtn = () => {
+      const gate = testGate ? testGate.state : { loaded: true, blocking: false };
+      const gateOK = gate.loaded && !gate.blocking;
+      mergeBtn.disabled = !checksGreen || !gateOK;
+      mergeBtn.title = !checksGreen ? 'Enabled when all checks are green'
+        : !gate.loaded ? 'Checking test coverage…'
+        : !gateOK ? 'Not tested: see Test coverage. Use Merge without tests to bypass.' : '';
+      if (mergeBtn.disabled) mergeConfirmForm.style.display = 'none';
+    };
+    section.addEventListener('pr-checks', (e) => {
+      checksGreen = e.detail.summary === 'passed';
+      updateMergeBtn();
+    });
+    section.addEventListener('test-gate', updateMergeBtn);
+    section.addEventListener('pr-head-moved', (e) => {
+      mergeBtn.disabled = true;
+      headMovedBanner.querySelector('.ship-review-head-moved-text').textContent =
+        `PR head moved to ${(e.detail.sha || '?').slice(0, 12)} after the checks started. Merge blocked until the card is re-pinned and checks re-run. `;
+      headMovedBanner.style.display = '';
+    });
+  } else {
+    const approveLabel = approveMode === 'open_pr' ? '✓ Approve & open PR'
+      : approveMode === 'pr_merge' ? (card.pr_number > 0 ? `✓ Approve & push to PR #${card.pr_number}` : '✓ Approve & open PR')
+      : '✓ Approve & Merge';
+    const approveBtn = el('button', 'ship-review-approve-btn', approveLabel);
+    approveBtn.addEventListener('click', () => showOnly(approveConfirmForm));
+    actions.appendChild(approveBtn);
+    // direct and open_pr Approve land on main, so they wait for the test
+    // gate (STA-734); pr_merge Approve only opens the PR.
+    if (testGate && approveMode !== 'pr_merge') {
+      const updateApproveBtn = () => {
+        const g = testGate.state;
+        approveBtn.disabled = !g.loaded || g.blocking;
+        approveBtn.title = !g.loaded ? 'Checking test coverage…'
+          : g.blocking ? 'Not tested: see Test coverage. Use Merge without tests to bypass.' : '';
+        if (approveBtn.disabled) approveConfirmForm.style.display = 'none';
+      };
+      updateApproveBtn();
+      section.addEventListener('test-gate', updateApproveBtn);
+    }
+  }
 
   const sendBackBtn = el('button', 'ship-review-sendback-btn', '↩ Send Back');
   sendBackBtn.addEventListener('click', () => {
-    rejectForm.style.display = 'none';
-    approveConfirmForm.style.display = 'none';
-    headMovedBanner.style.display = 'none';
-    clearErr();
-    sendBackForm.style.display = sendBackForm.style.display === 'none' ? '' : 'none';
+    if (sendBackCI) {
+      sendBackCI = false;
+      sbLabel.textContent = 'Feedback for the agent (required):';
+      sbTextareaRef.value = '';
+      sbTextareaRef.rows = 3;
+      sendBackForm.style.display = 'none';
+    }
+    showOnly(sendBackForm);
   });
   actions.appendChild(sendBackBtn);
 
   const rejectBtn = el('button', 'ship-review-reject-btn', '✕ Reject');
-  rejectBtn.addEventListener('click', () => {
-    sendBackForm.style.display = 'none';
-    approveConfirmForm.style.display = 'none';
-    headMovedBanner.style.display = 'none';
-    clearErr();
-    rejectForm.style.display = rejectForm.style.display === 'none' ? '' : 'none';
-  });
+  rejectBtn.addEventListener('click', () => showOnly(rejectForm));
   actions.appendChild(rejectBtn);
 
   // On the task page the buttons sit in the sticky header and their forms
@@ -8618,10 +9476,11 @@ function renderShipReviewCardFromData(container, taskId, card) {
     section.appendChild(actionsWrap);
   }
   container.appendChild(section);
+  if (applyPRChecks) applyPRChecks(card.pr_checks_summary || 'running', card.pr_checks || []);
 
   // For SSE-driven re-renders the buttons may already be in the DOM.
   // Hide them so they don't sit alongside the card's own action buttons.
-  const page = container.closest('#task-page-content') || container;
+  const page = container.closest('#task-page-content, #panel-content') || container;
   for (const btn of page.querySelectorAll('.run-now-btn, .mark-done-btn, .mark-done-error, .ship-review-see-card-link')) {
     btn.style.display = 'none';
   }
@@ -9211,8 +10070,15 @@ function buildTaskPagePanel(taskId, defaultKey) {
   return { side, panels, select, setCount };
 }
 
-function renderTaskPage(container, task, comments, interactions, diffData, checkpoints, runErrors, shipCard) {
+// Renders the task layout into the full page (#task-page-content) or, with
+// opts.drawer, into the drawer (#panel-content, STA-700). The drawer has no
+// Back button (it has its own close / expand / open controls) and actions
+// that reload the task reload it in the drawer.
+function renderTaskPage(container, task, comments, interactions, diffData, checkpoints, runErrors, shipCard, opts = {}) {
   container.innerHTML = '';
+  const drawer = Boolean(opts.drawer);
+  const reopen = () => (drawer ? openDetail(task.id, false) : openTaskPage(task.id));
+  const openTask = (id) => (drawer ? openDetail(id) : openTaskPage(id));
 
   const ident = task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : '');
 
@@ -9222,14 +10088,16 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   // buttons (mounted by renderShipReviewCardFromData into the review slot).
   const header = el('div', 'task-page-header');
   const headerRow = el('div', 'task-page-header-row');
-  const backBtn = el('button', 'task-page-back-btn', '← Back');
-  backBtn.addEventListener('click', () => {
-    stopChatPoll();
-    stopElapsedTicker();
-    state.openDetailTaskId = null;
-    history.back();
-  });
-  headerRow.appendChild(backBtn);
+  if (!drawer) {
+    const backBtn = el('button', 'task-page-back-btn', '← Back');
+    backBtn.addEventListener('click', () => {
+      stopChatPoll();
+      stopElapsedTicker();
+      state.openDetailTaskId = null;
+      history.back();
+    });
+    headerRow.appendChild(backBtn);
+  }
 
   const headerMain = el('div', 'task-page-header-main');
   const metaLine = taskPageHeaderMeta(task, ident);
@@ -9270,6 +10138,25 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     statsBar.appendChild(buildTimelineStats(task, curSteps, elapsedMs, stuck));
   }
   container.appendChild(statsBar);
+
+  // Run queue line (STA-773): a run refused for capacity waits here until a
+  // slot, its repo, or its quota pool frees up. Kept current by run.queue SSE.
+  const queueLine = el('div', 'task-page-queue-line');
+  queueLine.id = `run-queue-line-${task.id}`;
+  queueLine.setAttribute('role', 'status');
+  setRunQueueLine(queueLine, task.queue);
+  container.appendChild(queueLine);
+
+  // Non-git task (STA-864): runs in place; nothing is checkpointed, and
+  // there is no ship review card or Approve.
+  if (task.workspace && task.workspace.git === false) {
+    const warn = el('div', 'task-page-nongit-banner',
+      task.workspace.warning || 'Warning: not a git repository — changes are not checkpointed and can\'t be reviewed or undone');
+    warn.id = `nongit-banner-${task.id}`;
+    warn.setAttribute('role', 'note');
+    if (task.workspace.dir) warn.title = task.workspace.dir;
+    container.appendChild(warn);
+  }
 
   // Two-column body: timeline left, panel right, each scrolling internally.
   const layout = el('div', 'task-page-layout');
@@ -9453,6 +10340,10 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   // Rendered synchronously from the pre-fetched shipCard so it appears
   // immediately with no extra round-trip; its action buttons go to the header.
   renderShipReviewCardFromData(reviewCardSlot, task.id || '', shipCard || null);
+  // STA-774: a run that changed nothing gets no card and no Approve.
+  if (!shipCard && diffData && diffData.answer_only) {
+    reviewCardSlot.appendChild(renderAnswerOnlyPanel(comments || [], diffData.files_read || []));
+  }
 
   // Migrations panel — lazy-loads migration files from the task's diff
   const migPanel = tabPanels.migrations;
@@ -9571,6 +10462,10 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   addMetaField('Project', projectSlug(task) !== 'default' ? projectSlug(task) : null);
   addMetaField('Org', task.organization || null);
   addMetaField('Stage', task.execution_stage || null);
+  addMetaField('Kind of work', workKindLabel(task.work_kind));
+  if (task.id && !isFleetTaskId(task.id)) addMetaField('Provider', buildProviderField(task));
+  addMetaField('Goal', task.goal_title || (task.goal_id ? task.goal_id.slice(0, 12) : null));
+  addMetaField('Repo', task.repo_path ? `${task.repo_path} (${task.git_branch || 'main'})` : null);
   addMetaField('Spend',
     (task.spent_usd || task.spent_tokens)
       ? `${fmtCurrency(task.spent_usd || 0)} · ${fmtCompactNum(task.spent_tokens || 0)} tokens`
@@ -9602,6 +10497,15 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     meta.appendChild(lblWrap);
   }
 
+  if (task.source_ref) {
+    // Paperclip import (STA-857): where this task came from.
+    meta.appendChild(el('div', 'task-source-ref', `Imported from ${task.source_ref}`));
+  }
+  if (task.origin === 'paperclip_import' && !task.repo_path) {
+    meta.appendChild(el('div', 'task-source-ref muted-text', 'No repo yet: set one (staypoint task set-repo) before moving it out of backlog.'));
+  }
+  appendTaskRelations(meta, task, openTask);
+
   // A ship review card in pending/sent_back/approved/rejected state blocks
   // Run Now and Mark done — starting a new run on finished work or closing
   // without merging both confuse the review flow.
@@ -9624,7 +10528,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
         });
         if (!res.ok) throw new Error(`${res.status}`);
         runBtn.textContent = '✓ Started';
-        setTimeout(() => openTaskPage(task.id), 800);
+        setTimeout(reopen, 800);
       } catch (err) {
         runBtn.disabled = false;
         runBtn.textContent = '▶ Run Now';
@@ -9670,7 +10574,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
           return;
         }
         doneBtn.textContent = '✓ Done';
-        setTimeout(() => openTaskPage(task.id), 800);
+        setTimeout(reopen, 800);
       } catch (err) {
         doneError.textContent = err.message || 'Request failed';
         doneError.style.display = 'block';
@@ -9693,9 +10597,12 @@ document.addEventListener('click', (e) => {
   const panel = document.getElementById('detail-panel');
   if (!panel || panel.classList.contains('hidden')) return;
   // If detail was just opened/switched in this click event, do not close
-  if (Date.now() - lastDetailOpenTime < 150) return;
+  if (e === detailOpenEvent || Date.now() - lastDetailOpenTime < 150) return;
   // If clicked inside the detail panel, do not close
   if (panel.contains(e.target)) return;
+  // Nor for clicks in a dialog the drawer opened (body-level overlays), or on
+  // a control that removed itself, such as a dialog's close button.
+  if (!e.target.isConnected || e.target.closest('.content-modal, .file-diff-modal')) return;
   // If clicked on close, expand, or open button, ignore
   if (e.target.closest('#panel-close') || e.target.closest('#panel-expand') || e.target.closest('#panel-open')) return;
   closeDetailPanel();
@@ -11103,6 +12010,7 @@ document.getElementById('projects-org-filter')?.addEventListener('change', (e) =
 
   connectSSE();
   refreshBoardPasskeyStatus();
+  refreshDevBuildBadge();
   const bannerEnrollBtn = document.getElementById('board-passkey-banner-enroll');
   bannerEnrollBtn?.addEventListener('click', async () => {
     bannerEnrollBtn.disabled = true;
@@ -11141,14 +12049,23 @@ setInterval(() => {
   const form    = document.getElementById('create-task-form');
   const errBox  = document.getElementById('create-task-error');
   const workKindSel = document.getElementById('ct-work-kind');
+  const providerSel = document.getElementById('ct-provider');
+  const providerHint = document.getElementById('ct-provider-hint');
   const submitBtn = document.getElementById('create-task-submit');
 
   if (!modal || !openBtn || !form) return;
+
+  const gateProvider = () => {
+    if (providerSel) gateGeminiOptions(providerSel, (workKindSel && workKindSel.value) || 'coding', providerHint);
+  };
+  if (workKindSel) workKindSel.addEventListener('change', gateProvider);
 
   function openModal() {
     modal.style.display = 'flex';
     form.reset();
     if (workKindSel) workKindSel.value = 'coding';
+    if (providerSel) providerSel.value = '';
+    gateProvider();
     errBox.style.display = 'none';
     submitBtn.disabled = false;
     document.getElementById('ct-name').focus();
@@ -11184,10 +12101,17 @@ setInterval(() => {
       max_budget_usd: parseFloat(document.getElementById('ct-budget').value) || 0,
       max_turns:    parseInt(document.getElementById('ct-turns').value, 10) || 0,
       ...(descVal && { description: descVal }),
+      ...splitProviderChoice(providerSel ? providerSel.value : ''),
     };
 
     try {
-      const task = await apiFetch('/api/tasks', { method: 'POST', body: JSON.stringify(body) });
+      const resp = await fetch('/api/tasks', {
+        method: 'POST',
+        headers: { ...authHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const task = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(task.error || `${resp.status} ${resp.statusText}`);
       closeModal();
       // Refresh task list
       const fresh = await apiFetch('/api/tasks?status=all').catch(() => ({ tasks: [] }));

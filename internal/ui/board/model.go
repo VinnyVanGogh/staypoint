@@ -28,7 +28,7 @@ type Model struct {
 
 	allTasks     []meshContext.Task
 	columns      map[ColumnType][]meshContext.Task
-	columnCursor [4]int
+	columnCursor [len(AllColumns)]int
 	activeCol    int
 
 	activeTask     *meshContext.Task
@@ -98,7 +98,7 @@ func NewModel(cfg Config) (*Model, error) {
 		sseClient:  sseClient,
 		viewMode:   ViewBoard,
 		columns:    cols,
-		activeCol:  0,
+		activeCol:  1, // todo; backlog (0) is parked work
 		textarea:   ta,
 		viewport:   vp,
 		eventsChan: make(chan DaemonEvent, 32),
@@ -235,6 +235,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case ViewMove:
 			switch lowerKey {
 			case "esc", "q":
+				m.viewMode = m.prevMode
+			case "0", "b":
+				if m.activeTask != nil {
+					cmds = append(cmds, m.changeStageCmd(m.activeTask.ID, string(ColBacklog)))
+				}
 				m.viewMode = m.prevMode
 			case "1", "t":
 				if m.activeTask != nil {
@@ -400,6 +405,11 @@ func (m *Model) rebuildColumns() {
 	}
 
 	for _, t := range m.allTasks {
+		if meshContext.IsHiddenByDefault(t) {
+			// Legacy tasks and archived imports stay off the board;
+			// 'staypoint task list --legacy' shows them.
+			continue
+		}
 		col := MapTaskToColumn(t)
 		newCols[col] = append(newCols[col], t)
 	}
@@ -517,6 +527,7 @@ func (m *Model) renderMoveModalView() string {
 	}
 
 	options := []string{
+		"[0] / [b]  BACKLOG",
 		"[1] / [t]  TODO",
 		"[2] / [p]  IN PROGRESS",
 		"[3] / [r]  IN REVIEW",

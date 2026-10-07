@@ -18,7 +18,14 @@ func TestIsWorkRepoDetection(t *testing.T) {
 		path     string
 		expected bool
 	}{
-		{filepath.Join(home, "Documents/dev/worktrees/feat-auth"), true},
+		// The shared worktrees folder holds personal and work worktrees, so its
+		// name alone says nothing; a worktree there is work only by git remote.
+		{filepath.Join(home, "Documents/dev/worktrees/feat-auth"), false},
+		{filepath.Join(home, "Documents/dev/worktrees/staypointd-main"), false},
+		{filepath.Join(home, "Documents/dev/work"), true},
+		{filepath.Join(home, "Documents/dev/work/client-x"), true},
+		{filepath.Join(home, "Documents/dev/work-repos/client-x"), true},
+		{filepath.Join(home, "Documents/dev/workbench"), false},
 		{filepath.Join(home, "Documents/dev/mansol-apps-server/github_repo-prod"), true},
 		{filepath.Join(home, "Documents/dev/mansol/vps-hr-automation"), true},
 		{filepath.Join(home, "Documents/dev/managed-solution-dashboard"), true},
@@ -97,7 +104,8 @@ func TestBalancedPeerPacingRouting(t *testing.T) {
 		t.Errorf("expected tool claude for higher headroom, got %s (reason: %s)", dec1.Tool, dec1.Reason)
 	}
 
-	// Case 2: Repo continuity within 20% margin: LastUsedTool is agy sticks with agy even if Claude has slightly more
+	// Case 2: the last tool used in the repo being agy no longer keeps a
+	// session on agy: the router never picks it (GeminiCodeForbidden).
 	continuityPacer := &PacerState{
 		Pools: map[PoolID]*QuotaPool{
 			PoolGeminiNative: {
@@ -119,8 +127,23 @@ func TestBalancedPeerPacingRouting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Route failed: %v", err)
 	}
-	if dec2.Tool != "agy" {
-		t.Errorf("expected tool agy for repo continuity within 20%% margin, got %s", dec2.Tool)
+	if dec2.Tool != "claude" {
+		t.Errorf("expected claude even after an agy session in this repo, got %s", dec2.Tool)
+	}
+	// A remembered preference for agy is ignored (with a warning), and so is
+	// Gemini having far more headroom.
+	for _, pref := range []string{"agy", "gemini"} {
+		gemRich := &PacerState{Pools: map[PoolID]*QuotaPool{
+			PoolGeminiNative:   {TurnsRunway: 100, FiveHour: QuotaWindow{RemainingPct: 100}, Weekly: QuotaWindow{RemainingPct: 100}},
+			PoolPersonalClaude: {TurnsRunway: 5, FiveHour: QuotaWindow{RemainingPct: 10}, Weekly: QuotaWindow{RemainingPct: 5}},
+		}}
+		d, err := Route(ctx, "/Users/vincevasile/Documents/dev/personal-app", gemRich, RouteOptions{PreferredPersonalTool: pref, LastUsedTool: "agy"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Tool != "claude" || d.Target != TargetClaudePersonal || len(d.Warnings) == 0 {
+			t.Errorf("pref %s: got tool=%s target=%s warnings=%v, want claude with a warning", pref, d.Tool, d.Target, d.Warnings)
+		}
 	}
 
 	// Case 2b: Repo continuity overridden when tool is >20% starved compared to peer
@@ -179,7 +202,8 @@ func TestBalancedPeerPacingRouting(t *testing.T) {
 func TestDynamicQuotaAwareFallback(t *testing.T) {
 	ctx := context.Background()
 
-	// 1. When Claude (Work) is locked out -> Opus tier falls back to Gemini 3.1 Pro
+	// 1. When Claude (Work) is locked out -> personal Claude seat, never agy
+	//    (STA-856: Gemini never writes code in a work repo).
 	lockedWorkPacer := &PacerState{
 		Pools: map[PoolID]*QuotaPool{
 			PoolWorkClaude: {
@@ -199,11 +223,25 @@ func TestDynamicQuotaAwareFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Route failed: %v", err)
 	}
-	if decWork.Tool != "agy" || decWork.Model != "gemini-3.1-pro" {
-		t.Errorf("expected agy / gemini-3.1-pro for locked work Opus tier, got tool=%s, model=%s", decWork.Tool, decWork.Model)
+	if decWork.Tool != "claude" || decWork.Target != TargetClaudePersonal || decWork.Waiting {
+		t.Errorf("expected personal Claude for locked work seat, got tool=%s target=%s waiting=%v", decWork.Tool, decWork.Target, decWork.Waiting)
 	}
 
-	// 2. Personal repo: Preferred Claude (Opus) locked -> falls back to Gemini 3.1 Pro
+	// 1b. Both seats locked -> wait on the work seat, still never agy.
+	bothLocked := &PacerState{Pools: map[PoolID]*QuotaPool{
+		PoolWorkClaude:     {IsLocked: true, LockoutReason: "weekly limit"},
+		PoolPersonalClaude: {IsLocked: true, LockoutReason: "5h limit"},
+		PoolGeminiNative:   {TurnsRunway: 100, FiveHour: QuotaWindow{RemainingPct: 80}, Weekly: QuotaWindow{RemainingPct: 60}},
+	}}
+	decWait, err := Route(ctx, "/Users/vincevasile/Documents/dev/mansol-apps-server/github_repo-prod", bothLocked, RouteOptions{PreferredPersonalTool: "agy"})
+	if err != nil {
+		t.Fatalf("Route failed: %v", err)
+	}
+	if decWait.Tool == "agy" || !decWait.Waiting || decWait.Target != TargetLocalClaudeWork {
+		t.Errorf("expected waiting on work Claude, got tool=%s target=%s waiting=%v", decWait.Tool, decWait.Target, decWait.Waiting)
+	}
+
+	// 2. Personal repo: Claude locked -> waits on personal Claude, never agy.
 	lockedPersonalPacer := &PacerState{
 		Pools: map[PoolID]*QuotaPool{
 			PoolPersonalClaude: {
@@ -226,11 +264,11 @@ func TestDynamicQuotaAwareFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Route failed: %v", err)
 	}
-	if decOpus.Tool != "agy" || decOpus.Model != "gemini-3.1-pro" {
-		t.Errorf("expected agy / gemini-3.1-pro for locked Claude Opus, got tool=%s, model=%s", decOpus.Tool, decOpus.Model)
+	if decOpus.Tool != "claude" || decOpus.Model != "claude-opus-5" || !decOpus.Waiting || decOpus.Target != TargetClaudePersonal {
+		t.Errorf("expected waiting on personal Claude Opus, got tool=%s model=%s waiting=%v", decOpus.Tool, decOpus.Model, decOpus.Waiting)
 	}
 
-	// 3. Personal repo: Preferred Claude (Sonnet) locked -> falls back to Gemini 3.8 Flash
+	// 3. Same with Sonnet preferred.
 	decSonnet, err := Route(ctx, "/Users/vincevasile/Documents/dev/personal-app", lockedPersonalPacer, RouteOptions{
 		PreferredPersonalTool: "claude",
 		PreferredModel:        "claude-sonnet-4-6",
@@ -239,8 +277,32 @@ func TestDynamicQuotaAwareFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Route failed: %v", err)
 	}
-	if decSonnet.Tool != "agy" || decSonnet.Model != "gemini-3.8-flash" {
-		t.Errorf("expected agy / gemini-3.8-flash for locked Claude Sonnet, got tool=%s, model=%s", decSonnet.Tool, decSonnet.Model)
+	if decSonnet.Tool != "claude" || decSonnet.Model != "claude-sonnet-4-6" || !decSonnet.Waiting {
+		t.Errorf("expected waiting on personal Claude Sonnet, got tool=%s model=%s waiting=%v", decSonnet.Tool, decSonnet.Model, decSonnet.Waiting)
+	}
+
+	// 3b. Every personal pool locked (including 3P Claude in Antigravity):
+	// still Claude, waiting, never agy.
+	allLocked := &PacerState{Pools: map[PoolID]*QuotaPool{
+		PoolPersonalClaude: {IsLocked: true, LockoutReason: "5h"},
+		PoolGeminiNative:   {IsLocked: true},
+		Pool3PClaude:       {TurnsRunway: 50, FiveHour: QuotaWindow{RemainingPct: 100}, Weekly: QuotaWindow{RemainingPct: 100}},
+	}}
+	decAll, err := Route(ctx, "/Users/vincevasile/Documents/dev/personal-app", allLocked, RouteOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decAll.Tool != "claude" || !decAll.Waiting {
+		t.Errorf("all locked: want waiting Claude, got tool=%s waiting=%v", decAll.Tool, decAll.Waiting)
+	}
+
+	// 3c. No pacer data at all: Claude, not agy.
+	decNone, err := Route(ctx, "/Users/vincevasile/Documents/dev/personal-app", &PacerState{Pools: map[PoolID]*QuotaPool{}}, RouteOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decNone.Tool != "claude" || decNone.Waiting {
+		t.Errorf("no data: want Claude, got tool=%s waiting=%v", decNone.Tool, decNone.Waiting)
 	}
 
 	// 4. When Claude lock resets -> routes back to primary Claude model

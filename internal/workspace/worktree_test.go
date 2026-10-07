@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"database/sql"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,7 +51,7 @@ func TestNewWorktreeManager(t *testing.T) {
 
 func TestWorktreeManager_CreateAndPrune(t *testing.T) {
 	repoDir := setupTestGitRepo(t)
-	wm := NewWorktreeManager(repoDir, nil)
+	wm := NewWorktreeManager(repoDir, testDB(t))
 
 	taskID := "task-test-01"
 	wtPath, err := wm.Create(taskID, "sess-01")
@@ -93,39 +94,34 @@ func TestWorktreeManager_CreateAndPrune(t *testing.T) {
 	}
 }
 
-func TestWorktreeManager_Create_BranchAlreadyExists(t *testing.T) {
+// TestWorktreeManager_Create_UnrecordedBranchRefused: a task branch the daemon
+// recorded no base for (pre-STA-774, or made by something else, e.g. the
+// agent) is not run on: its base cannot be verified (fail closed).
+func TestWorktreeManager_Create_UnrecordedBranchRefused(t *testing.T) {
 	repoDir := setupTestGitRepo(t)
-	wm := NewWorktreeManager(repoDir, nil)
+	wm := NewWorktreeManager(repoDir, testDB(t))
 
 	taskID := "task-existing-branch"
 	branch := "staypoint/" + taskID
 
-	// Pre-create branch
 	cmd := exec.Command("git", "branch", branch)
 	cmd.Dir = repoDir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to pre-create branch: %v, out: %s", err, string(out))
 	}
 
-	// Create should succeed by falling back to existing branch
-	wtPath, err := wm.Create(taskID, "sess-02")
-	if err != nil {
-		t.Fatalf("wm.Create failed when branch already exists: %v", err)
+	_, err := wm.Create(taskID, "sess-02")
+	if !errors.Is(err, ErrNoTaskBase) {
+		t.Fatalf("Create on unrecorded branch: err = %v, want ErrNoTaskBase", err)
 	}
-
-	if _, err := os.Stat(wtPath); err != nil {
-		t.Fatalf("worktree dir not found: %v", err)
-	}
-
-	// Clean up
-	if err := wm.Prune(taskID); err != nil {
-		t.Fatalf("wm.Prune failed: %v", err)
+	if _, statErr := os.Stat(filepath.Join(repoDir, ".worktrees", taskID)); !os.IsNotExist(statErr) {
+		t.Fatalf("worktree created from an unverified base (stat err %v)", statErr)
 	}
 }
 
 func TestWorktreeManager_Create_StaleWorktreeCleanup(t *testing.T) {
 	repoDir := setupTestGitRepo(t)
-	wm := NewWorktreeManager(repoDir, nil)
+	wm := NewWorktreeManager(repoDir, testDB(t))
 
 	taskID := "task-stale"
 	// Create once
@@ -160,13 +156,14 @@ func TestWorktreeManager_Prune_NonExistent(t *testing.T) {
 
 func TestWorktreeManager_SweepOrphans_NilDB(t *testing.T) {
 	repoDir := setupTestGitRepo(t)
+	creator := NewWorktreeManager(repoDir, testDB(t))
 	wm := NewWorktreeManager(repoDir, nil)
 
-	wtA, err := wm.Create("task-sweep-a", "sess-a")
+	wtA, err := creator.Create("task-sweep-a", "sess-a")
 	if err != nil {
 		t.Fatalf("Create task-sweep-a: %v", err)
 	}
-	wtB, err := wm.Create("task-sweep-b", "sess-b")
+	wtB, err := creator.Create("task-sweep-b", "sess-b")
 	if err != nil {
 		t.Fatalf("Create task-sweep-b: %v", err)
 	}
@@ -201,6 +198,13 @@ func TestWorktreeManager_SweepOrphans_WithDB(t *testing.T) {
 	CREATE TABLE agent_working_files (
 		session_id TEXT NOT NULL,
 		file_path TEXT NOT NULL
+	);
+	CREATE TABLE task_worktree_bases (
+		task_id TEXT PRIMARY KEY,
+		repo_path TEXT NOT NULL DEFAULT '',
+		base_sha TEXT NOT NULL,
+		created_at TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL DEFAULT ''
 	);
 	`
 	if _, err := db.Exec(schema); err != nil {
@@ -267,7 +271,7 @@ func TestWorktreeManager_SweepOrphans_NoWorktreesDir(t *testing.T) {
 // work and backs open ship-review previews (STA-637).
 func TestWorktreeManager_Create_StaleWorktreeKeepsBranch(t *testing.T) {
 	repoDir := setupTestGitRepo(t)
-	wm := NewWorktreeManager(repoDir, nil)
+	wm := NewWorktreeManager(repoDir, testDB(t))
 	taskID := "task-stale-keep"
 
 	wtPath, err := wm.Create(taskID, "sess-1")

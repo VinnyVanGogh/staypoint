@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -83,6 +84,24 @@ type Card struct {
 	BranchDeleted bool `json:"branch_deleted"`
 	// BranchDeleteError holds the last cleanup failure; the merge still stands.
 	BranchDeleteError string `json:"branch_delete_error,omitempty"`
+	// MergeMode is the project's effective merge mode when the card was
+	// approved (STA-717): "direct", "open_pr" or "pr_merge". Empty until then.
+	MergeMode string `json:"merge_mode,omitempty"`
+	// PRNumber / PRURL identify the GitHub PR a PR-mode Approve opened or reused.
+	PRNumber int    `json:"pr_number,omitempty"`
+	PRURL    string `json:"pr_url,omitempty"`
+	// PRChecks is the last checks snapshot polled from GitHub, for the head
+	// in PRChecksSHA. PRChecksSummary is derived at read time.
+	PRChecks        []PRCheck `json:"pr_checks"`
+	PRChecksSHA     string    `json:"pr_checks_sha,omitempty"`
+	PRChecksAt      string    `json:"pr_checks_at,omitempty"`
+	PRChecksSummary string    `json:"pr_checks_summary,omitempty"`
+	// PRMergeError is GitHub's verbatim refusal from the last merge attempt.
+	PRMergeError string `json:"pr_merge_error,omitempty"`
+	// CIFixRequested is set when the Board sent CI failures back to the agent;
+	// the agent's resubmitted card then re-pushes the PR and re-runs checks.
+	CIFixRequested bool `json:"ci_fix_requested,omitempty"`
+
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -92,6 +111,10 @@ var ErrHeadMoved = errors.New("branch HEAD moved since card was rendered; re-ren
 
 // ErrNoCard is returned when no card exists for a task.
 var ErrNoCard = errors.New("no ship review card found")
+
+// ErrNoChanges is returned when the task branch has no changes against its
+// base: an answer-only run gets no card and no Approve (STA-774).
+var ErrNoChanges = errors.New("No changes: answer-only run")
 
 // ErrTestStepsRequired is returned when test_steps is empty.
 var ErrTestStepsRequired = errors.New("test_steps are required to create a ship review card")
@@ -306,7 +329,7 @@ func (m *procManager) kill(taskID string) {
 	delete(m.worktrees, taskID)
 	m.mu.Unlock()
 	if ok && p != nil {
-		_ = p.Kill()
+		killDevProcessGroup(p)
 	}
 	if wtPath != "" {
 		removeDevWorktree(repoPath, wtPath)
@@ -358,8 +381,13 @@ func CreateCard(db *sql.DB, taskID, branch, headSHA string, testSteps []string, 
 		return nil, fmt.Errorf("marshal test_steps: %w", err)
 	}
 
-	// Derive files changed from git diff against the merge-base.
-	filesChanged := diffFilesChanged(repoDir, headSHA)
+	// Files changed come from the task's recorded base, the same resolver
+	// the Diff tab and Approve use (STA-774). A tampered base or an
+	// answer-only run gets no card.
+	filesChanged, err := diffFilesChanged(db, repoDir, taskID, headSHA)
+	if err != nil {
+		return nil, err
+	}
 	filesJSON, err := json.Marshal(filesChanged)
 	if err != nil {
 		return nil, fmt.Errorf("marshal files_changed: %w", err)
@@ -373,6 +401,10 @@ func CreateCard(db *sql.DB, taskID, branch, headSHA string, testSteps []string, 
 		return nil, fmt.Errorf("marshal check_runs: %w", err)
 	}
 
+	// The PR outlives the card it was opened from: a resubmitted card keeps
+	// it, with its checks reset until the new head is pushed (STA-717).
+	prev := previousOpenPR(db, taskID)
+
 	// Replace any existing pending card for this task (agent iterating).
 	_, _ = db.Exec(`DELETE FROM ship_review_cards WHERE task_id = ? AND status IN ('pending', 'sent_back')`, taskID)
 
@@ -381,10 +413,10 @@ func CreateCard(db *sql.DB, taskID, branch, headSHA string, testSteps []string, 
 	_, err = db.Exec(`
 		INSERT INTO ship_review_cards
 			(id, task_id, branch, head_sha, test_steps_json, dev_url, dev_pid, status,
-			 files_changed_json, check_runs_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?)`,
+			 files_changed_json, check_runs_json, merge_mode, pr_number, pr_url, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
 		id, taskID, branch, headSHA, string(stepsJSON), devURL,
-		string(filesJSON), string(checksJSON),
+		string(filesJSON), string(checksJSON), prev.mode, prev.number, prev.url,
 		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -393,40 +425,48 @@ func CreateCard(db *sql.DB, taskID, branch, headSHA string, testSteps []string, 
 	return GetCard(db, taskID)
 }
 
-// diffFilesChanged returns the list of files changed between the merge-base of
-// "main" (or "master") and headSHA. Returns an empty slice on any error.
-func diffFilesChanged(repoDir, headSHA string) []string {
-	if repoDir == "" || headSHA == "" {
-		return []string{}
+// diffFilesChanged returns the files headSHA changes against the task's
+// recorded base (workspace.TaskBase). It fails closed: a base that is missing,
+// tampered with or unreadable is an error (no card), and ErrNoChanges is
+// returned when nothing differs. repoDir "" skips the diff for DB-only
+// callers; such a card still cannot be approved, since Approve re-verifies
+// the base (VerifyCardChanges).
+func diffFilesChanged(db *sql.DB, repoDir, taskID, headSHA string) ([]string, error) {
+	if repoDir == "" {
+		return []string{}, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	return taskChanges(ctx, db, repoDir, taskID, headSHA)
+}
 
-	// Find merge-base against main (or master as fallback).
-	var base string
-	for _, target := range []string{"main", "master"} {
-		out, err := gitOutput(ctx, repoDir, "merge-base", target, headSHA)
-		if err == nil && out != "" {
-			base = out
-			break
-		}
+// taskChanges lists the files head changes against the task's verified base:
+// ErrNoChanges when there are none, the workspace error when the base cannot
+// be verified.
+func taskChanges(ctx context.Context, db *sql.DB, repoDir, taskID, head string) ([]string, error) {
+	if head == "" {
+		return nil, fmt.Errorf("task %s: no head to diff", taskID)
 	}
-	if base == "" {
-		return []string{}
+	files, _, err := workspace.TaskFilesChanged(ctx, db, repoDir, taskID, head)
+	if err != nil {
+		return nil, fmt.Errorf("verify task base: %w", err)
 	}
+	if len(files) == 0 {
+		return nil, ErrNoChanges
+	}
+	return files, nil
+}
 
-	out, err := gitOutput(ctx, repoDir, "diff", "--name-only", base, headSHA)
-	if err != nil || out == "" {
-		return []string{}
+// VerifyCardChanges re-checks, at Approve time, that card's pinned head still
+// has changes against the task's recorded base. Any failure to verify the
+// base (missing record, moved pin, git or DB error) is returned, and Approve
+// must refuse: the Board is never asked to merge something measured against
+// a base the agent could have chosen.
+func VerifyCardChanges(ctx context.Context, db *sql.DB, card *Card, repoDir string) ([]string, error) {
+	if card == nil {
+		return nil, ErrNoCard
 	}
-	files := strings.Split(out, "\n")
-	result := make([]string, 0, len(files))
-	for _, f := range files {
-		if f != "" {
-			result = append(result, f)
-		}
-	}
-	return result
+	return taskChanges(ctx, db, repoDir, card.TaskID, card.HeadSHA)
 }
 
 // GetCard returns the most recent ship review card for a task.
@@ -437,13 +477,16 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 		       COALESCE(files_changed_json, '[]'), COALESCE(check_runs_json, '[]'),
 		       COALESCE(dev_state,''), COALESCE(dev_log_json,'[]'),
 		       COALESCE(branch_deleted,0), COALESCE(branch_delete_error,''),
+		       COALESCE(merge_mode,''), COALESCE(pr_number,0), COALESCE(pr_url,''),
+		       COALESCE(pr_checks_json,'[]'), COALESCE(pr_checks_sha,''), COALESCE(pr_checks_at,''),
+		       COALESCE(pr_merge_error,''), COALESCE(ci_fix_requested,0),
 		       created_at, updated_at
 		FROM ship_review_cards
 		WHERE task_id = ?
 		ORDER BY created_at DESC LIMIT 1`, taskID)
 
 	var c Card
-	var stepsJSON, filesJSON, checksJSON, devLogJSON string
+	var stepsJSON, filesJSON, checksJSON, devLogJSON, prChecksJSON string
 	var approvedSHA, mainSHA, sendBack, reject sql.NullString
 	var createdAt, updatedAt string
 
@@ -453,6 +496,9 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 		&filesJSON, &checksJSON,
 		&c.DevState, &devLogJSON,
 		&c.BranchDeleted, &c.BranchDeleteError,
+		&c.MergeMode, &c.PRNumber, &c.PRURL,
+		&prChecksJSON, &c.PRChecksSHA, &c.PRChecksAt,
+		&c.PRMergeError, &c.CIFixRequested,
 		&createdAt, &updatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -471,6 +517,16 @@ func GetCard(db *sql.DB, taskID string) (*Card, error) {
 	}
 	if err := json.Unmarshal([]byte(devLogJSON), &c.DevLog); err != nil {
 		c.DevLog = []string{}
+	}
+	if err := json.Unmarshal([]byte(prChecksJSON), &c.PRChecks); err != nil || c.PRChecks == nil {
+		c.PRChecks = []PRCheck{}
+	}
+	if c.PRNumber > 0 && c.PRChecksSHA != "" {
+		// Pushed but not polled yet: CI is starting.
+		c.PRChecksSummary = ChecksRunning
+		if c.PRChecksAt != "" {
+			c.PRChecksSummary = SummarizeChecks(c.PRChecks)
+		}
 	}
 	c.ApprovedSHA = approvedSHA.String
 	c.MainSHA = mainSHA.String
@@ -772,6 +828,7 @@ func startDevServerSync(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath 
 	emit("server", "Starting dev server…", true)
 	cmd := exec.Command("/bin/sh", "-c", cfg.DevCommand) //nolint:gosec
 	cmd.Dir = wtPath
+	startDevInOwnGroup(cmd)
 	// Strip inherited VITE_* and SUPABASE_* vars: process env beats every .env
 	// file in Vite, so an inherited VITE_SUPABASE_URL would route to production
 	// even when .env.local points at localhost.
@@ -789,7 +846,7 @@ func startDevServerSync(db *sql.DB, card *Card, cfg *ProjectDevConfig, repoPath 
 	}
 
 	if !devServerManager.storeIfActive(card.TaskID, setup, cmd.Process, repoPath, wtPath) {
-		_ = cmd.Process.Kill()
+		killDevProcessGroup(cmd.Process)
 		_ = cmd.Wait()
 		removeDevWorktree(repoPath, wtPath)
 		return ErrDevSetupCanceled
@@ -856,23 +913,48 @@ func StopDevServer(db *sql.DB, card *Card) {
 // server from the project config (if any) and persists dev_url.
 func BuildAndStartCard(ctx context.Context, db *sql.DB, taskID, repoPath string, testSteps []string, devURL string, checkRuns []CheckRun) (*Card, error) {
 	branch := "staypoint/" + taskID
+	if repoPath == "" {
+		// Files changed cannot be measured against a verified base.
+		return nil, fmt.Errorf("task %s has no repo path: %w", taskID, workspace.ErrNoTaskBase)
+	}
 
 	headSHA, err := CurrentBranchHEAD(ctx, repoPath, branch)
 	if err != nil {
 		return nil, fmt.Errorf("cannot resolve branch HEAD for %q: %w", branch, err)
 	}
 
+	prev := previousOpenPR(db, taskID)
 	card, err := CreateCard(db, taskID, branch, headSHA, testSteps, devURL, repoPath, checkRuns)
 	if err != nil {
 		return nil, err
+	}
+
+	// STA-717: the Board sent CI failures back with "Send failures to agent",
+	// which asks for exactly this: push the fix to the PR and re-run checks.
+	// Fast-forward only; anything else waits for the Board's Approve.
+	if prev.ciFixReq && prev.mode == MergeModePRMerge && prev.number > 0 {
+		cfg, _ := GetProjectDevConfig(db, repoPath)
+		if auth, aErr := ResolveGHAuth(cfg, repoPath); aErr != nil {
+			_ = SetPRMergeError(db, card.ID, "re-push to PR failed: "+aErr.Error())
+		} else if pr, pErr := OpenOrUpdatePR(ctx, auth, card, false); pErr != nil {
+			_ = SetPRMergeError(db, card.ID, "re-push to PR failed: "+pErr.Error())
+		} else {
+			_ = SetPROpened(db, card.ID, MergeModePRMerge, pr, card.HeadSHA)
+		}
+		if refreshed, gErr := GetCard(db, taskID); gErr == nil {
+			card = refreshed
+		}
 	}
 
 	// Auto-start dev server only from an explicitly human-saved project config.
 	// Auto-detection of Supabase projects is handled in the board-facing StartDev
 	// HTTP endpoint (after the board user explicitly clicks Start), not here —
 	// BuildAndStartCard is agent-reachable and must not silently run dev commands.
-	cfg, _ := GetProjectDevConfig(db, repoPath)
-	if cfg != nil && cfg.DevCommand != "" {
+	// A live_credentials project is never auto-started: its previews hit
+	// production, so only a confirmed Board start-dev may run it (STA-727),
+	// and neither is a repo path that cannot be told apart from one (STA-767).
+	cfg, gated, err := LiveGateConfig(db, repoPath)
+	if err == nil && !gated && cfg.DevCommand != "" {
 		if startedURL, startErr := StartDevServer(db, card, cfg, repoPath); startErr == nil && startedURL != "" && card.DevURL == "" {
 			card.DevURL = startedURL
 			_ = SetDevURL(db, card.ID, startedURL)
@@ -1209,6 +1291,9 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 	defer cancel()
 	cmd := gitexec.Command(ctx, args...) //nolint:gosec
 	cmd.Dir = dir
+	if env := gitEnvFrom(ctx); env != nil {
+		cmd.Env = env
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -1251,40 +1336,372 @@ type ProjectDevConfig struct {
 	SupabaseEnabled bool     `json:"supabase_enabled"`
 	// SupabaseKeepUp prevents auto-stop of the local DB after review. Default false.
 	SupabaseKeepUp  bool     `json:"supabase_keep_up"`
+	// MergeMode is how Approve lands the branch (STA-717): "direct" merges
+	// locally and pushes main, "open_pr" only opens a GitHub PR, "pr_merge"
+	// opens a PR and merges it once CI is green. Empty means unset; see
+	// EffectiveMergeMode for the default.
+	MergeMode string `json:"merge_mode"`
+	// GHConfigDir is the GH_CONFIG_DIR used for this repo's gh and git push
+	// calls. Work repos must set it in the PR modes so the personal gh login
+	// is never used on them.
+	GHConfigDir string `json:"gh_config_dir"`
+	// LiveCredentials marks a project whose previews run against production
+	// credentials (STA-727). Set only through the Board-gated PUT. Starting
+	// its dev server needs the Board passkey plus an explicit confirm, and
+	// BuildAndStartCard never auto-starts it.
+	LiveCredentials bool `json:"live_credentials"`
 }
 
 // GetProjectDevConfig loads the dev config for a repo path, or returns defaults.
+//
+// Rows are matched by directory, not by string (STA-767): a path that reaches
+// a configured repo through a symlink, a trailing "/", "/./" or a different
+// case on a case-insensitive volume loads that repo's row. When several rows
+// name the same directory, a live_credentials row wins, so an alias row can
+// never hide the live flag. The returned RepoPath is the matched row's key, so
+// saving the config back updates that row instead of adding an alias row.
 func GetProjectDevConfig(db *sql.DB, repoPath string) (*ProjectDevConfig, error) {
-	var stepsJSON, devCommand, devURL, migGlobsJSON, sqlEditorURL string
-	var supabaseEnabled, supabaseKeepUp int
-	err := db.QueryRow(
-		`SELECT dev_command, dev_url, setup_steps_json,
-		        COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
-		        COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0)
-		 FROM project_dev_configs WHERE repo_path = ?`,
-		repoPath,
-	).Scan(&devCommand, &devURL, &stepsJSON, &migGlobsJSON, &sqlEditorURL, &supabaseEnabled, &supabaseKeepUp)
+	cfg, _, err := lookupDevConfig(db, repoPath)
+	return cfg, err
+}
+
+// Reasons LiveGate reports for gating a dev server start (STA-799).
+const (
+	// LiveGateLiveCredentials: the project is flagged live_credentials.
+	LiveGateLiveCredentials = "live_credentials"
+	// LiveGateUnverifiedPath: repoPath cannot be ruled out as an alias of a
+	// live_credentials project.
+	LiveGateUnverifiedPath = "unverified_path"
+)
+
+// LiveGate loads repoPath's dev config for starting a dev server and reports
+// why the start needs the Board gate, or "" when it does not:
+// LiveGateLiveCredentials when the project is live_credentials, else
+// LiveGateUnverifiedPath when repoPath cannot be compared with a live project
+// (repoPath cannot be stat'ed, or the live project's path fails to stat for a
+// reason other than not existing, or either stat is still running after
+// devConfigStatTimeout). It fails closed.
+func LiveGate(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, reason string, err error) {
+	cfg, unverified, err := lookupDevConfig(db, repoPath)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return &ProjectDevConfig{RepoPath: repoPath}, nil
-		}
+		return nil, "", err
+	}
+	switch {
+	case cfg.LiveCredentials:
+		reason = LiveGateLiveCredentials
+	case unverified:
+		reason = LiveGateUnverifiedPath
+	}
+	return cfg, reason, nil
+}
+
+// LiveGateConfig is LiveGate reduced to whether the start is gated. It fails
+// closed: an error reports gated.
+func LiveGateConfig(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, gated bool, err error) {
+	cfg, reason, err := LiveGate(db, repoPath)
+	if err != nil {
+		return nil, true, err
+	}
+	return cfg, reason != "", nil
+}
+
+const devConfigColumns = `repo_path, dev_command, dev_url, setup_steps_json,
+	COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
+	COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0),
+	COALESCE(merge_mode,''), COALESCE(gh_config_dir,''), COALESCE(live_credentials,0)`
+
+func scanDevConfig(rows *sql.Rows) (*ProjectDevConfig, error) {
+	var c ProjectDevConfig
+	var stepsJSON, migGlobsJSON string
+	var supEnabled, supKeepUp, live int
+	if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL, &supEnabled, &supKeepUp, &c.MergeMode, &c.GHConfigDir, &live); err != nil {
 		return nil, err
 	}
-	cfg := &ProjectDevConfig{
-		RepoPath:        repoPath,
-		DevCommand:      devCommand,
-		DevURL:          devURL,
-		SQLEditorURL:    sqlEditorURL,
-		SupabaseEnabled: supabaseEnabled != 0,
-		SupabaseKeepUp:  supabaseKeepUp != 0,
+	c.SupabaseEnabled = supEnabled != 0
+	c.SupabaseKeepUp = supKeepUp != 0
+	c.LiveCredentials = live != 0
+	if err := json.Unmarshal([]byte(stepsJSON), &c.SetupSteps); err != nil {
+		c.SetupSteps = []string{}
 	}
-	if err := json.Unmarshal([]byte(stepsJSON), &cfg.SetupSteps); err != nil {
-		cfg.SetupSteps = []string{}
+	if err := json.Unmarshal([]byte(migGlobsJSON), &c.MigrationGlobs); err != nil {
+		c.MigrationGlobs = []string{}
 	}
-	if err := json.Unmarshal([]byte(migGlobsJSON), &cfg.MigrationGlobs); err != nil {
-		cfg.MigrationGlobs = []string{}
+	return &c, nil
+}
+
+// statPath is os.Stat; tests swap it to simulate a path whose stat blocks.
+var statPath = os.Stat
+
+// devConfigStatTimeout bounds how long lookupDevConfig waits for the stats it
+// needs to compare repo paths (STA-801). A stat can block indefinitely, e.g. on
+// a ~/Documents folder behind a pending macOS TCC prompt (STA-685).
+var devConfigStatTimeout = 2 * time.Second
+
+// errStatTimeout is the result of a stat still running at its deadline.
+var errStatTimeout = errors.New("stat timed out")
+
+// devConfigStats holds the stats in flight, by path. A lookup joins a stat of
+// the same path that is still running instead of starting another, so a path
+// whose stat never returns ties up one goroutine, not one per lookup.
+var devConfigStats = struct {
+	sync.Mutex
+	inflight map[string]*pathStat
+}{inflight: map[string]*pathStat{}}
+
+type pathStat struct {
+	deadline time.Time
+	done     chan struct{}
+	info     os.FileInfo
+	err      error
+}
+
+type statResult struct {
+	info os.FileInfo
+	err  error
+}
+
+// sharedStat stats path, or joins a stat of path already in flight. The
+// deadline runs from when that stat started, so once a hung stat is overdue,
+// later lookups get errStatTimeout at once instead of waiting on it again.
+func sharedStat(stat func(string) (os.FileInfo, error), timeout time.Duration, path string) statResult {
+	devConfigStats.Lock()
+	if s, ok := devConfigStats.inflight[path]; ok {
+		devConfigStats.Unlock()
+		return s.wait()
 	}
-	return cfg, nil
+	s := &pathStat{deadline: time.Now().Add(timeout), done: make(chan struct{})}
+	devConfigStats.inflight[path] = s
+	devConfigStats.Unlock()
+
+	s.info, s.err = stat(path)
+	devConfigStats.Lock()
+	delete(devConfigStats.inflight, path)
+	devConfigStats.Unlock()
+	close(s.done)
+	return statResult{s.info, s.err}
+}
+
+// wait returns the stat's result, or errStatTimeout if it is still running at
+// its deadline.
+func (s *pathStat) wait() statResult {
+	t := time.NewTimer(time.Until(s.deadline))
+	defer t.Stop()
+	select {
+	case <-s.done:
+	case <-t.C:
+		select {
+		case <-s.done:
+		default:
+			return statResult{err: errStatTimeout}
+		}
+	}
+	return statResult{s.info, s.err}
+}
+
+// devConfigStatTTL is how long lookups reuse a stat that succeeded or found
+// nothing. Lookups come in bursts (one card render reaches several handlers),
+// and a fresh result skips the background stat entirely. Errors and timeouts
+// are never reused, so a path that failed is retried on the next lookup.
+var devConfigStatTTL = time.Second
+
+var devConfigStatCache = struct {
+	sync.Mutex
+	m map[string]cachedStat
+}{m: map[string]cachedStat{}}
+
+type cachedStat struct {
+	statResult
+	at time.Time
+}
+
+// statPaths stats each of paths (no duplicates) and returns the results by
+// path. A path still unresolved after devConfigStatTimeout gets errStatTimeout.
+//
+// One goroutine stats the paths in order, which costs the same as stat'ing
+// them inline; a goroutine per path measured ~30% slower. If that goroutine
+// makes no progress for a tenth of the timeout, another one takes over the
+// rest of the queue, so a path whose stat blocks holds up only itself.
+func statPaths(paths []string) map[string]statResult {
+	stat, timeout, ttl := statPath, devConfigStatTimeout, devConfigStatTTL
+	start := time.Now()
+	out := make(map[string]statResult, len(paths))
+	var misses []string
+	devConfigStatCache.Lock()
+	for _, p := range paths {
+		if c, ok := devConfigStatCache.m[p]; ok && start.Sub(c.at) < ttl {
+			out[p] = c.statResult
+		} else {
+			misses = append(misses, p)
+		}
+	}
+	devConfigStatCache.Unlock()
+	if len(misses) == 0 {
+		return out
+	}
+
+	type indexed struct {
+		i int
+		statResult
+	}
+	// Room for every path, so a worker that unblocks after we return never
+	// blocks on the send. We only wake when all are in, on a stall check, or
+	// at the deadline, not once per path.
+	results := make(chan indexed, len(misses))
+	allDone := make(chan struct{})
+	var next, completed atomic.Int64
+	work := func() {
+		for {
+			i := int(next.Add(1) - 1)
+			if i >= len(misses) {
+				return
+			}
+			results <- indexed{i, sharedStat(stat, timeout, misses[i])}
+			if completed.Add(1) == int64(len(misses)) {
+				close(allDone)
+			}
+		}
+	}
+	go work()
+
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	stall := time.NewTicker(timeout / 10)
+	defer stall.Stop()
+	var seen int64
+wait:
+	for {
+		select {
+		case <-allDone:
+			break wait
+		case <-stall.C:
+			if n := completed.Load(); n == seen {
+				go work()
+			} else {
+				seen = n
+			}
+		case <-deadline.C:
+			break wait
+		}
+	}
+
+	devConfigStatCache.Lock()
+	defer devConfigStatCache.Unlock()
+	if len(devConfigStatCache.m) > 256 {
+		for p, c := range devConfigStatCache.m {
+			if start.Sub(c.at) >= ttl {
+				delete(devConfigStatCache.m, p)
+			}
+		}
+	}
+	for {
+		select {
+		case r := <-results:
+			out[misses[r.i]] = r.statResult
+			if r.err == nil || errors.Is(r.err, os.ErrNotExist) {
+				// Stamped with when this lookup began, not when the stat
+				// returned, so the entry never outlives the TTL.
+				devConfigStatCache.m[misses[r.i]] = cachedStat{r.statResult, start}
+			}
+			continue
+		default:
+		}
+		break
+	}
+	for _, p := range misses {
+		if _, ok := out[p]; !ok {
+			out[p] = statResult{err: errStatTimeout}
+		}
+	}
+	return out
+}
+
+// lookupDevConfig returns the row for repoPath's directory (see
+// GetProjectDevConfig). unverified is true when that directory could not be
+// compared with every live row; LiveGateConfig gates on it.
+func lookupDevConfig(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, unverified bool, err error) {
+	configs, err := loadDevConfigs(db)
+	if err != nil {
+		return nil, false, err
+	}
+
+	want := filepath.Clean(repoPath)
+	sameString := func(c *ProjectDevConfig) bool {
+		return c.RepoPath == repoPath || filepath.Clean(c.RepoPath) == want
+	}
+	// Stat repoPath and every row it does not match by string, bounded by
+	// devConfigStatTimeout however many of them hang.
+	paths := []string{repoPath}
+	queued := map[string]bool{repoPath: true}
+	for _, c := range configs {
+		if !sameString(c) && !queued[c.RepoPath] {
+			queued[c.RepoPath] = true
+			paths = append(paths, c.RepoPath)
+		}
+	}
+	var stats map[string]statResult
+	var wantInfo os.FileInfo
+	if len(paths) > 1 {
+		stats = statPaths(paths)
+		wantInfo = stats[repoPath].info
+	}
+
+	var exact, alias, live *ProjectDevConfig
+	for _, c := range configs {
+		same := sameString(c)
+		if !same && wantInfo == nil && c.LiveCredentials {
+			// repoPath cannot be stat'ed, so it cannot be ruled out as an
+			// alias of this live repo.
+			unverified = true
+		}
+		if !same && wantInfo != nil {
+			info, err := stats[c.RepoPath].info, stats[c.RepoPath].err
+			switch {
+			case err == nil:
+				same = os.SameFile(wantInfo, info)
+			case c.LiveCredentials && !errors.Is(err, os.ErrNotExist):
+				// A live repo we cannot stat (in time) could be repoPath
+				// itself. A non-live one is skipped.
+				unverified = true
+			}
+		}
+		if !same {
+			continue
+		}
+		switch {
+		case c.RepoPath == repoPath:
+			exact = c
+		case alias == nil:
+			alias = c
+		}
+		if c.LiveCredentials && (live == nil || c.RepoPath == repoPath) {
+			live = c
+		}
+	}
+	for _, c := range []*ProjectDevConfig{live, exact, alias} {
+		if c != nil {
+			return c, unverified, nil
+		}
+	}
+	return &ProjectDevConfig{RepoPath: repoPath}, unverified, nil
+}
+
+// loadDevConfigs reads every dev config row. It returns before any stat runs,
+// so a slow stat never holds a database connection.
+func loadDevConfigs(db *sql.DB) ([]*ProjectDevConfig, error) {
+	rows, err := db.Query(`SELECT ` + devConfigColumns + ` FROM project_dev_configs`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var configs []*ProjectDevConfig
+	for rows.Next() {
+		c, err := scanDevConfig(rows)
+		if err != nil {
+			return nil, err
+		}
+		configs = append(configs, c)
+	}
+	return configs, rows.Err()
 }
 
 // devExecer is satisfied by both *sql.DB and *sql.Tx.
@@ -1319,11 +1736,15 @@ func upsertDevConfig(exec devExecer, cfg *ProjectDevConfig) error {
 	if cfg.SupabaseKeepUp {
 		supabaseKeepUp = 1
 	}
+	liveCredentials := 0
+	if cfg.LiveCredentials {
+		liveCredentials = 1
+	}
 	_, err = exec.Exec(`
 		INSERT INTO project_dev_configs
 			(repo_path, dev_command, dev_url, setup_steps_json, migration_globs_json,
-			 sql_editor_url, supabase_enabled, supabase_keep_up, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			 sql_editor_url, supabase_enabled, supabase_keep_up, merge_mode, gh_config_dir, live_credentials, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 		ON CONFLICT(repo_path) DO UPDATE SET
 			dev_command          = excluded.dev_command,
 			dev_url              = excluded.dev_url,
@@ -1332,42 +1753,31 @@ func upsertDevConfig(exec devExecer, cfg *ProjectDevConfig) error {
 			sql_editor_url       = excluded.sql_editor_url,
 			supabase_enabled     = excluded.supabase_enabled,
 			supabase_keep_up     = excluded.supabase_keep_up,
+			merge_mode           = excluded.merge_mode,
+			gh_config_dir        = excluded.gh_config_dir,
+			live_credentials     = excluded.live_credentials,
 			updated_at           = excluded.updated_at`,
 		cfg.RepoPath, cfg.DevCommand, cfg.DevURL,
 		string(stepsJSON), string(migGlobsJSON), cfg.SQLEditorURL,
-		supabaseEnabled, supabaseKeepUp,
+		supabaseEnabled, supabaseKeepUp, cfg.MergeMode, cfg.GHConfigDir, liveCredentials,
 	)
 	return err
 }
 
 // ListProjectDevConfigs returns all project dev configs.
 func ListProjectDevConfigs(db *sql.DB) ([]*ProjectDevConfig, error) {
-	rows, err := db.Query(`
-		SELECT repo_path, dev_command, dev_url, setup_steps_json,
-		       COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
-		       COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0)
-		FROM project_dev_configs ORDER BY repo_path`)
+	rows, err := db.Query(`SELECT ` + devConfigColumns + ` FROM project_dev_configs ORDER BY repo_path`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []*ProjectDevConfig
 	for rows.Next() {
-		var c ProjectDevConfig
-		var stepsJSON, migGlobsJSON string
-		var supEnabled, supKeepUp int
-		if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL, &supEnabled, &supKeepUp); err != nil {
+		c, err := scanDevConfig(rows)
+		if err != nil {
 			continue
 		}
-		c.SupabaseEnabled = supEnabled != 0
-		c.SupabaseKeepUp = supKeepUp != 0
-		if err := json.Unmarshal([]byte(stepsJSON), &c.SetupSteps); err != nil {
-			c.SetupSteps = []string{}
-		}
-		if err := json.Unmarshal([]byte(migGlobsJSON), &c.MigrationGlobs); err != nil {
-			c.MigrationGlobs = []string{}
-		}
-		out = append(out, &c)
+		out = append(out, c)
 	}
 	return out, rows.Err()
 }

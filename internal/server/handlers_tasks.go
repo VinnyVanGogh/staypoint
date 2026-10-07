@@ -1,6 +1,7 @@
 package server
 
 import (
+	gocontext "context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -14,8 +15,10 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
+	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/migration"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
+	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 	"github.com/google/uuid"
@@ -33,6 +36,8 @@ func isNotFound(err error) bool {
 type TasksHandler struct {
 	db  *sql.DB
 	hub *EventHub
+	// boardGate guards the Board override flags (STA-859); see SetBoardGate.
+	boardGate func(http.Handler) http.Handler
 }
 
 func NewTasksHandler(db *sql.DB, hub *EventHub) *TasksHandler {
@@ -40,8 +45,23 @@ func NewTasksHandler(db *sql.DB, hub *EventHub) *TasksHandler {
 }
 
 // ListTasks handles GET /api/tasks
+//
+// Query: status (active|done|soft_deleted|all), stage (an execution stage),
+// origin (native|paperclip_import|legacy), include_legacy / include_archive
+// (1/true; legacy tasks and archived imports are hidden unless set, or
+// origin=legacy), limit, offset.
 func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
+	stageFilter := strings.TrimSpace(r.URL.Query().Get("stage"))
+	originFilter := strings.TrimSpace(r.URL.Query().Get("origin"))
+	if originFilter != "" && !context.IsValidOrigin(originFilter) {
+		writeError(w, http.StatusBadRequest, "invalid origin: must be native, paperclip_import, or legacy")
+		return
+	}
+	// include_legacy and include_archive are one switch: legacy tasks and
+	// archived (done/cancelled) Paperclip imports.
+	includeLegacy := parseBoolParam(r.URL.Query().Get("include_legacy")) ||
+		parseBoolParam(r.URL.Query().Get("include_archive")) || originFilter == context.OriginLegacy
 	limitStr := r.URL.Query().Get("limit")
 	offsetStr := r.URL.Query().Get("offset")
 
@@ -66,13 +86,21 @@ func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	tasks = context.FilterLegacy(tasks, includeLegacy)
 
 	// Filter by specific status if requested and not "all"
 	var filtered []context.Task
 	for _, t := range tasks {
-		if status == "" || status == "all" || strings.EqualFold(t.Status, status) {
-			filtered = append(filtered, t)
+		if !(status == "" || status == "all" || strings.EqualFold(t.Status, status)) {
+			continue
 		}
+		if stageFilter != "" && !strings.EqualFold(t.ExecutionStage, stageFilter) {
+			continue
+		}
+		if originFilter != "" && t.Origin != originFilter {
+			continue
+		}
+		filtered = append(filtered, t)
 	}
 
 	total := len(filtered)
@@ -100,6 +128,14 @@ func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func parseBoolParam(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 // GetTask handles GET /api/tasks/{id}
 func (h *TasksHandler) GetTask(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -123,15 +159,37 @@ func (h *TasksHandler) GetTask(w http.ResponseWriter, r *http.Request) {
 		"comments":     comments,
 		"dependencies": depGraph,
 		"work_kind":    task.WorkKind,
+		// Run queue position (STA-773): {queued, ahead, wait}.
+		"queue": orchestrator.GlobalRunSlots.Position(task.ID),
+		// Turn in flight, for the task page's turn timer; null when idle.
+		"turn": orchestrator.GlobalActiveTurns.Get(task.ID),
+		// Where the task runs; git=false shows the non-git warning banner (STA-864).
+		"workspace": taskWorkspace(task.RepoPath, task.ID),
 	})
+}
+
+// taskWorkspace describes where a task runs for the task page. Read-only: it
+// never creates the scratch dir or runs git.
+func taskWorkspace(repoPath, taskID string) map[string]any {
+	td, err := workspace.DescribeTaskDir(repoPath, taskID)
+	if err != nil {
+		return nil
+	}
+	out := map[string]any{"git": td.Git, "dir": td.Dir, "scratch": td.Scratch}
+	if !td.Git {
+		out["warning"] = workspace.NonGitWarning
+	}
+	return out
 }
 
 // validWorkKinds is the set of accepted work_kind values.
 var validWorkKinds = map[string]bool{
 	"coding":       true,
+	"review":       true,
 	"architecture": true,
 	"planning":     true,
 	"qa":           true,
+	"docs":         true,
 }
 
 // CreateTask handles POST /api/tasks
@@ -148,6 +206,19 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 		AssigneeAgentID string  `json:"assignee_agent_id"`
 		WorkKind        string  `json:"work_kind"`
 		Description     string  `json:"description"`
+		// STA-820: child task fields. Repo/org/project are inherited from the parent.
+		ParentID string `json:"parent_id"`
+		Handoff  string `json:"handoff"`
+		// AllowDeep is the Board override for the child depth cap.
+		AllowDeep bool `json:"allow_deep"`
+		// ExecutionStage is the initial stage: todo (default) or backlog
+		// (parked: created without waking an agent).
+		ExecutionStage string `json:"execution_stage"`
+		// Provider / ModelOverride are the Board's explicit provider choice
+		// (STA-838): provider "", "claude" or "gemini"; gemini is refused
+		// for code kinds (router.GeminiCodeForbidden).
+		Provider      string `json:"provider"`
+		ModelOverride string `json:"model_override"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -161,7 +232,29 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.WorkKind != "" && !validWorkKinds[req.WorkKind] {
-		writeError(w, http.StatusBadRequest, "invalid work_kind: must be one of coding, architecture, planning, qa")
+		writeError(w, http.StatusBadRequest, "invalid work_kind: must be one of coding, review, architecture, planning, qa, docs")
+		return
+	}
+
+	choice, err := router.ValidateTaskChoice(req.WorkKind, repoIsWork(req.RepoPath), req.Provider, req.ModelOverride)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	req.ExecutionStage = strings.ToLower(strings.TrimSpace(req.ExecutionStage))
+	switch req.ExecutionStage {
+	case "", governance.StageTodo, governance.StageBacklog:
+	default:
+		writeError(w, http.StatusBadRequest, "invalid execution_stage: a new task starts in todo or backlog")
+		return
+	}
+
+	if strings.TrimSpace(req.ParentID) != "" {
+		if req.AllowDeep && !h.requireBoardForOverride(w, r, "allow_deep") {
+			return
+		}
+		h.createChildTask(w, req.ParentID, req.Name, req.WorkKind, req.Handoff, req.Description, req.MaxBudgetUSD, req.MaxTurns, req.AllowDeep)
 		return
 	}
 
@@ -177,6 +270,9 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 		AssigneeAgentID: req.AssigneeAgentID,
 		WorkKind:        req.WorkKind,
 		Description:     req.Description,
+		ExecutionStage:  req.ExecutionStage,
+		Provider:        choice.Provider,
+		ModelOverride:   choice.Model,
 	}
 
 	task, err := context.CreateTaskWithOptions(h.db, opts)
@@ -300,17 +396,28 @@ func (h *TasksHandler) AddComment(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// MarkDone handles POST /api/tasks/{id}/done
+// MarkDone handles POST /api/tasks/{id}/done. A parent with open child tasks
+// is refused with 409 unless the Board passes {"override": true}; the
+// override is honored only through the Board gate (STA-859).
 func (h *TasksHandler) MarkDone(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "task id is required")
 		return
 	}
+	var req struct {
+		Override bool `json:"override"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req) // body is optional
+	if req.Override && !h.requireBoardForOverride(w, r, "override") {
+		return
+	}
 
-	if err := context.MarkTaskDone(h.db, id); err != nil {
+	if err := context.MarkTaskDoneWithOptions(h.db, id, context.DoneOptions{BoardOverride: req.Override}); err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, err.Error())
+		} else if errors.Is(err, context.ErrOpenChildren) {
+			writeError(w, http.StatusConflict, err.Error())
 		} else if strings.Contains(err.Error(), "without a registered work product") {
 			writeError(w, http.StatusConflict, err.Error())
 		} else {
@@ -641,7 +748,8 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Stage string `json:"stage"`
+		Stage    string `json:"stage"`
+		Override bool   `json:"override"` // Board override: done with open children
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -654,16 +762,24 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch req.Stage {
-	case "todo", "in_progress", "in_review", "done":
-	default:
-		writeError(w, http.StatusBadRequest, "invalid stage: must be todo, in_progress, in_review, or done")
+	req.Stage = strings.ToLower(req.Stage)
+	if !governance.IsBoardSettableStage(req.Stage) {
+		writeError(w, http.StatusBadRequest, "invalid stage: must be one of "+strings.Join(governance.BoardSettableStages, ", "))
+		return
+	}
+	if req.Override && !h.requireBoardForOverride(w, r, "override") {
 		return
 	}
 
-	if err := context.SetTaskExecutionStage(h.db, id, req.Stage); err != nil {
+	if err := context.SetTaskExecutionStageWithOptions(h.db, id, req.Stage, context.DoneOptions{BoardOverride: req.Override}); err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, err.Error())
+		} else if errors.Is(err, context.ErrOpenChildren) {
+			writeError(w, http.StatusConflict, err.Error())
+		} else if errors.Is(err, context.ErrInvalidStage) {
+			writeError(w, http.StatusBadRequest, err.Error())
+		} else if errors.Is(err, context.ErrNoRepo) {
+			writeError(w, http.StatusConflict, err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "failed to update task stage: "+err.Error())
 		}
@@ -677,7 +793,9 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	if req.Stage == "in_progress" {
+	if req.Stage == governance.StageInProgress {
+		// Run Now. A backlog task was moved to todo first by
+		// SetTaskExecutionStageWithOptions, so the claim accepts it.
 		// Per-click key so each Run Now press can start a new run even within 24 h.
 		orchestrator.GlobalDispatcher.Wake(id, "run_now", "run_now:"+id+":"+uuid.New().String()[:8])
 	}
@@ -688,6 +806,76 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 		"task_id": id,
 		"stage":   req.Stage,
 	})
+}
+
+// SetRepo handles PUT /api/tasks/{id}/repo {"repo_path": "/abs", "git_branch": ""}.
+// Imported tasks start without a repo and stay in backlog until it is set.
+func (h *TasksHandler) SetRepo(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RepoPath  string `json:"repo_path"`
+		GitBranch string `json:"git_branch"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	task, err := context.SetTaskRepo(h.db, r.PathValue("id"), req.RepoPath, req.GitBranch)
+	if err != nil {
+		switch {
+		case isNotFound(err):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, context.ErrInvalidRepo):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, task)
+}
+
+// repoIsWork classifies a task repo for the Gemini rules. An empty path is
+// the daemon's working directory, as task creation defaults it. Unreadable
+// classification counts as work (fail closed).
+func repoIsWork(repo string) bool {
+	if strings.TrimSpace(repo) == "" {
+		repo, _ = os.Getwd()
+	}
+	ok, _, err := router.IsWorkRepo(repo)
+	return err != nil || ok
+}
+
+// SetProvider handles PUT /api/tasks/{id}/provider: the Board's explicit
+// provider/model choice (STA-838). {"provider":"","model_override":""}
+// restores the default. provider=gemini is refused for a code kind.
+func (h *TasksHandler) SetProvider(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Provider      string `json:"provider"`
+		ModelOverride string `json:"model_override"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	task, err := context.GetTask(h.db, r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	choice, err := router.ValidateTaskChoice(task.WorkKind, repoIsWork(task.RepoPath), req.Provider, req.ModelOverride)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated, err := context.SetTaskProvider(h.db, task.ID, choice.Provider, choice.Model)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if h.hub != nil {
+		h.hub.Publish("task_updated", updated)
+	}
+	writeJSON(w, updated)
 }
 
 // GetRunSteps handles GET /api/tasks/{id}/run-steps
@@ -759,12 +947,16 @@ func (h *TasksHandler) GetTaskDiff(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := gitRequestContext(r)
 	defer cancel()
 
-	// "Whole run" (empty checkpoint) should diff against the task's pre-run
-	// baseline, not refs/staypoint/checkpoints/latest (which is the newest
-	// turn checkpoint and shows "No changes" after a run completes).
-	if cpID == "" {
-		if preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID); preRunID != "" {
-			cpID = preRunID
+	// "Whole run" (empty checkpoint) diffs against the task's base: the same
+	// verified commit the ship review card and Approve use (STA-774).
+	wholeRun := cpID == ""
+	baseVerified := false
+	if wholeRun {
+		var err error
+		cpID, baseVerified, err = wholeRunBase(ctx, h.db, task)
+		if err != nil {
+			writeWholeRunBaseError(w, err)
+			return
 		}
 	}
 
@@ -801,13 +993,74 @@ func (h *TasksHandler) GetTaskDiff(w http.ResponseWriter, r *http.Request) {
 		files[i] = s.Path
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	resp := map[string]any{
 		"diff":          stat,
 		"files":         files,
 		"file_stats":    fileStats,
 		"checkpoint_id": cpID,
-	})
+	}
+	if wholeRun {
+		resp["base_verified"] = baseVerified
+		// An answer-only run: nothing differs from the verified base, so
+		// there is no card and the UI shows the final message instead.
+		answerOnly := baseVerified && statErr == nil && filesErr == nil && len(fileStats) == 0
+		resp["answer_only"] = answerOnly
+		if answerOnly {
+			resp["files_read"] = taskFilesRead(ctx, h.db, task.ID)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// wholeRunBase returns the commit the Diff tab's whole-run view compares
+// against: the task's recorded base, verified (workspace.VerifiedBase), the
+// same one the ship card and Approve use. A task with no recorded base
+// (created before STA-774) falls back to its pre-run checkpoint for display
+// only, reported as verified=false: such a task can never get a card or an
+// Approve. A moved pin or a git/DB error is returned.
+func wholeRunBase(ctx gocontext.Context, db *sql.DB, task *context.Task) (cpID string, verified bool, err error) {
+	base, err := workspace.VerifiedBase(ctx, db, task.RepoPath, task.ID)
+	if err == nil {
+		return base, true, nil
+	}
+	if !errors.Is(err, workspace.ErrNoTaskBase) {
+		return "", false, err
+	}
+	preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID)
+	return preRunID, false, nil
+}
+
+// writeWholeRunBaseError answers a whole-run diff whose base failed
+// verification: 409 when the pin was moved, the git status otherwise. It
+// never returns a diff measured from an unverified commit.
+func writeWholeRunBaseError(w http.ResponseWriter, err error) {
+	if errors.Is(err, workspace.ErrTaskBaseTampered) {
+		writeErrorJSON(w, http.StatusConflict, map[string]any{"error": "base_tampered", "message": err.Error()})
+		return
+	}
+	writeError(w, gitErrorStatus(err), "could not verify the task base: "+err.Error())
+}
+
+// taskFilesRead lists the distinct files the task's runs read, from the
+// timeline's "Read <path>" steps (STA-774: shown for runs with no edits).
+func taskFilesRead(ctx gocontext.Context, db *sql.DB, taskID string) []string {
+	files := []string{}
+	rows, err := db.QueryContext(ctx,
+		`SELECT DISTINCT substr(title, 6) FROM run_steps
+		 WHERE task_id = ? AND kind = 'read' AND title LIKE 'Read %'
+		 ORDER BY 1`, taskID)
+	if err != nil {
+		return files
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p string
+		if rows.Scan(&p) == nil && p != "" {
+			files = append(files, p)
+		}
+	}
+	return files
 }
 
 // GetTaskFileDiff handles GET /api/tasks/{id}/diff/file?path={path}&checkpoint={id}
@@ -834,9 +1087,12 @@ func (h *TasksHandler) GetTaskFileDiff(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := gitRequestContext(r)
 	defer cancel()
 	if cpID == "" {
-		if preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID); preRunID != "" {
-			cpID = preRunID
+		base, _, baseErr := wholeRunBase(ctx, h.db, task)
+		if baseErr != nil {
+			writeWholeRunBaseError(w, baseErr)
+			return
 		}
+		cpID = base
 	}
 
 	workDir, hasWorktree := taskCheckpointWorkDir(task)
@@ -1065,9 +1321,10 @@ func (h *TasksHandler) GetTaskMigrations(w http.ResponseWriter, r *http.Request)
 	// Get the full diff file list.
 	ctx, cancel := gitRequestContext(r)
 	defer cancel()
-	cpID := ""
-	if preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID); preRunID != "" {
-		cpID = preRunID
+	cpID, _, baseErr := wholeRunBase(ctx, h.db, task)
+	if baseErr != nil {
+		writeWholeRunBaseError(w, baseErr)
+		return
 	}
 	workDir, hasWorktree := taskCheckpointWorkDir(task)
 	var fileStats []checkpoint.FileDiffStat

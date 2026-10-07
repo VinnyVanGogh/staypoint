@@ -186,7 +186,7 @@ func TestBuildRunFooter_NeedsAttentionIncluded(t *testing.T) {
 //   - the agent's last assistant text (from Claude stream-json)
 //   - the run footer with disposition and turn count
 func TestRunPostsAgentSummaryComment(t *testing.T) {
-	activeClaims.Store(0)
+	useSlots(t, 1)
 
 	db := openTestDB(t)
 	insertTask(t, db, "summary-task", "/tmp")

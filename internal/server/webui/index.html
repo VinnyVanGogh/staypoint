@@ -15,6 +15,7 @@
     <span class="badge badge-version">Fleet Pacer</span>
   </div>
   <div class="header-right">
+    <span id="dev-build-badge" class="badge badge-dev-build" hidden>DEV BUILD</span>
     <span id="pacing-pill" class="pill pill-green">Fleet On Track</span>
     <span id="conn-badge" class="badge badge-connecting">connecting</span>
   </div>
@@ -344,25 +345,12 @@
     <section id="view-kanban" class="view">
       <div class="view-header">
         <h1 class="view-title">Kanban Board</h1>
-      </div>
-      <div id="kanban-board" class="kanban-board">
-        <div class="kanban-col" data-status="todo">
-          <h2 class="col-title">Todo</h2>
-          <div class="card-list" id="col-todo"></div>
-        </div>
-        <div class="kanban-col" data-status="in_progress">
-          <h2 class="col-title">In Progress</h2>
-          <div class="card-list" id="col-in_progress"></div>
-        </div>
-        <div class="kanban-col" data-status="blocked">
-          <h2 class="col-title">Blocked</h2>
-          <div class="card-list" id="col-blocked"></div>
-        </div>
-        <div class="kanban-col" data-status="done">
-          <h2 class="col-title">Done</h2>
-          <div class="card-list" id="col-done"></div>
+        <div class="table-controls kanban-controls">
+          <label class="kanban-toggle"><input type="checkbox" id="kanban-group-company"> Group by company</label>
+          <label class="kanban-toggle"><input type="checkbox" id="kanban-show-legacy"> Show archive &amp; legacy <span id="kanban-legacy-count" class="muted-text"></span></label>
         </div>
       </div>
+      <div id="kanban-board" class="kanban-board-wrap"></div>
     </section>
 
     <!-- Recent Tasks view -->
@@ -410,11 +398,24 @@
           <div class="form-field">
             <label for="ct-work-kind">Kind of work</label>
             <select id="ct-work-kind">
-              <option value="coding" selected>Coding &amp; review — Claude Opus, backup Gemini 3.1 Pro</option>
+              <option value="coding" selected>Coding — Claude Opus only (Gemini never writes code)</option>
+              <option value="qa">QA &amp; testing — Claude Opus only (writes tests)</option>
+              <option value="review">Review — Gemini 3.1 Pro, backup Claude Opus (advisory)</option>
               <option value="architecture">Architecture — Gemini 3.1 Pro, backup Claude Opus</option>
-              <option value="planning">Planning &amp; docs — Gemini Flash, backup Claude Sonnet</option>
-              <option value="qa">QA &amp; testing — Gemini Flash, backup Claude Sonnet</option>
+              <option value="planning">Planning — Gemini Flash, backup Claude Sonnet</option>
+              <option value="docs">Docs — Gemini Flash, backup Claude Sonnet</option>
             </select>
+          </div>
+          <div class="form-field">
+            <label for="ct-provider">Provider</label>
+            <select id="ct-provider">
+              <option value="" selected>Default for the kind of work</option>
+              <option value="claude">Claude (Opus)</option>
+              <option value="claude:sonnet">Claude Sonnet</option>
+              <option value="gemini" data-gemini="1">Gemini 3.1 Pro</option>
+              <option value="gemini:gemini-3.8-flash-high" data-gemini="1">Gemini 3.8 Flash</option>
+            </select>
+            <div class="form-hint" id="ct-provider-hint"></div>
           </div>
           <div class="form-row">
             <div class="form-field">
@@ -754,8 +755,10 @@
 <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="true"></div>
 
 <script src="/ui/lib/runsteps.js"></script>
+<script src="/ui/lib/taskboard.js"></script>
 <script src="/ui/lib/diffsyntax.js"></script>
 <script src="/ui/lib/markdown.js"></script>
+<script src="/ui/lib/quotagauge.js"></script>
 <script src="/ui/app.js"></script>
 </body>
 </html>

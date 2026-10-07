@@ -19,6 +19,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
+	"github.com/VinnyVanGogh/staypoint/internal/trackgate"
 	"github.com/VinnyVanGogh/staypoint/internal/wire"
 	"github.com/spf13/cobra"
 )
@@ -166,16 +167,11 @@ func handleHookPrompt() {
 			}
 		}
 
-		// C. Agent Circuit Breaker check
-		cb, _ := telemetry.GetCircuitBreaker(dbConn, sessionID)
-		if cb == nil {
-			cbs, _ := telemetry.ListCircuitBreakers(dbConn, cwd, true)
-			if len(cbs) > 0 {
-				cb = &cbs[0]
-			}
-		}
-		if cb != nil && cb.IsTripped {
-			notices = append(notices, fmt.Sprintf("🚨 [STAYPOINT CIRCUIT BREAKER ACTIVE]: Execution pause active because an agent loop was detected (%s on %s).\nLast error: %s\nTo reset and proceed, run: staypoint breaker reset %s", cb.FailingTool, cb.FailingCommand, cb.LastError, cb.SessionID))
+		// C. Agent Circuit Breaker check. Only this session's own breaker
+		// pauses it: borrowing another session's tripped breaker for the same
+		// repo told unrelated agents (e.g. a reviewer) to stop working.
+		if cb, _ := telemetry.GetCircuitBreaker(dbConn, sessionID); cb != nil && cb.IsTripped {
+			notices = append(notices, circuitBreakerNotice(cb))
 		}
 
 		// D. Task Budget Evaluation
@@ -401,7 +397,7 @@ var hookInstallCmd = &cobra.Command{
 // Board approves or the run is stopped — with no auto-deny timeout.
 var hookPreToolCmd = &cobra.Command{
 	Use:   "pre-tool",
-	Short: "Claude Code PreToolUse hook: gate Red-tier Bash commands (Board approval required)",
+	Short: "PreToolUse hook (Claude Code and agy): tracking gate + Red-tier Board approval gate",
 	Run: func(cmd *cobra.Command, args []string) {
 		handleHookPreTool()
 	},
@@ -412,23 +408,16 @@ func preToolAllow() { fmt.Println("{}") }
 
 // preToolBlock writes a block decision back to Claude Code.
 func preToolBlock(reason string) {
-	out, _ := json.Marshal(map[string]string{"decision": "block", "reason": reason})
-	fmt.Println(string(out))
+	fmt.Println(claudeBlockJSON(reason))
 }
+
+var (
+	hookPreToolFormat       string
+	hookPreToolTrackingOnly bool
+)
 
 func handleHookPreTool() {
 	raw, _ := io.ReadAll(os.Stdin)
-
-	var payload struct {
-		ToolName  string          `json:"tool_name"`
-		ToolInput json.RawMessage `json:"tool_input"`
-		SessionID string          `json:"session_id"`
-		CWD       string          `json:"cwd"` // working directory for bare-push branch resolution
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil || payload.ToolName == "" {
-		preToolAllow()
-		return
-	}
 
 	// Pause gate: block before ANY tool call when the run is paused.
 	// This implements step-boundary pause (STA-505): at most the step in
@@ -439,6 +428,31 @@ func handleHookPreTool() {
 		if daemonURL != "" {
 			waitForStepResume(daemonURL, token, taskID)
 		}
+	}
+
+	// Tracking gate (STA-854): no writes in gated work repos unless the
+	// session is attached to a StayPoint task. Runs for Claude Code and agy.
+	client, blockOut, blocked := runTrackingGate(raw, hookPreToolFormat, os.Getenv, productionTrackingGate())
+	if blocked {
+		fmt.Println(blockOut)
+		return
+	}
+	if client == trackgate.ClientGemini || hookPreToolTrackingOnly {
+		// The Red-tier Board gate below understands Claude payloads only, and
+		// interactive registrations (hook install) opt out of it.
+		preToolAllow()
+		return
+	}
+
+	var payload struct {
+		ToolName  string          `json:"tool_name"`
+		ToolInput json.RawMessage `json:"tool_input"`
+		SessionID string          `json:"session_id"`
+		CWD       string          `json:"cwd"` // working directory for bare-push branch resolution
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil || payload.ToolName == "" {
+		preToolAllow()
+		return
 	}
 
 	// Only intercept Bash tool calls for security classification.
@@ -625,8 +639,25 @@ func waitForStepResume(daemonURL, token, taskID string) {
 
 func init() {
 	hookPromptCmd.Flags().StringVar(&hookPromptFormat, "format", "auto", "Output format: auto, gemini, or claude")
+	hookPreToolCmd.Flags().StringVar(&hookPreToolFormat, "format", "auto", "Payload/output format: auto, gemini (agy), or claude")
+	hookPreToolCmd.Flags().BoolVar(&hookPreToolTrackingOnly, "tracking-only", false, "Run only the pause and tracking gates, not the Red-tier Board approval gate (interactive sessions)")
 	rootCmd.AddCommand(hookCmd)
 	hookCmd.AddCommand(hookPromptCmd)
 	hookCmd.AddCommand(hookPreToolCmd)
 	hookCmd.AddCommand(hookInstallCmd)
+}
+
+// circuitBreakerNotice renders a tripped breaker for the prompt hook, leaving
+// out the tool and command when the watcher could not attribute the failure.
+func circuitBreakerNotice(cb *telemetry.CircuitBreaker) string {
+	what := "repeated tool failures"
+	switch {
+	case cb.FailingTool != "" && cb.FailingTool != "tool" && cb.FailingCommand != "":
+		what = fmt.Sprintf("repeated failures of %s on %s", cb.FailingTool, cb.FailingCommand)
+	case cb.FailingTool != "" && cb.FailingTool != "tool":
+		what = fmt.Sprintf("repeated failures of %s", cb.FailingTool)
+	case cb.FailingCommand != "":
+		what = fmt.Sprintf("repeated failures of %s", cb.FailingCommand)
+	}
+	return fmt.Sprintf("🚨 [STAYPOINT CIRCUIT BREAKER ACTIVE]: Execution pause active because an agent loop was detected (%s).\nLast error: %s\nTo reset and proceed, run: staypoint breaker reset %s", what, cb.LastError, cb.SessionID)
 }

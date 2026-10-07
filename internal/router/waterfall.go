@@ -53,7 +53,11 @@ type RouteDecision struct {
 	AccountEmail   string      `json:"account_email"`
 	Reason         string      `json:"reason"`
 	Warnings       []string    `json:"warnings,omitempty"`
-	PacerState     *PacerState `json:"pacer_state,omitempty"`
+	// Waiting is set when the decision's seat is locked and there is no
+	// permitted fallback: the caller should wait for it (work repos never fall
+	// back to Gemini, GeminiCodeForbidden).
+	Waiting    bool        `json:"waiting,omitempty"`
+	PacerState *PacerState `json:"pacer_state,omitempty"`
 }
 
 type scanReposFile struct {
@@ -88,9 +92,12 @@ func IsWorkRepo(cwd string) (bool, string, error) {
 		evalCwd = cleanCwd
 	}
 
-	// 1. Check patterns: ~/Documents/dev/work*, ~/Documents/dev/mansol*
-	workPrefix := filepath.Join(home, "Documents", "dev", "work")
-	if strings.HasPrefix(cleanCwd, workPrefix) || strings.HasPrefix(evalCwd, workPrefix) {
+	// 1. Check patterns: ~/Documents/dev/work[-_]*, ~/Documents/dev/mansol*
+	// The work pattern matches a whole directory name, so the shared
+	// ~/Documents/dev/worktrees folder (personal and work worktrees side by
+	// side) is classified by its git remote below instead.
+	devDir := filepath.Join(home, "Documents", "dev")
+	if isWorkDirName(firstComponentUnder(devDir, cleanCwd)) || isWorkDirName(firstComponentUnder(devDir, evalCwd)) {
 		return true, "prefix: ~/Documents/dev/work*", nil
 	}
 	mansolPrefix := filepath.Join(home, "Documents", "dev", "mansol")
@@ -272,10 +279,13 @@ func FallbackPairingMatrix(claudeModel, effort string) (geminiModel, geminiEffor
 
 // Route executes the dynamic waterfall routing engine:
 //  1. Check if cwd is an enterprise work repo.
-//  2. If work repo: check if Claude Work is locked (falls back to Gemini 3.1 Pro per STA-12);
-//     otherwise check SSH connectivity to remote node -> route to remote Claude, or fallback to local Claude work seat.
-//  3. If personal repo: balanced peer pacing between Claude Code and Antigravity,
-//     with dynamic quota-aware fallback to Gemini 3.1 Pro (Opus) / Gemini 3.8 Flash (Sonnet) when Claude is locked out.
+//  2. If work repo: always Claude, never agy (GeminiCodeForbidden, STA-856). A
+//     locked work seat falls back to the personal Claude seat; with both locked
+//     the decision sets Waiting instead of falling back to Gemini. Otherwise check SSH connectivity to the remote node
+//     -> route to remote Claude, or fall back to the local Claude work seat.
+//  3. If personal repo: Claude Code on the personal seat; with it locked the
+//     decision sets Waiting. The router never picks agy (GeminiCodeForbidden):
+//     Gemini is launched only explicitly (--gemini, agy, agy --force).
 func Route(ctx context.Context, cwd string, pacerState *PacerState, opts RouteOptions) (*RouteDecision, error) {
 	if cwd == "" || cwd == "." {
 		if cur, err := os.Getwd(); err == nil {
@@ -313,16 +323,36 @@ func Route(ctx context.Context, cwd string, pacerState *PacerState, opts RouteOp
 
 	if isWork {
 		decision.AccountRole = "work"
+		now := opts.Now
+		if now.IsZero() {
+			now = time.Now()
+		}
 		poolWork := pacerState.Pools[PoolWorkClaude]
-		if poolWork != nil && poolWork.IsLocked {
-			// Dynamic Fallback Pairing Matrix (STA-12): Opus tier routes to Gemini 3.1 Pro
-			decision.Target = TargetGeminiNative
-			decision.Tool = "agy"
-			decision.Model = "gemini-3.1-pro"
-			decision.Command = "agy --model gemini-3.1-pro --effort high"
-			decision.Reason = fmt.Sprintf("Enterprise work repo (%s); Claude Work Opus locked until %s, dynamically falling back to Gemini 3.1 Pro (STA-12)",
-				workSrc, poolWork.LockoutUntil.Format("03:04pm"))
-			decision.Warnings = append(decision.Warnings, fmt.Sprintf("Claude Work locked out until %s; routed to Gemini 3.1 Pro", poolWork.LockoutUntil.Format("03:04pm")))
+		if locked, why := PoolLockReason(poolWork, now); locked && GeminiCodeForbidden(true) {
+			// Board rule (STA-856): Gemini never writes code in a work repo.
+			// Fall back to the personal Claude seat; if it is locked too, wait.
+			until := ""
+			if poolWork != nil && !poolWork.LockoutUntil.IsZero() {
+				until = " until " + poolWork.LockoutUntil.Format("03:04pm")
+			}
+			decision.Tool = "claude"
+			decision.Model = "claude-opus-5"
+			if pLocked, _ := PoolLockReason(pacerState.Pools[PoolPersonalClaude], now); !pLocked {
+				decision.Target = TargetClaudePersonal
+				decision.AccountRole = "personal"
+				decision.Command = "claude"
+				decision.Reason = fmt.Sprintf("Enterprise work repo (%s); fell back to personal Claude: work seat locked (%s%s). %s",
+					workSrc, why, until, GeminiCodeRule)
+				decision.Warnings = append(decision.Warnings, fmt.Sprintf("Work Claude seat locked (%s%s); using the personal Claude seat. Gemini is not used in work repos.", why, until))
+				return decision, nil
+			}
+			_, pWhy := PoolLockReason(pacerState.Pools[PoolPersonalClaude], now)
+			decision.Target = TargetLocalClaudeWork
+			decision.Command = "CLAUDE_CONFIG_DIR=~/.claude-work claude"
+			decision.Waiting = true
+			decision.Reason = fmt.Sprintf("Enterprise work repo (%s); waiting for a Claude seat: work seat locked (%s%s), personal seat locked (%s). %s, so there is no Gemini fallback",
+				workSrc, why, until, pWhy, GeminiCodeRule)
+			decision.Warnings = append(decision.Warnings, "Both Claude seats are locked; waiting. Gemini is not used in work repos.")
 			return decision, nil
 		}
 
@@ -354,24 +384,18 @@ func Route(ctx context.Context, cwd string, pacerState *PacerState, opts RouteOp
 		return decision, nil
 	}
 
-	// 2. Personal Repo: Balanced Peer Pacing between Claude Code and Antigravity
+	// 2. Personal repo: Claude Code on the personal seat. Board rule
+	// (GeminiCodeForbidden): an interactive session may write code, so the
+	// router never picks agy (no pacing balance, repo continuity, remembered
+	// preference or quota fallback). Gemini runs only when launched
+	// explicitly: --gemini, the agy wrapper, agy --force, or resuming an agy
+	// session. With the personal seat locked the decision waits.
 	decision.AccountRole = "personal"
-
-	poolGemini := pacerState.Pools[PoolGeminiNative]
-	pool3P := pacerState.Pools[Pool3PClaude]
 	poolPersonal := pacerState.Pools[PoolPersonalClaude]
 
-	geminiOk := poolGemini != nil && !poolGemini.IsLocked && poolGemini.Weekly.RemainingPct > 0.0 && poolGemini.FiveHour.RemainingPct > 0.0
-	claudeOk := poolPersonal != nil && !poolPersonal.IsLocked && poolPersonal.Weekly.RemainingPct > 0.0 && poolPersonal.FiveHour.RemainingPct > 0.0
-
-	routeToGemini := func(reason string) (*RouteDecision, error) {
-		decision.Target = TargetGeminiNative
-		decision.Tool = "agy"
-		targetModel, _, cmd := FallbackPairingMatrix(opts.PreferredModel, opts.PreferredEffort)
-		decision.Model = targetModel
-		decision.Command = cmd
-		decision.Reason = reason
-		return decision, nil
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now()
 	}
 
 	routeToClaude := func(reason string) (*RouteDecision, error) {
@@ -387,123 +411,50 @@ func Route(ctx context.Context, cwd string, pacerState *PacerState, opts RouteOp
 		return decision, nil
 	}
 
-	now := opts.Now
-	if now.IsZero() {
-		now = time.Now()
+	if opts.PreferredPersonalTool == "agy" || opts.PreferredPersonalTool == "gemini" {
+		decision.Warnings = append(decision.Warnings, "preferred_personal_tool = "+opts.PreferredPersonalTool+" is ignored: Gemini never writes code, so it is only launched explicitly (staypoint --gemini or agy).")
 	}
 
-	// Priority 0 (use-it-or-lose-it): near the weekly reset with unspent personal
-	// Claude quota, spend it rather than let it expire. Beats balance/continuity,
-	// but not an explicit user preference for Antigravity.
-	if claudeOk && opts.PreferredPersonalTool != "agy" && opts.PreferredPersonalTool != "gemini" {
+	if locked, why := PoolLockReason(poolPersonal, now); locked {
+		until := ""
+		if poolPersonal != nil && !poolPersonal.LockoutUntil.IsZero() {
+			until = " until " + poolPersonal.LockoutUntil.Format("03:04pm")
+		}
+		d, _ := routeToClaude(fmt.Sprintf("Personal repo: waiting for the personal Claude seat (%s%s). %s, so there is no automatic Gemini fallback; launch agy explicitly for non-code work",
+			why, until, GeminiCodeRule))
+		d.Waiting = true
+		d.Warnings = append(d.Warnings, fmt.Sprintf("Personal Claude seat locked (%s%s); waiting. Gemini is not picked automatically.", why, until))
+		return d, nil
+	}
+
+	// Use-it-or-lose-it: near the weekly reset with unspent personal Claude
+	// quota, high-priority work gets the top-tier model.
+	if poolPersonal != nil {
 		if u := poolPersonal.UIOLIPressure(now, opts.UIOLI); u.Active {
 			if opts.PreferredModel == "" && opts.HighPriority {
 				opts.PreferredModel = UIOLIHighPriorityModel
 			}
-			return routeToClaude("Personal repo: " + u.describe() + " - preferring Claude Code over Gemini")
+			return routeToClaude("Personal repo: " + u.describe() + " - Claude Code")
 		}
+		return routeToClaude(fmt.Sprintf("Personal repo: Claude Code on the personal seat (%d turns runway | week: %s left)",
+			poolPersonal.TurnsRunway, poolPersonal.Weekly.FormatPct(true, 1)))
 	}
+	return routeToClaude("Personal repo: Claude Code on the personal seat")
+}
 
-	// Priority 1: User explicitly configured a preferred personal tool
-	if opts.PreferredPersonalTool == "claude" {
-		if claudeOk {
-			return routeToClaude(fmt.Sprintf("Personal repo: Claude Code selected by user preference (%d turns runway | week: %.1f%% left)",
-				poolPersonal.TurnsRunway, poolPersonal.Weekly.RemainingPct))
-		}
-		if geminiOk {
-			decision.Warnings = append(decision.Warnings, "Preferred tool Claude Code is locked out; dynamically falling back to Gemini Native per STA-12 pairing.")
-			return routeToGemini(fmt.Sprintf("Personal repo: Preferred tool Claude Code locked out, dynamically falling back to Gemini Native (%d turns runway | week: %.1f%% left)",
-				poolGemini.TurnsRunway, poolGemini.Weekly.RemainingPct))
-		}
+// firstComponentUnder returns the first path element of p below root, or ""
+// when p is not inside root.
+func firstComponentUnder(root, p string) string {
+	rel, err := filepath.Rel(root, p)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
 	}
-	if (opts.PreferredPersonalTool == "agy" || opts.PreferredPersonalTool == "gemini") && geminiOk {
-		return routeToGemini(fmt.Sprintf("Personal repo: Antigravity selected by user preference (%d turns runway | week: %.1f%% left)",
-			poolGemini.TurnsRunway, poolGemini.Weekly.RemainingPct))
-	}
+	return strings.SplitN(rel, string(filepath.Separator), 2)[0]
+}
 
-	// Priority 2: Both tools are available, balance between them
-	if claudeOk && geminiOk {
-		// Repo continuity: if this repository was recently used with one tool, stick to it
-		// provided that tool has not fallen behind by > ContinuityQuotaMarginPct weekly quota margin
-		if opts.LastUsedTool == "claude" && poolPersonal.Weekly.RemainingPct >= poolGemini.Weekly.RemainingPct-ContinuityQuotaMarginPct {
-			return routeToClaude(fmt.Sprintf("Personal repo: continuing with Claude Code (last tool used in this repo: %d turns runway | week: %.1f%% left)",
-				poolPersonal.TurnsRunway, poolPersonal.Weekly.RemainingPct))
-		}
-		if (opts.LastUsedTool == "agy" || opts.LastUsedTool == "gemini") && poolGemini.Weekly.RemainingPct >= poolPersonal.Weekly.RemainingPct-ContinuityQuotaMarginPct {
-			return routeToGemini(fmt.Sprintf("Personal repo: continuing with Antigravity (last tool used in this repo: %d turns runway | week: %.1f%% left)",
-				poolGemini.TurnsRunway, poolGemini.Weekly.RemainingPct))
-		}
-
-		// Weekly headroom balance: route to the tool with more weekly quota remaining
-		diff := poolPersonal.Weekly.RemainingPct - poolGemini.Weekly.RemainingPct
-		if diff >= 5.0 {
-			return routeToClaude(fmt.Sprintf("Personal repo: balanced pacing favors Claude Code (%.1f%% week left vs Gemini %.1f%%)",
-				poolPersonal.Weekly.RemainingPct, poolGemini.Weekly.RemainingPct))
-		}
-		if diff <= -5.0 {
-			return routeToGemini(fmt.Sprintf("Personal repo: balanced pacing favors Antigravity (%.1f%% week left vs Claude %.1f%%)",
-				poolGemini.Weekly.RemainingPct, poolPersonal.Weekly.RemainingPct))
-		}
-
-		// Within 5%: alternate by ISO week number
-		_, weekNum := time.Now().ISOWeek()
-		if weekNum%2 == 0 {
-			return routeToClaude(fmt.Sprintf("Personal repo: balanced weekly pacing (week %d) favors Claude Code (%.1f%% left)",
-				weekNum, poolPersonal.Weekly.RemainingPct))
-		}
-		return routeToGemini(fmt.Sprintf("Personal repo: balanced weekly pacing (week %d) favors Antigravity (%.1f%% left)",
-			weekNum, poolGemini.Weekly.RemainingPct))
-	}
-
-	// Priority 3: Only one tool is available
-	if claudeOk && !geminiOk {
-		geminiReason := "Gemini quota exhausted"
-		if poolGemini != nil && poolGemini.LockoutReason != "" {
-			geminiReason = poolGemini.LockoutReason
-		}
-		decision.Warnings = append(decision.Warnings, fmt.Sprintf("Gemini Native is locked: %s. Routing to standalone Claude Code.", geminiReason))
-		return routeToClaude(fmt.Sprintf("Personal repo: Gemini Native locked (%s), routing to Claude Code (%d turns runway | week: %.1f%% left)",
-			geminiReason, poolPersonal.TurnsRunway, poolPersonal.Weekly.RemainingPct))
-	}
-
-	if geminiOk && !claudeOk {
-		claudeReason := "Claude quota exhausted or locked out"
-		if poolPersonal != nil && poolPersonal.LockoutReason != "" {
-			claudeReason = poolPersonal.LockoutReason
-		}
-		decision.Warnings = append(decision.Warnings, fmt.Sprintf("Claude Code is locked (%s). Dynamically routed to Gemini Native per STA-12 fallback pairing.", claudeReason))
-		return routeToGemini(fmt.Sprintf("Personal repo: Claude Code locked (%s), routing to Gemini Native (%d turns runway | week: %.1f%% left)",
-			claudeReason, poolGemini.TurnsRunway, poolGemini.Weekly.RemainingPct))
-	}
-
-	// Priority 4: Both native tools exhausted, check 3P Claude in Antigravity
-	if pool3P != nil && !pool3P.IsLocked && pool3P.Weekly.RemainingPct > 0.0 && pool3P.FiveHour.RemainingPct > 0.0 {
-		decision.Target = TargetClaude3P
-		decision.Tool = "agy"
-		decision.Model = "claude-sonnet-4-6"
-		decision.Command = "agy"
-		decision.Reason = fmt.Sprintf("Gemini Native & Standalone Claude locked, falling back to 3P Claude in Antigravity (%d turns runway)",
-			pool3P.TurnsRunway)
-		decision.Warnings = append(decision.Warnings, "Gemini Native and Standalone Claude are locked. Switch model in agy using '/model claude-sonnet-4-6'.")
-		return decision, nil
-	}
-
-	// Priority 5: All locked
-	decision.Target = TargetGeminiNative
-	decision.Tool = "agy"
-	decision.Model = "gemini-3.8-flash-high"
-	decision.Command = "agy"
-	decision.Reason = "All personal quota pools are currently locked or exhausted; awaiting window reset"
-
-	if poolGemini != nil && poolGemini.IsLocked {
-		decision.Warnings = append(decision.Warnings, fmt.Sprintf("Gemini Native locked until %s", poolGemini.LockoutUntil.Format("03:04pm")))
-	}
-	if poolPersonal != nil && poolPersonal.IsLocked {
-		decision.Warnings = append(decision.Warnings, fmt.Sprintf("Personal Claude locked until %s", poolPersonal.LockoutUntil.Format("03:04pm")))
-	}
-	if pool3P != nil && pool3P.IsLocked {
-		decision.Warnings = append(decision.Warnings, fmt.Sprintf("3P Claude locked until %s", pool3P.LockoutUntil.Format("03:04pm")))
-	}
-
-	return decision, nil
+// isWorkDirName reports whether a ~/Documents/dev entry is a work folder by
+// name: "work" itself or "work-…"/"work_…". "worktrees" is not.
+func isWorkDirName(name string) bool {
+	n := strings.ToLower(name)
+	return n == "work" || strings.HasPrefix(n, "work-") || strings.HasPrefix(n, "work_")
 }

@@ -9,7 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/geminiapproval"
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
+	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
+	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 )
 
@@ -54,6 +57,30 @@ func (h *SecurityGateHandler) CreateGateRequest(w http.ResponseWriter, r *http.R
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Cmdline == "" {
 		http.Error(w, `{"error":"cmdline required"}`, http.StatusBadRequest)
+		return
+	}
+	if req.RunID == geminiapproval.RunID {
+		// Board Touch ID for Gemini code: personal repos only. A work-repo
+		// request is refused outright, so it can never be approved.
+		scope, ok := geminiapproval.Parse(req.Cmdline)
+		if !ok {
+			http.Error(w, `{"error":"invalid gemini-code request"}`, http.StatusBadRequest)
+			return
+		}
+		if err := geminiapproval.Validate(scope, isWorkRepoForGate); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusForbidden)
+			return
+		}
+		gr, err := geminiapproval.Request(h.db, scope, isWorkRepoForGate)
+		if err != nil {
+			http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+			return
+		}
+		h.hub.Publish("security_gate_request", map[string]any{
+			"id": gr.ID, "cmdline": gr.Cmdline, "reasons": gr.Reasons, "status": gr.Status,
+		})
+		w.WriteHeader(http.StatusCreated)
+		writeJSON(w, gr)
 		return
 	}
 	gr, err := security.CreateGateRequest(h.db, req.Cmdline, req.Reasons, req.RunID)
@@ -132,6 +159,24 @@ func (h *SecurityGateHandler) DecideGateRequest(w http.ResponseWriter, r *http.R
 		http.Error(w, `{"error":"decision must be approved or denied"}`, http.StatusBadRequest)
 		return
 	}
+	var geminiScope *geminiapproval.Scope
+	if cur, err := security.GetGateRequest(h.db, id); err == nil && cur != nil && cur.RunID == geminiapproval.RunID {
+		scope, ok := geminiapproval.Parse(cur.Cmdline)
+		if approved {
+			// Hard no in work repos, even for the Board.
+			if !ok {
+				http.Error(w, `{"error":"invalid gemini-code request"}`, http.StatusForbidden)
+				return
+			}
+			if err := geminiapproval.Validate(scope, isWorkRepoForGate); err != nil {
+				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusForbidden)
+				return
+			}
+		}
+		if ok {
+			geminiScope = &scope
+		}
+	}
 	gr, err := security.DecideGateRequest(h.db, id, approved)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found or already decided") {
@@ -162,7 +207,19 @@ func (h *SecurityGateHandler) DecideGateRequest(w http.ResponseWriter, r *http.R
 		"id":       gr.ID,
 		"decision": gr.Status,
 	})
+	if geminiScope != nil && geminiScope.TaskID != "" {
+		// Wake the held task: an approval starts its run (consumed there),
+		// a denial makes the daemon refuse it with a clear reason.
+		orchestrator.GlobalDispatcher.Wake(geminiScope.TaskID, "gemini_code_"+string(gr.Status), "gemini_code:"+gr.ID)
+	}
 	writeJSON(w, gr)
+}
+
+// isWorkRepoForGate classifies a repo for Gemini-code approvals; an error
+// counts as work (fail closed).
+func isWorkRepoForGate(p string) bool {
+	ok, _, err := router.IsWorkRepo(p)
+	return err != nil || ok
 }
 
 // ListGateAuditLog handles GET /api/security/gate-requests/{id}/audit-log

@@ -46,6 +46,12 @@ html, body {
 .logo { font-weight: 700; font-size: 17px; letter-spacing: .5px; color: var(--accent-light); }
 .badge-version { font-size: 10px; background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
 .header-right { display: flex; align-items: center; gap: 10px; }
+/* Daemon is not a reviewed main build (STA-805). */
+.badge-dev-build {
+  background: rgba(239, 68, 68, 0.18); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.6);
+  font-weight: 700; letter-spacing: .5px; cursor: help;
+}
+.badge-dev-build[hidden] { display: none; }
 
 .sidebar-toggle {
   background: none; border: none; color: var(--muted); cursor: pointer;
@@ -394,7 +400,7 @@ body.has-passkey-banner { --passkey-banner-h: 40px; }
 
 /* ── Kanban ──────────────────────────────────────────────── */
 .kanban-board {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
   gap: 14px; align-items: start;
 }
 .kanban-col { background: var(--surface); border-radius: var(--radius); padding: 10px; }
@@ -403,10 +409,22 @@ body.has-passkey-banner { --passkey-banner-h: 40px; }
   color: var(--muted); margin-bottom: 10px;
 }
 [data-status="in_progress"] .col-title { color: var(--blue); }
+[data-status="in_review"]   .col-title { color: var(--accent-light); }
 [data-status="blocked"]     .col-title { color: var(--red); }
 [data-status="done"]        .col-title { color: var(--green); }
 
 .card-list { display: flex; flex-direction: column; gap: 7px; min-height: 40px; }
+.task-source-ref { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.kanban-board-wrap { display: flex; flex-direction: column; gap: 18px; }
+.kanban-lane-title {
+  font-size: 13px; font-weight: 700; margin: 0 0 8px; color: var(--text);
+}
+.kanban-controls { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.kanban-toggle { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); cursor: pointer; }
+.card-origin-badge {
+  font-size: 10px; padding: 0 5px; border-radius: 3px; margin-left: auto;
+  background: rgba(255,255,255,.08); color: var(--muted); text-transform: uppercase; letter-spacing: .4px;
+}
 
 /* ── Task card ───────────────────────────────────────────── */
 .task-card {
@@ -423,6 +441,8 @@ body.has-passkey-banner { --passkey-banner-h: 40px; }
 .dot-in_progress { background: var(--blue); }
 .dot-blocked     { background: var(--red); }
 .dot-done        { background: var(--green); }
+.dot-backlog     { background: var(--muted); opacity: .6; }
+.dot-in_review   { background: var(--accent-light); }
 .dot-soft_deleted { background: var(--muted); opacity: .4; }
 
 /* ── Fleet grid ─────────────────────────────────────────── */
@@ -748,39 +768,10 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   left: 0;
 }
 
-.detail-panel.full-page #panel-content {
-  max-width: 1080px;
-  margin: 0 auto;
-  padding: 10px 24px 60px;
-}
-
-.detail-panel.full-page .panel-title {
-  font-size: 22px;
-  margin-top: 8px;
-  margin-bottom: 16px;
-}
-
-.detail-panel.full-page .panel-meta-row {
-  margin-bottom: 20px;
-  gap: 12px;
-}
-
 .detail-panel.full-page .panel-gov-section {
   max-width: 800px;
 }
 
-.panel-title { font-size: 16px; font-weight: 700; margin-bottom: 12px; margin-top: 8px; line-height: 1.4; }
-.panel-meta-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
-.panel-meta-item {
-  display: inline-flex; align-items: center; gap: 5px;
-  background: rgba(255, 255, 255, 0.04); border: 1px solid var(--border);
-  border-radius: 4px; padding: 3px 8px; font-size: 12px;
-}
-.panel-meta-tag-label {
-  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px;
-  color: var(--muted); user-select: none;
-}
-.panel-meta-value { font-weight: 600; color: var(--text); }
 .muted-text { font-size: 12px; color: var(--muted); }
 
 .panel-field { margin-top: 14px; }
@@ -3191,6 +3182,87 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   .task-page-tabpanel { padding: 12px 16px; }
   .task-page-dock { position: sticky; bottom: 0; z-index: 10; padding: 6px 16px 10px; }
 }
+/* Drawer (peek) view (STA-700): the task page layout in #detail-panel, stacked
+   like the narrow page above but sized by the drawer, not the viewport. The
+   drawer content scrolls under a sticky header and composer; the panel's
+   close / expand / open buttons stay put in its top-right corner. Wide enough
+   (#panel-expand), the body goes back to two columns. */
+.detail-panel:has(> #panel-content.task-page-drawer) {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+/* Above the sticky header, which comes later in the panel. */
+.detail-panel:has(> #panel-content.task-page-drawer) > .panel-header-actions { z-index: 20; }
+.detail-panel #panel-content.task-page-drawer {
+  flex: 1;
+  min-height: 0;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  container: task-drawer / inline-size;
+}
+.task-page-drawer > .task-page-header { padding: 10px 16px; }
+/* Clears the panel's ↗ / ⛶ / × buttons. */
+.task-page-drawer .task-page-header-main { padding-right: 104px; }
+.task-page-drawer .task-page-header-row { row-gap: 8px; }
+.task-page-drawer .task-page-actions { margin-left: 0; }
+.task-page-drawer .task-page-stats .timeline-stat { padding: 6px 12px; }
+.task-page-drawer .task-page-stats .timeline-stat-val { font-size: 15px; }
+.task-page-drawer > .task-page-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+}
+.task-page-drawer .task-page-layout > .task-page-timeline {
+  min-height: 0;
+  max-height: 50vh;
+  overflow-y: auto;
+  padding: 12px 16px;
+}
+.task-page-drawer .task-page-layout > .task-page-side {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: visible;
+  border-left: 0;
+  border-top: 1px solid var(--border);
+}
+.task-page-drawer .task-page-tabs {
+  gap: 2px;
+  margin: 12px 16px 0;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface2);
+  overflow-x: visible;
+}
+.task-page-drawer .task-page-tab {
+  flex: 1 1 0;
+  min-width: 0;
+  justify-content: center;
+  margin: 0;
+  padding: 6px 8px;
+  border-bottom: 0;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.task-page-drawer .task-page-tab[aria-selected="true"] { background: var(--surface); box-shadow: inset 0 0 0 1px var(--accent); }
+.task-page-drawer .task-page-tabpanel { overflow: visible; padding: 12px 16px; }
+.task-page-drawer > .task-page-dock { position: sticky; bottom: 0; z-index: 10; padding: 6px 16px 10px; }
+@container task-drawer (min-width: 900px) {
+  /* Title and actions share a row here, so the whole row clears the controls. */
+  .task-page-drawer > .task-page-header { padding-right: 124px; }
+  .task-page-drawer .task-page-header-main { padding-right: 0; }
+  .task-page-drawer > .task-page-layout { grid-template-columns: minmax(0, 1fr) 440px; align-items: start; }
+  .task-page-drawer .task-page-layout > .task-page-timeline { max-height: none; overflow-y: visible; padding: 16px 20px; }
+  .task-page-drawer .task-page-layout > .task-page-side { border-top: 0; border-left: 1px solid var(--border); }
+}
 .task-page-back-btn {
   background: none;
   border: 1px solid var(--border);
@@ -3667,6 +3739,18 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 
 /* ── Timeline ──────────────────────────────────────────── */
 .timeline-stats-bar { margin-bottom: 10px; }
+/* Run queue line under the stats strip (STA-773). */
+.task-page-queue-line {
+  margin: 0 0 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--amber);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+}
+.task-page-queue-line.hidden { display: none; }
 .timeline-stats-inner {
   display: flex;
   flex-wrap: wrap;
@@ -4189,6 +4273,73 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   flex-shrink: 0;
 }
 .ship-review-restart-btn:hover { color: var(--text, #cdd6f4); }
+.ship-review-start-dev-btn {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 4px;
+  background: var(--surface2, #28283e);
+  border: 1px solid var(--border, #30304a);
+  color: var(--text, #cdd6f4);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.ship-review-start-dev-btn:disabled,
+.ship-review-restart-btn:disabled { opacity: 0.5; cursor: default; }
+/* STA-727: live_credentials project — previews hit production. */
+.ship-review-live-banner {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: #b91c1c;
+  border-left: 4px solid #ef4444;
+  color: #fff;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+.ship-review-start-dev-btn--live,
+.ship-review-restart-btn--live {
+  border-color: #ef4444;
+  color: #fecaca;
+}
+.ship-review-live-tag {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: #b91c1c;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.ship-review-live-confirm {
+  margin: 6px 0 10px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid #ef4444;
+  background: rgba(185, 28, 28, 0.15);
+}
+.ship-review-live-confirm-warning { color: #fca5a5; font-weight: 700; font-size: 13px; }
+.ship-review-live-confirm-text { margin-top: 4px; font-size: 12px; color: var(--text, #cdd6f4); }
+.ship-review-live-confirm-error { margin-top: 6px; font-size: 12px; color: #fca5a5; }
+.ship-review-live-confirm-actions { display: flex; gap: 8px; margin-top: 8px; }
+.ship-review-live-confirm-btn {
+  padding: 4px 12px;
+  border-radius: 4px;
+  border: 1px solid #ef4444;
+  background: #b91c1c;
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ship-review-live-cancel-btn {
+  padding: 4px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--border, #30304a);
+  background: var(--surface2, #28283e);
+  color: var(--text, #cdd6f4);
+  cursor: pointer;
+}
 .ship-review-sha {
   font-family: monospace;
   font-size: 12px;
@@ -4617,3 +4768,150 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .task-pending-gates-title { font-weight: 600; font-size: 13px; color: var(--amber, #f59e0b); margin-bottom: 8px; }
 .task-pending-gate-row { font-size: 12px; display: flex; align-items: flex-start; gap: 10px; margin-bottom: 6px; }
 .task-pending-gate-cmd { font-family: 'JetBrains Mono', ui-monospace, monospace; word-break: break-all; flex: 1; }
+
+/* ── Ship review PR modes: PR link, CI checks, merge warning (STA-717) ───── */
+.ship-review-pr-section { margin-bottom: 14px; display: flex; flex-direction: column; gap: 6px; }
+.ship-review-pr-link { font-weight: 600; color: var(--accent, #58a6ff); }
+.ship-review-pr-note { font-size: 12px; color: var(--text-muted, #8b949e); }
+.ship-review-pr-summary { margin-left: 8px; text-transform: none; letter-spacing: 0; font-weight: 600; }
+.ship-review-pr-checks { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+.ship-review-pr-check {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border, #30363d);
+  min-width: 0;
+}
+.ship-review-pr-check:last-child { border-bottom: none; }
+.ship-review-pr-check-icon { width: 14px; flex: none; text-align: center; font-weight: 700; }
+.ship-review-pr-check-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.ship-review-pr-check-state, .ship-review-pr-check-duration { color: var(--text-muted, #8b949e); white-space: nowrap; }
+.ship-review-pr-check-link { white-space: nowrap; color: var(--accent, #58a6ff); }
+.ship-review-pr-check--pass .ship-review-pr-check-icon { color: var(--green, #3fb950); }
+.ship-review-pr-check--fail .ship-review-pr-check-icon,
+.ship-review-pr-check--cancel .ship-review-pr-check-icon { color: var(--red, #f85149); }
+.ship-review-pr-check--pending .ship-review-pr-check-icon { color: #f8c436; }
+.ship-review-pr-check--empty { color: var(--text-muted, #8b949e); }
+.ship-review-pr-warning {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: rgba(248,196,54,.1);
+  border: 1px solid rgba(248,196,54,.35);
+  color: #f8c436;
+  font-size: 12px;
+}
+.ship-review-pr-warning-title { font-weight: 600; }
+.ship-review-pr-warning-list { margin: 0 0 0 16px; padding: 0; overflow-wrap: anywhere; }
+.ship-review-github-refusal {
+  padding: 7px 12px;
+  border-radius: 6px;
+  background: rgba(248,81,73,.12);
+  border: 1px solid rgba(248,81,73,.4);
+  color: var(--red, #f85149);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.ship-review-github-refusal-label { font-weight: 600; }
+.ship-review-github-refusal-text { font-family: var(--mono, ui-monospace, monospace); }
+.ship-review-merge-btn {
+  padding: 7px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  background: rgba(40,167,69,.15);
+  border: 1.5px solid rgba(40,167,69,.5);
+  color: #28a745;
+}
+.ship-review-merge-btn:hover:not(:disabled) { background: rgba(40,167,69,.25); }
+.ship-review-merge-btn:disabled { opacity: .45; cursor: not-allowed; }
+.ship-review-merge-anyway-btn, .ship-review-send-failures-btn {
+  padding: 5px 12px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ship-review-merge-anyway-btn {
+  background: rgba(248,81,73,.1);
+  border: 1px solid rgba(248,81,73,.45);
+  color: var(--red, #f85149);
+}
+.ship-review-send-failures-btn {
+  background: rgba(248,196,54,.15);
+  border: 1px solid rgba(248,196,54,.45);
+  color: #f8c436;
+}
+.ship-review-merge-anyway-btn:disabled, .ship-review-send-failures-btn:disabled { opacity: .5; cursor: default; }
+.ship-review-form-input {
+  border-radius: 5px;
+  border: 1px solid var(--border, #30363d);
+  background: var(--bg, #0d1117);
+  color: var(--text, #cdd6f4);
+  font-size: 13px;
+  padding: 6px 8px;
+}
+.ship-review-status-badge.status-checks-running,
+.ship-review-status-badge.status-checks-none { background: rgba(248,196,54,.15); color: #f8c436; }
+.ship-review-status-badge.status-checks-passed { background: rgba(40,167,69,.15); color: #28a745; }
+.ship-review-status-badge.status-checks-failed { background: rgba(248,81,73,.12); color: var(--red, #f85149); }
+
+/* ── Merge test gate (STA-734) ─────────────────────────────────────────── */
+.ship-review-test-coverage {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0;
+}
+.ship-review-test-coverage-status {
+  margin-left: 8px;
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--text-muted, #8b949e);
+}
+.ship-review-test-coverage[data-state="blocking"] .ship-review-test-coverage-status,
+.ship-review-test-coverage[data-state="error"] .ship-review-test-coverage-status { color: #f8c436; }
+.ship-review-test-coverage[data-state="ok"] .ship-review-test-coverage-status { color: var(--green, #3fb950); }
+.ship-review-test-coverage-body { display: flex; flex-direction: column; gap: 6px; }
+.ship-review-test-coverage-note { font-size: 12px; color: var(--text-muted, #8b949e); }
+.ship-review-test-ok { font-size: 13px; color: var(--green, #3fb950); }
+.ship-review-test-warning {
+  padding: 7px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  border: 1px solid var(--border, #30363d);
+  color: var(--text-muted, #8b949e);
+  overflow-wrap: anywhere;
+}
+.ship-review-test-warning--blocking {
+  background: rgba(248,196,54,.1);
+  border-color: rgba(248,196,54,.35);
+  color: #f8c436;
+}
+.ship-review-test-warning-msg { font-weight: 600; }
+.ship-review-test-warning:not(.ship-review-test-warning--blocking) .ship-review-test-warning-msg { font-weight: 400; }
+.ship-review-test-warning-items { margin: 4px 0 0 16px; padding: 0; font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; }
+.ship-review-test-warning .ship-review-test-coverage-retry { margin-left: 8px; }
+.ship-review-merge-without-tests-missing { margin: 4px 0 4px 16px; padding: 0; }
+.ship-review-merge-without-tests-note { font-size: 12px; color: var(--text-muted, #8b949e); margin-bottom: 4px; }
+.ship-review-test-task-link { overflow-wrap: anywhere; }
+.ship-review-test-task-note { margin-left: 8px; font-size: 12px; color: var(--text-muted, #8b949e); }
+
+/* Non-git task (STA-864): runs in place, nothing checkpointed or reviewable. */
+.task-page-nongit-banner {
+  margin: 0 0 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--amber);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--amber);
+  font-size: 13px;
+  font-weight: 600;
+}
+.timeline-row-warn .timeline-title { color: var(--amber); }

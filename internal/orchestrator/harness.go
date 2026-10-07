@@ -9,11 +9,12 @@ import (
 	"io"
 	"log/slog"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
+	"github.com/VinnyVanGogh/staypoint/internal/geminiguard"
 	"github.com/VinnyVanGogh/staypoint/internal/gitgate"
+	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/logging"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/VinnyVanGogh/staypoint/internal/workspace"
@@ -24,11 +25,11 @@ import (
 var (
 	ErrAlreadyClaimed = errors.New("Can't start run: this task is already checked out by another run in this session. Wait for it to finish or clear the stale checkout.")
 	ErrTaskNotFound   = errors.New("task not found")
-	ErrConcurrencyCap = errors.New("Can't start run: only one agent may run at a time and another is currently active. Try again in a moment.")
+	// ErrNotRunnable: the task is parked (backlog) or closed (done,
+	// cancelled, rejected). Run Now moves a backlog task to todo first.
+	ErrNotRunnable    = errors.New("Can't start run: this task is not runnable in its current stage (backlog, done or cancelled). Move it to todo first.")
+	ErrConcurrencyCap = errors.New("Can't start run: the maximum number of parallel runs (max_concurrent_runs) is already active.")
 )
-
-// Hard cap: at most one agent may hold a task claim inside this process.
-var activeClaims atomic.Int32
 
 // taskCompleteMarker is the canonical signal an adapter emits on completion.
 const taskCompleteMarker = "[[TASK_COMPLETE]]"
@@ -77,8 +78,21 @@ type RunConfig struct {
 	MaxTurns int
 	// MaxBudgetUSD caps cumulative spend; 0 = unlimited.
 	MaxBudgetUSD float64
-	// MaxWallclock caps wall-clock duration; 0 defaults to 30 min.
+	// MaxWallclock caps the whole run's wall-clock duration; 0 = no limit.
+	// The daemon never sets it (Board: no fixed time cap); `staypoint run
+	// --max-wallclock` can.
 	MaxWallclock time.Duration
+	// TurnTimeout caps one adapter turn's wall-clock time; 0 = no limit
+	// (config.toml turn_timeout).
+	TurnTimeout time.Duration
+	// StallTimeout stops a turn after this long with no agent output or tool
+	// activity (config.toml stall_timeout). 0 = DefaultStallTimeout (20m);
+	// negative turns the check off.
+	StallTimeout time.Duration
+	// Clock, when set, replaces time.Now for the turn watch (tests).
+	Clock func() time.Time
+	// watchPoll is how often the turn watch checks; 0 = defaultWatchPoll.
+	watchPoll time.Duration
 	// SkipPermissions forwards --dangerously-skip-permissions to the adapter.
 	// Opt-in only; never set by default.
 	SkipPermissions bool
@@ -110,6 +124,27 @@ type RunConfig struct {
 	// per-run --settings file (STA-525).  Should point to the staypoint CLI binary
 	// built from the same commit as the daemon.
 	HookBin string
+	// GeminiDocsOnly applies the Board rule router.GeminiCodeForbidden to this
+	// run (every repo, STA-856 revised 2026-10-06): after any turn that
+	// spawned Gemini, changes outside the non-code allowlist are reverted to
+	// the daemon's pre-turn checkpoint and the run fails.
+	GeminiDocsOnly bool
+	// GeminiCodeApproved relaxes the guard for this one run after a Board
+	// Touch ID approval (personal repo only, router.GeminiCodeApprovalAllowed):
+	// code changes are allowed, .git tampering and paths outside the repo are
+	// still reverted. Requires GeminiDocsOnly (the guard still runs).
+	GeminiCodeApproved bool
+	// TurnUsedGemini reports whether a Gemini CLI was spawned since its last
+	// call, and resets. Nil falls back to the static Provider.
+	TurnUsedGemini func() bool
+}
+
+// turnUsedGemini reports whether the turn that just ran spawned Gemini.
+func (cfg RunConfig) turnUsedGemini() bool {
+	if cfg.TurnUsedGemini != nil {
+		return cfg.TurnUsedGemini()
+	}
+	return geminiguard.IsGeminiProvider(cfg.Provider)
 }
 
 // RunResult summarises a completed autonomous run.
@@ -138,6 +173,26 @@ type Harness struct {
 	RepoRoot    string
 	WM          WorktreeManagerIface
 	Interceptor *Interceptor
+	// Slots enforces the parallel-run caps. Nil uses GlobalRunSlots.
+	Slots *RunSlots
+}
+
+func (h *Harness) slots() *RunSlots {
+	if h.Slots != nil {
+		return h.Slots
+	}
+	return GlobalRunSlots
+}
+
+// RepoKeyForTask returns the slot key for the repo a task runs in: its
+// repo_path, or the harness default repo when unset.
+func (h *Harness) RepoKeyForTask(ctx context.Context, taskID string) string {
+	var repoPath string
+	_ = h.DB.QueryRowContext(ctx, "SELECT COALESCE(repo_path,'') FROM tasks WHERE id=?", taskID).Scan(&repoPath)
+	if repoPath == "" {
+		repoPath = h.RepoRoot
+	}
+	return RepoKey(repoPath)
 }
 
 // NewHarness creates a Harness backed by the given SQLite DB and repo root.
@@ -152,34 +207,40 @@ func NewHarness(db *sql.DB, repoRoot string) *Harness {
 
 // Claim atomically checks out a task for the given runID.
 //
-// The hard concurrency cap of 1 is enforced via an atomic counter within the
-// process. Across restarts, RecoveryScan clears stale checkout_run_id values so
+// Parallelism is bounded by RunSlots (STA-773): a global cap
+// (max_concurrent_runs, default 3) and one run per repo. A refusal returns an
+// error matching errors.Is(err, ErrConcurrencyCap); callers queue the run and
+// RunSlots re-dispatches it when a slot frees. Across restarts, RecoveryScan clears stale checkout_run_id values so
 // the DB guard (checkout_run_id IS NULL) unblocks on the next wake.
-// Terminal tasks (execution_stage = 'done') are never re-claimed.
+// Parked (backlog) and closed (done, cancelled, rejected) tasks are never
+// claimed; see governance.IsRunnableStage.
 func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) error {
-	if activeClaims.Add(1) > 1 {
-		activeClaims.Add(-1)
-		return ErrConcurrencyCap
+	slots := h.slots()
+	if err := slots.Acquire(taskID, h.RepoKeyForTask(ctx, taskID)); err != nil {
+		return err
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := h.DB.ExecContext(ctx,
 		`UPDATE tasks
 		    SET execution_stage='in_progress', checkout_run_id=?, checkout_agent_id=?, updated_at=?
-		  WHERE id=? AND checkout_run_id IS NULL AND execution_stage NOT IN ('done')`,
+		  WHERE id=? AND checkout_run_id IS NULL AND execution_stage NOT IN (`+governance.NonRunnableStagesSQL()+`)`,
 		runID, agentID, now, taskID,
 	)
 	if err != nil {
-		activeClaims.Add(-1)
+		slots.Release(taskID)
 		return fmt.Errorf("claim db update: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		activeClaims.Add(-1)
+		slots.Release(taskID)
 		var stage string
 		_ = h.DB.QueryRowContext(ctx, "SELECT execution_stage FROM tasks WHERE id=?", taskID).Scan(&stage)
 		if stage == "" {
 			return ErrTaskNotFound
+		}
+		if !governance.IsRunnableStage(stage) {
+			return ErrNotRunnable
 		}
 		return ErrAlreadyClaimed
 	}
@@ -188,10 +249,11 @@ func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) erro
 	return nil
 }
 
-// Release decrements the concurrency counter and clears the task checkout.
-// Always called via defer; uses a fresh context to survive parent cancellation.
+// Release clears the task checkout, then frees the run slot (which
+// re-dispatches queued runs). Always called via defer; uses a fresh context to
+// survive parent cancellation.
 func (h *Harness) Release(taskID, runID string) {
-	activeClaims.Add(-1)
+	defer h.slots().Release(taskID)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, _ = h.DB.ExecContext(ctx,
@@ -227,45 +289,62 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	if maxTurns <= 0 {
 		maxTurns = 50
 	}
-	maxWall := cfg.MaxWallclock
-	if maxWall <= 0 {
-		maxWall = 30 * time.Minute
+	// No fixed run-time cap by default: a stuck turn is caught by the turn
+	// watch's stall timeout instead (see turn_watch.go).
+	cancel := context.CancelFunc(func() {})
+	if cfg.MaxWallclock > 0 {
+		ctx, cancel = context.WithTimeout(ctx, cfg.MaxWallclock)
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, maxWall)
 	defer cancel()
 
 	var repoPath string
 	if err := h.DB.QueryRowContext(ctx, "SELECT COALESCE(repo_path,'') FROM tasks WHERE id=?", taskID).Scan(&repoPath); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("fetch repo path: %w", err)
 	}
-	if repoPath == "" {
+	// Non-git tasks (STA-864): an existing directory that is not a git repo,
+	// or no repo_path at all (per-task scratch dir), runs in place with a
+	// warning: no worktree, checkpoints or ship review. See plaindir.go.
+	taskDir, err := workspace.ResolveTaskDir(repoPath, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("task directory: %w", err)
+	}
+	nonGit := !taskDir.Git
+	if nonGit {
+		repoPath = taskDir.Dir
+		ctx = withPlainDir(ctx)
+	} else if repoPath == "" {
 		repoPath = h.RepoRoot
 	}
 
-	// When the task names a specific repo that differs from the harness default,
-	// build a fresh WorktreeManager for that repo so worktrees land in the right
-	// place and never touch h.RepoRoot.
-	wm := h.WM
-	if repoPath != h.RepoRoot {
-		wm = workspace.NewWorktreeManager(repoPath, h.DB)
-	}
-
-	wtPath, err := wm.CreateContext(ctx, taskID, runID)
-	if err != nil {
-		return nil, fmt.Errorf("create worktree: %w", err)
-	}
-	defer func() {
-		if pruneErr := wm.PruneWorktreeDirContext(context.Background(), taskID); pruneErr != nil {
-			runLog.Warn("worktree prune failed", slog.Any("error", pruneErr))
+	var wtPath string
+	var preCP *checkpoint.Checkpoint
+	if nonGit {
+		wtPath = taskDir.Dir
+	} else {
+		// When the task names a specific repo that differs from the harness default,
+		// build a fresh WorktreeManager for that repo so worktrees land in the right
+		// place and never touch h.RepoRoot.
+		wm := h.WM
+		if repoPath != h.RepoRoot {
+			wm = workspace.NewWorktreeManager(repoPath, h.DB)
 		}
-	}()
 
-	preCP, _ := checkpoint.CreateCheckpoint(ctx, checkpoint.CreateOptions{
-		WorkDir:   wtPath,
-		SessionID: runID,
-		Message:   "pre-run " + taskID,
-	})
+		wtPath, err = wm.CreateContext(ctx, taskID, runID)
+		if err != nil {
+			return nil, fmt.Errorf("create worktree: %w", err)
+		}
+		defer func() {
+			if pruneErr := wm.PruneWorktreeDirContext(context.Background(), taskID); pruneErr != nil {
+				runLog.Warn("worktree prune failed", slog.Any("error", pruneErr))
+			}
+		}()
+
+		preCP, _ = checkpoint.CreateCheckpoint(ctx, checkpoint.CreateOptions{
+			WorkDir:   wtPath,
+			SessionID: runID,
+			Message:   "pre-run " + taskID,
+		})
+	}
 
 	providerEnv := security.ChildEnv(defaultProviderEnvKeys...)
 	if cfg.SkipPermissions {
@@ -347,10 +426,14 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		}
 	}
 
+	if nonGit {
+		h.announceNonGit(ctx, taskID, taskDir, sr)
+	}
+
 	// Git pre-flight: fetch, dirty check, fast-forward.
 	// A failure is logged as a timeline comment and blocks the run.
 	// Skipped when cfg.SkipGitPreflight is true (tests running in a non-git dir).
-	if !cfg.SkipGitPreflight {
+	if !cfg.SkipGitPreflight && !nonGit {
 		gfCtx, gfCancel := context.WithTimeout(ctx, 60*time.Second)
 		gfResult, gfErr := gitgate.PreFlight(gfCtx, wtPath, "main")
 		gfCancel()
@@ -387,6 +470,11 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			)
 			return result, nil
 		}
+		// STA-774: the recorded task base is never moved from git state
+		// here. The preflight's fetch and fast-forward follow the worktree's
+		// remote config and refs, which the agent can rewrite (e.g. a fetch
+		// refspec that maps its own branch onto origin/main); commits a
+		// fast-forward brings in are listed as task changes instead.
 	} // end git preflight block
 
 	// Clear stale run control flags from previous runs.
@@ -396,6 +484,11 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 
 	// Fetch the task brief once; pass it to each turn.
 	brief := fetchTaskBrief(ctx, h.DB, taskID)
+	if nonGit {
+		brief.RepoPath = wtPath
+		brief.PlainDir = true
+		brief.ShipReviewGate = false // nothing to merge, no card
+	}
 
 	// Track the highest comment id seen so far so each turn only injects new comments.
 	var lastSeenCommentID int64
@@ -421,13 +514,28 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// (→ post-loop interceptor run, old behaviour).
 	var completionRejected bool
 
+	// Silent-run detection (STA-775): whether any adapter turn ran, whether
+	// the agent produced any output, and the last turn's exit code and stderr
+	// for the "Run ended with no output" reason.
+	var adapterRan, sawOutput bool
+	var lastExitCode int
+	var lastStderr string
+
+	// turnCP is the daemon-created checkpoint the next turn starts from. The
+	// Gemini guard (STA-856) restores from its in-memory commit SHA, never from
+	// refs the agent could move.
+	turnCP := preCP
+
 	for turn := 0; turn < maxTurns; turn++ {
 		if ctx.Err() != nil {
 			result.Disposition = "capped"
+			if sr != nil && cfg.MaxWallclock > 0 {
+				sr.EmitMessage("Stopped: run hit max wall-clock "+fmtWatchDuration(cfg.MaxWallclock), "", "error")
+			}
 			break
 		}
 
-		if turn > 0 && !lastTurnWasAdapterError {
+		if turn > 0 && !lastTurnWasAdapterError && !nonGit {
 			cp, _ := checkpoint.CreateCheckpoint(ctx, checkpoint.CreateOptions{
 				WorkDir:   wtPath,
 				SessionID: runID,
@@ -436,8 +544,35 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			if sr != nil && cp != nil {
 				sr.EmitCheckpoint(cp.ID, fmt.Sprintf("turn %d", turn))
 			}
+			if cp != nil {
+				turnCP = cp
+			}
 		}
 		lastTurnWasAdapterError = false
+
+		// Gemini guard (STA-856): record the worktree before the turn so a
+		// Gemini turn's changes can be checked and reverted afterwards.
+		var guardSnap *geminiguard.Snapshot
+		var guardSnapErr error
+		if nonGit && cfg.RunAdapter != nil {
+			// No checkpoint to restore from: snapshot only, never run git.
+			guardSnap, guardSnapErr = geminiguard.TakeNoGit(wtPath)
+			if cfg.TurnUsedGemini != nil {
+				_ = cfg.TurnUsedGemini()
+			}
+		} else if cfg.GeminiDocsOnly && cfg.RunAdapter != nil {
+			cpSHA := ""
+			if turnCP != nil {
+				cpSHA = turnCP.CommitSHA
+			}
+			guardSnap, guardSnapErr = geminiguard.Take(ctx, wtPath, cpSHA)
+			if guardSnapErr == nil && cfg.GeminiCodeApproved {
+				guardSnap.AllowCode()
+			}
+			if cfg.TurnUsedGemini != nil {
+				_ = cfg.TurnUsedGemini() // clear spawns from before this turn
+			}
+		}
 
 		// Drive one adapter turn. Tee stdout through StepRecorder line scanner if enabled.
 		var outBuf bytes.Buffer
@@ -471,8 +606,76 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 				}()
 			}
 
-			turnErr := cfg.RunAdapter(turnCtx, wtPath, cfg.Provider, rawArgs, providerEnv, stdout, &stderrBuf)
+			// Turn watch: stop the turn if the agent goes quiet for the stall
+			// timeout (or passes turn_timeout, if set). Not a fixed cap.
+			watch := startTurnWatch(cfg, boardWaiting(h.DB, cfg.RunControl, taskID), turnCancel)
+			beginTurn(cfg, taskID, turn, sr)
+			var turnOut, turnErrOut io.Writer = stdout, &stderrBuf
+			if watch != nil {
+				turnOut = &activityWriter{dst: stdout, w: watch}
+				turnErrOut = &activityWriter{dst: &stderrBuf, w: watch}
+			}
+			turnErr := cfg.RunAdapter(turnCtx, wtPath, cfg.Provider, rawArgs, providerEnv, turnOut, turnErrOut)
+			watchStop := watch.Stop()
+			endTurn(taskID, sr)
 			turnCancel()
+			adapterRan = true
+			lastExitCode = exitCodeFrom(turnErr)
+			lastStderr = stderrBuf.String()
+
+			// Non-git dir (STA-864): any Gemini turn that changed a non-doc
+			// file fails the run; it cannot be reverted. Fails closed.
+			if nonGit && cfg.turnUsedGemini() {
+				nr := geminiguard.NoGitResult{Dir: wtPath, Err: guardSnapErr}
+				if guardSnapErr == nil {
+					nr = geminiguard.CheckNoGit(ctx, guardSnap)
+				}
+				if nr.Violated() {
+					h.blockGeminiNoGit(result, nr, taskID, turn, stdout, sr, runLog)
+					sawOutput = true
+					break
+				}
+			}
+			// Board rule (STA-856): Gemini never writes code in a work repo.
+			// Checked before error handling so a failed Gemini turn is checked too.
+			if cfg.GeminiDocsOnly && !nonGit && cfg.turnUsedGemini() {
+				gr := geminiguard.Result{Err: guardSnapErr}
+				if guardSnapErr == nil {
+					gCtx, gCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+					gr = geminiguard.Enforce(gCtx, guardSnap)
+					gCancel()
+				}
+				if gr.Violated() {
+					if stw, ok := stdout.(*stepTeeWriter); ok {
+						_ = stw.Close()
+					}
+					result.Turns++
+					sawOutput = true // the block row explains the run; not a silent run
+					result.Disposition = "error"
+					result.DiagnosticMsg = gr.Title()
+					runLog.Warn("gemini code guard blocked turn",
+						slog.Int("turn", turn),
+						slog.Any("blocked", gr.Blocked),
+						slog.Any("unresolved", gr.Unresolved),
+						slog.Any("error", gr.Err),
+					)
+					if sr != nil {
+						sr.EmitMessage(gr.Title(), gr.Body(), "error")
+					}
+					_, _ = h.DB.ExecContext(context.Background(),
+						`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'gemini_code_blocked', ?)`,
+						taskID, gr.Title(),
+					)
+					break
+				}
+			}
+
+			if watchStop != "" {
+				if h.stopTurnForWatch(result, watch, watchStop, taskID, stdout, sr) {
+					sawOutput = true // the stop row explains the run
+					break
+				}
+			}
 
 			turnDuration := time.Since(turnStart)
 			if turnErr != nil {
@@ -528,6 +731,12 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			lastTurnOutput = make([]byte, n)
 			copy(lastTurnOutput, outBuf.Bytes())
 		}
+		if extractFinalResponse(outBuf.Bytes()) != "" {
+			sawOutput = true
+		} else if _, parsed := stdout.(*stepTeeWriter); !parsed && len(bytes.TrimSpace(outBuf.Bytes())) > 0 {
+			// No stream parser wired: any printed output counts.
+			sawOutput = true
+		}
 
 		// Prefer text-only detection when the stream parser is active; fall back
 		// to raw-byte scan only when no parser is wired (dry-run/test mode).
@@ -541,6 +750,9 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			// STA-391 ordering: register the branch work product BEFORE the interceptor
 			// so checkWorkProducts finds it. Eagerly compute the diff; calling
 			// DiffCheckpoint here is idempotent with the post-loop call.
+			if !workProductRegistered && nonGit {
+				workProductRegistered = h.registerPlainDirProduct(ctx, taskID, wtPath)
+			}
 			if !workProductRegistered && preCP != nil {
 				if ds, dsErr := checkpoint.DiffCheckpoint(ctx, wtPath, preCP.ID); dsErr == nil && ds != "" {
 					result.DiffStat = ds
@@ -630,7 +842,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// Git post-flight: dirty check, unpushed commits, merged-to-main report.
 	// A failure is recorded but does not override the disposition — it annotates
 	// the timeline and blocks `Mark done` at the UI/interceptor layer.
-	{
+	if !nonGit {
 		pfCtx, pfCancel := context.WithTimeout(context.Background(), 60*time.Second)
 		pfResult, pfErr := gitgate.PostFlight(pfCtx, wtPath, "main")
 		pfCancel()
@@ -708,6 +920,34 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		}
 	}
 
+	// Silent run (STA-775): the adapter ran but the agent printed nothing and
+	// changed nothing. Say so with the exit code and stderr tail, and mark the
+	// run failed instead of leaving it in_progress looking idle. A run the
+	// Board stopped or a cap ended keeps that disposition; only the reason
+	// is added to the timeline.
+	var noOutputMsg string
+	if sr != nil && sr.SawContent() {
+		sawOutput = true
+	}
+	// A run the interceptor approved (in_review, e.g. from earlier work
+	// products) is left alone: the task is ready regardless of this run.
+	if adapterRan && !sawOutput && result.DiffStat == "" && result.Disposition != "in_review" {
+		noOutputMsg = noOutputMessage(lastExitCode, lastStderr)
+		switch result.Disposition {
+		case "stopped", "capped":
+		case "error":
+			if result.DiagnosticMsg == "" {
+				result.DiagnosticMsg = noOutputMsg
+			}
+		default: // in_progress: ended without completing and said nothing
+			result.Disposition = "error"
+			result.DiagnosticMsg = noOutputMsg
+		}
+		if sr != nil {
+			sr.EmitMessage("Run ended with no output", noOutputMsg, "error")
+		}
+	}
+
 	// Inject stop comment before updating execution_stage.
 	if result.Disposition == "stopped" {
 		result.DiagnosticMsg = "Run stopped by user request."
@@ -745,6 +985,8 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		var summaryBody string
 		if agentText != "" {
 			summaryBody = agentText + "\n\n" + footer
+		} else if noOutputMsg != "" {
+			summaryBody = noOutputMsg + "\n\n" + footer
 		} else {
 			summaryBody = footer
 		}
@@ -786,6 +1028,10 @@ type taskBrief struct {
 	GitBranch       string
 	Description     string
 	ShipReviewGate  bool // true when gates.ship_review is enabled
+	// PlainDir is set when the task runs in a non-git directory (STA-864).
+	PlainDir bool
+	// Handoff is the daemon-stored handoff from the parent task (STA-820).
+	Handoff string
 }
 
 // harnessComment is a non-harness comment visible to the agent.
@@ -807,10 +1053,56 @@ func fetchTaskBrief(ctx context.Context, db *sql.DB, taskID string) taskBrief {
 		`SELECT content FROM task_documents WHERE task_id = ? AND doc_key = 'description' ORDER BY version DESC LIMIT 1`,
 		taskID,
 	).Scan(&b.Description)
+	b.Handoff = fetchHandoff(ctx, db, taskID)
 	var gateVal string
 	_ = db.QueryRowContext(ctx, `SELECT value FROM settings_kv WHERE key='gates.ship_review'`).Scan(&gateVal)
 	b.ShipReviewGate = gateVal != "false"
 	return b
+}
+
+// handoffMaxBytes caps the parent handoff block separately from the brief so a
+// long description cannot push the plan out of the first prompt.
+const handoffMaxBytes = 16 * 1024
+
+// fetchHandoff returns a child task's stored handoff document (STA-820). When
+// the parent posted a final message after the child was created (the child
+// was spawned mid-run), that message is appended so the child sees it too.
+func fetchHandoff(ctx context.Context, db *sql.DB, taskID string) string {
+	var handoff string
+	_ = db.QueryRowContext(ctx,
+		`SELECT content FROM task_documents WHERE task_id = ? AND doc_key = 'handoff' ORDER BY version DESC LIMIT 1`,
+		taskID,
+	).Scan(&handoff)
+	if handoff == "" {
+		return ""
+	}
+	var parentID string
+	_ = db.QueryRowContext(ctx, `SELECT COALESCE(parent_id,'') FROM tasks WHERE id = ?`, taskID).Scan(&parentID)
+	if parentID == "" {
+		return handoff
+	}
+	var finalMsg string
+	_ = db.QueryRowContext(ctx,
+		`SELECT message FROM task_comments WHERE task_id = ? AND author = 'agent-summary' ORDER BY id DESC LIMIT 1`,
+		parentID,
+	).Scan(&finalMsg)
+	finalMsg = strings.TrimSpace(finalMsg)
+	if finalMsg != "" && !strings.Contains(handoff, finalMsg) {
+		handoff = strings.TrimRight(handoff, "\n") + "\n--- Parent's latest final message ---\n" + finalMsg + "\n"
+	}
+	return handoff
+}
+
+// buildHandoffBlock wraps the parent handoff for the first-turn prompt.
+func buildHandoffBlock(handoff string) string {
+	if handoff == "" {
+		return ""
+	}
+	body := safeField(handoff)
+	if len(body) > handoffMaxBytes {
+		body = body[:handoffMaxBytes] + "\n[...handoff truncated at 16 KB...]"
+	}
+	return "<<<PARENT_HANDOFF_BEGIN>>>\n" + body + "\n<<<PARENT_HANDOFF_END>>>\n"
 }
 
 // fetchUserComments returns board/user comments for taskID with id > afterID, ordered ascending.
@@ -848,6 +1140,9 @@ func buildBriefBlock(brief taskBrief, comments []harnessComment, isFirstTurn boo
 			b.WriteString("Project: " + safeField(brief.Org+"/"+brief.Project) + "\n")
 		}
 		b.WriteString("Repo: " + safeField(brief.RepoPath) + "\n")
+		if brief.PlainDir {
+			b.WriteString("Workspace: this folder is not a git repository. Work in it directly: there is no branch, no commit and no Ship Review card, and StayPoint cannot undo your edits, so change only what the task needs. Do not run git init.\n")
+		}
 		if brief.GitBranch != "" {
 			b.WriteString("Branch: " + safeField(brief.GitBranch) + "\n")
 		}
@@ -892,6 +1187,8 @@ func safeField(s string) string {
 	s = strings.ReplaceAll(s, "<<<TASK_BRIEF_END>>>", "(TASK_BRIEF_END)")
 	s = strings.ReplaceAll(s, "<<<NEW_COMMENTS_BEGIN>>>", "(NEW_COMMENTS_BEGIN)")
 	s = strings.ReplaceAll(s, "<<<NEW_COMMENTS_END>>>", "(NEW_COMMENTS_END)")
+	s = strings.ReplaceAll(s, "<<<PARENT_HANDOFF_BEGIN>>>", "(PARENT_HANDOFF_BEGIN)")
+	s = strings.ReplaceAll(s, "<<<PARENT_HANDOFF_END>>>", "(PARENT_HANDOFF_END)")
 	return s
 }
 
@@ -903,6 +1200,11 @@ func buildRawArgs(taskID string, turn int, cfg RunConfig, brief taskBrief, newCo
 
 	if briefBlock != "" {
 		prompt = briefBlock + "\n"
+	}
+	if turn == 0 {
+		if hb := buildHandoffBlock(brief.Handoff); hb != "" {
+			prompt += hb + "\n"
+		}
 	}
 	prompt += fmt.Sprintf(
 		"Continue work on task %s (turn %d). When you are finished, emit %s on its own line.",
@@ -933,15 +1235,24 @@ func buildRunID(agentID string) string {
 }
 
 // stepTeeWriter tees all writes to dst AND feeds each newline-delimited line to StepRecorder.
-// textDetected is set only when [[TASK_COMPLETE]] appears in an assistant text block,
-// never in thinking/tool/user blocks or echoed prompts.
+// textDetected is set only when [[TASK_COMPLETE]] appears on its own line in the
+// agent's own answer text, never in thinking/tool/user blocks or echoed prompts.
+// The provider's parser decides what counts as answer text, so every output
+// format works: Claude text blocks, the agy/Gemini final response (event=result),
+// token-streamed text, and plain non-JSON output.
 type stepTeeWriter struct {
 	dst          io.Writer
 	rec          *StepRecorder
 	parse        func([]byte) ([]StepDelta, error)
 	buf          []byte
 	textDetected bool
+	// agentText accumulates this turn's answer text so a marker split across
+	// token-streamed deltas (or plain-text lines) is still seen on its own line.
+	agentText []byte
 }
+
+// agentTextMax bounds agentText; past it only the most recent tail is kept.
+const agentTextMax = 1 << 20
 
 func (w *stepTeeWriter) Write(p []byte) (int, error) {
 	n, err := w.dst.Write(p)
@@ -963,28 +1274,50 @@ func (w *stepTeeWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// checkTextMarker scans text deltas from assistant messages only.
-// It ignores thinking blocks, tool inputs, tool results, and user-turn echoes
-// (the continuation prompt itself contains the literal marker and must not fire).
+// checkTextMarker scans the agent's answer text for the completion marker.
+// Text deltas from input events (FromUser: the continuation prompt itself
+// contains the literal marker), thinking, tool input/output and failed results
+// are ignored.
 func (w *stepTeeWriter) checkTextMarker(line []byte) {
 	if w.textDetected {
 		return
 	}
 	line = bytes.TrimSpace(line)
-	// Quick guard: only assistant events can contain the agent's own text output.
-	// User-turn events carry echoed prompts, tool_result blocks, etc. — never agent output.
-	if !bytes.Contains(line, []byte(`"type":"assistant"`)) {
+	if len(line) == 0 {
 		return
 	}
 	deltas, err := w.parse(line)
 	if err != nil {
+		// Not a stream event. Plain-text output is the agent's answer; a
+		// malformed JSON event is not.
+		if line[0] != '{' {
+			w.addAgentText(line)
+			w.addAgentText([]byte{'\n'})
+			w.textDetected = markerOnOwnLine(string(w.agentText))
+		}
 		return
 	}
 	for _, d := range deltas {
-		if d.Kind == StepDeltaText && markerOnOwnLine(d.Text) {
+		switch {
+		case d.Kind == StepDeltaText && !d.FromUser:
+			w.addAgentText([]byte(d.Text))
+		case d.Kind == StepDeltaResult && !d.IsError:
+			// The final answer (agy result.response, Claude result.result).
+		default:
+			continue
+		}
+		if markerOnOwnLine(d.Text) {
 			w.textDetected = true
 			return
 		}
+	}
+	w.textDetected = markerOnOwnLine(string(w.agentText))
+}
+
+func (w *stepTeeWriter) addAgentText(p []byte) {
+	w.agentText = append(w.agentText, p...)
+	if over := len(w.agentText) - agentTextMax; over > 0 {
+		w.agentText = append(w.agentText[:0], w.agentText[over:]...)
 	}
 }
 

@@ -37,13 +37,13 @@ func TestDefaultKindChains_CodingChain(t *testing.T) {
 		t.Errorf("coding[0]: want claude-opus primary, got provider=%q model=%q",
 			coding[0].Provider, coding[0].Model)
 	}
-	// 1st backup must be Gemini 3.1 Pro
-	if len(coding) < 2 {
-		t.Fatal("coding chain must have at least 2 slots")
-	}
-	if !strings.Contains(coding[1].Provider, "gemini") || !strings.Contains(coding[1].Model, "3.1-pro") {
-		t.Errorf("coding[1]: want gemini-3.1-pro backup, got provider=%q model=%q",
-			coding[1].Provider, coding[1].Model)
+	// Board rule (GeminiCodeForbidden): code is Claude only, no Gemini backup.
+	for _, k := range []WorkKind{WorkKindCoding, WorkKindQA} {
+		for _, slot := range chains[k] {
+			if strings.Contains(slot.Provider, "gemini") {
+				t.Errorf("%s chain must never contain Gemini, got %+v", k, chains[k])
+			}
+		}
 	}
 }
 
@@ -124,19 +124,19 @@ func TestDefaultKindChains_PlanningChain(t *testing.T) {
 }
 
 func TestDefaultKindChains_QAChain(t *testing.T) {
+	qa := DefaultKindChains()[WorkKindQA]
+	if len(qa) != 1 || qa[0].Provider != "claude-opus" || qa[0].Model != "opus" {
+		t.Fatalf("qa (writes tests) must be Claude Opus only, got %+v", qa)
+	}
+}
+
+func TestDefaultKindChains_NonCodeKindsGeminiFirst(t *testing.T) {
 	chains := DefaultKindChains()
-	if chains == nil {
-		t.Fatal("DefaultKindChains() returned nil")
-	}
-	qa := chains[WorkKindQA]
-	if len(qa) < 2 {
-		t.Fatal("qa chain must have at least 2 slots (gemini-3.8-flash + claude-sonnet)")
-	}
-	if !strings.Contains(qa[0].Provider, "gemini") || !strings.Contains(qa[0].Model, "3.8-flash") {
-		t.Errorf("qa[0]: want gemini-3.8-flash, got provider=%q model=%q", qa[0].Provider, qa[0].Model)
-	}
-	if !strings.Contains(qa[1].Provider, "claude") || !strings.Contains(qa[1].Model, "sonnet") {
-		t.Errorf("qa[1]: want claude-sonnet, got provider=%q model=%q", qa[1].Provider, qa[1].Model)
+	for _, k := range []WorkKind{WorkKindReview, WorkKindArchitecture, WorkKindPlanning, WorkKindDocs} {
+		c := chains[k]
+		if len(c) < 2 || !strings.HasPrefix(c[0].Provider, "gemini") || !strings.HasPrefix(c[1].Provider, "claude-") {
+			t.Errorf("%s: want Gemini first then Claude, got %+v", k, c)
+		}
 	}
 }
 

@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,7 +25,6 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/mcp"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/repoaccess"
-	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/server"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
 )
@@ -33,7 +34,57 @@ var (
 	commit    = "none"
 	GitCommit = "none"
 	date      = "unknown"
+	// DevBuild is set to "true" by reinstall-daemon.sh --allow-dev-build.
+	DevBuild = "false"
 )
+
+// devBuildReason says why this binary is not a reviewed main build, or ""
+// when it is (STA-805). The Go VCS stamp is trusted here because
+// reinstall-daemon.sh builds clean trees from a throwaway clone, so for a
+// script main build vcs.revision is the deployed commit and vcs.modified is
+// false. A raw `go build -ldflags "-X main.GitCommit=x"` from a dirty or
+// different tree is caught by the stamp even though GitCommit looks real.
+func devBuildReason() string {
+	rev, modified := vcsStamp()
+	return devBuildReasonFrom(DevBuild, GitCommit, rev, modified)
+}
+
+// vcsStamp returns the vcs.revision and vcs.modified settings Go embedded in
+// this binary, or "" for each one that is missing.
+func vcsStamp() (revision, modified string) {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "", ""
+	}
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = s.Value
+		case "vcs.modified":
+			modified = s.Value
+		}
+	}
+	return revision, modified
+}
+
+func devBuildReasonFrom(flag, gitCommit, vcsRevision, vcsModified string) string {
+	if flag == "true" {
+		return "deployed with --allow-dev-build"
+	}
+	if gitCommit == "" || gitCommit == "none" {
+		return "not built by reinstall-daemon.sh: no commit stamped"
+	}
+	if vcsRevision == "" {
+		return "no vcs.revision stamped: reinstall-daemon.sh refuses such builds"
+	}
+	if vcsModified == "true" {
+		return "built from a tree with uncommitted changes (vcs.modified=true)"
+	}
+	if !strings.HasPrefix(vcsRevision, strings.TrimSuffix(gitCommit, "-dirty")) {
+		return fmt.Sprintf("vcs.revision %s does not match the stamped commit %s", vcsRevision, gitCommit)
+	}
+	return ""
+}
 
 func init() {
 	if GitCommit != "none" && commit == "none" {
@@ -204,6 +255,7 @@ func runDaemon(ctx context.Context) error {
 		BoardTokenPath: boardTokenPath,
 		DB:             dbStore.DB(),
 		GitCommit:      GitCommit,
+		DevBuildReason: devBuildReason(),
 		CORSAllowAll:   cfg.CORSAllowAll,
 		RepoAccess:     repoChecker,
 	}); err != nil {
@@ -243,6 +295,8 @@ func runDaemon(ctx context.Context) error {
 	// HarnessRepoRoot comes from STAYPOINT_REPO_ROOT env or harness_repo_root config key.
 	// work_repo_root is intentionally NOT used here — it belongs to billing/bridge.
 	orchestrator.GlobalRunControl.SetDB(dbStore.DB())
+	wireRunQueue(ctx, cfg.MaxConcurrentRunsOrDefault(), httpServer)
+	setTurnLimits(cfg)
 
 	repoRoot := cfg.HarnessRepoRoot
 	if repoRoot == "" {
@@ -298,6 +352,14 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			}
 			slog.Log(context.Background(), lvl, "wake: agent id lookup failed; skipping run",
 				slog.String("task", taskID), slog.Any("error", err))
+			// A queued run whose task is gone must not hold its queue place.
+			orchestrator.GlobalRunSlots.Dequeue(taskID)
+			return
+		}
+		// Respect pacer locks per pool (STA-773): a run whose whole provider
+		// chain is quota-locked waits in the queue instead of taking a slot.
+		if taskQuotaLocked(dbStore.DB(), taskID, repoRoot) {
+			queueRun(h, taskID, reason, orchestrator.WaitQuota)
 			return
 		}
 		if agentID == "" {
@@ -307,43 +369,6 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 		sessID := "paperclip-" + taskID
 		if len(taskID) >= 8 {
 			sessID = "paperclip-" + taskID[:8]
-		}
-
-		// resolvedProv is set by adapterFn before each adapter turn writes to
-		// stdout; parseDelta reads it to select the right stream parser.
-		var resolvedProv string
-
-		var adapterFn orchestrator.AdapterRunFunc
-		if adapterOverride != nil {
-			adapterFn = func(runCtx context.Context, cwd, prov string, rawArgs, extraEnv []string, stdout, stderr io.Writer) error {
-				agentType := prov
-				if agentType == "" {
-					agentType = "claude"
-				}
-				resolvedProv = agentType
-				return adapterOverride(runCtx, cwd, prov, rawArgs, extraEnv, stdout, stderr)
-			}
-		} else {
-			adapterFn = func(runCtx context.Context, cwd, prov string, rawArgs, extraEnv []string, stdout, stderr io.Writer) error {
-				agentType := prov
-				if agentType == "" {
-					agentType = "claude"
-				}
-				resolvedProv = agentType
-				if err := telemetry.HeartbeatSession(dbStore.DB(), telemetry.AgentSession{
-					ID:        sessID,
-					AgentType: agentType,
-					RepoPath:  cwd,
-					PID:       os.Getpid(),
-				}); err != nil {
-					slog.Warn("wake: session heartbeat failed",
-						slog.String("task", taskID), slog.Any("error", err))
-				}
-				if len(extraEnv) > 0 {
-					runCtx = adapter.WithExtraEnv(runCtx, extraEnv)
-				}
-				return adapter.RunAdapter(runCtx, cwd, nil, prov, rawArgs, nil, stdout, stderr)
-			}
 		}
 
 		// Build a per-run StepRecorder when a live EventHub is available.
@@ -361,16 +386,48 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			idPrefix = taskID[:8]
 		}
 		runID := fmt.Sprintf("run-%s-%d", idPrefix, time.Now().UnixMilli())
+
+		// Board Touch ID gate (2026-10-06): provider=gemini on a code kind in
+		// a personal repo waits for a per-run approval; denied runs are
+		// refused. An approval is consumed here, by this run only.
+		codeGate := geminiCodeGate(dbStore.DB(), taskID, repoRoot, runID, publishFn)
+		if codeGate.Hold {
+			slog.Info("run held for Board Touch ID: Gemini code", slog.String("task", taskID))
+			return
+		}
 		sr := orchestrator.NewStepRecorder(dbStore.DB(), publishFn, runID, taskID)
 		// Wake and route steps are now emitted from inside harness.Run() after
 		// Claim() succeeds, so refused runs (ErrConcurrencyCap) never write steps.
 
-		parseDelta := func(line []byte) ([]orchestrator.StepDelta, error) {
-			prov := resolvedProv
-			if prov == "" {
-				prov = "claude"
+		// One routing decision per run (STA-772): work_kind + repo seat + quota
+		// pick the chain. The spawned CLI and the route row both come from it,
+		// and the tracker re-labels the row if a turn spawns a different slot.
+		route := resolveTaskRouteApproved(dbStore.DB(), taskID, repoRoot, currentPacer(), time.Now(), codeGate.ApprovalID)
+		tracker := newRouteTracker(route, sr.EmitRoute)
+
+		var adapterFn orchestrator.AdapterRunFunc
+		if adapterOverride != nil {
+			adapterFn = adapterOverride
+		} else {
+			adapterFn = func(runCtx context.Context, cwd, _ string, rawArgs, extraEnv []string, stdout, stderr io.Writer) error {
+				if err := telemetry.HeartbeatSession(dbStore.DB(), telemetry.AgentSession{
+					ID:        sessID,
+					AgentType: tracker.Provider(),
+					RepoPath:  cwd,
+					PID:       os.Getpid(),
+				}); err != nil {
+					slog.Warn("wake: session heartbeat failed",
+						slog.String("task", taskID), slog.Any("error", err))
+				}
+				if len(extraEnv) > 0 {
+					runCtx = adapter.WithExtraEnv(runCtx, extraEnv)
+				}
+				return tracker.runRouted(runCtx, cwd, rawArgs, stdout, stderr)
 			}
-			raw, err := adapter.AdapterFor(prov).ParseStreamDelta(line)
+		}
+
+		parseDelta := func(line []byte) ([]orchestrator.StepDelta, error) {
+			raw, err := adapter.AdapterFor(tracker.Provider()).ParseStreamDelta(line)
 			if err != nil {
 				return nil, err
 			}
@@ -383,6 +440,7 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 					ToolID:    d.ToolID,
 					ToolInput: d.ToolInput,
 					IsError:   d.IsError,
+					FromUser:  d.FromUser,
 				}
 				if d.Usage != nil {
 					sd.Usage = &orchestrator.StepUsage{
@@ -401,25 +459,46 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 		// Use context.Background() so daemon shutdown does not abruptly kill
 		// in-flight harness work; the dispatcher's Drain() provides the graceful
 		// drain window during shutdown.
-		db := dbStore.DB()
 		result, runErr := h.Run(context.Background(), taskID, orchestrator.RunConfig{
 			AgentID:    agentID,
 			WakeReason: reason,
 			RunAdapter: adapterFn,
-			EmitRoute: func(sr *orchestrator.StepRecorder) {
-				emitRouteStep(sr, db, taskID)
+			EmitRoute: func(*orchestrator.StepRecorder) {
+				tracker.EmitPlanned()
 			},
 			StepRecorder:     sr,
 			ParseDelta:       parseDelta,
 			RunControl:       orchestrator.GlobalRunControl,
-			SkipGitPreflight: adapterOverride != nil,
+			SkipGitPreflight: adapterOverride != nil || testSkipGitPreflight,
 			HookBin:          resolveStaypointCLIBin(),
+			// Board rule (STA-856, all repos): Gemini never writes code; a
+			// Board Touch ID approval (personal repo, this run) relaxes it.
+			GeminiDocsOnly:     geminiDocsOnly(route),
+			GeminiCodeApproved: route.GeminiCodeApprovalID != "",
+			TurnUsedGemini:     tracker.TakeGeminiSpawned,
+			TurnTimeout:        turnLimits.turn,
+			StallTimeout:       turnLimits.stall,
 		})
 		if runErr != nil {
 			if errors.Is(runErr, orchestrator.ErrConcurrencyCap) {
-				// Refused: lock held by another run. No steps were emitted (wake/route
-				// are now deferred to after Claim), so nothing to close out.
-				slog.Warn("run refused: concurrency cap", slog.String("task", taskID))
+				// Refused for capacity (global cap or repo busy). No steps were
+				// emitted (wake/route come after Claim). Queue it so it starts on
+				// its own when a slot or its repo frees (STA-773).
+				queueRun(h, taskID, reason, orchestrator.WaitFor(runErr))
+				return
+			}
+			if errors.Is(runErr, orchestrator.ErrAlreadyClaimed) {
+				// The task is already running (e.g. Run Now pressed again). With
+				// parallel slots this no longer hits the global cap first; it must
+				// stay quiet and not post an error state over the live run.
+				slog.Info("run refused: task already running", slog.String("task", taskID))
+				return
+			}
+			if errors.Is(runErr, orchestrator.ErrNotRunnable) {
+				// Parked (backlog) or closed: a wake is not a reason to run it.
+				// Drop any queue place so it does not hold a slot.
+				slog.Info("run refused: task not runnable in its stage", slog.String("task", taskID))
+				orchestrator.GlobalRunSlots.Dequeue(taskID)
 				return
 			}
 			slog.Error("harness run failed", slog.String("task", taskID), slog.Any("error", runErr))
@@ -432,49 +511,6 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			slog.String("disposition", result.Disposition),
 			slog.Int("turns", result.Turns),
 		)
-	}
-}
-
-// emitRouteStep looks up the task's repo_path and work_kind, resolves the
-// actual adapter provider chain (the same chain RunAdapter will execute), and
-// emits a route step as the first substantive timeline row.
-//
-// Using adapter.ResolveProviderChain instead of router.DefaultKindChains
-// ensures the label matches the provider that actually runs (STA-481).
-func emitRouteStep(sr *orchestrator.StepRecorder, dbConn *sql.DB, taskID string) {
-	var repoPath, workKind string
-	if err := dbConn.QueryRowContext(context.Background(),
-		"SELECT COALESCE(repo_path,''), COALESCE(work_kind,'coding') FROM tasks WHERE id=?", taskID,
-	).Scan(&repoPath, &workKind); err != nil {
-		slog.Warn("route step: task lookup failed", slog.String("task", taskID), slog.Any("err", err))
-		return
-	}
-
-	isWork, _, _ := router.IsWorkRepo(repoPath)
-
-	pacer, err := router.LoadPacerState()
-	if err != nil {
-		slog.Warn("route step: pacer state load failed", slog.Any("err", err))
-		pacer = &router.PacerState{Pools: make(map[router.PoolID]*router.QuotaPool)}
-	}
-
-	res := adapter.ResolveProviderChain(isWork, "", pacer)
-
-	if res.AllLocked {
-		sr.EmitRoute("All providers locked", "No viable provider in the chain")
-		return
-	}
-	if res.IsCloud {
-		sr.EmitRoute("Running in Claude Cloud", "Kind of work: "+workKind)
-		return
-	}
-	if res.FallbackFromDisplay != "" {
-		sr.EmitRoute(
-			"Fell back to "+res.SelectedDisplay+": "+res.FallbackFromDisplay+" quota locked",
-			"Kind of work: "+workKind,
-		)
-	} else {
-		sr.EmitRoute("Ran on "+res.SelectedDisplay, "Kind of work: "+workKind)
 	}
 }
 

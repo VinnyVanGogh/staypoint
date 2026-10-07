@@ -78,6 +78,8 @@ func TestClaudeSessionParsing(t *testing.T) {
 }
 
 func TestGenerateSessionHandoff(t *testing.T) {
+	// GenerateSessionHandoff saves its manifest under ~/.staypoint/handoffs (STA-741).
+	t.Setenv("HOME", t.TempDir())
 	sess := &SessionInfo{
 		ID:             "sess-test-handoff",
 		AgentType:      "claude",

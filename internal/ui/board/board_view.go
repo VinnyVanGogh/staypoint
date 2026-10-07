@@ -51,6 +51,8 @@ var (
 
 func columnHeaderColor(col ColumnType) lipgloss.Color {
 	switch col {
+	case ColBacklog:
+		return lipgloss.Color("245")
 	case ColTodo:
 		return colCyan
 	case ColInProgress:

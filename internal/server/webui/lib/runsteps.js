@@ -81,7 +81,60 @@
     return m ? m[1].trim() : '';
   }
 
-  const api = { groupStepsByRun, isRealRunGroup, latestRunSteps, currentRunSteps, runElapsedMs, isStuck, routeModel };
+  // Task page line for a run waiting in the daemon's run queue (STA-773).
+  // pos is GET /api/tasks/{id} .queue: { queued, ahead, wait }. Returns ''
+  // when the task is not queued.
+  const QUEUE_WAIT_TEXT = {
+    repo: 'waiting for another run in this repo',
+    slots: 'all parallel run slots are busy',
+    quota: 'provider quota is locked',
+  };
+  function queueLabel(pos) {
+    if (!pos || !pos.queued) return '';
+    const n = Math.max(0, Number(pos.ahead) || 0);
+    const base = `Queued: ${n} run${n === 1 ? '' : 's'} ahead`;
+    const why = QUEUE_WAIT_TEXT[pos.wait];
+    return why ? `${base} (${why})` : base;
+  }
+
+  // Queue position of taskId in a "run.queue" SSE payload's queue array.
+  function queuePositionIn(queue, taskId) {
+    const list = Array.isArray(queue) ? queue : [];
+    const i = list.findIndex(q => q && q.task_id === taskId);
+    return i < 0 ? { queued: false, ahead: 0 } : { queued: true, ahead: i, wait: list[i].wait };
+  }
+
+  // Stats strip "Step" label for a run's steps (STA-775). A run that ended
+  // with an error message row (e.g. "Run ended with no output") reads
+  // "Failed: <that title>" rather than a bare state row; no steps is 'idle'.
+  function runStepLabel(runSteps) {
+    const steps = Array.isArray(runSteps) ? runSteps.filter(Boolean) : [];
+    if (!steps.length) return 'idle';
+    const last = steps[steps.length - 1];
+    if (last.kind === 'state' && /error$/i.test(String(last.title || ''))) {
+      const why = [...steps].reverse().find(s => s.kind === 'message' && s.status === 'error' && s.title);
+      // A turn the stall watch stopped already reads as the reason.
+      if (why) return /^Stopped:/.test(why.title) ? why.title : `Failed: ${why.title}`;
+    }
+    return last.title || 'idle';
+  }
+
+  // Stats strip "Turn" value for the turn in flight: GET /api/tasks/{id}
+  // .turn or a run.turn SSE payload ({turn, started_at}). '' when idle.
+  function turnElapsedLabel(turn, nowMs) {
+    if (!turn || !turn.started_at) return '';
+    const start = new Date(turn.started_at).getTime();
+    if (isNaN(start)) return '';
+    const sec = Math.max(0, Math.floor((nowMs - start) / 1000));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    const elapsed = h > 0 ? `${h}h ${pad(m)}m` : `${m}m ${pad(s)}s`;
+    return `#${(turn.turn || 0) + 1} · ${elapsed}`;
+  }
+
+  const api = { turnElapsedLabel, groupStepsByRun, isRealRunGroup, latestRunSteps, currentRunSteps, runElapsedMs, isStuck, routeModel, queueLabel, queuePositionIn, runStepLabel };
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;

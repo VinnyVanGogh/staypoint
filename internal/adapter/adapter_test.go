@@ -325,13 +325,16 @@ func TestBuildProviderChain_WorkRepo_GeminiStart(t *testing.T) {
 }
 
 // TestBuildProviderChain_WorkRepo_ClaudeStart verifies that a work repo with
-// provider=claude produces the chain: [work-claude, personal-claude, gemini].
+// provider=claude (or empty/unknown) is Claude only: [work-claude,
+// personal-claude]. Gemini is never a fallback (GeminiCodeForbidden).
 func TestBuildProviderChain_WorkRepo_ClaudeStart(t *testing.T) {
-	chain := BuildProviderChain(true, "claude")
-	if len(chain) != 3 {
-		t.Fatalf("expected 3 candidates for work+claude, got %d", len(chain))
+	for _, p := range []string{"claude", "", "bogus"} {
+		if c := BuildProviderChain(true, p); len(c) != 2 || c[0].Name != "work-claude" || c[1].Name != "personal-claude" {
+			t.Errorf("work provider %q: got %v", p, c)
+		}
 	}
-	expected := []string{"work-claude", "personal-claude", "gemini"}
+	chain := BuildProviderChain(true, "claude")
+	expected := []string{"work-claude", "personal-claude"}
 	for i, name := range expected {
 		if chain[i].Name != name {
 			t.Errorf("chain[%d]: expected %q, got %q", i, name, chain[i].Name)
@@ -355,13 +358,15 @@ func TestBuildProviderChain_PersonalRepo_GeminiStart(t *testing.T) {
 }
 
 // TestBuildProviderChain_PersonalRepo_ClaudeStart verifies that a personal repo
-// with provider=claude produces the chain: [personal-claude, gemini].
+// with provider=claude (or empty/unknown) is [personal-claude] only.
 func TestBuildProviderChain_PersonalRepo_ClaudeStart(t *testing.T) {
-	chain := BuildProviderChain(false, "claude")
-	if len(chain) != 2 {
-		t.Fatalf("expected 2 candidates for personal+claude, got %d", len(chain))
+	for _, p := range []string{"claude", "", "bogus"} {
+		if c := BuildProviderChain(false, p); len(c) != 1 || c[0].Name != "personal-claude" {
+			t.Errorf("personal provider %q: got %v", p, c)
+		}
 	}
-	expected := []string{"personal-claude", "gemini"}
+	chain := BuildProviderChain(false, "claude")
+	expected := []string{"personal-claude"}
 	for i, name := range expected {
 		if chain[i].Name != name {
 			t.Errorf("chain[%d]: expected %q, got %q", i, name, chain[i].Name)
@@ -1080,31 +1085,34 @@ func TestResolveProviderChain(t *testing.T) {
 		wantLocked  bool
 	}{
 		{
-			name: "personal repo default provider runs Gemini first",
+			name: "personal repo default provider runs Claude",
 			isWork: false, provider: "", pacer: unlockedPacer,
-			wantSel: "Gemini", wantFallback: "",
+			wantSel: "Claude", wantFallback: "",
 		},
 		{
-			name: "personal repo falls back to Claude when Gemini locked",
+			name: "personal repo claude locked waits, never Gemini",
 			isWork: false, provider: "", pacer: lockedClaude,
-			// lockedClaude has gemini unlocked — Gemini is still first
-			wantSel: "Gemini", wantFallback: "",
-		},
-		{
-			name: "personal repo claude-locked falls back correctly",
-			isWork: false, provider: "claude", pacer: lockedClaude,
-			// chain is [personal-claude, gemini]; claude locked → falls back to Gemini
-			wantSel: "Gemini", wantFallback: "Claude",
-		},
-		{
-			name: "all providers locked",
-			isWork: false, provider: "", pacer: allLocked,
 			wantLocked: true,
 		},
 		{
-			name: "work repo default provider runs Gemini first",
-			isWork: true, provider: "", pacer: unlockedPacer,
+			name: "personal repo provider=claude locked waits",
+			isWork: false, provider: "claude", pacer: lockedClaude,
+			wantLocked: true,
+		},
+		{
+			name: "explicit gemini runs Gemini first",
+			isWork: false, provider: "gemini", pacer: unlockedPacer,
 			wantSel: "Gemini", wantFallback: "",
+		},
+		{
+			name: "all providers locked",
+			isWork: false, provider: "gemini", pacer: allLocked,
+			wantLocked: true,
+		},
+		{
+			name: "work repo default provider runs work Claude",
+			isWork: true, provider: "", pacer: unlockedPacer,
+			wantSel: "Claude (work)", wantFallback: "",
 		},
 	}
 
