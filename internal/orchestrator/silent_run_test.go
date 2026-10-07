@@ -24,7 +24,9 @@ func silentHarness(t *testing.T, taskID string) *Harness {
 		WM:          &noopWorktreeManager{},
 		Interceptor: NewInterceptor(db),
 	}
-	h.Interceptor.Guards = nil
+	// No work products: the post-loop completion check rejects, as it did for
+	// the silent Gemini run, so the run would otherwise end in_progress.
+	h.Interceptor.Guards = []GuardFunc{h.Interceptor.checkWorkProducts}
 	return h
 }
 

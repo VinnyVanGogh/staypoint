@@ -757,7 +757,9 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	if sr != nil && sr.SawContent() {
 		sawOutput = true
 	}
-	if adapterRan && !sawOutput && result.DiffStat == "" {
+	// A run the interceptor approved (in_review, e.g. from earlier work
+	// products) is left alone: the task is ready regardless of this run.
+	if adapterRan && !sawOutput && result.DiffStat == "" && result.Disposition != "in_review" {
 		noOutputMsg = noOutputMessage(lastExitCode, lastStderr)
 		switch result.Disposition {
 		case "stopped", "capped":
@@ -765,7 +767,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			if result.DiagnosticMsg == "" {
 				result.DiagnosticMsg = noOutputMsg
 			}
-		default:
+		default: // in_progress: ended without completing and said nothing
 			result.Disposition = "error"
 			result.DiagnosticMsg = noOutputMsg
 		}
