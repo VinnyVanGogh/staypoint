@@ -355,7 +355,7 @@ func TestRefusedRun_NoSteps(t *testing.T) {
 	h := &Harness{DB: db}
 
 	// Saturate the concurrency cap (simulates an active run in another repo).
-	if err := GlobalRunSlots.Acquire("other-task", "/elsewhere"); err != nil {
+	if err := GlobalRunSlots.Acquire("other-task", SlotKey{Dir: "/elsewhere"}); err != nil {
 		t.Fatal(err)
 	}
 

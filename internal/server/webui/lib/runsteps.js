@@ -84,10 +84,13 @@
   // Task page line for a run waiting in the daemon's run queue (STA-773).
   // pos is GET /api/tasks/{id} .queue: { queued, ahead, wait }. Returns ''
   // when the task is not queued.
+  // Each reason names the cap that holds the run (STA-867).
   const QUEUE_WAIT_TEXT = {
-    repo: 'waiting for another run in this repo',
-    slots: 'all parallel run slots are busy',
-    quota: 'provider quota is locked',
+    repo: 'repo limit: this repo is at max_runs_per_repo',
+    folder: 'repo limit: another run is using this non-git folder',
+    org: 'org limit: this organization is at max_runs_per_org',
+    slots: 'global limit: max_concurrent_runs reached',
+    quota: 'quota: provider quota is locked',
   };
   function queueLabel(pos) {
     if (!pos || !pos.queued) return '';

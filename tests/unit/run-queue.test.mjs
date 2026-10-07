@@ -17,9 +17,18 @@ test('queued line counts runs ahead', () => {
   assert.equal(queueLabel({ queued: true, ahead: 0 }), 'Queued: 0 runs ahead');
   assert.equal(queueLabel({ queued: true, ahead: 1 }), 'Queued: 1 run ahead');
   assert.equal(queueLabel({ queued: true, ahead: 2, wait: 'repo' }),
-    'Queued: 2 runs ahead (waiting for another run in this repo)');
+    'Queued: 2 runs ahead (repo limit: this repo is at max_runs_per_repo)');
   assert.equal(queueLabel({ queued: true, ahead: 0, wait: 'quota' }),
-    'Queued: 0 runs ahead (provider quota is locked)');
+    'Queued: 0 runs ahead (quota: provider quota is locked)');
+});
+
+test('queued line names the cap that holds the run (STA-867)', () => {
+  assert.equal(queueLabel({ queued: true, ahead: 1, wait: 'org' }),
+    'Queued: 1 run ahead (org limit: this organization is at max_runs_per_org)');
+  assert.equal(queueLabel({ queued: true, ahead: 3, wait: 'slots' }),
+    'Queued: 3 runs ahead (global limit: max_concurrent_runs reached)');
+  assert.equal(queueLabel({ queued: true, ahead: 0, wait: 'folder' }),
+    'Queued: 0 runs ahead (repo limit: another run is using this non-git folder)');
 });
 
 test('position from a run.queue SSE payload', () => {

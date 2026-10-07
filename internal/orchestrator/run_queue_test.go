@@ -11,13 +11,13 @@ import (
 func TestRunSlots_NewcomerDoesNotStealFreedSlot(t *testing.T) {
 	s := NewRunSlots(1)
 	s.Wake = func(string, string) {}
-	_ = s.Acquire("a", "/r1")
-	s.Enqueue("b", "/r2", "x", WaitSlots)
+	_ = s.Acquire("a", SlotKey{Dir: "/r1"})
+	s.Enqueue("b", SlotKey{Dir: "/r2"}, "x", WaitSlots)
 	s.Release("a")
-	if err := s.Acquire("c", "/r3"); !errors.Is(err, ErrConcurrencyCap) {
+	if err := s.Acquire("c", SlotKey{Dir: "/r3"}); !errors.Is(err, ErrConcurrencyCap) {
 		t.Fatalf("newcomer took the slot reserved for queued b: %v", err)
 	}
-	if err := s.Acquire("b", "/r2"); err != nil {
+	if err := s.Acquire("b", SlotKey{Dir: "/r2"}); err != nil {
 		t.Fatalf("queued b should start: %v", err)
 	}
 }
@@ -26,8 +26,8 @@ func TestRunSlots_NewcomerDoesNotStealFreedSlot(t *testing.T) {
 func TestRunSlots_QuotaWaitDoesNotReserveSlot(t *testing.T) {
 	s := NewRunSlots(1)
 	s.Wake = func(string, string) {}
-	s.Enqueue("b", "/r2", "x", WaitQuota)
-	if err := s.Acquire("c", "/r3"); err != nil {
+	s.Enqueue("b", SlotKey{Dir: "/r2"}, "x", WaitQuota)
+	if err := s.Acquire("c", SlotKey{Dir: "/r3"}); err != nil {
 		t.Fatalf("quota-waiting run blocked a newcomer on another pool: %v", err)
 	}
 }
@@ -39,9 +39,9 @@ func TestRunSlots_PumpDoesNotDoubleDispatch(t *testing.T) {
 	var mu sync.Mutex
 	woke := map[string]int{}
 	s.Wake = func(id, _ string) { mu.Lock(); woke[id]++; mu.Unlock() }
-	_ = s.Acquire("a", "/r1")
-	_ = s.Acquire("b", "/r2")
-	s.Enqueue("c", "/r3", "x", WaitSlots)
+	_ = s.Acquire("a", SlotKey{Dir: "/r1"})
+	_ = s.Acquire("b", SlotKey{Dir: "/r2"})
+	s.Enqueue("c", SlotKey{Dir: "/r3"}, "x", WaitSlots)
 	s.Release("a")
 	s.Release("b")
 	mu.Lock()
@@ -51,7 +51,7 @@ func TestRunSlots_PumpDoesNotDoubleDispatch(t *testing.T) {
 		t.Fatalf("c dispatched %d times, want 1", n)
 	}
 	// Once the dispatch resolves (re-queued), a later pump may retry it.
-	s.Enqueue("c", "/r3", "x", WaitQuota)
+	s.Enqueue("c", SlotKey{Dir: "/r3"}, "x", WaitQuota)
 	s.Pump()
 	mu.Lock()
 	n = woke["c"]
@@ -68,9 +68,9 @@ func TestRunSlots_PumpProbesQuotaWaitWithoutSpendingSlot(t *testing.T) {
 	var mu sync.Mutex
 	var woke []string
 	s.Wake = func(id, _ string) { mu.Lock(); woke = append(woke, id); mu.Unlock() }
-	_ = s.Acquire("a", "/r1")
-	s.Enqueue("q", "/r2", "x", WaitQuota)
-	s.Enqueue("b", "/r3", "x", WaitSlots)
+	_ = s.Acquire("a", SlotKey{Dir: "/r1"})
+	s.Enqueue("q", SlotKey{Dir: "/r2"}, "x", WaitQuota)
+	s.Enqueue("b", SlotKey{Dir: "/r3"}, "x", WaitSlots)
 	s.Release("a")
 	mu.Lock()
 	defer mu.Unlock()
