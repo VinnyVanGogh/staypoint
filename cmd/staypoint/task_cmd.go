@@ -63,6 +63,8 @@ var taskListCmd = &cobra.Command{
 		}
 		defer store.Close()
 		all, _ := cmd.Flags().GetBool("all")
+		includeLegacy, _ := cmd.Flags().GetBool("legacy")
+		stageFilter, _ := cmd.Flags().GetString("stage")
 		tasks, err := meshContext.ListTasks(store.DB(), all)
 		if err != nil {
 			if len(pclipIssues) == 0 {
@@ -71,6 +73,7 @@ var taskListCmd = &cobra.Command{
 			}
 			return
 		}
+		tasks = filterTaskList(tasks, includeLegacy, stageFilter)
 		if len(tasks) == 0 {
 			if len(pclipIssues) == 0 {
 				fmt.Println("  No active tasks found.")
@@ -96,8 +99,12 @@ var taskListCmd = &cobra.Command{
 			if t.Organization != "" || t.Project != "" {
 				orgProjInfo = fmt.Sprintf(" (Org: %s | Proj: %s)", t.Organization, t.Project)
 			}
-			fmt.Printf("  • %s[%s]\033[0m \033[1m%s\033[0m%s (branch: %s, role: %s)%s\n",
-				statusColor, t.Status, t.Name, orgProjInfo, t.GitBranch, t.AccountRole, budgetInfo)
+			originInfo := ""
+			if t.Origin != "" && t.Origin != meshContext.OriginNative {
+				originInfo = " [" + t.Origin + "]"
+			}
+			fmt.Printf("  • %s[%s/%s]\033[0m \033[1m%s\033[0m%s%s (branch: %s, role: %s)%s\n",
+				statusColor, t.Status, t.ExecutionStage, t.Name, orgProjInfo, originInfo, t.GitBranch, t.AccountRole, budgetInfo)
 		}
 	},
 }
@@ -387,6 +394,8 @@ func init() {
 	taskBlockCmd.Flags().String("reason", "", "Reason for blocking the task")
 
 	taskListCmd.Flags().BoolP("all", "a", false, "Include done and soft-deleted tasks")
+	taskListCmd.Flags().Bool("legacy", false, "Include legacy tasks (created before task origins were tracked)")
+	taskListCmd.Flags().String("stage", "", "Only tasks in this execution stage (backlog, todo, in_progress, in_review, blocked, done, cancelled)")
 	taskAddCmd.Flags().Float64("budget", 0.0, "Maximum budget limit in USD")
 	taskAddCmd.Flags().Int("max-turns", 0, "Maximum allowed turns")
 	taskAddCmd.Flags().Bool("tui", false, "Launch Bubble Tea TUI interactive textarea")

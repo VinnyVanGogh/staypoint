@@ -345,25 +345,12 @@
     <section id="view-kanban" class="view">
       <div class="view-header">
         <h1 class="view-title">Kanban Board</h1>
-      </div>
-      <div id="kanban-board" class="kanban-board">
-        <div class="kanban-col" data-status="todo">
-          <h2 class="col-title">Todo</h2>
-          <div class="card-list" id="col-todo"></div>
-        </div>
-        <div class="kanban-col" data-status="in_progress">
-          <h2 class="col-title">In Progress</h2>
-          <div class="card-list" id="col-in_progress"></div>
-        </div>
-        <div class="kanban-col" data-status="blocked">
-          <h2 class="col-title">Blocked</h2>
-          <div class="card-list" id="col-blocked"></div>
-        </div>
-        <div class="kanban-col" data-status="done">
-          <h2 class="col-title">Done</h2>
-          <div class="card-list" id="col-done"></div>
+        <div class="table-controls kanban-controls">
+          <label class="kanban-toggle"><input type="checkbox" id="kanban-group-company"> Group by company</label>
+          <label class="kanban-toggle"><input type="checkbox" id="kanban-show-legacy"> Show legacy <span id="kanban-legacy-count" class="muted-text"></span></label>
         </div>
       </div>
+      <div id="kanban-board" class="kanban-board-wrap"></div>
     </section>
 
     <!-- Recent Tasks view -->
@@ -756,6 +743,7 @@
 <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="true"></div>
 
 <script src="/ui/lib/runsteps.js"></script>
+<script src="/ui/lib/taskboard.js"></script>
 <script src="/ui/lib/diffsyntax.js"></script>
 <script src="/ui/lib/markdown.js"></script>
 <script src="/ui/lib/quotagauge.js"></script>

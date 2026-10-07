@@ -1140,6 +1140,16 @@ var Migrations = []Migration{
 		},
 	},
 	{
+		Version: 33,
+		Name:    "task_origin_and_legacy_cleanup",
+		Up: func(conn *sql.DB) error {
+			// Backlog stage + task origins: tasks.origin, every existing task
+			// marked legacy, organization 'STA' -> 'StayPoint', and exact
+			// duplicate legacy titles merged. See migrate_origin.go.
+			return migrateTaskOrigins(conn)
+		},
+	},
+	{
 		// 34, not 33: 33 is left for the concurrent backlog-stage branch.
 		Version: 34,
 		Name:    "task_session_attachments",
