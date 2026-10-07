@@ -18,7 +18,14 @@ func TestIsWorkRepoDetection(t *testing.T) {
 		path     string
 		expected bool
 	}{
-		{filepath.Join(home, "Documents/dev/worktrees/feat-auth"), true},
+		// The shared worktrees folder holds personal and work worktrees, so its
+		// name alone says nothing; a worktree there is work only by git remote.
+		{filepath.Join(home, "Documents/dev/worktrees/feat-auth"), false},
+		{filepath.Join(home, "Documents/dev/worktrees/staypointd-main"), false},
+		{filepath.Join(home, "Documents/dev/work"), true},
+		{filepath.Join(home, "Documents/dev/work/client-x"), true},
+		{filepath.Join(home, "Documents/dev/work-repos/client-x"), true},
+		{filepath.Join(home, "Documents/dev/workbench"), false},
 		{filepath.Join(home, "Documents/dev/mansol-apps-server/github_repo-prod"), true},
 		{filepath.Join(home, "Documents/dev/mansol/vps-hr-automation"), true},
 		{filepath.Join(home, "Documents/dev/managed-solution-dashboard"), true},
