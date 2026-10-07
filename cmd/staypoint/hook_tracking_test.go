@@ -294,3 +294,86 @@ func TestInstallClaudePreToolHook(t *testing.T) {
 		t.Error("second install changed the file")
 	}
 }
+
+// agyHookOutput is what `staypoint hook pre-tool --format gemini` prints for
+// raw: the deny JSON when the tracking gate blocks, else the agy allow JSON.
+func agyHookOutput(t *testing.T, raw []byte, getenv func(string) string) map[string]string {
+	t.Helper()
+	client, out, blocked := runTrackingGate(raw, "gemini", getenv, productionTrackingGate())
+	if client != trackgate.ClientGemini {
+		t.Fatalf("client = %s, want gemini", client)
+	}
+	if !blocked {
+		out = preToolAllowJSON(client)
+	}
+	var resp map[string]string
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatalf("hook output %q: %v", out, err)
+	}
+	return resp
+}
+
+func agyCall(tool string, args map[string]any, workspace string) []byte {
+	b, _ := json.Marshal(map[string]any{
+		"toolCall":       map[string]any{"name": tool, "args": args},
+		"conversationId": "conv-7c9",
+		"workspacePaths": []string{workspace},
+	})
+	return b
+}
+
+// task-7c9df5b6: every agy tool call in a daemon run was denied with an empty
+// reason because the hook printed {} and agy requires "decision". Reads and
+// doc writes must come back {"decision":"allow"}; code writes deny with a
+// reason naming the path; no deny ever has an empty reason.
+func TestPreToolHook_AgyWorkRepoAllowsReadsAndDocs(t *testing.T) {
+	work, _ := trackingEnv(t)
+	if err := os.Mkdir(filepath.Join(work, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	daemon := func(k string) string {
+		if k == "STAYPOINT_TASK_ID" {
+			return "task-d8338ab9"
+		}
+		return ""
+	}
+	for name, raw := range map[string][]byte{
+		"view_file":           agyCall("view_file", map[string]any{"AbsolutePath": filepath.Join(work, "app.py")}, work),
+		"list_dir":            agyCall("list_dir", map[string]any{"DirectoryPath": work}, work),
+		"run_command echo":    agyCall("run_command", map[string]any{"CommandLine": "echo hi", "Cwd": work}, work),
+		"write README.md":     agyCall("write_to_file", map[string]any{"TargetFile": filepath.Join(work, "README.md"), "CodeContent": "# hi"}, work),
+		"write docs/guide.md": agyCall("write_to_file", map[string]any{"TargetFile": filepath.Join(work, "docs", "guide.md"), "CodeContent": "x"}, work),
+	} {
+		if resp := agyHookOutput(t, raw, daemon); resp["decision"] != "allow" {
+			t.Errorf("%s: got %v, want decision allow", name, resp)
+		}
+	}
+
+	app := filepath.Join(work, "app.py")
+	resp := agyHookOutput(t, agyCall("write_to_file", map[string]any{"TargetFile": app, "CodeContent": "x"}, work), daemon)
+	if resp["decision"] != "deny" || !strings.HasPrefix(resp["reason"], "Gemini may not write code in work repos: "+app) {
+		t.Errorf("write app.py: got %v", resp)
+	}
+
+	// Interactive (no task id, not attached): reads still pass; a doc write is
+	// held by the tracking gate, with a reason.
+	if resp := agyHookOutput(t, agyCall("view_file", map[string]any{"AbsolutePath": app}, work), noEnv); resp["decision"] != "allow" {
+		t.Errorf("interactive view_file: got %v", resp)
+	}
+	resp = agyHookOutput(t, agyCall("write_to_file", map[string]any{"TargetFile": filepath.Join(work, "README.md")}, work), noEnv)
+	if resp["decision"] != "deny" || strings.TrimSpace(resp["reason"]) == "" {
+		t.Errorf("interactive README write: got %v", resp)
+	}
+}
+
+func TestPreToolDenyNeverEmptyReason(t *testing.T) {
+	for _, c := range []trackgate.Client{trackgate.ClientGemini, trackgate.ClientClaude} {
+		out := preToolDeny(c, "  ")
+		if !strings.Contains(out, "recorded no reason") {
+			t.Errorf("%s deny with empty reason: %s", c, out)
+		}
+	}
+	if got := preToolAllowJSON(trackgate.ClientClaude); got != "{}" {
+		t.Errorf("claude allow = %s", got)
+	}
+}

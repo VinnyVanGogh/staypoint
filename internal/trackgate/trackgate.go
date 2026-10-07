@@ -232,13 +232,21 @@ func (g *Gate) Evaluate(req Request) Decision {
 	return g.block(req, hit, hitPath, company, "this session is not attached to a StayPoint task")
 }
 
-// docExtensions are the files agy may still write in a work repo (subject to
-// the normal tracking rules).
-var docExtensions = map[string]bool{".md": true, ".markdown": true, ".txt": true, ".rst": true, ".adoc": true}
-
-// IsDocFile reports whether path is a documentation file.
-func IsDocFile(path string) bool {
-	return docExtensions[strings.ToLower(filepath.Ext(path))]
+// isWorkRepoDocPath reports whether Gemini may write p in a work repo. It
+// uses the same rule as the post-turn guard (geminiguard.IsDocPath) on the
+// repo-relative path, so docs/** non-code files pass and code-named .txt files
+// such as requirements.txt do not. Outside a git checkout only the file name
+// is judged.
+func isWorkRepoDocPath(p string) bool {
+	rel := filepath.Base(p)
+	if root, ok := gitRoot(p); ok {
+		r, err := filepath.Rel(root, p)
+		if err != nil {
+			return false
+		}
+		rel = r
+	}
+	return geminiguard.IsDocPath(filepath.ToSlash(rel))
 }
 
 // geminiWorkRepoDeny enforces the Board decision of 2026-10-06: Gemini (agy)
@@ -252,13 +260,14 @@ func (g *Gate) geminiWorkRepoDeny(req Request, acts []action) (Decision, bool) {
 	}
 	for _, a := range acts {
 		for _, p := range a.paths {
-			if p == "" || !g.IsWorkRepo(p) || IsDocFile(p) {
+			if p == "" || !g.IsWorkRepo(p) || isWorkRepoDocPath(p) {
 				continue
 			}
-			msg := fmt.Sprintf("STAYPOINT: %s denied in %s (%s).\n"+
-				"Board decision 2026-10-06: Gemini/agy never writes code in Managed Solution work repos, "+
-				"with or without a StayPoint task. Only documentation files (.md, .txt, .rst, .adoc) may be written.\n"+
-				"Hand this to Claude on the work seat instead:  claude --work", a.what, p, CompanyManagedSolution)
+			msg := fmt.Sprintf("Gemini may not write code in work repos: %s\n"+
+				"STAYPOINT: %s denied (%s). Board decision 2026-10-06: Gemini/agy never writes code in "+
+				"Managed Solution work repos, with or without a StayPoint task. Reading is allowed, and so is "+
+				"writing documentation (*.md, *.txt and other doc files, non-code files under docs/).\n"+
+				"Hand code changes to Claude on the work seat instead:  claude --work", p, a.what, CompanyManagedSolution)
 			return Decision{Block: true, Reason: msg, Company: CompanyManagedSolution, Repo: p}, true
 		}
 	}
