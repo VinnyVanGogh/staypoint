@@ -95,6 +95,10 @@ func (h *SecurityGateHandler) CreateGateRequest(w http.ResponseWriter, r *http.R
 		RunID   string   `json:"run_id"`
 		TaskID  string   `json:"task_id"`
 		CWD     string   `json:"cwd"`
+		// Scripts are the hook's snapshots of the scripts the command runs;
+		// Pinned says the hook will run exactly those bytes (STA-868).
+		Scripts []gates.HookScript `json:"scripts"`
+		Pinned  bool               `json:"pinned"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Cmdline == "" {
 		http.Error(w, `{"error":"cmdline required"}`, http.StatusBadRequest)
@@ -127,6 +131,9 @@ func (h *SecurityGateHandler) CreateGateRequest(w http.ResponseWriter, r *http.R
 	in := security.GateRequestInput{Cmdline: req.Cmdline, Reasons: req.Reasons, RunID: req.RunID, TaskID: req.TaskID, CWD: req.CWD}
 	var scripts []security.ScriptRef
 	if !gates.SpecialRunIDs[req.RunID] {
+		if req.Scripts != nil {
+			in.Scripts = gates.ScriptsFromHook(req.Scripts, req.Pinned)
+		}
 		scripts = h.res().Resolve(&in)
 	}
 
@@ -301,7 +308,7 @@ func (h *SecurityGateHandler) decideOne(r *http.Request, id, decisionStr string,
 		if !approved {
 			return nil, nil, nil, &decideError{http.StatusBadRequest, "only an approval can be remembered"}
 		}
-		draft, err := gates.RuleFromRequest(cur, *remember, h.res().CurrentScripts(cur), time.Now())
+		draft, err := gates.RuleFromRequest(cur, *remember, time.Now())
 		if err != nil {
 			return nil, nil, nil, &decideError{http.StatusUnprocessableEntity, err.Error()}
 		}
@@ -468,7 +475,7 @@ func (h *SecurityGateHandler) CreateRule(w http.ResponseWriter, r *http.Request)
 		http.Error(w, `{"error":"gate request not found"}`, http.StatusNotFound)
 		return
 	}
-	draft, err := gates.RuleFromRequest(gr, req.RuleSpec, h.res().CurrentScripts(gr), time.Now())
+	draft, err := gates.RuleFromRequest(gr, req.RuleSpec, time.Now())
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusUnprocessableEntity)
 		return
@@ -571,7 +578,7 @@ func (h *SecurityGateHandler) ReviewPending(w http.ResponseWriter, r *http.Reque
 		}
 		var scripts []security.ScriptRef
 		if !gates.SpecialRunIDs[gr.RunID] {
-			scripts = h.res().CurrentScripts(gr)
+			scripts = gates.AdviceScripts(gr.Scripts)
 		}
 		items = append(items, gates.ReviewItem{Request: gr, Scripts: scripts})
 		if len(items) == 50 {

@@ -22,8 +22,11 @@ const (
 type ScriptHash struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
-	// Trusted is false when the same command could rewrite the file first.
+	// Trusted is true only when the hook pinned the command to run exactly
+	// these bytes (PinCommand), so the hash describes what runs.
 	Trusted bool `json:"trusted"`
+	// Content is the script text (truncated) for reviewers.
+	Content string `json:"content,omitempty"`
 }
 
 // GateRequest is a Board-approval record for a Red-tier command intercepted by

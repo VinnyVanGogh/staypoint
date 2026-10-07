@@ -14,10 +14,23 @@ type redirect struct {
 	heredoc bool
 	quoted  bool
 	body    string
+	// fd is the explicit file descriptor before the operator ("2" in 2>), "".
+	fd string
+	// dyn is true when target contains an unquoted (or double-quoted)
+	// expansion: its runtime value is not the text we see.
+	dyn bool
+	// udyn: an expansion outside any quotes (word splitting and globbing
+	// apply to its value); meta: unquoted glob, brace or leading tilde.
+	udyn, meta bool
 }
 
 type segment struct {
-	argv      []string
+	argv []string
+	// dyn[i] is true when argv[i] contains an expansion ($VAR, ${..},
+	// $(...), backticks, $'..') outside single quotes (STA-868).
+	dyn       []bool
+	udyn      []bool // argv[i] has an expansion outside any quotes
+	meta      []bool // argv[i] has an unquoted *, ?, [, { or leading ~
 	redirects []*redirect
 	// piped is true when this segment's stdout feeds the next segment.
 	piped bool
@@ -35,7 +48,12 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 		tok     strings.Builder
 		inTok   bool
 		quoted  bool   // the current token contained quoting
+		dyn     bool   // the current token contains an expansion
+		udyn    bool   // ... outside any quotes
+		meta    bool   // the current token has unquoted glob/brace/tilde
 		pending string // redirect operator awaiting its target
+		pendFd  string // fd digits of the pending redirect
+		bad     string // set when the line has a construct we refuse
 		// heredocs whose body starts after the next newline, in order.
 		pendingDocs []*redirect
 	)
@@ -46,19 +64,27 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 		t := tok.String()
 		tok.Reset()
 		inTok = false
-		q := quoted
-		quoted = false
+		q, d, ud, m := quoted, dyn, udyn, meta
+		quoted, dyn, udyn, meta = false, false, false, false
 		if pending != "" {
-			r := &redirect{op: pending, target: t}
+			r := &redirect{op: pending, target: t, fd: pendFd, dyn: d, udyn: ud, meta: m}
 			if pending == "<<" || pending == "<<-" {
 				r.heredoc, r.quoted = true, q
+				// bash never expands a delimiter word; ours would not match
+				// what bash ends the document on, so refuse it (STA-868).
+				if d || strings.ContainsAny(t, "$`") {
+					bad = "here-document delimiter with expansion characters"
+				}
 				pendingDocs = append(pendingDocs, r)
 			}
 			cur.redirects = append(cur.redirects, r)
-			pending = ""
+			pending, pendFd = "", ""
 			return
 		}
 		cur.argv = append(cur.argv, t)
+		cur.dyn = append(cur.dyn, d)
+		cur.udyn = append(cur.udyn, ud)
+		cur.meta = append(cur.meta, m)
 	}
 	endSeg := func(piped bool) {
 		flushTok()
@@ -67,14 +93,34 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 			segs = append(segs, cur)
 		}
 		cur = segment{}
-		pending = ""
+		pending, pendFd = "", ""
 	}
+	inDQ := false
 	sub := func(body string) {
 		subs = append(subs, body)
-		inTok = true
+		inTok, dyn = true, true
+		if !inDQ {
+			udyn = true
+		}
 		tok.WriteString("$SUBST")
 	}
+	// expands reports whether a $ at rs[k] starts an expansion.
+	expands := func(rs []rune, k int) bool {
+		if k+1 >= len(rs) {
+			return false
+		}
+		n := rs[k+1]
+		return n == '{' || n == '_' || n == '\'' || n == '"' || (n >= 'a' && n <= 'z') || (n >= 'A' && n <= 'Z') ||
+			(n >= '0' && n <= '9') || strings.ContainsRune("@*#?$!-", n)
+	}
 
+	if strings.ContainsRune(line, '\r') && strings.Contains(line, "<<") {
+		// bash keeps \r in words and delimiter lines; we cannot match it.
+		return nil, nil, fmt.Errorf("carriage return in a command with a here-document")
+	}
+	if strings.ContainsRune(line, 0) {
+		return nil, nil, fmt.Errorf("NUL byte in command")
+	}
 	rs := []rune(line)
 	for i := 0; i < len(rs); i++ {
 		c := rs[i]
@@ -92,12 +138,26 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 			i = j
 		case c == '"':
 			inTok, quoted = true, true
+			inDQ = true
 			j := i + 1
 			for ; j < len(rs) && rs[j] != '"'; j++ {
 				switch {
 				case rs[j] == '\\' && j+1 < len(rs):
+					// Inside "...", \ escapes only $ ` " \ and newline.
 					j++
-					tok.WriteRune(rs[j])
+					if !strings.ContainsRune("$`\"\\\n", rs[j]) {
+						tok.WriteRune('\\')
+					}
+					if rs[j] != '\n' {
+						tok.WriteRune(rs[j])
+					}
+				case rs[j] == '$' && expands(rs, j):
+					dyn = true
+					if rs[j+1] != '(' {
+						tok.WriteRune(rs[j])
+						continue
+					}
+					fallthrough
 				case rs[j] == '$' && j+1 < len(rs) && rs[j+1] == '(':
 					body, end, e := scanParen(rs, j+1)
 					if e != nil {
@@ -119,6 +179,7 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 			if j >= len(rs) {
 				return nil, nil, fmt.Errorf("unterminated double quote")
 			}
+			inDQ = false
 			i = j
 		case c == '\\':
 			if i+1 < len(rs) {
@@ -134,6 +195,9 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 			for i+1 < len(rs) && rs[i+1] != '\n' {
 				i++
 			}
+		case c == '$' && expands(rs, i):
+			inTok, dyn, udyn = true, true, true
+			tok.WriteRune(c)
 		case c == '$' && i+1 < len(rs) && rs[i+1] == '(':
 			body, end, e := scanParen(rs, i+1)
 			if e != nil {
@@ -159,6 +223,7 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 		case c == '<' || c == '>':
 			// a pure-digit token before the operator is an fd number (2>)
 			if inTok && isDigits(tok.String()) {
+				pendFd = tok.String()
 				tok.Reset()
 				inTok = false
 			} else {
@@ -185,6 +250,9 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 			pending = op
 		case c == '\n' && (len(pendingDocs) > 0 || (inTok && (pending == "<<" || pending == "<<-"))):
 			endSeg(false) // flushes the delimiter word first
+			if bad != "" {
+				return nil, nil, fmt.Errorf("%s", bad)
+			}
 			next, err := readHeredocs(rs, i+1, pendingDocs)
 			if err != nil {
 				return nil, nil, err
@@ -212,11 +280,17 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 		case c == ' ' || c == '\t' || c == '\r':
 			flushTok()
 		default:
+			if strings.ContainsRune("*?[{", c) || (c == '~' && tok.Len() == 0) {
+				meta = true
+			}
 			inTok = true
 			tok.WriteRune(c)
 		}
 	}
 	endSeg(false)
+	if bad != "" {
+		return nil, nil, fmt.Errorf("%s", bad)
+	}
 	if len(pendingDocs) > 0 {
 		return nil, nil, fmt.Errorf("unterminated here-document")
 	}

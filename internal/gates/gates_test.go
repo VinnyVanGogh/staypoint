@@ -37,10 +37,21 @@ func script(t *testing.T, body string) string {
 	return p
 }
 
-// pendingRequest stores a pending request for cmd with resolved scripts.
+// hookSnapshot mimics the pre-tool hook: snapshot every script the command
+// runs and mark it pinned (the hook runs exactly those bytes).
+func hookSnapshot(cmd string) []security.ScriptHash {
+	var hs []HookScript
+	for _, r := range security.ScriptRefs(cmd, "", os.ReadFile, 0) {
+		hs = append(hs, HookScript{Path: r.Path, Content: string(r.Full)})
+	}
+	return ScriptsFromHook(hs, true)
+}
+
+// pendingRequest stores a pending request for cmd with pinned scripts.
 func pendingRequest(t *testing.T, d *sql.DB, cmd, task, repo, org string) *security.GateRequest {
 	t.Helper()
 	in := security.GateRequestInput{Cmdline: cmd, Reasons: []string{"bash: runs an opaque script"}, RunID: "sess", TaskID: task, Repo: repo, Org: org}
+	in.Scripts = hookSnapshot(cmd)
 	(&Resolver{DB: d, RepoRoot: func(string) string { return "" }}).Resolve(&in)
 	in.Repo, in.Org = repo, org
 	gr, err := security.InsertGateRequest(d, in, security.GateRequestPending, "")
@@ -52,6 +63,7 @@ func pendingRequest(t *testing.T, d *sql.DB, cmd, task, repo, org string) *secur
 
 func input(gr *security.GateRequest, d *sql.DB) security.GateRequestInput {
 	in := security.GateRequestInput{Cmdline: gr.Cmdline, Reasons: gr.Reasons, RunID: "sess2", TaskID: gr.TaskID, Repo: gr.Repo, Org: gr.Org}
+	in.Scripts = hookSnapshot(gr.Cmdline)
 	(&Resolver{DB: d, RepoRoot: func(string) string { return "" }}).Resolve(&in)
 	in.Repo, in.Org = gr.Repo, gr.Org
 	return in
@@ -59,7 +71,7 @@ func input(gr *security.GateRequest, d *sql.DB) security.GateRequestInput {
 
 func remember(t *testing.T, d *sql.DB, gr *security.GateRequest, spec RuleSpec) *Rule {
 	t.Helper()
-	r, err := RuleFromRequest(gr, spec, (&Resolver{DB: d}).CurrentScripts(gr), time.Now())
+	r, err := RuleFromRequest(gr, spec, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +133,7 @@ func TestRuleScopeAndExpiry(t *testing.T) {
 		{ScopeOrg, "T9", "/z", "StayPoint", true},
 		{ScopeOrg, "T1", "/repo/a", "Other", false},
 	} {
-		r, err := RuleFromRequest(gr, RuleSpec{Scope: tc.scope}, nil, now)
+		r, err := RuleFromRequest(gr, RuleSpec{Scope: tc.scope}, now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -131,7 +143,7 @@ func TestRuleScopeAndExpiry(t *testing.T) {
 		}
 	}
 
-	r, _ := RuleFromRequest(gr, RuleSpec{Scope: ScopeTask, ExpiresInMinutes: 10}, nil, now)
+	r, _ := RuleFromRequest(gr, RuleSpec{Scope: ScopeTask, ExpiresInMinutes: 10}, now)
 	in := security.GateRequestInput{Cmdline: gr.Cmdline, Reasons: gr.Reasons, TaskID: "T1"}
 	if !r.Matches(in, now.Add(9*time.Minute)) {
 		t.Fatal("rule should match before expiry")
@@ -149,17 +161,17 @@ func TestRuleScopeAndExpiry(t *testing.T) {
 	if r.Matches(in, now) {
 		t.Fatal("rule matched a gemini-code policy request")
 	}
-	if _, err := RuleFromRequest(&security.GateRequest{Cmdline: "x", RunID: "tracking-gate-override", TaskID: "T"}, RuleSpec{Scope: ScopeTask}, nil, now); err == nil {
+	if _, err := RuleFromRequest(&security.GateRequest{Cmdline: "x", RunID: "tracking-gate-override", TaskID: "T"}, RuleSpec{Scope: ScopeTask}, now); err == nil {
 		t.Fatal("policy request must not be rememberable")
 	}
-	if _, err := RuleFromRequest(&security.GateRequest{Cmdline: "x"}, RuleSpec{Scope: ScopeTask}, nil, now); !errors.Is(err, ErrScopeUnavailable) {
+	if _, err := RuleFromRequest(&security.GateRequest{Cmdline: "x"}, RuleSpec{Scope: ScopeTask}, now); !errors.Is(err, ErrScopeUnavailable) {
 		t.Fatalf("no task: want ErrScopeUnavailable, got %v", err)
 	}
 }
 
 func TestPrefixRuleRejectsAddedCommands(t *testing.T) {
 	gr := &security.GateRequest{Cmdline: "bash /opt/tool.sh --all", TaskID: "T", Reasons: []string{"bash: runs an opaque script"}}
-	r, err := RuleFromRequest(gr, RuleSpec{Scope: ScopeTask, MatchKind: MatchPrefix, Pattern: "bash /opt/tool.sh *"}, nil, time.Now())
+	r, err := RuleFromRequest(gr, RuleSpec{Scope: ScopeTask, MatchKind: MatchPrefix, Pattern: "bash /opt/tool.sh *"}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,20 +185,31 @@ func TestPrefixRuleRejectsAddedCommands(t *testing.T) {
 			t.Errorf("prefix rule matched %q", bad)
 		}
 	}
-	if _, err := RuleFromRequest(gr, RuleSpec{Scope: ScopeTask, MatchKind: MatchPrefix, Pattern: "bash /other"}, nil, time.Now()); err == nil {
+	if _, err := RuleFromRequest(gr, RuleSpec{Scope: ScopeTask, MatchKind: MatchPrefix, Pattern: "bash /other"}, time.Now()); err == nil {
 		t.Fatal("pattern that is not a prefix must be refused")
 	}
 }
 
-func TestRuleFromRequestRefusesChangedScript(t *testing.T) {
+// A request whose scripts the hook did not pin (old hook, ambiguous command)
+// cannot be remembered, and a pinned rule never matches an unpinned request.
+func TestUnpinnedScriptsNeverRemembered(t *testing.T) {
 	d := openDB(t)
 	p := script(t, "ls\n")
-	gr := pendingRequest(t, d, "bash "+p, "T1", "", "")
-	if err := os.WriteFile(p, []byte("ls\ngit push\n"), 0o755); err != nil {
+	in := security.GateRequestInput{Cmdline: "bash " + p, Reasons: []string{"x"}, TaskID: "T1"}
+	(&Resolver{DB: d, RepoRoot: func(string) string { return "" }}).Resolve(&in) // daemon-read: untrusted
+	gr, err := security.InsertGateRequest(d, in, security.GateRequestPending, "")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RuleFromRequest(gr, RuleSpec{Scope: ScopeTask}, (&Resolver{}).CurrentScripts(gr), time.Now()); err == nil || !strings.Contains(err.Error(), "changed since") {
-		t.Fatalf("want changed-script refusal, got %v", err)
+	if _, err := RuleFromRequest(gr, RuleSpec{Scope: ScopeTask}, time.Now()); err == nil || !strings.Contains(err.Error(), "not pinned") {
+		t.Fatalf("want not-pinned refusal, got %v", err)
+	}
+	pinned := pendingRequest(t, d, "bash "+p, "T1", "", "")
+	rule := remember(t, d, pinned, RuleSpec{Scope: ScopeTask})
+	unpinned := security.GateRequestInput{Cmdline: "bash " + p, Reasons: pinned.Reasons, TaskID: "T1",
+		Scripts: ScriptsFromHook([]HookScript{{Path: p, Content: "ls\n"}}, false)}
+	if rule.Matches(unpinned, time.Now()) {
+		t.Fatal("a rule matched an unpinned request")
 	}
 }
 

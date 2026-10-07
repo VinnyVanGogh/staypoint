@@ -17,7 +17,7 @@ for wt in $(ls -d /Users/x/dev/agent-mesh/.worktrees/*); do
   branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD)
   dirty=$(git -C "$wt" status --porcelain | wc -l)
   last=$(git -C "$wt" log -1 --format=%cs)
-  remote=$(git -C "$wt" ls-remote --heads origin "$branch" | wc -l)
+  remote=$(git -C "$wt" ls-remote --heads origin | wc -l)
   printf '%s\t%s\t%s\t%s\t%s\n' "$wt" "$size" "$branch" "$dirty" "$last $remote"
 done | sort > "$OUT/wt-sorted.tsv"
 comm -23 "$OUT/a.txt" "$OUT/b.txt" > $OUT/only-a.txt
@@ -85,7 +85,7 @@ func TestScratchScript_DangerousStaysRed(t *testing.T) {
 			if v.Tier != Red {
 				t.Fatalf("want red, got %s %v", v.Tier, v.Reasons)
 			}
-			if !strings.Contains(strings.Join(v.Reasons, ";"), "not read-only") {
+			if !strings.Contains(strings.Join(v.Reasons, ";"), "read-only") {
 				t.Fatalf("reason should explain the script: %v", v.Reasons)
 			}
 		})

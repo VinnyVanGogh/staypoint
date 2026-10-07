@@ -114,10 +114,11 @@ type RuleSpec struct {
 	Note             string `json:"note"`
 }
 
-// RuleFromRequest builds a rule for gr. current are the scripts re-read now
-// (approval time); a script that changed since the request was made, or that
-// the command could rewrite before running, cannot be pinned.
-func RuleFromRequest(gr *security.GateRequest, spec RuleSpec, current []security.ScriptRef, now time.Time) (Rule, error) {
+// RuleFromRequest builds a rule for gr. Its scripts are pinned by the hashes
+// of the bytes the hook snapshotted and pinned the command to; a request whose
+// scripts were not pinned (old hook, unreadable, ambiguous command) cannot be
+// remembered.
+func RuleFromRequest(gr *security.GateRequest, spec RuleSpec, now time.Time) (Rule, error) {
 	if SpecialRunIDs[gr.RunID] {
 		return Rule{}, errors.New("policy requests (Gemini code, tracking override) cannot be remembered")
 	}
@@ -144,19 +145,12 @@ func RuleFromRequest(gr *security.GateRequest, spec RuleSpec, current []security
 	default:
 		return Rule{}, fmt.Errorf("unknown match kind %q", kind)
 	}
-	pinned := make([]security.ScriptHash, 0, len(current))
-	byPath := map[string]security.ScriptHash{}
+	pinned := make([]security.ScriptHash, 0, len(gr.Scripts))
 	for _, s := range gr.Scripts {
-		byPath[s.Path] = s
-	}
-	for _, c := range current {
-		if !c.Trusted || c.SHA256 == "" {
-			return Rule{}, fmt.Errorf("script %s cannot be pinned (unreadable, or the command rewrites it)", c.Path)
+		if !s.Trusted || s.SHA256 == "" {
+			return Rule{}, fmt.Errorf("script %s was not pinned to the bytes reviewed, so it cannot be remembered", s.Path)
 		}
-		if old, ok := byPath[c.Path]; ok && old.SHA256 != "" && old.SHA256 != c.SHA256 {
-			return Rule{}, fmt.Errorf("script %s changed since the request was made; review it again", c.Path)
-		}
-		pinned = append(pinned, security.ScriptHash{Path: c.Path, SHA256: c.SHA256, Trusted: true})
+		pinned = append(pinned, security.ScriptHash{Path: s.Path, SHA256: s.SHA256, Trusted: true})
 	}
 	r := Rule{
 		Pattern: pattern, MatchKind: kind, Reasons: append([]string{}, gr.Reasons...), Scripts: pinned,

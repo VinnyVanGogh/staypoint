@@ -61,6 +61,10 @@ func (t Tier) String() string {
 type Verdict struct {
 	Tier    Tier
 	Reasons []string
+	// Scripts were judged by their contents (STA-868). A verdict below Red
+	// that lists scripts holds only if the command is rewritten to run
+	// exactly these bytes (PinCommand); otherwise treat it as Red.
+	Scripts []JudgedScript
 }
 
 func (v *Verdict) raise(t Tier, reason string) {
@@ -77,6 +81,7 @@ func (v *Verdict) merge(o Verdict) {
 		v.Tier = o.Tier
 	}
 	v.Reasons = append(v.Reasons, o.Reasons...)
+	v.Scripts = append(v.Scripts, o.Scripts...)
 }
 
 // Classifier assigns tiers. Worktree, when non-nil, additionally makes any
@@ -98,6 +103,7 @@ type Classifier struct {
 
 	line    *lineCtx // facts about the whole command line being classified
 	baseCWD string   // CWD before any `cd` in the line
+	inner   bool     // classifying a wrapper's inner command (env/xargs/find -exec ...)
 }
 
 // Classify classifies a shell command line. Unparseable input is Red (fail closed).
@@ -267,9 +273,15 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 				return
 			}
 		}
-		script, ok := shellScriptArg(args)
+		idx, ok := shellScriptIndex(args)
+		off := len(s.argv) - len(argv)
+		call := scriptCall{name: name, prefixed: off > 0}
+		if ok {
+			call.token, call.flags = args[idx], args[:idx]
+			call.tokenDyn = segDyn(s, off+1+idx) || segMeta(s, off+1+idx)
+		}
 		switch {
-		case ok && c.scriptVerdict(name, script, v, depth):
+		case ok && c.scriptVerdict(call, v, depth):
 		case ok:
 			v.raise(Red, name+": runs an opaque script")
 		case shellFedByHeredoc && !shellReadsInput(args):
@@ -329,7 +341,10 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 	case greenCmds[name]:
 		// green unless redirected (handled above)
 	default:
-		if strings.Contains(argv[0], "/") && c.scriptVerdict(name, argv[0], v, depth) {
+		off := len(s.argv) - len(argv)
+		call := scriptCall{name: name, token: argv[0], direct: true, prefixed: off > 0,
+			tokenDyn: segDyn(s, off) || segMeta(s, off)}
+		if strings.Contains(argv[0], "/") && c.scriptVerdict(call, v, depth) {
 			return
 		}
 		v.raise(Yellow, "")
@@ -341,7 +356,9 @@ func (c *Classifier) classifyInner(argv []string, v *Verdict, depth int) {
 		v.raise(Red, "command nesting too deep to analyse")
 		return
 	}
-	c.classifySegment(segment{argv: argv}, v, depth+1)
+	ic := *c
+	ic.inner = true
+	ic.classifySegment(segment{argv: argv}, v, depth+1)
 }
 
 func trimUntil(a []string, stops ...string) []string {

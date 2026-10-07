@@ -197,7 +197,7 @@ func TestParseShellRedirections(t *testing.T) {
 			line:     "go test 2> errors.txt",
 			wantArgv: []string{"go", "test"},
 			wantRedirects: []*redirect{
-				{op: ">", target: "errors.txt"},
+				{op: ">", target: "errors.txt", fd: "2"},
 			},
 		},
 		{

@@ -133,7 +133,13 @@ func (e *gateEnv) create(t *testing.T, cmd, taskID string, reasons ...string) ma
 	if len(reasons) == 0 {
 		reasons = []string{"bash: runs an opaque script"}
 	}
-	b, _ := json.Marshal(map[string]any{"cmdline": cmd, "reasons": reasons, "run_id": "sess", "task_id": taskID})
+	// Like the hook: snapshot the scripts and say the command is pinned.
+	var scripts []map[string]string
+	for _, r := range security.ScriptRefs(cmd, "", os.ReadFile, 0) {
+		scripts = append(scripts, map[string]string{"path": r.Path, "content": string(r.Full)})
+	}
+	b, _ := json.Marshal(map[string]any{"cmdline": cmd, "reasons": reasons, "run_id": "sess", "task_id": taskID,
+		"scripts": scripts, "pinned": len(scripts) > 0})
 	st, out, _ := e.do(t, "POST", "/api/security/gate-requests", string(b), false, "")
 	if st != http.StatusCreated {
 		t.Fatalf("create: %d %v", st, out)
@@ -448,5 +454,31 @@ func TestPasskeyGrace_CoversGateActionsOnly(t *testing.T) {
 	}
 	if st, _, _ := e.do(t, "POST", "/api/settings/security-gate", `{"passkey_grace_minutes":9}`, true, "good"); st != http.StatusBadRequest {
 		t.Fatalf("grace above 5 minutes: want 400, got %d", st)
+	}
+}
+
+// A request from an old hook (no pinned snapshot) is never auto-approved by a
+// rule that pins a script, and cannot itself be remembered.
+func TestGateRule_UnpinnedRequestsNotAutoApproved(t *testing.T) {
+	e := startGateServer(t, nil, nil)
+	seedTask(t, e.db, "T1", "/repo/a", "StayPoint")
+	p := filepath.Join(t.TempDir(), "s.sh")
+	if err := os.WriteFile(p, []byte("ls\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first := e.create(t, "bash "+p, "T1")
+	if st, out, _ := e.do(t, "POST", "/api/security/gate-requests/"+first["id"].(string)+"/decide",
+		`{"decision":"approved","remember":{"scope":"task"}}`, true, "good"); st != http.StatusOK {
+		t.Fatalf("remember: %d %v", st, out)
+	}
+	raw, _ := json.Marshal(map[string]any{"cmdline": "bash " + p, "reasons": []string{"bash: runs an opaque script"}, "run_id": "s", "task_id": "T1"})
+	st, out, _ := e.do(t, "POST", "/api/security/gate-requests", string(raw), false, "")
+	if st != http.StatusCreated || out["status"] != "pending" {
+		t.Fatalf("unpinned request must be held: %d %v", st, out)
+	}
+	st, out, _ = e.do(t, "POST", "/api/security/gate-requests/"+out["id"].(string)+"/decide",
+		`{"decision":"approved","remember":{"scope":"task"}}`, true, "good")
+	if st != http.StatusUnprocessableEntity {
+		t.Fatalf("remembering an unpinned request: want 422, got %d %v", st, out)
 	}
 }
