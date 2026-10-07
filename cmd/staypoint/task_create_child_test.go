@@ -100,3 +100,22 @@ func TestRunTaskCreateChild(t *testing.T) {
 		t.Error("no --parent should keep the normal create path")
 	}
 }
+
+// STA-859: --allow-deep writes the DB directly, so the CLI refuses it in an
+// agent session or without a terminal (the daemon passkey gate never sees it).
+func TestChildCreate_AllowDeepRefusedInAgentContext(t *testing.T) {
+	t.Setenv("STAYPOINT_TASK_ID", "task-agent")
+	cmd, _ := newChildTestCmd(t, "--parent", "task-x", "--allow-deep")
+	_, err := childTaskOptionsFromFlags(cmd, []string{"deep"})
+	if err == nil || !strings.Contains(err.Error(), "--allow-deep: refused inside an agent session") {
+		t.Fatalf("want agent-session refusal, got %v", err)
+	}
+
+	noEnv := func(string) string { return "" }
+	if err := refuseBoardOnlyInAgentContext("--allow-deep", noEnv, false); err == nil {
+		t.Error("no terminal: want refusal")
+	}
+	if err := refuseBoardOnlyInAgentContext("--allow-deep", noEnv, true); err != nil {
+		t.Errorf("Board terminal: want allowed, got %v", err)
+	}
+}
