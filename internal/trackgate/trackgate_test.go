@@ -3,12 +3,14 @@ package trackgate
 import (
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/db"
+	"github.com/VinnyVanGogh/staypoint/internal/geminiapproval"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 )
 
@@ -356,9 +358,10 @@ func TestGeminiToolsGated(t *testing.T) {
 	if !d.Block || !strings.Contains(d.Reason, "--session conv-1 --client gemini") {
 		t.Errorf("unattached agy doc write: %+v", d)
 	}
-	// Personal repos: agy unaffected by default.
+	// Outside any git repo (personalRepo here has no .git): not repo code,
+	// so the personal-repo Gemini code gate does not apply.
 	if d := g.Evaluate(Request{Client: ClientGemini, ToolName: "code_action", FilePaths: []string{personalRepo + "/a.go"}, CWD: personalRepo}); d.Block {
-		t.Errorf("agy personal write blocked:\n%s", d.Reason)
+		t.Errorf("agy write outside a git repo blocked:\n%s", d.Reason)
 	}
 	for _, req := range []Request{
 		{Client: ClientGemini, ToolName: "view_file", FilePaths: []string{workRepo + "/a.go"}, CWD: workRepo},
@@ -367,5 +370,87 @@ func TestGeminiToolsGated(t *testing.T) {
 		if d := g.Evaluate(req); d.Block {
 			t.Errorf("agy read-only %s blocked", req.ToolName)
 		}
+	}
+}
+
+// gitRepo makes a temp dir with a .git entry (a personal repo).
+func gitRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func approveGeminiSession(t *testing.T, conn *sql.DB, session, repo string, decidedAt time.Time) {
+	t.Helper()
+	s := geminiapproval.Scope{SessionID: session, Repo: repo}
+	if _, err := conn.Exec(`INSERT INTO security_gate_requests (id, cmdline, run_id, status, created_at, decided_at) VALUES (?, ?, ?, 'approved', ?, ?)`,
+		"gc-"+session+"-"+filepath.Base(repo), s.Cmdline(), geminiapproval.RunID,
+		decidedAt.UTC().Format(time.RFC3339Nano), decidedAt.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Board addition (2026-10-06): interactive agy in a personal repo may not
+// write code without a Touch ID approval for its conversationId.
+func TestGeminiPersonalRepoCodeNeedsSessionApproval(t *testing.T) {
+	conn := openStore(t)
+	repo := gitRepo(t)
+	now := time.Now()
+	g := gateFor(conn, now)
+	code := []Request{
+		{Client: ClientGemini, ToolName: "write_to_file", FilePaths: []string{repo + "/main.go"}, CWD: repo, SessionID: "conv-7"},
+		{Client: ClientGemini, ToolName: "replace_file_content", FilePaths: []string{repo + "/config.yaml"}, CWD: repo, SessionID: "conv-7"},
+		{Client: ClientGemini, ToolName: "run_command", Command: "echo x > main.go", CWD: repo, SessionID: "conv-7"},
+	}
+	for _, req := range code {
+		d := g.Evaluate(req)
+		if !d.Block || !strings.Contains(d.Reason, "staypoint gate gemini-code --session conv-7") || !strings.Contains(d.Reason, "never writes code") {
+			t.Errorf("unapproved %s: %+v", req.ToolName, d)
+		}
+	}
+	// Non-code files pass without approval.
+	for _, f := range []string{"README.md", "docs/guide.md", "deck.pptx"} {
+		if d := g.Evaluate(Request{Client: ClientGemini, ToolName: "write_to_file", FilePaths: []string{filepath.Join(repo, f)}, CWD: repo, SessionID: "conv-7"}); d.Block {
+			t.Errorf("doc write %s blocked:\n%s", f, d.Reason)
+		}
+	}
+	// Daemon runs are guarded after each turn instead.
+	if d := g.Evaluate(Request{Client: ClientGemini, ToolName: "write_to_file", FilePaths: []string{repo + "/main.go"}, CWD: repo, TaskID: "task-1"}); d.Block {
+		t.Errorf("daemon-run write blocked by the interactive gate:\n%s", d.Reason)
+	}
+	// Claude is unaffected.
+	if d := g.Evaluate(Request{Client: ClientClaude, ToolName: "Write", FilePaths: []string{repo + "/main.go"}, CWD: repo, SessionID: "s"}); d.Block {
+		t.Errorf("claude write blocked:\n%s", d.Reason)
+	}
+
+	approveGeminiSession(t, conn, "conv-7", repo, now.Add(-time.Hour))
+	for _, req := range code {
+		if d := g.Evaluate(req); d.Block {
+			t.Errorf("approved %s still blocked:\n%s", req.ToolName, d.Reason)
+		}
+	}
+	// Another conversation is not covered.
+	other := code[0]
+	other.SessionID = "conv-8"
+	if d := g.Evaluate(other); !d.Block {
+		t.Error("approval leaked to another conversation")
+	}
+	// Expired after MaxSessionHours.
+	late := gateFor(conn, now.Add((geminiapproval.MaxSessionHours+1)*time.Hour))
+	if d := late.Evaluate(code[0]); !d.Block {
+		t.Error("approval did not expire")
+	}
+}
+
+func TestGeminiWorkRepoForgedApprovalStillDenied(t *testing.T) {
+	conn := openStore(t)
+	approveGeminiSession(t, conn, "conv-1", workRepo, time.Now())
+	g := gateFor(conn, time.Now())
+	d := g.Evaluate(Request{Client: ClientGemini, ToolName: "write_to_file", FilePaths: []string{workRepo + "/a.go"}, CWD: workRepo, SessionID: "conv-1"})
+	if !d.Block || !strings.Contains(d.Reason, "never writes code") {
+		t.Fatalf("work repo with forged approval: %+v", d)
 	}
 }

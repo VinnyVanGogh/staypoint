@@ -14,6 +14,8 @@ const (
 	WorkKindArchitecture WorkKind = "architecture"
 	WorkKindPlanning     WorkKind = "planning"
 	WorkKindQA           WorkKind = "qa"
+	// WorkKindDocs is documentation work: non-code, Gemini-first.
+	WorkKindDocs WorkKind = "docs"
 )
 
 // ValidWorkKinds is the complete set of accepted WorkKind values.
@@ -23,6 +25,7 @@ var ValidWorkKinds = []WorkKind{
 	WorkKindArchitecture,
 	WorkKindPlanning,
 	WorkKindQA,
+	WorkKindDocs,
 }
 
 // KindSlot is one ordered entry in a work-kind routing chain.
@@ -45,43 +48,45 @@ type KindSlot struct {
 
 // DefaultKindChains returns the built-in routing table when no [routing] section
 // is present in config.toml. Claude slots carry PoolPersonalClaude as a
-// placeholder; ChainsForRepo / ResolveRoute bind them to the repo's seat.
+// placeholder; ChainsForRepo / ResolveRoute bind them to the repo's seat
+// (work repos then fall back to the personal seat).
 //
-// Routing table (source of truth):
+// Board rule (GeminiCodeForbidden, all repos): code kinds are Claude only and
+// wait in the queue when every Claude seat is locked; non-code kinds run
+// Gemini first with Claude as the fallback.
 //
-//	coding       : Claude Opus → Gemini 3.1 Pro
-//	review       : Claude Opus → Gemini 3.1 Pro (code review always on Opus)
-//	architecture : Gemini 3.1 Pro → Claude Cloud (Opus) [off] → Claude Opus
-//	planning     : Gemini 3.8 Flash → Claude Cloud [off] → Claude Sonnet
-//	qa           : Gemini 3.8 Flash → Claude Sonnet
+//	coding       : Claude Opus                              (code)
+//	qa           : Claude Opus                              (code: writes tests)
+//	review       : Gemini 3.1 Pro → Claude Opus             (non-code, advisory)
+//	architecture : Gemini 3.1 Pro → Claude Opus → Claude Cloud [off]
+//	planning     : Gemini 3.8 Flash → Claude Sonnet → Claude Cloud [off]
+//	docs         : Gemini 3.8 Flash → Claude Sonnet
 //
 // Empty or unknown work_kind routes as coding (see NormalizeWorkKind).
 func DefaultKindChains() map[WorkKind][]KindSlot {
+	opus := func() KindSlot {
+		return KindSlot{Provider: "claude-opus", Model: "opus", PoolID: PoolPersonalClaude, Enabled: true}
+	}
+	sonnet := func() KindSlot {
+		return KindSlot{Provider: "claude-sonnet", Model: "sonnet", PoolID: PoolPersonalClaude, Enabled: true}
+	}
+	pro := func() KindSlot {
+		return KindSlot{Provider: "gemini-3.1-pro", Model: "gemini-3.1-pro-high", PoolID: PoolGeminiNative, Enabled: true}
+	}
+	flash := func() KindSlot {
+		return KindSlot{Provider: "gemini-3.8-flash", Model: "gemini-3.8-flash-high", PoolID: PoolGeminiNative, Enabled: true}
+	}
+	// Cloud slot off until STA-410 lands; gated by cloud_credit_expires = 2026-11-04.
+	cloud := func() KindSlot {
+		return KindSlot{Provider: "claude-cloud", Model: "opus", PoolID: "", Enabled: false, CloudCreditExpires: "2026-11-04T00:00:00Z"}
+	}
 	return map[WorkKind][]KindSlot{
-		WorkKindCoding: {
-			{Provider: "claude-opus", Model: "opus", PoolID: PoolPersonalClaude, Enabled: true},
-			{Provider: "gemini-3.1-pro", Model: "gemini-3.1-pro-high", PoolID: PoolGeminiNative, Enabled: true},
-		},
-		WorkKindReview: {
-			{Provider: "claude-opus", Model: "opus", PoolID: PoolPersonalClaude, Enabled: true},
-			{Provider: "gemini-3.1-pro", Model: "gemini-3.1-pro-high", PoolID: PoolGeminiNative, Enabled: true},
-		},
-		WorkKindArchitecture: {
-			{Provider: "gemini-3.1-pro", Model: "gemini-3.1-pro-high", PoolID: PoolGeminiNative, Enabled: true},
-			// Cloud slot off until STA-410 lands; gated by cloud_credit_expires = 2026-11-04.
-			{Provider: "claude-cloud", Model: "opus", PoolID: "", Enabled: false, CloudCreditExpires: "2026-11-04T00:00:00Z"},
-			{Provider: "claude-opus", Model: "opus", PoolID: PoolPersonalClaude, Enabled: true},
-		},
-		WorkKindPlanning: {
-			{Provider: "gemini-3.8-flash", Model: "gemini-3.8-flash-high", PoolID: PoolGeminiNative, Enabled: true},
-			// Cloud slot off until STA-410 lands.
-			{Provider: "claude-cloud", Model: "opus", PoolID: "", Enabled: false, CloudCreditExpires: "2026-11-04T00:00:00Z"},
-			{Provider: "claude-sonnet", Model: "sonnet", PoolID: PoolPersonalClaude, Enabled: true},
-		},
-		WorkKindQA: {
-			{Provider: "gemini-3.8-flash", Model: "gemini-3.8-flash-high", PoolID: PoolGeminiNative, Enabled: true},
-			{Provider: "claude-sonnet", Model: "sonnet", PoolID: PoolPersonalClaude, Enabled: true},
-		},
+		WorkKindCoding:       {opus()},
+		WorkKindQA:           {opus()},
+		WorkKindReview:       {pro(), opus()},
+		WorkKindArchitecture: {pro(), opus(), cloud()},
+		WorkKindPlanning:     {flash(), sonnet(), cloud()},
+		WorkKindDocs:         {flash(), sonnet()},
 	}
 }
 

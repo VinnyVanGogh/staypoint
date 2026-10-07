@@ -144,24 +144,41 @@ func TestRunRoute_ModelOverrideSpawnsSonnet(t *testing.T) {
 	}
 }
 
-// A Claude spawn that fails before committing output falls over to Gemini,
-// and the observer reports the switch with a reason so the timeline can say so.
+// A Gemini spawn (non-code kind) that fails before committing output falls
+// over to Claude, and the observer reports the switch with a reason so the
+// timeline can say so.
 func TestRunRoute_RuntimeFailoverReportsReason(t *testing.T) {
 	pacer := &router.PacerState{Pools: map[router.PoolID]*router.QuotaPool{}}
-	d := router.ResolveRoute("coding", false, pacer, "", time.Now())
-	spawns, log, err := runRouteWithFake(t, d, pacer, "--print")
+	d := router.ResolveRoute("planning", false, pacer, "", time.Now())
+	spawns, log, err := runRouteWithFake(t, d, pacer, "gemini")
 	if err != nil {
 		t.Fatalf("RunRoute: %v", err)
 	}
-	if len(spawns) != 2 || !isClaudeSpawn(spawns[0]) || isClaudeSpawn(spawns[1]) {
-		t.Fatalf("want claude then gemini spawns, got %v", spawns)
+	if len(spawns) != 2 || isClaudeSpawn(spawns[0]) || !isClaudeSpawn(spawns[1]) {
+		t.Fatalf("want gemini then claude spawns, got %v", spawns)
 	}
 	if len(log.attempts) != 2 {
 		t.Fatalf("want 2 attempts, got %+v", log.attempts)
 	}
 	second := log.attempts[1]
-	if second.Slot.Family != router.FamilyGemini || !strings.Contains(second.FallbackReason, "Claude Opus · personal seat failed") {
+	if second.Slot.Family != router.FamilyClaude || !strings.Contains(second.FallbackReason, "Gemini 3.8 Flash failed") {
 		t.Errorf("second attempt = %+v", second)
+	}
+}
+
+// A failing Claude spawn on a code kind never falls over to Gemini: the run
+// fails (and the queue retries on Claude).
+func TestRunRoute_CodingClaudeFailureNeverSpawnsGemini(t *testing.T) {
+	pacer := &router.PacerState{Pools: map[router.PoolID]*router.QuotaPool{}}
+	d := router.ResolveRoute("coding", false, pacer, "", time.Now())
+	spawns, _, err := runRouteWithFake(t, d, pacer, "--print")
+	if err == nil {
+		t.Fatal("want an error when the only Claude slot fails")
+	}
+	for _, s := range spawns {
+		if !isClaudeSpawn(s) {
+			t.Fatalf("coding run spawned a non-Claude CLI: %v", spawns)
+		}
 	}
 }
 

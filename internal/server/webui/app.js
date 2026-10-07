@@ -6586,15 +6586,110 @@ async function sendComment(taskId, body) {
 
 // ── Detail panel (Right sidebar / Properties) ─────────────
 const WORK_KIND_LABELS = {
-  coding:       'Coding — Claude Opus, backup Gemini 3.1 Pro',
-  review:       'Code review — Claude Opus, backup Gemini 3.1 Pro',
+  coding:       'Coding — Claude Opus only (Gemini never writes code)',
+  qa:           'QA & testing — Claude Opus only (writes tests)',
+  review:       'Review — Gemini 3.1 Pro, backup Claude Opus (advisory)',
   architecture: 'Architecture — Gemini 3.1 Pro, backup Claude Opus',
-  planning:     'Planning & docs — Gemini Flash, backup Claude Sonnet',
-  qa:           'QA & testing — Gemini Flash, backup Claude Sonnet',
+  planning:     'Planning — Gemini Flash, backup Claude Sonnet',
+  docs:         'Docs — Gemini Flash, backup Claude Sonnet',
 };
 
 function workKindLabel(kind) {
   return WORK_KIND_LABELS[kind] || kind || null;
+}
+
+// Board rule (router.GeminiCodeForbidden): Gemini never writes code. Code
+// kinds (and unknown kinds, which route as coding) cannot pick Gemini.
+const NON_CODE_KINDS = new Set(['planning', 'architecture', 'review', 'docs']);
+function kindAllowsGemini(kind) { return NON_CODE_KINDS.has(kind); }
+
+// Provider choices (STA-838): value is "provider" or "provider:model".
+const PROVIDER_CHOICES = [
+  { value: '',                              label: 'Default for the kind of work' },
+  { value: 'claude',                        label: 'Claude (Opus)' },
+  { value: 'claude:sonnet',                 label: 'Claude Sonnet' },
+  { value: 'gemini',                        label: 'Gemini 3.1 Pro', gemini: true },
+  { value: 'gemini:gemini-3.8-flash-high',  label: 'Gemini 3.8 Flash', gemini: true },
+];
+
+function splitProviderChoice(v) {
+  const [provider, model] = String(v || '').split(':');
+  return { provider: provider || '', model_override: model || '' };
+}
+
+function providerChoiceValue(task) {
+  const p = task.provider || '';
+  const m = task.model_override || '';
+  if (!p) return '';
+  if (p === 'claude') return m === 'sonnet' ? 'claude:sonnet' : 'claude';
+  if (p === 'gemini') return m === 'gemini-3.8-flash-high' ? 'gemini:gemini-3.8-flash-high' : 'gemini';
+  return '';
+}
+
+// gateGeminiOptions applies the Gemini rule to a provider select. Non-code
+// kinds: Gemini allowed. Code kinds: refused in a work repo (isWork true),
+// and in a personal repo every run waits for a Board Touch ID approval.
+// isWork null = unknown (create form): the server decides from the repo.
+function gateGeminiOptions(select, kind, hintEl, isWork = null) {
+  const nonCode = kindAllowsGemini(kind);
+  const allowed = nonCode || isWork !== true;
+  for (const opt of select.options) {
+    if (opt.dataset.gemini === '1') opt.disabled = !allowed;
+  }
+  if (!allowed && select.selectedOptions[0] && select.selectedOptions[0].dataset.gemini === '1') select.value = '';
+  let hint = '';
+  if (!allowed) hint = 'Gemini never writes code in a work repo, even with Board approval.';
+  else if (!nonCode) hint = 'Gemini on a code task: personal repos only, and every run waits for your Touch ID approval. Refused in work repos.';
+  if (hintEl) hintEl.textContent = hint;
+}
+
+async function putTaskProvider(taskId, choiceValue) {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/provider`, {
+    method: 'PUT',
+    headers: { ...authHeader(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(splitProviderChoice(choiceValue)),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `${r.status} ${r.statusText}`);
+  return data;
+}
+
+// buildProviderField is the task page's provider select (Details).
+function buildProviderField(task) {
+  const wrap = el('div', 'task-provider-field');
+  const select = document.createElement('select');
+  select.className = 'task-provider-select';
+  select.setAttribute('aria-label', 'Provider');
+  for (const c of PROVIDER_CHOICES) {
+    const opt = document.createElement('option');
+    opt.value = c.value;
+    opt.textContent = c.label;
+    if (c.gemini) opt.dataset.gemini = '1';
+    select.appendChild(opt);
+  }
+  select.value = providerChoiceValue(task);
+  const hint = el('div', 'form-hint');
+  const gate = () => gateGeminiOptions(select, task.work_kind || 'coding', hint, task.account_role === 'work');
+  gate();
+  select.addEventListener('change', async () => {
+    const prev = providerChoiceValue(task);
+    select.disabled = true;
+    try {
+      const updated = await putTaskProvider(task.id, select.value);
+      Object.assign(task, { provider: updated.provider || '', model_override: updated.model_override || '' });
+      if (state.tasks[task.id]) Object.assign(state.tasks[task.id], { provider: task.provider, model_override: task.model_override });
+      gate();
+      hint.textContent = (hint.textContent ? hint.textContent + ' ' : '') + 'Saved. The next run uses this provider.';
+    } catch (err) {
+      select.value = prev;
+      hint.textContent = err.message || 'Failed to set provider.';
+    } finally {
+      select.disabled = false;
+    }
+  });
+  wrap.appendChild(select);
+  wrap.appendChild(hint);
+  return wrap;
 }
 
 function addPanelField(content, label, value) {
@@ -10321,6 +10416,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   addMetaField('Org', task.organization || null);
   addMetaField('Stage', task.execution_stage || null);
   addMetaField('Kind of work', workKindLabel(task.work_kind));
+  if (task.id && !isFleetTaskId(task.id)) addMetaField('Provider', buildProviderField(task));
   addMetaField('Goal', task.goal_title || (task.goal_id ? task.goal_id.slice(0, 12) : null));
   addMetaField('Repo', task.repo_path ? `${task.repo_path} (${task.git_branch || 'main'})` : null);
   addMetaField('Spend',
@@ -11906,14 +12002,23 @@ setInterval(() => {
   const form    = document.getElementById('create-task-form');
   const errBox  = document.getElementById('create-task-error');
   const workKindSel = document.getElementById('ct-work-kind');
+  const providerSel = document.getElementById('ct-provider');
+  const providerHint = document.getElementById('ct-provider-hint');
   const submitBtn = document.getElementById('create-task-submit');
 
   if (!modal || !openBtn || !form) return;
+
+  const gateProvider = () => {
+    if (providerSel) gateGeminiOptions(providerSel, (workKindSel && workKindSel.value) || 'coding', providerHint);
+  };
+  if (workKindSel) workKindSel.addEventListener('change', gateProvider);
 
   function openModal() {
     modal.style.display = 'flex';
     form.reset();
     if (workKindSel) workKindSel.value = 'coding';
+    if (providerSel) providerSel.value = '';
+    gateProvider();
     errBox.style.display = 'none';
     submitBtn.disabled = false;
     document.getElementById('ct-name').focus();
@@ -11949,10 +12054,17 @@ setInterval(() => {
       max_budget_usd: parseFloat(document.getElementById('ct-budget').value) || 0,
       max_turns:    parseInt(document.getElementById('ct-turns').value, 10) || 0,
       ...(descVal && { description: descVal }),
+      ...splitProviderChoice(providerSel ? providerSel.value : ''),
     };
 
     try {
-      const task = await apiFetch('/api/tasks', { method: 'POST', body: JSON.stringify(body) });
+      const resp = await fetch('/api/tasks', {
+        method: 'POST',
+        headers: { ...authHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const task = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(task.error || `${resp.status} ${resp.statusText}`);
       closeModal();
       // Refresh task list
       const fresh = await apiFetch('/api/tasks?status=all').catch(() => ({ tasks: [] }));

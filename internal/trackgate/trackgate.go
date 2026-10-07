@@ -19,12 +19,15 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/geminiapproval"
+	"github.com/VinnyVanGogh/staypoint/internal/geminiguard"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 )
 
@@ -143,6 +146,9 @@ func (g *Gate) Evaluate(req Request) Decision {
 	if d, denied := g.geminiWorkRepoDeny(req, acts); denied {
 		return d
 	}
+	if d, denied := g.geminiPersonalCodeDeny(req, acts); denied {
+		return d
+	}
 	if strings.TrimSpace(req.TaskID) != "" {
 		return Decision{} // daemon run: the task is the run's own
 	}
@@ -257,6 +263,91 @@ func (g *Gate) geminiWorkRepoDeny(req Request, acts []action) (Decision, bool) {
 		}
 	}
 	return Decision{}, false
+}
+
+// geminiPersonalCodeDeny enforces the Board rule in personal repos for an
+// interactive agy session: Gemini never writes code unless the Board approved
+// it with Touch ID for this conversationId (geminiapproval, up to
+// MaxSessionHours). Non-code files (geminiguard.IsDocPath) pass. Daemon runs
+// (STAYPOINT_TASK_ID set) are checked after each turn by the harness guard
+// instead. Writes outside any git repo are not repo code and pass.
+func (g *Gate) geminiPersonalCodeDeny(req Request, acts []action) (Decision, bool) {
+	if req.Client != ClientGemini || strings.TrimSpace(req.TaskID) != "" {
+		return Decision{}, false
+	}
+	for _, a := range acts {
+		for _, p := range a.paths {
+			if p == "" || (g.IsWorkRepo != nil && g.IsWorkRepo(p)) {
+				continue
+			}
+			root, ok := gitRoot(p)
+			if !ok {
+				continue
+			}
+			rel, err := filepath.Rel(root, p)
+			if err == nil && rel != "." && geminiguard.IsDocPath(filepath.ToSlash(rel)) {
+				continue
+			}
+			approved, why := g.geminiSessionApproved(req.SessionID, root)
+			if approved {
+				return Decision{}, false
+			}
+			return Decision{Block: true, Reason: geminiCodeDenyMessage(a.what, p, req.SessionID, why), Repo: p}, true
+		}
+	}
+	return Decision{}, false
+}
+
+func (g *Gate) geminiSessionApproved(sessionID, root string) (bool, string) {
+	if strings.TrimSpace(sessionID) == "" {
+		return false, "this agy call has no conversationId, so it cannot be approved"
+	}
+	conn, closeDB, err := g.openDB()
+	if err != nil {
+		return false, fmt.Sprintf("the StayPoint database is unreadable (%v); failing closed", err)
+	}
+	defer closeDB()
+	isWork := g.IsWorkRepo
+	if isWork == nil {
+		isWork = func(string) bool { return false }
+	}
+	ok, err := geminiapproval.SessionApproved(conn, sessionID, root, isWork, g.now())
+	if err != nil {
+		return false, fmt.Sprintf("Board approvals could not be read (%v); failing closed", err)
+	}
+	return ok, ""
+}
+
+func geminiCodeDenyMessage(what, path, sessionID, why string) string {
+	msg := fmt.Sprintf("STAYPOINT: %s denied (%s).\n"+
+		"Board rule 2026-10-06: Gemini never writes code. In a personal repo the Board may allow it for this agy session with Touch ID.\n", what, path)
+	if sessionID != "" {
+		msg += "Request approval for this session:  " + geminiapproval.RequestCommand(sessionID) + "\n" +
+			"Once the Board approves, code writes in this repo are allowed for this conversation (up to " + fmt.Sprint(geminiapproval.MaxSessionHours) + "h)."
+	}
+	if why != "" {
+		msg += "\n(" + why + ")"
+	}
+	return msg
+}
+
+// gitRoot returns the nearest directory at or above p (or p's directory)
+// holding a .git entry.
+func gitRoot(p string) (string, bool) {
+	dir := filepath.Clean(p)
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		dir = filepath.Dir(dir)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
+	}
 }
 
 func (g *Gate) openDB() (*sql.DB, func(), error) {

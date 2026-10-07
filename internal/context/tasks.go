@@ -45,7 +45,7 @@ type Task struct {
 	Description     string            `json:"description,omitempty"`
 	Comments        []TaskComment     `json:"comments,omitempty"`
 	// WorkKind is the routing category for this task.
-	// Valid values: "coding" (default), "architecture", "planning", "qa".
+	// Valid values: "coding" (default), "review", "architecture", "planning", "qa", "docs".
 	WorkKind        string            `json:"work_kind"`
 	// Origin is where the task came from: native (created in StayPoint),
 	// paperclip_import (staypoint import paperclip) or legacy (existed before
@@ -58,6 +58,13 @@ type Task struct {
 	// tasks created in StayPoint.
 	SourceRef string `json:"source_ref,omitempty"`
 	SourceID  string `json:"source_id,omitempty"`
+	// Provider is the Board's explicit provider choice: "" (default: Claude
+	// Opus on the repo's seat), "claude" or "gemini". Gemini runs only when
+	// this is "gemini" (router.GeminiRequiresExplicitChoice).
+	Provider string `json:"provider"`
+	// ModelOverride pins the model for Provider ("opus", "sonnet",
+	// "gemini-3.1-pro-high", "gemini-3.8-flash-high"); "" = the default.
+	ModelOverride string `json:"model_override"`
 }
 
 // TaskBlockerInfo contains summarized info about an upstream or downstream related task.
@@ -123,6 +130,11 @@ type TaskCreateOptions struct {
 	// SourceRef / SourceID record an imported task's source (see Task).
 	SourceRef string
 	SourceID  string
+	// Provider / ModelOverride are the explicit provider choice (see Task).
+	// Callers normalise them with router.NormalizeRouteChoice (this package
+	// cannot import router); CreateTaskWithOptions rejects unknown providers.
+	Provider      string
+	ModelOverride string
 	// NoRepo leaves repo_path and git_branch empty instead of defaulting to
 	// the working directory. The task cannot leave backlog until the Board
 	// sets a repo (SetTaskRepo).
@@ -212,15 +224,18 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 		return nil, fmt.Errorf("%w %q", ErrInvalidOrigin, origin)
 	}
 	priority := NormalizeTaskPriority(opts.Priority)
+	if !IsValidTaskProvider(opts.Provider) {
+		return nil, fmt.Errorf("%w %q", ErrInvalidProvider, opts.Provider)
+	}
 
 	query := `
 		INSERT INTO tasks (
 			id, name, repo_path, git_branch, status, account_role,
 			max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 			organization, project, parent_id, assignee_agent_id, work_kind,
-			execution_stage, origin, priority, source_ref, source_id, created_at, updated_at
+			execution_stage, origin, priority, source_ref, source_id, provider, model_override, created_at, updated_at
 		)
-		VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+		VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 	`
 
 	var parentID interface{}
@@ -233,7 +248,7 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 		assigneeAgentID = opts.AssigneeAgentID
 	}
 
-	if _, err := db.Exec(query, taskID, name, repoPath, gitBranch, role, opts.MaxBudgetUSD, opts.MaxTurns, opts.Organization, opts.Project, parentID, assigneeAgentID, workKind, stage, origin, priority, opts.SourceRef, opts.SourceID); err != nil {
+	if _, err := db.Exec(query, taskID, name, repoPath, gitBranch, role, opts.MaxBudgetUSD, opts.MaxTurns, opts.Organization, opts.Project, parentID, assigneeAgentID, workKind, stage, origin, priority, opts.SourceRef, opts.SourceID, opts.Provider, opts.ModelOverride); err != nil {
 		return nil, fmt.Errorf("failed to insert task: %w", err)
 	}
 
@@ -366,7 +381,8 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 			       max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 			       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
 			       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
-			       COALESCE(origin, 'native'), COALESCE(priority, 'medium'), source_ref, source_id
+			       COALESCE(origin, 'native'), COALESCE(priority, 'medium'), source_ref, source_id,
+			       COALESCE(provider, ''), COALESCE(model_override, '')
 			FROM tasks
 			WHERE status != 'soft_deleted'
 			ORDER BY created_at DESC
@@ -377,7 +393,8 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 			       max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 			       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
 			       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
-			       COALESCE(origin, 'native'), COALESCE(priority, 'medium'), source_ref, source_id
+			       COALESCE(origin, 'native'), COALESCE(priority, 'medium'), source_ref, source_id,
+			       COALESCE(provider, ''), COALESCE(model_override, '')
 			FROM tasks
 			WHERE status = 'active'
 			ORDER BY created_at DESC
@@ -422,6 +439,8 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 			&t.Priority,
 			&t.SourceRef,
 			&t.SourceID,
+			&t.Provider,
+			&t.ModelOverride,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan task row: %w", err)
 		}
@@ -500,7 +519,8 @@ func GetTask(db *sql.DB, id string) (*Task, error) {
 		       max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 		       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
 		       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
-		       COALESCE(work_kind, 'coding'), COALESCE(origin, 'native'), COALESCE(priority, 'medium'), source_ref, source_id
+		       COALESCE(work_kind, 'coding'), COALESCE(origin, 'native'), COALESCE(priority, 'medium'), source_ref, source_id,
+			       COALESCE(provider, ''), COALESCE(model_override, '')
 		FROM tasks
 		WHERE id = ? OR id = ? OR id LIKE ?
 		ORDER BY created_at DESC
@@ -544,6 +564,8 @@ func GetTask(db *sql.DB, id string) (*Task, error) {
 		&t.Priority,
 		&t.SourceRef,
 		&t.SourceID,
+		&t.Provider,
+		&t.ModelOverride,
 	); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("task not found: %s", id)

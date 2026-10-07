@@ -11,6 +11,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/adapter"
 	"github.com/VinnyVanGogh/staypoint/internal/config"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
+	"github.com/VinnyVanGogh/staypoint/internal/geminiguard"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
 	"github.com/spf13/cobra"
@@ -105,6 +106,9 @@ The harness:
 			AgentID:         agentID,
 			Provider:        provider,
 			RunAdapter:      adapterFn,
+			// Board rule (STA-856, all repos): Gemini never writes code. A
+			// Gemini turn (provider gemini) is checked and reverted.
+			GeminiDocsOnly: geminiguard.IsGeminiProvider(provider),
 		}
 
 		result, err := h.Run(context.Background(), taskID, runCfg)

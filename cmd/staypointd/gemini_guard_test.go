@@ -80,7 +80,7 @@ func TestWake_WorkRepoGeminiCodeEditIsRevertedAndRunFails(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(wt, "extra.go")); !os.IsNotExist(err) {
 		t.Errorf("extra.go left in the worktree: %v", err)
 	}
-	want := "Blocked: Gemini edited code in a work repo: extra.go, main.go (reverted)"
+	want := "Blocked: Gemini edited code: extra.go, main.go (reverted)"
 	if len(r.messages) != 1 || r.messages[0] != want {
 		t.Errorf("error rows = %q, want [%q]", r.messages, want)
 	}
@@ -110,21 +110,47 @@ func TestWake_WorkRepoGeminiDocEditsAreAllowed(t *testing.T) {
 	}
 }
 
-func TestWake_PersonalRepoGeminiMayEditCode(t *testing.T) {
+// Revised Board rule (2026-10-06): Gemini never writes code in ANY repo; the
+// guard runs on every Gemini turn, personal repos included.
+func TestWake_PersonalRepoGeminiCodeEditIsRevertedAndRunFails(t *testing.T) {
 	wt := guardWorktree(t)
-	bin, logPath := editingCLI(t, "echo '// gemini' >> main.go")
+	bin, logPath := editingCLI(t, "echo '// gemini' >> main.go; echo 'a: 1' > config.yaml")
 	r := runWakeIn(t, personalRepo(t), "planning", openPacer(), bin, logPath, wt)
+
+	_, args := mustOneSpawn(t, r)
+	if isClaude(args) {
+		t.Fatalf("spawned %q, want agy", args)
+	}
+	if got := readFile(t, filepath.Join(wt, "main.go")); got != "package main\n" {
+		t.Errorf("main.go = %q, want reverted", got)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "config.yaml")); !os.IsNotExist(err) {
+		t.Errorf("config.yaml left in the worktree: %v", err)
+	}
+	want := "Blocked: Gemini edited code: config.yaml, main.go (reverted)"
+	if len(r.messages) != 1 || r.messages[0] != want {
+		t.Errorf("error rows = %q, want [%q]", r.messages, want)
+	}
+	if r.stage != "error" {
+		t.Errorf("execution_stage = %q, want error", r.stage)
+	}
+}
+
+func TestWake_PersonalRepoGeminiDocEditsAreAllowed(t *testing.T) {
+	wt := guardWorktree(t)
+	bin, logPath := editingCLI(t, "mkdir -p docs; echo '# x' > docs/x.md; echo 'more' >> README.md")
+	r := runWakeIn(t, personalRepo(t), "docs", openPacer(), bin, logPath, wt)
 
 	if len(r.spawns) == 0 || isClaude(r.spawns[0]) {
 		t.Fatalf("want an agy spawn, got %q", r.spawns)
 	}
-	if got := readFile(t, filepath.Join(wt, "main.go")); got != "package main\n// gemini\n" {
-		t.Errorf("personal repo edit reverted: main.go = %q", got)
-	}
 	for _, m := range r.messages {
 		if strings.HasPrefix(m, "Blocked:") {
-			t.Fatalf("personal repo turn blocked: %q", m)
+			t.Fatalf("doc-only turn blocked: %q", m)
 		}
+	}
+	if got := readFile(t, filepath.Join(wt, "README.md")); got != "# app\nmore\n" {
+		t.Errorf("README.md = %q", got)
 	}
 }
 

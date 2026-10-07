@@ -9,6 +9,7 @@ import (
 
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
+	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/trackgate"
 	"github.com/spf13/cobra"
 )
@@ -123,22 +124,39 @@ func runTaskCreateLocalOrg(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	kind, _ := cmd.Flags().GetString("kind")
+	if kind != "" && !meshContext.IsValidWorkKind(kind) {
+		return fmt.Errorf("invalid --kind %q: must be one of %s", kind, strings.Join(meshContext.ValidWorkKinds(), ", "))
+	}
+	choice, err := taskChoiceFromFlags(cmd, kind, repo)
+	if err != nil {
+		return err
+	}
 	store, err := db.Open(cfg.DBPath)
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
 	defer store.Close()
-	return createLocalOrgTask(cmd.OutOrStdout(), store.DB(), strings.TrimSpace(org), project, title, repo, session, client, budget, maxTurns)
+	return createLocalOrgTaskWith(cmd.OutOrStdout(), store.DB(), strings.TrimSpace(org), project, title, repo, session, client, budget, maxTurns, kind, choice)
 }
 
 func createLocalOrgTask(out io.Writer, conn *sql.DB, org, project, title, repo, session string, client trackgate.Client, budget float64, maxTurns int) error {
+	return createLocalOrgTaskWith(out, conn, org, project, title, repo, session, client, budget, maxTurns, "", router.RouteChoice{})
+}
+
+// createLocalOrgTaskWith is createLocalOrgTask with a work_kind and the
+// Board's provider choice (already validated by router.ValidateTaskChoice).
+func createLocalOrgTaskWith(out io.Writer, conn *sql.DB, org, project, title, repo, session string, client trackgate.Client, budget float64, maxTurns int, kind string, choice router.RouteChoice) error {
 	task, err := meshContext.CreateTaskWithOptions(conn, meshContext.TaskCreateOptions{
-		Name:         title,
-		RepoPath:     repo,
-		Organization: org,
-		Project:      project,
-		MaxBudgetUSD: budget,
-		MaxTurns:     maxTurns,
+		Name:          title,
+		RepoPath:      repo,
+		Organization:  org,
+		Project:       project,
+		MaxBudgetUSD:  budget,
+		MaxTurns:      maxTurns,
+		WorkKind:      kind,
+		Provider:      choice.Provider,
+		ModelOverride: choice.Model,
 	})
 	if err != nil {
 		return err

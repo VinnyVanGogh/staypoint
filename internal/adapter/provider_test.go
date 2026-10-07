@@ -476,11 +476,13 @@ func TestProbeVersion(t *testing.T) {
 	}
 }
 
+// An explicit Gemini run whose agy binary is missing falls over to Claude
+// (Claude is always a permitted fallback; Gemini never is).
 func TestFailoverWhenPrimaryBinaryMissing(t *testing.T) {
-	bin := writeExec(t, t.TempDir(), "fake-agy", "#!/bin/sh\necho ran-fallback\n")
+	bin := writeExec(t, t.TempDir(), "fake-claude", "#!/bin/sh\necho ran-fallback\n")
 	resolve := func(a ProviderAdapter) (string, error) {
-		if a.Provider() == "claude" {
-			return "", errors.New("claude CLI not found")
+		if a.Provider() != "claude" {
+			return "", errors.New("agy CLI not found")
 		}
 		return bin, nil
 	}
@@ -488,7 +490,7 @@ func TestFailoverWhenPrimaryBinaryMissing(t *testing.T) {
 	defer cancel()
 
 	var stdout, stderr bytes.Buffer
-	if err := runWithFailover(ctx, "", nil, "claude", []string{"--prompt", "x"}, nil, &stdout, &stderr, resolve); err != nil {
+	if err := runWithFailover(ctx, "", nil, "gemini", []string{"--prompt", "x"}, nil, &stdout, &stderr, resolve); err != nil {
 		t.Fatalf("expected fallback to succeed: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "ran-fallback") || !strings.Contains(stderr.String(), "trying next provider...") {

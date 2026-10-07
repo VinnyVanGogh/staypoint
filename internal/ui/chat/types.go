@@ -47,10 +47,12 @@ type Config struct {
 	CustomDaemonClient DaemonClientInterface
 }
 
-// DefaultModel returns the default model to use for chat if none is specified.
+// DefaultModel is the chat model when none is specified. A chat session can
+// write code, so it is Claude (router.GeminiCodeForbidden); Gemini only runs
+// when picked explicitly (--model gemini-..., /model gemini-...).
 const (
-	DefaultModel    = "gemini-2.5-flash"
-	DefaultProvider = "gemini"
+	DefaultModel    = "opus"
+	DefaultProvider = "claude"
 )
 
 // ResolveProvider returns the provider for a model name.
@@ -68,7 +70,8 @@ func ResolveProvider(model string) string {
 	case containsAny(m, "gemini", "flash", "pro", "agy"):
 		return "gemini"
 	default:
-		return "gemini"
+		// Unknown models are never routed to Gemini implicitly.
+		return DefaultProvider
 	}
 }
 

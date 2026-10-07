@@ -871,7 +871,7 @@ func TestWebUI_CreateTaskKindOfWork(t *testing.T) {
 	if !strings.Contains(html, `id="ct-work-kind"`) {
 		t.Error("index.html missing ct-work-kind select")
 	}
-	for _, kind := range []string{"coding", "architecture", "planning", "qa"} {
+	for _, kind := range []string{"coding", "review", "architecture", "planning", "qa", "docs"} {
 		if !strings.Contains(html, `value="`+kind+`"`) {
 			t.Errorf("index.html missing work_kind option %q", kind)
 		}
@@ -895,6 +895,16 @@ func TestWebUI_CreateTaskKindOfWork(t *testing.T) {
 	if !strings.Contains(js, "work_kind:") {
 		t.Error("app.js must send work_kind in create-task body")
 	}
+	// STA-838: provider select on create and on the task page; Gemini options
+	// gated off for code kinds.
+	if !strings.Contains(html, `id="ct-provider"`) {
+		t.Error("index.html missing ct-provider select")
+	}
+	for _, want := range []string{"splitProviderChoice(providerSel", "buildProviderField(task)", "gateGeminiOptions", "/provider`", "NON_CODE_KINDS"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js missing %q", want)
+		}
+	}
 	if !strings.Contains(js, "WORK_KIND_LABELS") {
 		t.Error("app.js missing WORK_KIND_LABELS map")
 	}
@@ -904,7 +914,7 @@ func TestWebUI_CreateTaskKindOfWork(t *testing.T) {
 	if !strings.Contains(js, "'Kind of work'") {
 		t.Error("app.js missing 'Kind of work' detail panel field")
 	}
-	for _, label := range []string{"Coding —", "Code review —", "Architecture", "Planning & docs", "QA & testing"} {
+	for _, label := range []string{"Coding —", "Review —", "Architecture", "Planning —", "Docs —", "QA & testing"} {
 		if !strings.Contains(js, label) {
 			t.Errorf("app.js missing work_kind label %q", label)
 		}

@@ -132,6 +132,9 @@ func runSmartLaunch(cmd *cobra.Command, args []string) {
 		}
 		targetTool = decision.Tool
 		targetModel = decision.Model
+		if decision.Waiting {
+			fmt.Fprintf(os.Stderr, "[staypoint] %s\n", decision.Reason)
+		}
 		if decision.Target == router.TargetRemoteClaude {
 			isRemoteWork = true
 		}
@@ -187,24 +190,22 @@ func runSmartLaunch(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	// Local session execution
-	binName := targetTool
-	if binName == "" {
-		binName = "agy"
-	}
-
+	// Local session execution. Board rule (router.GeminiCodeForbidden): agy is
+	// launched only when chosen explicitly (--gemini, the agy wrapper, agy
+	// --force); a missing claude binary is an error, never a switch to agy.
+	binName := smartLaunchBinary(targetTool)
 	binPath, err := exec.LookPath(binName)
 	if err != nil {
-		altBin := "claude"
-		if binName == "claude" {
-			altBin = "agy"
-		}
-		binPath, err = exec.LookPath(altBin)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: neither '%s' nor '%s' found in PATH.\n", binName, altBin)
+		if binName != "agy" {
+			fmt.Fprintf(os.Stderr, "Error: '%s' not found in PATH (staypoint never falls back to agy; use --gemini to launch it explicitly).\n", binName)
 			os.Exit(1)
 		}
-		binName = altBin
+		binPath, err = exec.LookPath("claude")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: neither 'agy' nor 'claude' found in PATH.\n")
+			os.Exit(1)
+		}
+		binName = "claude"
 	}
 
 	exitIfAgyInWorkRepo(binName, cwd) // STA-854: never agy in a work repo
@@ -233,6 +234,16 @@ func runSmartLaunch(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 	}
+}
+
+// smartLaunchBinary is the CLI the smart launch execs for a routed tool. An
+// empty or unrecognised tool is Claude: agy only runs when the route (an
+// explicit --gemini) named it.
+func smartLaunchBinary(tool string) string {
+	if tool == "agy" {
+		return "agy"
+	}
+	return "claude"
 }
 
 func extractPassthroughArgs(rawArgs []string) []string {

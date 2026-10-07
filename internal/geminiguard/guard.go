@@ -47,6 +47,27 @@ type Snapshot struct {
 	head       string // HEAD commit ("" when unborn or not a git repo)
 	branch     string // ref HEAD pointed at ("" when detached)
 	checkpoint string // pre-turn checkpoint commit created by the daemon
+	// allowCode is set for a run the Board approved with Touch ID (personal
+	// repo, one run): code changes are allowed, but .git tampering and paths
+	// escaping the repo are still blocked and reverted.
+	allowCode bool
+}
+
+// AllowCode switches the snapshot to the Board-approved code policy (see
+// Snapshot.allowCode) and returns it.
+func (s *Snapshot) AllowCode() *Snapshot {
+	if s != nil {
+		s.allowCode = true
+	}
+	return s
+}
+
+// allowed reports whether the turn may change repo-relative path p.
+func (s *Snapshot) allowed(p string) bool {
+	if s.allowCode {
+		return IsRepoPath(p)
+	}
+	return IsDocPath(p)
 }
 
 // Take records the worktree state before a turn. checkpointCommit is the
@@ -86,18 +107,18 @@ func (r Result) Violated() bool { return len(r.Blocked) > 0 || r.Err != nil }
 // Title is the timeline row for a violation.
 func (r Result) Title() string {
 	if len(r.Blocked) == 0 {
-		return "Blocked: could not verify Gemini's edits in a work repo"
+		return "Blocked: could not verify Gemini's edits"
 	}
 	status := "reverted"
 	if len(r.Unresolved) > 0 {
 		status = "revert incomplete: " + listPaths(r.Unresolved)
 	}
-	return "Blocked: Gemini edited code in a work repo: " + listPaths(r.Blocked) + " (" + status + ")"
+	return "Blocked: Gemini edited code: " + listPaths(r.Blocked) + " (" + status + ")"
 }
 
 // Body explains the rule and any verification error.
 func (r Result) Body() string {
-	parts := []string{"Board rule: Gemini may only edit documentation in work repos (" + strings.Join(Allowlist(), ", ") + ")."}
+	parts := []string{"Board rule: Gemini never writes code; it may only edit non-code files (" + strings.Join(Allowlist(), ", ") + ")."}
 	if r.Err != nil {
 		parts = append(parts, "Guard error: "+r.Err.Error()+".")
 	}
@@ -139,7 +160,7 @@ func Enforce(ctx context.Context, pre *Snapshot) Result {
 	}
 	if walkErr == nil {
 		for p, sig := range post {
-			if IsDocPath(p) {
+			if pre.allowed(p) {
 				continue
 			}
 			old, existed := pre.files[p]
@@ -152,7 +173,7 @@ func Enforce(ctx context.Context, pre *Snapshot) Result {
 			worktreeBad[p] = true
 		}
 		for p := range pre.files {
-			if _, still := post[p]; !still && !IsDocPath(p) {
+			if _, still := post[p]; !still && !pre.allowed(p) {
 				worktreeBad[p] = true
 			}
 		}
@@ -382,7 +403,7 @@ func (s *Snapshot) committedChanges(ctx context.Context) ([]string, bool, error)
 			continue
 		}
 		for _, p := range strings.Split(out, "\x00") {
-			if p != "" && !IsDocPath(p) {
+			if p != "" && !s.allowed(p) {
 				bad[p] = true
 			}
 		}

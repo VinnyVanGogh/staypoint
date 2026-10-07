@@ -45,8 +45,8 @@ func TestWake_CompletionMarkerDetectedForEveryProvider(t *testing.T) {
 		// planning routes Gemini-first since PR #213.
 		{"gemini planning run", "planning", "", "claude_marker_not_final.ndjson", "agy_task_complete.ndjson", 1, true},
 		{"claude coding run", "coding", "", "claude_task_complete.ndjson", "agy_marker_not_final.ndjson", 1, true},
-		// Claude dies before output, the same turn falls over to Gemini.
-		{"claude to gemini fallback", "coding", "--print", "claude_task_complete.ndjson", "agy_task_complete.ndjson", 2, true},
+		// Gemini dies before output, the same turn falls over to Claude.
+		{"gemini to claude fallback", "planning", "gemini-3.8-flash", "claude_task_complete.ndjson", "agy_task_complete.ndjson", 2, true},
 		// Marker only in tool output, echoed input or prose: not a completion.
 		{"gemini marker not final", "planning", "", "claude_task_complete.ndjson", "agy_marker_not_final.ndjson", 1, false},
 		{"claude marker not final", "coding", "", "claude_marker_not_final.ndjson", "agy_task_complete.ndjson", 1, false},
