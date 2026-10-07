@@ -536,6 +536,12 @@ func carryAssigns(outer, wrapperArgs, inner []string) []string {
 	return append(out, inner...)
 }
 
+// gitConfigReadFlags are value-less git config options that may precede a
+// read action.
+var gitConfigReadFlags = map[string]bool{"--local": true, "--global": true, "--system": true, "--worktree": true,
+	"-z": true, "--null": true, "--name-only": true, "--show-origin": true, "--show-scope": true,
+	"--includes": true, "--no-includes": true, "--bool": true, "--int": true, "--path": true, "--bool-or-int": true}
+
 // gitBuiltins are git subcommands; anything else may be an alias that runs
 // an arbitrary command (git config alias.x '!git push origin main').
 var gitBuiltins = map[string]bool{
@@ -812,8 +818,14 @@ func (a *trustAnalyzer) git(args []string, dir, baseDir string, depth int) {
 				read = true
 				break cfg
 			case x == "--file" || x == "-f" || x == "--blob" || x == "--type":
+				if j+1 >= len(rest) || strings.HasPrefix(rest[j+1], "-") {
+					break cfg
+				}
 				j++
 			case strings.HasPrefix(x, "-"):
+				if !gitConfigReadFlags[x] {
+					break cfg // unknown option: treat as a write
+				}
 			default:
 				read = x == "get" || x == "list"
 				break cfg
