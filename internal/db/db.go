@@ -1139,6 +1139,25 @@ var Migrations = []Migration{
 			return err
 		},
 	},
+	{
+		// 34, not 33: 33 is left for the concurrent backlog-stage branch.
+		Version: 34,
+		Name:    "task_session_attachments",
+		Up: func(conn *sql.DB) error {
+			// STA-854: interactive agent sessions (Claude session_id, agy
+			// conversationId) attached to a task with `staypoint task attach`.
+			// The PreToolUse tracking gate allows writes in work repos only
+			// for sessions with a row here (or a daemon run's STAYPOINT_TASK_ID).
+			_, err := conn.Exec(`CREATE TABLE IF NOT EXISTS task_session_attachments (
+				session_id  TEXT PRIMARY KEY,
+				task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+				client      TEXT NOT NULL DEFAULT 'claude',
+				repo_path   TEXT NOT NULL DEFAULT '',
+				attached_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			);`)
+			return err
+		},
+	},
 }
 
 func copyFile(src, dst string) error {
