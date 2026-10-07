@@ -61,7 +61,7 @@ func requestGeminiCode(out io.Writer, daemonURL, token, session, repo string, wa
 	}
 	fmt.Fprintln(out, "Waiting for the Board decision (Ctrl-C to stop waiting; the request stays pending)...")
 	for {
-		switch status := pollGateRequest(daemonURL, token, gr.ID); status {
+		switch status, _ := pollGateRequest(daemonURL, token, gr.ID); status {
 		case "approved":
 			fmt.Fprintf(out, "Approved. agy session %s may write code in %s for up to %dh.\n", scope.SessionID, repo, geminiapproval.MaxSessionHours)
 			return nil

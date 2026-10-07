@@ -237,6 +237,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.Handle("POST /api/security/gate-rules", s.secMid.WrapBoardGateAction(http.HandlerFunc(gateH.CreateRule)))
 		mux.Handle("DELETE /api/security/gate-rules/{id}", s.secMid.WrapBoardGateAction(http.HandlerFunc(gateH.DeleteRule)))
 		mux.HandleFunc("GET /api/security/gate-stats", gateH.Stats)
+		// task-6c1ed91f: "Trust this task until…". Creating one is a fresh
+		// Touch ID (no grace); revoking only removes power, so a session will do.
+		mux.HandleFunc("GET /api/security/trusts", gateH.ListTrusts)
+		mux.HandleFunc("GET /api/tasks/{id}/trust", gateH.GetTaskTrust)
+		mux.Handle("POST /api/tasks/{id}/trust", s.secMid.WrapBoardAction(http.HandlerFunc(gateH.CreateTaskTrust)))
+		mux.Handle("POST /api/tasks/{id}/trust/revoke", s.secMid.WrapBoardSession(http.HandlerFunc(gateH.RevokeTaskTrust)))
 		mux.Handle("GET /api/board/passkey-grace", s.secMid.WrapBoardSession(http.HandlerFunc(s.secMid.GraceStatus)))
 		mux.HandleFunc("GET /api/settings/security-gate", gateH.GetSecurityGateSettings)
 		// Board-only: toggling the gate itself requires the board token.

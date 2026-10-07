@@ -708,6 +708,11 @@ function handleEvent(evt) {
     }
     return;
   }
+  if (type === 'security_gate_deferred' && evt.data) {
+    updateGatesBadge();
+    if (document.getElementById('view-gates')?.classList.contains('active')) renderGatesPage();
+    return;
+  }
   // STA-868: an advisory arrived, or an allow rule changed.
   if ((type === 'security_gate_advice' || type === 'security_gate_rules') && evt.data) {
     if (document.getElementById('view-gates')?.classList.contains('active')) {
@@ -10561,6 +10566,11 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   // Pending security gate requests for this task's run
   if (task.run_id || task.runId) {
     renderPendingGatesForTask(main, task.run_id || task.runId);
+  }
+
+  // "Trust this task until…" (task-6c1ed91f): banner, auto-approvals, create.
+  if (task.id && !isFleetTaskId(task.id)) {
+    renderTaskTrust(main, task.id);
   }
 
   // Interaction cards (pending ask_user_questions / request_confirmation / suggest_tasks)

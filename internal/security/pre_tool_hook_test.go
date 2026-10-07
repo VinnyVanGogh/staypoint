@@ -31,7 +31,9 @@ func openTestDB(t *testing.T) *sql.DB {
 			org          TEXT NOT NULL DEFAULT '',
 			cwd          TEXT NOT NULL DEFAULT '',
 			scripts_json TEXT NOT NULL DEFAULT '[]',
-			decided_by   TEXT NOT NULL DEFAULT ''
+			decided_by   TEXT NOT NULL DEFAULT '',
+			defer_at     TEXT,
+			deferred_at  TEXT
 		);
 	`)
 	if err != nil {

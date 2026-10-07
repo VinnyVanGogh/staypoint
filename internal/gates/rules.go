@@ -25,7 +25,7 @@ const (
 	ScopeOrg  = "org"
 )
 
-// Match kinds.
+// Match kinds. MatchAny (trust.go) is created only by "Trust this task".
 const (
 	MatchExact  = "exact"
 	MatchPrefix = "prefix"
@@ -51,6 +51,11 @@ type Rule struct {
 	DeletedAt    *time.Time            `json:"deleted_at,omitempty"`
 	HitCount     int                   `json:"hit_count"`
 	LastHitAt    *time.Time            `json:"last_hit_at,omitempty"`
+	// Trust rules only (MatchAny): tev1 decides instead of a blanket
+	// approval, at this threshold. EndedReason says why a trust ended early.
+	Tev1          bool    `json:"tev1,omitempty"`
+	Tev1Threshold float64 `json:"tev1_threshold,omitempty"`
+	EndedReason   string  `json:"ended_reason,omitempty"`
 }
 
 // Execer is satisfied by *sql.DB and *sql.Tx.
@@ -184,11 +189,16 @@ func InsertRule(db Execer, r Rule) (*Rule, error) {
 	}
 	rj, _ := json.Marshal(r.Reasons)
 	sj, _ := json.Marshal(r.Scripts)
+	tev1 := 0
+	if r.Tev1 {
+		tev1 = 1
+	}
 	res, err := db.Exec(`INSERT INTO security_gate_rules
-		(pattern, match_kind, reasons_json, scripts_json, scope, scope_value, source_gate_id, note, created_by, created_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(pattern, match_kind, reasons_json, scripts_json, scope, scope_value, source_gate_id, note, created_by, created_at, expires_at,
+		 tev1, tev1_threshold)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.Pattern, r.MatchKind, string(rj), string(sj), r.Scope, r.ScopeValue, r.SourceGateID, r.Note,
-		r.CreatedBy, r.CreatedAt.UTC().Format(time.RFC3339Nano), fmtTime(r.ExpiresAt))
+		r.CreatedBy, r.CreatedAt.UTC().Format(time.RFC3339Nano), fmtTime(r.ExpiresAt), tev1, r.Tev1Threshold)
 	if err != nil {
 		return nil, fmt.Errorf("insert gate rule: %w", err)
 	}
@@ -197,7 +207,7 @@ func InsertRule(db Execer, r Rule) (*Rule, error) {
 }
 
 const ruleCols = `id, pattern, match_kind, reasons_json, scripts_json, scope, scope_value, source_gate_id, note,
-	created_by, created_at, expires_at, deleted_at, hit_count, last_hit_at`
+	created_by, created_at, expires_at, deleted_at, hit_count, last_hit_at, tev1, tev1_threshold, ended_reason`
 
 func parseTime(ns sql.NullString) *time.Time {
 	if !ns.Valid || ns.String == "" {
@@ -217,7 +227,8 @@ func scanRule(row interface{ Scan(...any) error }) (*Rule, error) {
 		expires, deleted, lastHit sql.NullString
 	)
 	if err := row.Scan(&r.ID, &r.Pattern, &r.MatchKind, &rj, &sj, &r.Scope, &r.ScopeValue, &r.SourceGateID,
-		&r.Note, &r.CreatedBy, &created, &expires, &deleted, &r.HitCount, &lastHit); err != nil {
+		&r.Note, &r.CreatedBy, &created, &expires, &deleted, &r.HitCount, &lastHit,
+		&r.Tev1, &r.Tev1Threshold, &r.EndedReason); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(rj), &r.Reasons)

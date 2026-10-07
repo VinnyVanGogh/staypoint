@@ -52,6 +52,9 @@ type DecisionResult struct {
 	RawResponse    string // raw JSON response body for debugging
 	// Reason is the model's one-line justification (DecideWithReason only).
 	Reason string
+	// Probability is the model's probability for the selected option, from
+	// /v1/systemone only; 0 when the endpoint does not report one.
+	Probability float64
 }
 
 // TogetherDecisionClient calls an OpenAI-compatible /v1/chat/completions endpoint
@@ -389,6 +392,7 @@ func (c *TogetherDecisionClient) callSystemOne(ctx context.Context, req Decision
 				SelectedLetter: o.Letter,
 				RawResponse:    string(raw),
 				Reason:         fmt.Sprintf("p=%.2f, confidence %.2f", ans.Probabilities[o.Key], ans.Confidence),
+				Probability:    ans.Probabilities[o.Key],
 			}, nil
 		}
 	}

@@ -30,6 +30,11 @@ type SecurityGateHandler struct {
 	resolver *gates.Resolver
 	// advisoryTimeout bounds one advisory call (default 20s).
 	advisoryTimeout time.Duration
+
+	// tev1 decides requests of tasks trusted in tev1 mode (default: advisor).
+	tev1 gates.RequestAdvisor
+	// now is the clock (tests).
+	now func() time.Time
 }
 
 func NewSecurityGateHandler(db *sql.DB, hub *EventHub) *SecurityGateHandler {
@@ -67,6 +72,7 @@ func (h *SecurityGateHandler) withAdvice(reqs []*security.GateRequest) []gateReq
 
 // ListGateRequests handles GET /api/security/gate-requests[?status=pending]
 func (h *SecurityGateHandler) ListGateRequests(w http.ResponseWriter, r *http.Request) {
+	h.deferDue()
 	status := r.URL.Query().Get("status")
 	var (
 		requests []*security.GateRequest
@@ -137,13 +143,18 @@ func (h *SecurityGateHandler) CreateGateRequest(w http.ResponseWriter, r *http.R
 		scripts = h.res().Resolve(&in)
 	}
 
-	gr, rule, err := h.createOrAutoApprove(in)
+	out, err := h.createOrAutoApprove(in)
 	if err != nil {
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
-	if rule != nil {
-		h.hub.Publish("security_gate_decided", map[string]any{"id": gr.ID, "decision": gr.Status, "rule_id": rule.ID})
+	gr := out.gr
+	if out.rule != nil {
+		h.hub.Publish("security_gate_decided", map[string]any{"id": gr.ID, "decision": gr.Status, "rule_id": out.rule.ID})
+		if out.rule.IsTrust() {
+			// Trust approvals still get an advisor rating for the Board's review.
+			h.startAdvisory(gr, scripts)
+		}
 		w.WriteHeader(http.StatusCreated)
 		writeJSON(w, gr)
 		return
@@ -153,51 +164,133 @@ func (h *SecurityGateHandler) CreateGateRequest(w http.ResponseWriter, r *http.R
 		"cmdline": gr.Cmdline,
 		"reasons": gr.Reasons,
 		"status":  gr.Status,
+		"held":    out.held,
 	})
-	h.startAdvisory(gr, scripts)
+	if out.tev1 != nil {
+		go h.runTev1(gr, scripts, out.tev1)
+	} else {
+		h.startAdvisory(gr, scripts)
+	}
 	w.WriteHeader(http.StatusCreated)
 	writeJSON(w, gr)
 }
 
+func (h *SecurityGateHandler) clock() time.Time {
+	if h.now != nil {
+		return h.now()
+	}
+	return time.Now()
+}
+
+// gateCreateOutcome is how a new request was stored.
+type gateCreateOutcome struct {
+	gr *security.GateRequest
+	// rule approved it (an allow rule or a task trust).
+	rule *gates.Rule
+	// held says why a request of a trusted task still waits for the Board.
+	held string
+	// tev1 is the trust whose tev1 mode decides this request.
+	tev1 *gates.Rule
+}
+
 // createOrAutoApprove stores the request: approved by the first matching
-// Board allow rule (with its audit row and hit count, in one transaction),
-// or pending.
-func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) (*security.GateRequest, *gates.Rule, error) {
-	now := time.Now()
+// Board allow rule or by the task's trust (with its audit row and hit count,
+// in one transaction), or pending. Under trust, merges/pushes to protected
+// branches stay pending, deletes outside the worktree stay pending with a
+// deferral deadline, and tev1 mode leaves the request to runTev1.
+func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) (*gateCreateOutcome, error) {
+	now := h.clock()
+	// Trust lookup and the exclusion analysis run git and read the
+	// filesystem: do them before the transaction holds the only connection.
+	var (
+		trust     *gates.Rule
+		facts     security.TrustFacts
+		deferMins int
+	)
+	if !gates.SpecialRunIDs[in.RunID] && in.TaskID != "" {
+		var err error
+		if trust, err = gates.ActiveTrust(h.db, in.TaskID, now); err != nil {
+			return nil, err
+		}
+		if trust != nil {
+			facts = security.AnalyzeForTrust(in.Cmdline, gates.TrustContextFor(h.db, in.TaskID, in.CWD, in.Scripts))
+			deferMins = gates.TrustDeferMinutes(h.db)
+		}
+	}
+
 	tx, err := h.db.Begin()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer tx.Rollback()
 	rule, err := gates.MatchRule(tx, in, now)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
+	}
+	if rule == nil && trust != nil {
+		// Revoked between the lookup and now: it approves nothing.
+		if cur, err := gates.GetRule(tx, trust.ID); err != nil {
+			return nil, err
+		} else if cur == nil || !cur.Active(now) {
+			trust = nil
+		}
+	}
+	pending, approved := string(security.GateRequestPending), string(security.GateRequestApproved)
+	if rule == nil && trust != nil && !facts.Protected && !facts.DeleteOutside && !trust.Tev1 {
+		rule = trust
 	}
 	if rule == nil {
 		gr, err := security.InsertGateRequest(tx, in, security.GateRequestPending, "")
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		return gr, nil, tx.Commit()
+		out := &gateCreateOutcome{gr: gr}
+		if trust != nil {
+			event, payload := "", map[string]any{"rule_id": trust.ID, "cmdline": gr.Cmdline, "task_id": gr.TaskID}
+			switch {
+			case facts.Protected:
+				event, out.held = "security_gate_trust_held", "protected: "+facts.ProtectedWhy
+				payload["message"] = "held for the Board under trust: " + facts.ProtectedWhy
+			case facts.DeleteOutside:
+				at := now.Add(time.Duration(deferMins) * time.Minute)
+				if err := security.SetDeferAt(tx, gr.ID, at); err != nil {
+					return nil, err
+				}
+				gr.DeferAt = &at
+				event, out.held = "security_gate_trust_deferring", "delete outside worktree: "+facts.DeleteWhy
+				payload["message"] = fmt.Sprintf("delete outside the worktree waits %d min, then is skipped: %s", deferMins, facts.DeleteWhy)
+				payload["defer_at"] = at.UTC().Format(time.RFC3339)
+			default:
+				event, out.tev1 = "security_gate_tev1_asked", trust
+				payload["message"] = fmt.Sprintf("tev1 decides (threshold %.2f)", trust.Tev1Threshold)
+			}
+			if err := governance.LogGateEventTx(tx, gr.ID, gates.DecidedByTrust(trust.ID), event, nil, &pending, payload); err != nil {
+				return nil, err
+			}
+		}
+		return out, tx.Commit()
 	}
 	by := fmt.Sprintf("rule:%d", rule.ID)
 	gr, err := security.InsertGateRequest(tx, in, security.GateRequestApproved, by)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	pending, approved := string(security.GateRequestPending), string(security.GateRequestApproved)
+	msg := fmt.Sprintf("auto-approved by rule #%d", rule.ID)
+	if rule.IsTrust() {
+		msg = fmt.Sprintf("auto-approved by trust #%d (task %s)", rule.ID, rule.ScopeValue)
+	}
 	if err := governance.LogGateEventTx(tx, gr.ID, by, "security_gate_auto_approved", &pending, &approved,
-		map[string]any{"message": fmt.Sprintf("auto-approved by rule #%d", rule.ID), "rule_id": rule.ID,
+		map[string]any{"message": msg, "rule_id": rule.ID, "trust": rule.IsTrust(),
 			"cmdline": gr.Cmdline, "run_id": gr.RunID, "task_id": gr.TaskID, "scope": rule.Scope, "scope_value": rule.ScopeValue}); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if err := gates.RecordHit(tx, rule.ID, now); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return gr, rule, nil
+	return &gateCreateOutcome{gr: gr, rule: rule}, nil
 }
 
 // startAdvisory asks the Together advisor about a new pending request in the
@@ -222,6 +315,7 @@ func (h *SecurityGateHandler) GetGateRequest(w http.ResponseWriter, r *http.Requ
 	id := r.PathValue("id")
 	wait := r.URL.Query().Get("wait") == "true"
 
+	h.deferDue()
 	gr, err := security.GetGateRequest(h.db, id)
 	if err != nil {
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
@@ -231,8 +325,8 @@ func (h *SecurityGateHandler) GetGateRequest(w http.ResponseWriter, r *http.Requ
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
 	}
-	if !wait || gr.Status != security.GateRequestPending {
-		writeJSON(w, gr)
+	if !wait || gr.Status != security.GateRequestPending || gr.DeferredAt != nil {
+		writeJSON(w, hookView(gr))
 		return
 	}
 
@@ -245,17 +339,20 @@ func (h *SecurityGateHandler) GetGateRequest(w http.ResponseWriter, r *http.Requ
 		select {
 		case <-ctx.Done():
 			// Return current state; hook will retry.
-			writeJSON(w, gr)
+			writeJSON(w, hookView(gr))
 			return
 		case <-ticker.C:
+			if gr.DeferAt != nil {
+				h.deferDue()
+			}
 			fresh, err := security.GetGateRequest(h.db, id)
 			if err != nil || fresh == nil {
-				writeJSON(w, gr)
+				writeJSON(w, hookView(gr))
 				return
 			}
 			gr = fresh
-			if gr.Status != security.GateRequestPending {
-				writeJSON(w, gr)
+			if gr.Status != security.GateRequestPending || gr.DeferredAt != nil {
+				writeJSON(w, hookView(gr))
 				return
 			}
 		}
@@ -330,6 +427,11 @@ func (h *SecurityGateHandler) decideOne(r *http.Request, id, decisionStr string,
 	pendingStatus := string(security.GateRequestPending)
 	decidedStatus := string(gr.Status)
 	payload := map[string]any{"cmdline": gr.Cmdline, "decision": string(gr.Status), "run_id": gr.RunID}
+	if cur.DeferredAt != nil {
+		// The hook gave up at the deadline: this records the decision only.
+		payload["deferred"] = true
+		payload["message"] = "deferred request decided; the command is not replayed (a follow-up run can redo it)"
+	}
 	if ruleDraft != nil {
 		if newRule, err = gates.InsertRule(tx, *ruleDraft); err != nil {
 			return nil, nil, nil, &decideError{http.StatusInternalServerError, "rule write failed"}
@@ -629,6 +731,8 @@ func (h *SecurityGateHandler) gateSettings() map[string]any {
 		"advisor_enabled":       gates.AdvisorEnabled(h.db),
 		"advisor_configured":    h.advisor != nil,
 		"passkey_grace_minutes": gates.GraceMinutes(h.db),
+		"trust_defer_minutes":   gates.TrustDeferMinutes(h.db),
+		"tev1_threshold":        gates.Tev1Threshold(h.db),
 	}
 }
 
@@ -641,9 +745,11 @@ func (h *SecurityGateHandler) GetSecurityGateSettings(w http.ResponseWriter, r *
 // field is optional; only the ones sent change.
 func (h *SecurityGateHandler) UpdateSecurityGateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		MainMergeApproval   *bool `json:"main_merge_approval"`
-		AdvisorEnabled      *bool `json:"advisor_enabled"`
-		PasskeyGraceMinutes *int  `json:"passkey_grace_minutes"`
+		MainMergeApproval   *bool    `json:"main_merge_approval"`
+		AdvisorEnabled      *bool    `json:"advisor_enabled"`
+		PasskeyGraceMinutes *int     `json:"passkey_grace_minutes"`
+		TrustDeferMinutes   *int     `json:"trust_defer_minutes"`
+		Tev1Threshold       *float64 `json:"tev1_threshold"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
@@ -651,6 +757,14 @@ func (h *SecurityGateHandler) UpdateSecurityGateSettings(w http.ResponseWriter, 
 	}
 	if req.PasskeyGraceMinutes != nil && (*req.PasskeyGraceMinutes < 0 || *req.PasskeyGraceMinutes > gates.MaxGraceMinutes) {
 		http.Error(w, `{"error":"passkey_grace_minutes must be 0 (off) to 5"}`, http.StatusBadRequest)
+		return
+	}
+	if req.TrustDeferMinutes != nil && (*req.TrustDeferMinutes < 1 || *req.TrustDeferMinutes > gates.MaxTrustDeferMinutes) {
+		http.Error(w, `{"error":"trust_defer_minutes must be 1 to 120"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Tev1Threshold != nil && (*req.Tev1Threshold < gates.MinTev1Threshold || *req.Tev1Threshold > gates.MaxTev1Threshold) {
+		http.Error(w, `{"error":"tev1_threshold must be 0.5 to 0.99"}`, http.StatusBadRequest)
 		return
 	}
 	tx, err := h.db.Begin()
@@ -686,6 +800,12 @@ func (h *SecurityGateHandler) UpdateSecurityGateSettings(w http.ResponseWriter, 
 	}
 	if err == nil && req.PasskeyGraceMinutes != nil {
 		err = set(gates.SettingPasskeyGraceMinutes, strconv.Itoa(*req.PasskeyGraceMinutes))
+	}
+	if err == nil && req.TrustDeferMinutes != nil {
+		err = set(gates.SettingTrustDeferMinutes, strconv.Itoa(*req.TrustDeferMinutes))
+	}
+	if err == nil && req.Tev1Threshold != nil {
+		err = set(gates.SettingTev1Threshold, strconv.FormatFloat(*req.Tev1Threshold, 'f', 2, 64))
 	}
 	if err != nil {
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)

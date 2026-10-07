@@ -4484,7 +4484,7 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   background: var(--bg-secondary, #161b22);
   border: 1px solid var(--border, #30363d);
 }
-.ship-review-form-label { font-size: 12px; font-weight: 600; color: var(--text-muted, #8b949e); }
+.ship-review-form-label { font-size: 12px; font-weight: 600; color: var(--muted); }
 .ship-review-form-textarea {
   resize: vertical;
   min-height: 60px;
@@ -4504,7 +4504,7 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   cursor: pointer;
   background: transparent;
   border: 1px solid var(--border, #30363d);
-  color: var(--text-muted, #8b949e);
+  color: var(--muted);
 }
 .ship-review-form-cancel-btn:hover { background: var(--bg-secondary, #161b22); }
 .ship-review-sendback-submit-btn {
@@ -4538,7 +4538,7 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .ship-review-card--working { opacity: .85; }
 .ship-review-status-badge.status-working {
   background: rgba(100,100,100,.2);
-  color: var(--text-muted, #8b949e);
+  color: var(--muted);
 }
 .ship-review-working-status {
   display: flex;
@@ -4546,7 +4546,7 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   gap: 8px;
   margin-top: 10px;
   font-size: 13px;
-  color: var(--text-muted, #8b949e);
+  color: var(--muted);
 }
 @keyframes ship-review-spin { to { transform: rotate(360deg); } }
 .ship-review-spinner {
@@ -4566,7 +4566,7 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: .06em;
-  color: var(--text-muted, #8b949e);
+  color: var(--muted);
   padding: 10px 0 4px;
   border-top: 1px solid var(--border, #30363d);
   margin-top: 4px;
@@ -4783,7 +4783,7 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 /* ── Ship review PR modes: PR link, CI checks, merge warning (STA-717) ───── */
 .ship-review-pr-section { margin-bottom: 14px; display: flex; flex-direction: column; gap: 6px; }
 .ship-review-pr-link { font-weight: 600; color: var(--accent, #58a6ff); }
-.ship-review-pr-note { font-size: 12px; color: var(--text-muted, #8b949e); }
+.ship-review-pr-note { font-size: 12px; color: var(--muted); }
 .ship-review-pr-summary { margin-left: 8px; text-transform: none; letter-spacing: 0; font-weight: 600; }
 .ship-review-pr-checks { list-style: none; margin: 0; padding: 0; font-size: 12px; }
 .ship-review-pr-check {
@@ -4797,13 +4797,13 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .ship-review-pr-check:last-child { border-bottom: none; }
 .ship-review-pr-check-icon { width: 14px; flex: none; text-align: center; font-weight: 700; }
 .ship-review-pr-check-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-.ship-review-pr-check-state, .ship-review-pr-check-duration { color: var(--text-muted, #8b949e); white-space: nowrap; }
+.ship-review-pr-check-state, .ship-review-pr-check-duration { color: var(--muted); white-space: nowrap; }
 .ship-review-pr-check-link { white-space: nowrap; color: var(--accent, #58a6ff); }
 .ship-review-pr-check--pass .ship-review-pr-check-icon { color: var(--green, #3fb950); }
 .ship-review-pr-check--fail .ship-review-pr-check-icon,
 .ship-review-pr-check--cancel .ship-review-pr-check-icon { color: var(--red, #f85149); }
 .ship-review-pr-check--pending .ship-review-pr-check-icon { color: #f8c436; }
-.ship-review-pr-check--empty { color: var(--text-muted, #8b949e); }
+.ship-review-pr-check--empty { color: var(--muted); }
 .ship-review-pr-warning {
   display: flex;
   flex-direction: column;
@@ -4883,20 +4883,20 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   margin-left: 8px;
   font-weight: 400;
   font-size: 12px;
-  color: var(--text-muted, #8b949e);
+  color: var(--muted);
 }
 .ship-review-test-coverage[data-state="blocking"] .ship-review-test-coverage-status,
 .ship-review-test-coverage[data-state="error"] .ship-review-test-coverage-status { color: #f8c436; }
 .ship-review-test-coverage[data-state="ok"] .ship-review-test-coverage-status { color: var(--green, #3fb950); }
 .ship-review-test-coverage-body { display: flex; flex-direction: column; gap: 6px; }
-.ship-review-test-coverage-note { font-size: 12px; color: var(--text-muted, #8b949e); }
+.ship-review-test-coverage-note { font-size: 12px; color: var(--muted); }
 .ship-review-test-ok { font-size: 13px; color: var(--green, #3fb950); }
 .ship-review-test-warning {
   padding: 7px 12px;
   border-radius: 6px;
   font-size: 13px;
   border: 1px solid var(--border, #30363d);
-  color: var(--text-muted, #8b949e);
+  color: var(--muted);
   overflow-wrap: anywhere;
 }
 .ship-review-test-warning--blocking {
@@ -4909,9 +4909,9 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .ship-review-test-warning-items { margin: 4px 0 0 16px; padding: 0; font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; }
 .ship-review-test-warning .ship-review-test-coverage-retry { margin-left: 8px; }
 .ship-review-merge-without-tests-missing { margin: 4px 0 4px 16px; padding: 0; }
-.ship-review-merge-without-tests-note { font-size: 12px; color: var(--text-muted, #8b949e); margin-bottom: 4px; }
+.ship-review-merge-without-tests-note { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
 .ship-review-test-task-link { overflow-wrap: anywhere; }
-.ship-review-test-task-note { margin-left: 8px; font-size: 12px; color: var(--text-muted, #8b949e); }
+.ship-review-test-task-note { margin-left: 8px; font-size: 12px; color: var(--muted); }
 
 /* Non-git task (STA-864): runs in place, nothing checkpointed or reviewable. */
 .task-page-nongit-banner {
@@ -4956,3 +4956,19 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .gates-stats, .gates-settings { padding: 12px; border-bottom: 1px solid var(--border, #30363d); display: flex; flex-direction: column; gap: 6px; }
 .gates-stats-title { font-weight: 600; font-size: 13px; }
 .gates-stat-line, .gates-setting-row { font-size: 13px; }
+
+/* Task trust: "Trust this task until…" (task-6c1ed91f) */
+.gate-status-deferred { color: var(--muted); font-weight: 600; font-style: italic; }
+.task-trust-section { display: flex; flex-direction: column; gap: 8px; }
+.trust-banner, .gates-trust-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 12px; border: 1px solid rgba(63,185,80,.45); border-radius: 6px; background: rgba(63,185,80,.08); }
+.gates-trust-ended { border-color: var(--border, #30363d); background: transparent; opacity: .8; }
+.trust-banner-text { font-weight: 600; }
+.trust-tev1-banner { padding: 8px 12px; border: 1px solid rgba(245,158,11,.6); border-radius: 6px; background: rgba(245,158,11,.14); color: var(--amber, #f59e0b); font-weight: 600; }
+.trust-create-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.trust-custom-minutes { width: 90px; }
+.trust-create-note, .trust-ended { font-size: 12px; }
+.trust-request-list, .trust-tev1-summary { display: flex; flex-direction: column; gap: 3px; }
+.trust-list-title { font-size: 12px; font-weight: 600; color: var(--muted); }
+.trust-request-row { display: flex; gap: 8px; align-items: baseline; }
+.trust-request-time { font-size: 11px; color: var(--muted); min-width: 72px; }
+.gates-trust-panel { margin: 10px 12px; display: flex; flex-direction: column; gap: 6px; }

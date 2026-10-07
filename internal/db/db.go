@@ -1333,6 +1333,68 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version: 40,
+		Name:    "gate_task_trust",
+		Up: func(conn *sql.DB) error {
+			// task-6c1ed91f: "Trust this task until…" is a task-scoped allow
+			// rule with match_kind 'any' and an optional tev1 mode. SQLite
+			// cannot alter a CHECK, so the rules table is rebuilt. Requests
+			// gain defer_at (when an under-trust delete outside the worktree
+			// stops waiting) and deferred_at (when it was skipped).
+			for _, stmt := range []string{
+				`ALTER TABLE security_gate_requests ADD COLUMN defer_at    TEXT;`,
+				`ALTER TABLE security_gate_requests ADD COLUMN deferred_at TEXT;`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			tx, err := conn.Begin()
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			for _, stmt := range []string{
+				`CREATE TABLE security_gate_rules_new (
+					id             INTEGER PRIMARY KEY AUTOINCREMENT,
+					pattern        TEXT NOT NULL,
+					match_kind     TEXT NOT NULL DEFAULT 'exact' CHECK (match_kind IN ('exact','prefix','any')),
+					reasons_json   TEXT NOT NULL DEFAULT '[]',
+					scripts_json   TEXT NOT NULL DEFAULT '[]',
+					scope          TEXT NOT NULL CHECK (scope IN ('task','repo','org')),
+					scope_value    TEXT NOT NULL,
+					source_gate_id TEXT NOT NULL DEFAULT '',
+					note           TEXT NOT NULL DEFAULT '',
+					created_by     TEXT NOT NULL DEFAULT 'board',
+					created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+					expires_at     TEXT,
+					deleted_at     TEXT,
+					hit_count      INTEGER NOT NULL DEFAULT 0,
+					last_hit_at    TEXT,
+					tev1           INTEGER NOT NULL DEFAULT 0,
+					tev1_threshold REAL NOT NULL DEFAULT 0,
+					ended_reason   TEXT NOT NULL DEFAULT '',
+					CHECK (match_kind <> 'any' OR (scope = 'task' AND expires_at IS NOT NULL))
+				);`,
+				`INSERT INTO security_gate_rules_new
+					(id, pattern, match_kind, reasons_json, scripts_json, scope, scope_value, source_gate_id, note,
+					 created_by, created_at, expires_at, deleted_at, hit_count, last_hit_at)
+				 SELECT id, pattern, match_kind, reasons_json, scripts_json, scope, scope_value, source_gate_id, note,
+					 created_by, created_at, expires_at, deleted_at, hit_count, last_hit_at
+				 FROM security_gate_rules;`,
+				`DROP TABLE security_gate_rules;`,
+				`ALTER TABLE security_gate_rules_new RENAME TO security_gate_rules;`,
+				`CREATE INDEX IF NOT EXISTS idx_sgr_scope ON security_gate_rules (scope, scope_value) WHERE deleted_at IS NULL;`,
+				`CREATE INDEX IF NOT EXISTS idx_sgreq_task ON security_gate_requests (task_id, created_at);`,
+			} {
+				if _, err := tx.Exec(stmt); err != nil {
+					return err
+				}
+			}
+			return tx.Commit()
+		},
+	},
 }
 
 func copyFile(src, dst string) error {
