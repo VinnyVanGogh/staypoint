@@ -1098,6 +1098,7 @@ function navigateTo(viewName, orgName = null, pushHistory = true) {
     if (viewName === 'kanban')       renderKanban();
     if (viewName === 'task-page')    { /* content rendered by openTaskPage() */ }
     if (viewName === 'logs')         renderLogsPage();
+    if (viewName === 'artifacts')    renderArtifactsPage();
     if (viewName === 'gates')        renderGatesPage();
     if (viewName === 'boss') {
       renderBoss();
@@ -10220,10 +10221,11 @@ const TASK_PAGE_TABS = [
   { key: 'diff', label: 'Diff' },
   { key: 'migrations', label: 'Migrations' },
   { key: 'brief', label: 'Brief' },
+  { key: 'artifacts', label: 'Artifacts' },
 ];
 
 // Right column of the task page (STA-638): one tablist over Review / Diff /
-// Migrations / Brief. Returns the column, the tabpanel per key (callers fill
+// Migrations / Brief / Artifacts. Returns the column, the tabpanel per key (callers fill
 // them with the existing renderers), and setters for the tab badges.
 function buildTaskPagePanel(taskId, defaultKey) {
   const side = el('div', 'task-page-side task-page-panel');
@@ -10590,6 +10592,14 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     }, showNoMigrations);
   } else {
     showNoMigrations();
+  }
+
+  // Artifacts panel: the task's documents (task_documents), latest version
+  // rendered, with version history and download.
+  if (task.id && !isFleetTaskId(task.id || '')) {
+    renderTaskArtifacts(tabPanels.artifacts, task.id).then(n => setTabCount('artifacts', n));
+  } else {
+    tabPanels.artifacts.appendChild(el('p', 'panel-field-muted task-page-tab-empty', 'Fleet tasks have no documents.'));
   }
 
   // Agent interaction (chat): only the composer row is pinned to the bottom of
@@ -12558,3 +12568,226 @@ function renderLogsTable(container, errors, filter, adapterFilter) {
 }
 
 // Gates page and task-page pending gates live in gates.js (STA-868).
+
+// ── Artifacts (task documents) ────────────────────────────
+// Task documents (`staypoint task doc add`) are the deliverables of planning,
+// architecture and docs tasks. The task page's Artifacts tab shows one task's
+// documents; the sidebar Artifacts page lists them across tasks.
+// Pure helpers (filtering, filter options, file names) live in lib/artifacts.js.
+
+// Doc key the Artifacts tab shows for a task: the last one picked, or the one
+// a row on the Artifacts page opened, so a re-render (SSE) keeps it.
+let artifactFocus = { taskId: null, docKey: null };
+
+const artifactDate = (ts) => (ts ? new Date(ts).toLocaleString() : '');
+
+function downloadArtifact(doc) {
+  const blob = new Blob([doc.content || ''], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = artifactFileName(doc, doc.version);
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+// renderTaskArtifacts fills panel with the task's documents: a list of doc
+// keys and a viewer for the selected one. Resolves to the document count.
+async function renderTaskArtifacts(panel, taskId) {
+  panel.innerHTML = '';
+  const wrap = el('div', 'task-artifacts');
+  panel.appendChild(wrap);
+  let docs;
+  try {
+    const resp = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/documents`);
+    docs = resp.documents || [];
+  } catch (err) {
+    wrap.appendChild(el('p', 'panel-field-muted task-page-tab-empty', `Failed to load documents: ${err.message}`));
+    return 0;
+  }
+  if (!docs.length) {
+    wrap.appendChild(el('p', 'panel-field-muted task-page-tab-empty',
+      'No documents on this task. Agents store deliverables with `staypoint task doc add <task> <key> <content>`.'));
+    return 0;
+  }
+
+  const list = el('div', 'artifact-key-list');
+  list.setAttribute('role', 'listbox');
+  list.setAttribute('aria-label', 'Task documents');
+  const viewer = el('div', 'artifact-viewer');
+  wrap.appendChild(list);
+  wrap.appendChild(viewer);
+
+  const buttons = {};
+  let loadSeq = 0;
+  const show = async (summary, version) => {
+    artifactFocus = { taskId, docKey: summary.doc_key };
+    for (const [k, b] of Object.entries(buttons)) {
+      const on = k === summary.doc_key;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-selected', on ? 'true' : 'false');
+    }
+    const seq = ++loadSeq;
+    viewer.innerHTML = '';
+    viewer.appendChild(el('p', 'panel-field-muted', 'Loading…'));
+    const q = version ? `?version=${version}` : '';
+    let doc;
+    try {
+      doc = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/documents/${encodeURIComponent(summary.doc_key)}${q}`);
+    } catch (err) {
+      if (seq !== loadSeq) return;
+      viewer.innerHTML = '';
+      viewer.appendChild(el('p', 'panel-field-muted', `Failed to load ${summary.doc_key}: ${err.message}`));
+      return;
+    }
+    if (seq !== loadSeq) return;
+    viewer.innerHTML = '';
+
+    const head = el('div', 'artifact-viewer-head');
+    head.appendChild(el('span', 'artifact-viewer-key', doc.doc_key));
+    const sel = el('select', 'select-filter artifact-version-select');
+    sel.setAttribute('aria-label', `${doc.doc_key} version`);
+    for (const v of summary.versions || [{ version: summary.latest_version, created_at: summary.updated_at }]) {
+      const opt = el('option', '', `v${v.version}${v.version === summary.latest_version ? ' (latest)' : ''} · ${artifactDate(v.created_at)}`);
+      opt.value = String(v.version);
+      if (v.version === doc.version) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.addEventListener('change', () => show(summary, Number(sel.value)));
+    head.appendChild(sel);
+    const named = { ...doc, task_identifier: summary.task_identifier };
+    const dl = el('button', 'btn btn-secondary artifact-download-btn', 'Download');
+    dl.type = 'button';
+    dl.title = `Download ${artifactFileName(named, doc.version)}`;
+    dl.addEventListener('click', () => downloadArtifact(named));
+    head.appendChild(dl);
+    viewer.appendChild(head);
+    viewer.appendChild(el('div', 'artifact-viewer-meta',
+      `Version ${doc.version} of ${summary.latest_version} · ${formatDocSize(new Blob([doc.content || '']).size)} · ${artifactDate(doc.created_at)}`));
+    const body = el('div', 'md-body markdown-body artifact-viewer-body');
+    body.innerHTML = renderMarkdown(doc.content || '');
+    viewer.appendChild(body);
+  };
+
+  for (const d of docs) {
+    const b = el('button', 'artifact-key-btn');
+    b.type = 'button';
+    b.setAttribute('role', 'option');
+    b.dataset.docKey = d.doc_key;
+    b.appendChild(el('span', 'artifact-key-name', d.doc_key));
+    b.appendChild(el('span', 'artifact-key-meta', `v${d.latest_version} · ${formatDocSize(d.size)} · ${artifactDate(d.updated_at)}`));
+    b.addEventListener('click', () => show(d));
+    list.appendChild(b);
+    buttons[d.doc_key] = b;
+  }
+
+  const focusKey = artifactFocus.taskId === taskId ? artifactFocus.docKey : null;
+  show(docs.find(d => d.doc_key === focusKey) || docs[0]);
+  return docs.length;
+}
+
+// Opens a task on its Artifacts tab with docKey selected.
+function openTaskArtifact(taskId, docKey) {
+  artifactFocus = { taskId, docKey };
+  taskPagePanelTab = { taskId, key: 'artifacts' };
+  openTaskPage(taskId);
+}
+
+const artifactsState = { docs: [], filter: { org: 'all', task: 'all', kind: 'all' } };
+
+function fillArtifactSelect(sel, allLabel, options, current) {
+  if (!sel) return;
+  sel.innerHTML = '';
+  const all = el('option', '', allLabel);
+  all.value = 'all';
+  sel.appendChild(all);
+  for (const o of options) {
+    const opt = el('option', '', o.label);
+    opt.value = o.value;
+    sel.appendChild(opt);
+  }
+  sel.value = options.some(o => o.value === current) ? current : 'all';
+}
+
+function renderArtifactsTable() {
+  const container = document.getElementById('artifacts-container');
+  if (!container) return;
+  container.innerHTML = '';
+  const rows = filterArtifacts(artifactsState.docs, artifactsState.filter);
+  if (!rows.length) {
+    const msg = artifactsState.docs.length
+      ? 'No documents match these filters.'
+      : 'No task documents yet. Planning and architecture tasks store deliverables with `staypoint task doc add`.';
+    container.appendChild(el('p', 'artifacts-empty', msg));
+    return;
+  }
+  const wrapper = el('div', 'task-table-wrapper');
+  const table = el('table', 'global-task-table artifacts-table');
+  const thead = el('thead');
+  const hr = el('tr');
+  for (const h of ['Document', 'Task', 'Org', 'Version', 'Size', 'Updated']) hr.appendChild(el('th', '', h));
+  thead.appendChild(hr);
+  table.appendChild(thead);
+  const tbody = el('tbody');
+  for (const d of rows) {
+    const tr = el('tr', 'artifacts-row');
+    tr.tabIndex = 0;
+    tr.title = `Open ${d.doc_key} on ${artifactTaskLabel(d)}`;
+    tr.appendChild(el('td', 'artifacts-doc-key', d.doc_key));
+    tr.appendChild(el('td', '', artifactTaskLabel(d)));
+    tr.appendChild(el('td', '', d.organization || '—'));
+    tr.appendChild(el('td', '', d.version_count > 1 ? `v${d.latest_version} (${d.version_count} versions)` : `v${d.latest_version}`));
+    tr.appendChild(el('td', '', formatDocSize(d.size)));
+    tr.appendChild(el('td', '', artifactDate(d.updated_at)));
+    const open = () => openTaskArtifact(d.task_id, d.doc_key);
+    tr.addEventListener('click', open);
+    tr.addEventListener('keydown', (e) => { if (e.key === 'Enter') open(); });
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  wrapper.appendChild(table);
+  container.appendChild(wrapper);
+}
+
+async function renderArtifactsPage() {
+  const container = document.getElementById('artifacts-container');
+  if (!container) return;
+  const selects = {
+    org: document.getElementById('artifacts-org-filter'),
+    task: document.getElementById('artifacts-task-filter'),
+    kind: document.getElementById('artifacts-kind-filter'),
+  };
+  for (const [key, sel] of Object.entries(selects)) {
+    if (sel && !sel._artifactsHandler) {
+      sel._artifactsHandler = true;
+      sel.addEventListener('change', () => {
+        artifactsState.filter[key] = sel.value;
+        renderArtifactsTable();
+      });
+    }
+  }
+  const refreshBtn = document.getElementById('artifacts-refresh-btn');
+  if (refreshBtn && !refreshBtn._artifactsHandler) {
+    refreshBtn._artifactsHandler = true;
+    refreshBtn.addEventListener('click', renderArtifactsPage);
+  }
+
+  container.innerHTML = '<p class="artifacts-empty">Loading…</p>';
+  try {
+    const resp = await apiFetch('/api/documents');
+    artifactsState.docs = resp.documents || [];
+  } catch (err) {
+    container.innerHTML = '';
+    container.appendChild(el('p', 'artifacts-empty artifacts-error', `Failed to load documents: ${err.message}`));
+    return;
+  }
+  const opts = artifactFilterOptions(artifactsState.docs);
+  const f = artifactsState.filter;
+  fillArtifactSelect(selects.org, 'All Orgs', opts.orgs.map(o => ({ value: o, label: o })), f.org);
+  fillArtifactSelect(selects.task, 'All Tasks', opts.tasks.map(t => ({ value: t.id, label: t.label })), f.task);
+  fillArtifactSelect(selects.kind, 'All Kinds', opts.kinds.map(k => ({ value: k, label: k })), f.kind);
+  for (const [key, sel] of Object.entries(selects)) if (sel) f[key] = sel.value;
+  renderArtifactsTable();
+}

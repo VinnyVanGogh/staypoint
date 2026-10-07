@@ -4,7 +4,7 @@
  * The drawer (#detail-panel) used to be its own one-column layout with the
  * description first. It now renders the full page's layout through
  * renderTaskPage(): header with status and actions, stats strip, timeline,
- * and the Review / Diff / Migrations / Brief tabs, stacked to fit the drawer
+ * and the Review / Diff / Migrations / Brief / Artifacts tabs, stacked to fit the drawer
  * and back in two columns once #panel-expand makes it wide.
  *
  * Also covered: Escape in a drawer dialog (content or file diff) closes only
@@ -19,7 +19,7 @@ import {
 
 const VIEWPORT = { width: 1512, height: 900 };
 const DRAWER = '#panel-content';
-const TABS = ['Review', 'Diff', 'Migrations', 'Brief'] as const;
+const TABS = ['Review', 'Diff', 'Migrations', 'Brief', 'Artifacts'] as const;
 const BRIEF_MARKER = 'DRAWER-BRIEF-MARKER';
 
 async function openDrawer(page: Page, task: Task): Promise<Locator> {
@@ -70,6 +70,7 @@ async function expectTaskLayout(page: Page, panel: Locator, task: Task) {
     Diff: panel.locator('#task-page-tabpanel-diff .task-page-diff'),
     Migrations: panel.locator('#task-page-tabpanel-migrations'),
     Brief: panel.locator('#task-page-tabpanel-brief').getByText(BRIEF_MARKER),
+    Artifacts: panel.locator('#task-page-tabpanel-artifacts .task-artifacts'),
   };
   for (const name of TABS) {
     await openTaskPanelTab(page, name, DRAWER);

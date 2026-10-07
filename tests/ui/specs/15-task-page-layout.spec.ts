@@ -281,7 +281,7 @@ async function selectTab(page: Page, name: RegExp): Promise<Locator> {
   return tabpanel;
 }
 
-const TABS = [/^\W*Review\b/, /^\W*Diff\b/, /^\W*Migrations\b/, /^\W*Brief\b/];
+const TABS = [/^\W*Review\b/, /^\W*Diff\b/, /^\W*Migrations\b/, /^\W*Brief\b/, /^\W*Artifacts\b/];
 
 test('seeded heavy task renders and is captured at 1512x900', async ({ page, api }) => {
   test.setTimeout(60_000);
@@ -358,14 +358,14 @@ test('step 2: one screen at 1512x900 with sticky header actions, stats strip and
   await expectInViewport(page, runHeader.getByRole('button', { name: /Stop( now)?\b/i }), 'header Stop button');
 });
 
-test('step 3: right panel tabs Review / Diff / Migrations / Brief swap the existing content', async ({ page, api }) => {
+test('step 3: right panel tabs Review / Diff / Migrations / Brief / Artifacts swap the existing content', async ({ page, api }) => {
   test.setTimeout(60_000);
   await openHeavyTask(page, api);
 
   const panel = page.locator('#task-page-content .task-page-panel');
   await expectInViewport(page, panel.getByRole('tablist'), '.task-page-panel tablist');
   const tabs = panel.getByRole('tab');
-  await expect(tabs).toHaveCount(4);
+  await expect(tabs).toHaveCount(TABS.length);
   for (let i = 0; i < TABS.length; i++) {
     await expect(tabs.nth(i)).toHaveAccessibleName(TABS[i]);
   }
@@ -376,6 +376,7 @@ test('step 3: right panel tabs Review / Diff / Migrations / Brief swap the exist
     [TABS[1], '.diff-file-row', 'internal/server/middleware.go'],
     [TABS[2], '.migration-file-card', '20261004120000_rate_limits.sql'],
     [TABS[3], '.desc-view', 'Add rate-limit headers to the events API.'],
+    [TABS[4], '.task-artifacts', 'No documents'],
   ];
   for (const [name, selector, text] of content) {
     const tabpanel = await selectTab(page, name);
@@ -624,7 +625,7 @@ test('step 6: at 800x900 the page stacks, tabs are a segmented control, nothing 
       overflows: list.scrollWidth > list.clientWidth + 1,
     };
   });
-  expect(seg.count).toBe(4);
+  expect(seg.count).toBe(TABS.length);
   expect(seg.oneRow, 'tabs wrap onto more than one row').toBe(true);
   expect(seg.filled, 'tabs do not fill the row like a segmented control').toBeGreaterThanOrEqual(0.9);
   expect(seg.overflows, 'tablist overflows horizontally').toBe(false);

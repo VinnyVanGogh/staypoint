@@ -634,14 +634,28 @@
       </div>
     </section>
 
-    <!-- Artifacts stub -->
+    <!-- Artifacts: task documents across tasks -->
     <section id="view-artifacts" class="view">
-      <div class="view-header"><h1 class="view-title">Artifacts</h1></div>
-      <div class="stub-page">
-        <div class="stub-icon">&#9741;</div>
-        <div class="stub-title">Artifacts</div>
-        <div class="stub-desc">Work products, uploaded files, and agent-generated deliverables.</div>
-        <div class="stub-phase">Coming in Phase 2</div>
+      <div class="view-header">
+        <div class="view-title-group">
+          <h1 class="view-title">Artifacts</h1>
+          <span class="refresh-indicator">Task documents (plans, bundles, architecture) across tasks</span>
+        </div>
+        <div class="table-controls">
+          <select id="artifacts-org-filter" class="select-filter" aria-label="Filter by organization">
+            <option value="all">All Orgs</option>
+          </select>
+          <select id="artifacts-task-filter" class="select-filter" aria-label="Filter by task">
+            <option value="all">All Tasks</option>
+          </select>
+          <select id="artifacts-kind-filter" class="select-filter" aria-label="Filter by kind">
+            <option value="all">All Kinds</option>
+          </select>
+          <button id="artifacts-refresh-btn" class="sidebar-filter-btn">Refresh</button>
+        </div>
+      </div>
+      <div class="dashboard-section" style="padding:0">
+        <div id="artifacts-container" class="artifacts-list"></div>
       </div>
     </section>
 
@@ -829,6 +843,7 @@
 <script src="/ui/lib/markdown.js"></script>
 <script src="/ui/lib/quotagauge.js"></script>
 <script src="/ui/lib/gates.js"></script>
+<script src="/ui/lib/artifacts.js"></script>
 <!-- gates.js before app.js: app.js boot() may open /gates straight away. -->
 <script src="/ui/gates.js"></script>
 <script src="/ui/app.js"></script>
