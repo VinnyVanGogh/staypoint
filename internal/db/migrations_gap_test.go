@@ -16,8 +16,10 @@ func TestOpen_AppliesMigrationBelowMaxThatNeverRan(t *testing.T) {
 		t.Fatalf("first Open: %v", err)
 	}
 	conn := store.DB()
-	// Undo migration 27 and record a later version from some other branch.
+	// Undo migration 27 and record a later version from some other branch,
+	// leaving the DB as a pre-STA-744 binary would (no schema_migrations).
 	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS schema_migrations`,
 		`ALTER TABLE board_webauthn_credentials DROP COLUMN flags_user_present`,
 		`ALTER TABLE board_webauthn_credentials DROP COLUMN flags_user_verified`,
 		`ALTER TABLE board_webauthn_credentials DROP COLUMN flags_backup_eligible`,
