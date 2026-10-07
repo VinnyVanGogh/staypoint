@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/config"
+	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/fleet"
 	"github.com/VinnyVanGogh/staypoint/internal/reporting"
 )
@@ -31,6 +32,9 @@ type TelemetryHandler struct {
 	fleetAgg        *fleet.Aggregator
 	telemetryDBPath string
 	overviewCache   fleetOverviewCache
+	// overviewCacheAll caches the include_legacy=1 overview separately so the
+	// default (hidden) and full bodies never overwrite each other.
+	overviewCacheAll fleetOverviewCache
 }
 
 func NewTelemetryHandler(db *sql.DB, hub *EventHub, telemetryDBPath string) *TelemetryHandler {
@@ -117,7 +121,9 @@ func (h *TelemetryHandler) GetTelemetry(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// 3. Task spend summary
+	// 3. Task spend summary (legacy tasks and archived imports hidden unless
+	// include_legacy / include_archive).
+	includeHidden := includeHiddenTasks(r)
 	var spend TaskSpendSummary
 	row := h.db.QueryRowContext(r.Context(), `
 		SELECT
@@ -126,7 +132,8 @@ func (h *TelemetryHandler) GetTelemetry(w http.ResponseWriter, r *http.Request) 
 			COALESCE(SUM(spent_turns), 0),
 			COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0)
-		FROM tasks;
+		FROM tasks
+		WHERE `+meshContext.VisibleTasksSQL("", includeHidden)+`;
 	`)
 	_ = row.Scan(&spend.TotalSpentUSD, &spend.TotalSpentTokens, &spend.TotalTurns, &spend.ActiveTasks, &spend.DoneTasks)
 
@@ -139,7 +146,7 @@ func (h *TelemetryHandler) GetTelemetry(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if h.fleetAgg != nil {
-		if fleetOverview, err := h.fleetAgg.Gather(r.Context()); err == nil {
+		if fleetOverview, err := h.fleetAgg.GatherWith(r.Context(), fleet.GatherOptions{IncludeHidden: includeHidden}); err == nil {
 			respMap["fleet"] = fleetOverview
 		}
 	}
@@ -148,6 +155,8 @@ func (h *TelemetryHandler) GetTelemetry(w http.ResponseWriter, r *http.Request) 
 }
 
 // GetFleetOverview handles GET /api/fleet/overview.
+// Legacy tasks and archived imports are left out of tasks, counts, projects
+// and spend unless include_legacy / include_archive is set.
 // Results are cached for fleetOverviewCacheTTL (10 s) to avoid the ≈3–4 s
 // Paperclip API round-trip on every page load.
 func (h *TelemetryHandler) GetFleetOverview(w http.ResponseWriter, r *http.Request) {
@@ -156,19 +165,25 @@ func (h *TelemetryHandler) GetFleetOverview(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	h.overviewCache.mu.Lock()
-	if time.Now().Before(h.overviewCache.expiresAt) && len(h.overviewCache.body) > 0 {
-		body := h.overviewCache.body
-		h.overviewCache.mu.Unlock()
+	includeHidden := includeHiddenTasks(r)
+	cache := &h.overviewCache
+	if includeHidden {
+		cache = &h.overviewCacheAll
+	}
+
+	cache.mu.Lock()
+	if time.Now().Before(cache.expiresAt) && len(cache.body) > 0 {
+		body := cache.body
+		cache.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Fleet-Cache", "hit")
 		_, _ = w.Write(body)
 		return
 	}
-	h.overviewCache.mu.Unlock()
+	cache.mu.Unlock()
 
 	t0 := time.Now()
-	overview, err := h.fleetAgg.Gather(r.Context())
+	overview, err := h.fleetAgg.GatherWith(r.Context(), fleet.GatherOptions{IncludeHidden: includeHidden})
 	elapsed := time.Since(t0)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -183,10 +198,10 @@ func (h *TelemetryHandler) GetFleetOverview(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	h.overviewCache.mu.Lock()
-	h.overviewCache.body = body
-	h.overviewCache.expiresAt = time.Now().Add(fleetOverviewCacheTTL)
-	h.overviewCache.mu.Unlock()
+	cache.mu.Lock()
+	cache.body = body
+	cache.expiresAt = time.Now().Add(fleetOverviewCacheTTL)
+	cache.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Fleet-Cache", "miss")

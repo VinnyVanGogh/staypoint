@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/paperclip"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
@@ -50,8 +51,23 @@ func NewAggregator(db *sql.DB, telemetryDBPath string, pclipClient *paperclip.Cl
 	}
 }
 
-// Gather builds the complete FleetOverview across all organizations.
+// GatherOptions tunes Gather. The zero value is the default every surface
+// uses: legacy tasks and archived Paperclip imports are left out of tasks,
+// counts, projects and spend.
+type GatherOptions struct {
+	// IncludeHidden keeps legacy tasks and archived imports (the
+	// include_legacy / include_archive switch).
+	IncludeHidden bool
+}
+
+// Gather builds the complete FleetOverview across all organizations, hiding
+// legacy tasks and archived imports.
 func (a *Aggregator) Gather(ctx context.Context) (*FleetOverview, error) {
+	return a.GatherWith(ctx, GatherOptions{})
+}
+
+// GatherWith is Gather with options.
+func (a *Aggregator) GatherWith(ctx context.Context, opts GatherOptions) (*FleetOverview, error) {
 	now := time.Now()
 	if a.Now != nil {
 		now = a.Now()
@@ -73,7 +89,7 @@ func (a *Aggregator) Gather(ctx context.Context) (*FleetOverview, error) {
 	a.gatherProviderQuotas(overview, now)
 
 	// 2. Gather Organizations, Tasks, and Active Running Agents
-	a.gatherOrgsAndTasks(ctx, overview, now)
+	a.gatherOrgsAndTasks(ctx, overview, now, opts.IncludeHidden)
 
 	// 3. Gather Token Telemetry and Cost Accounting
 	a.gatherTokenTelemetry(overview)
@@ -489,7 +505,7 @@ func pctPair(used, remaining *float64) (float64, float64) {
 }
 
 // gatherOrgsAndTasks consolidates organizations, tasks, and agent sessions across StayPoint and Paperclip.
-func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOverview, now time.Time) {
+func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOverview, now time.Time, includeHidden bool) {
 	orgMap := make(map[string]*OrgFleetSummary)
 
 	ensureOrg := func(name, id, prefix string) *OrgFleetSummary {
@@ -694,22 +710,24 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 			}
 		}
 
+		// Legacy tasks and archived imports are left out of every count,
+		// project list and spend total unless includeHidden.
 		tRows, err := a.DB.Query(`
 			SELECT id, name, COALESCE(organization, ''), COALESCE(project, ''),
 			       status, execution_stage, is_blocked, COALESCE(block_reason, ''),
 			       spent_usd, spent_tokens, updated_at, COALESCE(parent_id, ''),
-			       COALESCE(checkout_agent_id, '')
+			       COALESCE(checkout_agent_id, ''), COALESCE(origin, 'native')
 			FROM tasks
-			WHERE status != 'soft_deleted';
+			WHERE status != 'soft_deleted' AND ` + meshContext.VisibleTasksSQL("", includeHidden) + `;
 		`)
 		if err == nil {
 			defer tRows.Close()
 			for tRows.Next() {
-				var id, name, org, proj, st, stage, bReason, upAt, parentID, checkoutAgentID string
+				var id, name, org, proj, st, stage, bReason, upAt, parentID, checkoutAgentID, origin string
 				var isBlockedInt int
 				var spentUSD float64
 				var spentTokens int64
-				if err := tRows.Scan(&id, &name, &org, &proj, &st, &stage, &isBlockedInt, &bReason, &spentUSD, &spentTokens, &upAt, &parentID, &checkoutAgentID); err == nil {
+				if err := tRows.Scan(&id, &name, &org, &proj, &st, &stage, &isBlockedInt, &bReason, &spentUSD, &spentTokens, &upAt, &parentID, &checkoutAgentID, &origin); err == nil {
 					if org == "" {
 						org = "StayPoint"
 					}
@@ -803,6 +821,7 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 						BlockReason:     normalizeBlockReason(bReason),
 						UpdatedAt:       parsedUp,
 						CheckoutAgentID: checkoutAgentID,
+						Origin:          origin,
 					}
 					orgSummary.Tasks = append(orgSummary.Tasks, item)
 					overview.Tasks = append(overview.Tasks, item)
