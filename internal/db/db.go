@@ -1333,6 +1333,26 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version: 40,
+		Name:    "task_target_branch",
+		Up: func(conn *sql.DB) error {
+			// A project's work can land on a branch other than main (e.g.
+			// dev-server for work repos). The Board sets it per project; each
+			// task records the target it was cut from, next to its base, and
+			// each card the branch its Approve merges into.
+			for _, stmt := range []string{
+				`ALTER TABLE project_dev_configs ADD COLUMN target_branch TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE task_worktree_bases ADD COLUMN target_branch TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE ship_review_cards   ADD COLUMN target_branch TEXT NOT NULL DEFAULT '';`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {

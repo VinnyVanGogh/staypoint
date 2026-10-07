@@ -5080,7 +5080,7 @@ function renderSettings() {
       row.appendChild(el('span', 'settings-dev-config-cmd', c.dev_command || '—'));
       const mode = c.effective_merge_mode || 'direct';
       row.appendChild(el('span', 'settings-dev-config-merge-mode',
-        `${MERGE_MODE_LABELS[mode] || mode}${c.merge_mode ? '' : ' (default)'}${c.is_work_repo ? ' · work repo' : ''}`));
+        `${MERGE_MODE_LABELS[mode] || mode}${c.merge_mode ? '' : ' (default)'}${c.is_work_repo ? ' · work repo' : ''}${c.target_branch ? ` → ${c.target_branch}` : ''}`));
       row.title = 'Click to edit';
       row.style.cursor = 'pointer';
       // Load the saved values so a save never blanks fields it did not show.
@@ -5090,6 +5090,7 @@ function renderSettings() {
         stepsInput.value = (c.setup_steps || []).join('\n');
         mergeModeSelect.value = c.merge_mode || '';
         ghDirInput.value = c.gh_config_dir || '';
+        targetInput.value = c.target_branch || '';
       });
       devConfigList.appendChild(row);
     }
@@ -5130,6 +5131,10 @@ function renderSettings() {
   ghDirInput.type = 'text';
   ghDirInput.className = 'settings-dev-config-input settings-dev-config-gh-dir';
   ghDirInput.placeholder = 'Optional GH_CONFIG_DIR override (blank: the repo\'s normal gh login)';
+  const targetInput = el('input');
+  targetInput.type = 'text';
+  targetInput.className = 'settings-dev-config-input settings-dev-config-target-branch';
+  targetInput.placeholder = 'Target branch (blank: dev-server for work repos that have it, else the default branch)';
   const saveBtn = el('button', 'settings-dev-config-save', 'Save config');
   const saveStatus = el('span', 'settings-dev-config-status', '');
   devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Repo path'));
@@ -5140,6 +5145,8 @@ function renderSettings() {
   devForm.appendChild(stepsInput);
   devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Merge mode'));
   devForm.appendChild(mergeModeSelect);
+  devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Target branch'));
+  devForm.appendChild(targetInput);
   devForm.appendChild(el('div', 'settings-dev-config-field-label', 'gh config dir'));
   devForm.appendChild(ghDirInput);
   devForm.appendChild(saveBtn);
@@ -5158,6 +5165,7 @@ function renderSettings() {
       setup_steps: stepsInput.value.split('\n').map(s => s.trim()).filter(Boolean),
       merge_mode: mergeModeSelect.value,
       gh_config_dir: ghDirInput.value.trim(),
+      target_branch: targetInput.value.trim(),
     };
     const r = await withBoardWebAuthn((sessionToken, assertion) =>
       fetch('/api/project-dev-configs', {
@@ -8459,7 +8467,7 @@ function renderFinalShipReviewCard(taskId, headSHA, status, mainSHA, rejectComme
   shaRow.appendChild(el('span', 'ship-review-row-label', 'Reviewed SHA'));
   shaRow.appendChild(el('code', 'ship-review-sha', headSHA ? headSHA.slice(0, 12) : '—'));
   if (status === 'approved' && mainSHA) {
-    shaRow.appendChild(el('span', 'ship-review-arrow', ' → main '));
+    shaRow.appendChild(el('span', 'ship-review-arrow', ` → ${cardTarget(cleanup)} `));
     shaRow.appendChild(el('code', 'ship-review-sha ship-review-sha--main', mainSHA.slice(0, 12)));
   }
   section.appendChild(shaRow);
@@ -8511,6 +8519,7 @@ function renderBranchDeleteWarning(taskId, headSHA, mainSHA, cleanup) {
       if (!r.ok && !body.card) throw new Error(boardActionErrorText(r, body));
       const next = {
         branch: cleanup.branch,
+        target_branch: cleanup.target_branch,
         branch_deleted: !!body.branch_deleted,
         branch_delete_error: body.branch_delete_error || '',
       };
@@ -8647,6 +8656,11 @@ function devLogTrigger(logEl) {
 // A project's merge mode decides what Approve does: "direct" merges to main
 // as before, "open_pr" opens a GitHub PR and stops, "pr_merge" opens a PR,
 // waits for CI on the pinned head and merges through GitHub from the card.
+
+// cardTarget is the branch a card's Approve merges into.
+function cardTarget(card) {
+  return (card && card.target_branch) || 'main';
+}
 
 const MERGE_MODE_LABELS = {
   direct: 'Merge to main',
@@ -9094,6 +9108,10 @@ function renderShipReviewCardFromData(container, taskId, card) {
   shaRow.appendChild(el('span', 'ship-review-row-label', 'Branch SHA'));
   shaRow.appendChild(el('code', 'ship-review-sha', card.head_sha ? card.head_sha.slice(0, 12) : '—'));
   shaRow.appendChild(el('span', 'ship-review-branch', card.branch || ''));
+  // The branch Approve merges into (dev-server for work repos), never main implicitly.
+  if (card.target_branch) {
+    shaRow.appendChild(el('span', 'ship-review-target-branch', `→ ${card.target_branch}`));
+  }
   section.appendChild(shaRow);
 
   // PR + CI checks (STA-717). applyPRChecks is wired to the actions below.
@@ -9363,12 +9381,12 @@ function renderShipReviewCardFromData(container, taskId, card) {
     const repoSuffix = repoName ? ` (${repoName})` : '';
     const prTarget = card.pr_number > 0 ? `PR #${card.pr_number}` : 'a PR';
     approveConfirmForm.appendChild(el('div', 'ship-review-form-label',
-      approveMode === 'open_pr' ? `Push ${shortSHA} and open ${prTarget} → main${repoSuffix}. StayPoint will not merge it.`
-        : approveMode === 'pr_merge' ? `Push ${shortSHA} to ${prTarget} → main${repoSuffix} and run the checks. Merge comes after CI.`
-        : `Merge ${shortSHA} → main${repoSuffix}`));
+      approveMode === 'open_pr' ? `Push ${shortSHA} and open ${prTarget} → ${cardTarget(card)}${repoSuffix}. StayPoint will not merge it.`
+        : approveMode === 'pr_merge' ? `Push ${shortSHA} to ${prTarget} → ${cardTarget(card)}${repoSuffix} and run the checks. Merge comes after CI.`
+        : `Merge ${shortSHA} → ${cardTarget(card)}${repoSuffix}`));
     const acRow = el('div', 'ship-review-form-row');
     const acMerge = el('button', 'ship-review-form-submit',
-      approveMode === 'direct' ? 'Merge to main' : approveMode === 'open_pr' ? 'Open PR' : 'Push & run checks');
+      approveMode === 'direct' ? `Merge to ${cardTarget(card)}` : approveMode === 'open_pr' ? 'Open PR' : 'Push & run checks');
     const acCancel = el('button', 'ship-review-form-cancel', 'Cancel');
     acRow.appendChild(acMerge);
     acRow.appendChild(acCancel);
@@ -9424,6 +9442,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
         clearShipReviewHeaderActions(taskId);
         section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', mainSHA, '', {
           branch: card.branch,
+          target_branch: card.target_branch,
           branch_deleted: !!result.branch_deleted,
           branch_delete_error: result.branch_delete_error || '',
           test_task: result.test_task,
@@ -9479,7 +9498,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
       if (r.ok) {
         clearShipReviewHeaderActions(taskId);
         section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', body.main_sha || '', '', {
-          ...(body.card || { branch: card.branch, branch_deleted: !!body.branch_deleted, branch_delete_error: body.branch_delete_error || '' }),
+          ...(body.card || { branch: card.branch, target_branch: card.target_branch, branch_deleted: !!body.branch_deleted, branch_delete_error: body.branch_delete_error || '' }),
           test_task: body.test_task,
         }));
         return;
@@ -9517,7 +9536,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
     }
   };
   {
-    mergeConfirmForm.appendChild(el('div', 'ship-review-form-label', `Merge PR #${card.pr_number} ${shortHead} → main`));
+    mergeConfirmForm.appendChild(el('div', 'ship-review-form-label', `Merge PR #${card.pr_number} ${shortHead} → ${cardTarget(card)}`));
     const row = el('div', 'ship-review-form-row');
     const go = el('button', 'ship-review-form-submit ship-review-merge-submit', 'Merge PR');
     const cancel = el('button', 'ship-review-form-cancel', 'Cancel');
@@ -9555,7 +9574,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
   function showBypassConfirm(missing) {
     const list = (missing && missing.length) ? missing : ((testGate && testGate.state.missing) || []);
     const target = prActive ? `PR #${card.pr_number} ${shortHead}` : shortHead;
-    bypassLabel.textContent = `Merge ${target} → main without tests? Missing:`;
+    bypassLabel.textContent = `Merge ${target} → ${cardTarget(card)} without tests? Missing:`;
     bypassMissing.replaceChildren(...list.map((m) => el('li', 'ship-review-merge-without-tests-missing-item', m)));
     bypassNote.textContent = (prActive && !checksGreen)
       ? 'Checks are not all green either, so this also overrides them. Both are logged, and a backlog task to add the tests is created.'
@@ -9601,7 +9620,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
     prWarning.appendChild(warnRow);
     anywayBtn.addEventListener('click', () => {
       const n = prWarningList.children.length;
-      anywayLabel.textContent = `Merge PR #${card.pr_number} ${shortHead} → main with ${n} check${n === 1 ? '' : 's'} not green? This is logged as an override.`;
+      anywayLabel.textContent = `Merge PR #${card.pr_number} ${shortHead} → ${cardTarget(card)} with ${n} check${n === 1 ? '' : 's'} not green? This is logged as an override.`;
       showOnly(anywayConfirmForm);
     });
     failuresBtn.addEventListener('click', async () => {

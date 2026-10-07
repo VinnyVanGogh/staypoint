@@ -203,6 +203,7 @@ func TestWorktreeManager_SweepOrphans_WithDB(t *testing.T) {
 		task_id TEXT PRIMARY KEY,
 		repo_path TEXT NOT NULL DEFAULT '',
 		base_sha TEXT NOT NULL,
+		target_branch TEXT NOT NULL DEFAULT '',
 		created_at TEXT NOT NULL DEFAULT '',
 		updated_at TEXT NOT NULL DEFAULT ''
 	);

@@ -17,6 +17,10 @@ import (
 type WorktreeManager struct {
 	RepoRoot string
 	DB       *sql.DB
+	// TargetBranch, when set, names the branch a new task in repo is cut
+	// from ("" for the default branch). An error fails worktree creation
+	// rather than falling back to the default branch.
+	TargetBranch func(ctx context.Context, repo string) (string, error)
 }
 
 // NewWorktreeManager creates a manager for the given repository root.
@@ -90,17 +94,30 @@ func (w *WorktreeManager) CreateContext(ctx context.Context, taskID string, sess
 		return wtPath, nil
 	}
 
-	// A new task branches from origin/<default>, never from whatever the
+	// A new task branches from origin/<target> (the project's target
+	// branch, else the default branch), never from whatever the
 	// user's checkout has on HEAD: a feature branch there would otherwise be
 	// carried into the task and merged by its Approve (STA-774). The base is
 	// recorded in the daemon DB, which the agent cannot rewrite, before the
 	// branch exists; the branch is made from that SHA so it tracks no
 	// upstream. Any failure leaves no worktree.
-	baseSHA, err := resolveNewTaskBase(ctx, w.RepoRoot)
+	fetchOrigin(ctx, w.RepoRoot)
+	target := ""
+	if w.TargetBranch != nil {
+		var err error
+		if target, err = w.TargetBranch(ctx, w.RepoRoot); err != nil {
+			return "", fmt.Errorf("resolve target branch: %w", err)
+		}
+	}
+	baseSHA, targetBranch, err := resolveNewTaskBase(ctx, w.RepoRoot, target)
 	if err != nil {
 		return "", err
 	}
 	if err := RecordTaskBase(ctx, w.DB, w.RepoRoot, taskID, baseSHA); err != nil {
+		DeleteTaskBase(ctx, w.DB, w.RepoRoot, taskID)
+		return "", err
+	}
+	if err := RecordTaskTarget(ctx, w.DB, taskID, targetBranch); err != nil {
 		DeleteTaskBase(ctx, w.DB, w.RepoRoot, taskID)
 		return "", err
 	}
