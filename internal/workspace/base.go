@@ -55,22 +55,66 @@ func DefaultBranchRef(ctx context.Context, repo string) (string, error) {
 	return "", fmt.Errorf("%w in %s", ErrNoDefaultBranch, repo)
 }
 
-// resolveNewTaskBase fetches origin (best effort: an offline machine still
-// branches from the last fetched origin/<default>) and returns the commit SHA
-// of the default branch.
-func resolveNewTaskBase(ctx context.Context, repo string) (string, error) {
-	if hasRemote(ctx, repo, "origin") {
-		_, _ = runGit(ctx, repo, "fetch", "origin")
-	}
+// ErrNoTargetBranch is returned when a project's configured target branch
+// exists neither on origin nor locally. The default branch is never used
+// instead: work meant for the target would be cut from, and merged into, the
+// wrong branch.
+var ErrNoTargetBranch = errors.New("target branch not found")
+
+// DefaultBranchName is DefaultBranchRef as a branch name ("main").
+func DefaultBranchName(ctx context.Context, repo string) (string, error) {
 	ref, err := DefaultBranchRef(ctx, repo)
 	if err != nil {
 		return "", err
 	}
-	sha := commitOf(ctx, repo, ref)
-	if sha == "" {
-		return "", fmt.Errorf("resolve task base %s: no commit", ref)
+	return ShortBranch(ref), nil
+}
+
+// ShortBranch strips refs/heads/ or refs/remotes/origin/ from ref.
+func ShortBranch(ref string) string {
+	if b, ok := strings.CutPrefix(ref, "refs/remotes/origin/"); ok {
+		return b
 	}
-	return sha, nil
+	return strings.TrimPrefix(ref, "refs/heads/")
+}
+
+// TargetBranchRef returns the ref a task targeting branch is cut from:
+// origin/<branch>, else the local branch. branch "" is the default branch.
+func TargetBranchRef(ctx context.Context, repo, branch string) (string, error) {
+	if branch == "" {
+		return DefaultBranchRef(ctx, repo)
+	}
+	if strings.HasPrefix(branch, "-") || strings.HasPrefix(branch, "refs/") {
+		return "", fmt.Errorf("%w: invalid branch name %q", ErrNoTargetBranch, branch)
+	}
+	for _, ref := range []string{"refs/remotes/origin/" + branch, "refs/heads/" + branch} {
+		if commitOf(ctx, repo, ref) != "" {
+			return ref, nil
+		}
+	}
+	return "", fmt.Errorf("%w: %q in %s", ErrNoTargetBranch, branch, repo)
+}
+
+// fetchOrigin fetches origin, best effort: an offline machine still branches
+// from the last fetched origin/<target>.
+func fetchOrigin(ctx context.Context, repo string) {
+	if hasRemote(ctx, repo, "origin") {
+		_, _ = runGit(ctx, repo, "fetch", "origin")
+	}
+}
+
+// resolveNewTaskBase returns the commit SHA of the target branch ("" for the
+// default branch) and that branch's name. The caller fetches first.
+func resolveNewTaskBase(ctx context.Context, repo, target string) (sha, branch string, err error) {
+	ref, err := TargetBranchRef(ctx, repo, target)
+	if err != nil {
+		return "", "", err
+	}
+	sha = commitOf(ctx, repo, ref)
+	if sha == "" {
+		return "", "", fmt.Errorf("resolve task base %s: no commit", ref)
+	}
+	return sha, ShortBranch(ref), nil
 }
 
 // TaskBase returns the commit a task's changes are measured from. It is the
@@ -207,6 +251,40 @@ func RecordedTaskBase(ctx context.Context, db *sql.DB, taskID string) (string, e
 		return "", fmt.Errorf("read recorded task base: %w", err)
 	}
 	return sha, nil
+}
+
+// RecordTaskTarget stores the branch taskID was cut from and its Approve
+// merges into, next to its recorded base. Only the daemon calls this, at
+// worktree creation, right after RecordTaskBase.
+func RecordTaskTarget(ctx context.Context, db *sql.DB, taskID, branch string) error {
+	if db == nil {
+		return errors.New("record task target: no database")
+	}
+	res, err := db.ExecContext(ctx, `UPDATE task_worktree_bases SET target_branch = ? WHERE task_id = ?`, branch, taskID)
+	if err != nil {
+		return fmt.Errorf("record task target: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("record task target: %w %s", ErrNoTaskBase, taskID)
+	}
+	return nil
+}
+
+// RecordedTaskTarget returns the target branch recorded for taskID, or ""
+// when none was (tasks cut before targets were recorded, or no DB).
+func RecordedTaskTarget(ctx context.Context, db *sql.DB, taskID string) (string, error) {
+	if db == nil {
+		return "", nil
+	}
+	var branch string
+	err := db.QueryRowContext(ctx, `SELECT COALESCE(target_branch,'') FROM task_worktree_bases WHERE task_id = ?`, taskID).Scan(&branch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read recorded task target: %w", err)
+	}
+	return branch, nil
 }
 
 // DeleteTaskBase forgets taskID's recorded base and its pin, for when the

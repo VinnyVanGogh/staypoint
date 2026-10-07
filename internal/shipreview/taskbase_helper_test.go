@@ -33,6 +33,7 @@ func ensureTaskBaseTable(t *testing.T, db *sql.DB) {
 		task_id    TEXT PRIMARY KEY,
 		repo_path  TEXT NOT NULL DEFAULT '',
 		base_sha   TEXT NOT NULL,
+		target_branch TEXT NOT NULL DEFAULT '',
 		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 		updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 	)`); err != nil {

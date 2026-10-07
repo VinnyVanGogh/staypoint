@@ -19,6 +19,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/logging"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
+	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 	"github.com/google/uuid"
 )
@@ -209,12 +210,23 @@ func (h *Harness) SlotKeyForTask(ctx context.Context, taskID string) SlotKey {
 	return key
 }
 
+// newWorktreeManager makes a WorktreeManager that cuts new task branches
+// from the project's target branch (dev-server for work repos), the branch
+// Approve merges into.
+func newWorktreeManager(repoRoot string, db *sql.DB) *workspace.WorktreeManager {
+	wm := workspace.NewWorktreeManager(repoRoot, db)
+	wm.TargetBranch = func(ctx context.Context, repo string) (string, error) {
+		return shipreview.ProjectTargetBranch(ctx, db, repo)
+	}
+	return wm
+}
+
 // NewHarness creates a Harness backed by the given SQLite DB and repo root.
 func NewHarness(db *sql.DB, repoRoot string) *Harness {
 	return &Harness{
 		DB:          db,
 		RepoRoot:    repoRoot,
-		WM:          workspace.NewWorktreeManager(repoRoot, db),
+		WM:          newWorktreeManager(repoRoot, db),
 		Interceptor: NewInterceptor(db),
 	}
 }
@@ -347,7 +359,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		// place and never touch h.RepoRoot.
 		wm := h.WM
 		if repoPath != h.RepoRoot {
-			wm = workspace.NewWorktreeManager(repoPath, h.DB)
+			wm = newWorktreeManager(repoPath, h.DB)
 		}
 
 		wtPath, err = wm.CreateContext(ctx, taskID, runID)

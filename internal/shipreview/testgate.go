@@ -19,13 +19,26 @@ import (
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/testgate"
+	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 )
 
 // ChangeForGate returns the files the card's head changes against its
-// merge-base with main (or master), and the added/modified lines per file.
-func ChangeForGate(ctx context.Context, repoDir, headSHA string) ([]string, map[string][]int, error) {
+// merge-base with target (main, or master, when target is ""), and the
+// added/modified lines per file.
+func ChangeForGate(ctx context.Context, repoDir, headSHA, target string) ([]string, map[string][]int, error) {
 	if repoDir == "" || headSHA == "" {
 		return nil, nil, errors.New("card has no repo or head")
+	}
+	if target != "" && target != "main" && target != "master" {
+		ref, err := workspace.TargetBranchRef(ctx, repoDir, target)
+		if err != nil {
+			return nil, nil, err
+		}
+		base, err := gitOutput(ctx, repoDir, "merge-base", ref, headSHA)
+		if err != nil || base == "" {
+			return nil, nil, fmt.Errorf("no merge-base with %s: %w", target, err)
+		}
+		return changeSince(ctx, repoDir, base, headSHA)
 	}
 	// Report main's error: master is only a fallback, and its "unknown
 	// revision" would hide why main failed (e.g. a git timeout).
@@ -40,6 +53,11 @@ func ChangeForGate(ctx context.Context, repoDir, headSHA string) ([]string, map[
 			return nil, nil, fmt.Errorf("no merge-base with main: %w", mainErr)
 		}
 	}
+	return changeSince(ctx, repoDir, base, headSHA)
+}
+
+// changeSince lists what headSHA changes since base, for the test gate.
+func changeSince(ctx context.Context, repoDir, base, headSHA string) ([]string, map[string][]int, error) {
 	// A deleted file needs no new test, so it is not part of the change the
 	// gate checks (STA-791). With --no-renames a rename still lists its new path.
 	names, err := gitOutput(ctx, repoDir, "-c", "core.quotePath=false", "diff", "--name-only", "--no-renames", "--diff-filter=d", base, headSHA)
@@ -230,7 +248,7 @@ type GateDeps struct {
 // reused (always once final, else for coverageRecheck). An error means the
 // change itself could not be read; callers fail closed.
 func EvaluateTestGate(ctx context.Context, db *sql.DB, card *Card, repoDir string, deps GateDeps) (*testgate.Report, error) {
-	files, lines, err := ChangeForGate(ctx, repoDir, card.HeadSHA)
+	files, lines, err := ChangeForGate(ctx, repoDir, card.HeadSHA, card.TargetBranch)
 	if err != nil {
 		return nil, err
 	}
