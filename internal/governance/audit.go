@@ -59,6 +59,16 @@ func LogEvent(db *sql.DB, taskID, actorID, eventType string, fromState, toState 
 // Unlike LogEvent, gate_id is not a foreign key to tasks — gate requests have
 // their own UUID namespace in security_gate_requests.
 func LogGateEvent(db *sql.DB, gateID, actorID, eventType string, fromStatus, toStatus *string, payload any) error {
+	return logGateEvent(db, gateID, actorID, eventType, fromStatus, toStatus, payload)
+}
+
+// LogGateEventTx writes a gate audit row inside tx, so a decision and its
+// audit trail commit or roll back together (STA-868).
+func LogGateEventTx(tx *sql.Tx, gateID, actorID, eventType string, fromStatus, toStatus *string, payload any) error {
+	return logGateEvent(tx, gateID, actorID, eventType, fromStatus, toStatus, payload)
+}
+
+func logGateEvent(db boardExecer, gateID, actorID, eventType string, fromStatus, toStatus *string, payload any) error {
 	var payloadJSON *string
 	if payload != nil {
 		b, err := json.Marshal(payload)

@@ -1269,6 +1269,70 @@ var Migrations = []Migration{
 			return tx.Commit()
 		},
 	},
+	{
+		// 39: 38 is work_product_doc_type (STA-861).
+		Version: 39,
+		Name:    "gate_rules_and_decision_log",
+		Up: func(conn *sql.DB) error {
+			// STA-868: gate requests carry task/repo/org context and the
+			// scripts they run; Board allow rules auto-approve matching
+			// requests; decision_log records advisor recommendations next to
+			// the Board's decision (shared with STA-433's decision log).
+			for _, stmt := range []string{
+				`ALTER TABLE security_gate_requests ADD COLUMN task_id      TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE security_gate_requests ADD COLUMN repo         TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE security_gate_requests ADD COLUMN org          TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE security_gate_requests ADD COLUMN cwd          TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE security_gate_requests ADD COLUMN scripts_json TEXT NOT NULL DEFAULT '[]';`,
+				`ALTER TABLE security_gate_requests ADD COLUMN decided_by   TEXT NOT NULL DEFAULT '';`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			for _, stmt := range []string{
+				`CREATE TABLE IF NOT EXISTS security_gate_rules (
+					id             INTEGER PRIMARY KEY AUTOINCREMENT,
+					pattern        TEXT NOT NULL,
+					match_kind     TEXT NOT NULL DEFAULT 'exact' CHECK (match_kind IN ('exact','prefix')),
+					reasons_json   TEXT NOT NULL DEFAULT '[]',
+					scripts_json   TEXT NOT NULL DEFAULT '[]',
+					scope          TEXT NOT NULL CHECK (scope IN ('task','repo','org')),
+					scope_value    TEXT NOT NULL,
+					source_gate_id TEXT NOT NULL DEFAULT '',
+					note           TEXT NOT NULL DEFAULT '',
+					created_by     TEXT NOT NULL DEFAULT 'board',
+					created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+					expires_at     TEXT,
+					deleted_at     TEXT,
+					hit_count      INTEGER NOT NULL DEFAULT 0,
+					last_hit_at    TEXT
+				);`,
+				`CREATE INDEX IF NOT EXISTS idx_sgr_scope ON security_gate_rules (scope, scope_value) WHERE deleted_at IS NULL;`,
+				`CREATE TABLE IF NOT EXISTS decision_log (
+					id             INTEGER PRIMARY KEY AUTOINCREMENT,
+					subject_kind   TEXT NOT NULL,
+					subject_id     TEXT NOT NULL,
+					advisor        TEXT NOT NULL,
+					model          TEXT NOT NULL DEFAULT '',
+					recommendation TEXT NOT NULL DEFAULT '',
+					reason         TEXT NOT NULL DEFAULT '',
+					latency_ms     INTEGER NOT NULL DEFAULT 0,
+					error          TEXT NOT NULL DEFAULT '',
+					final_decision TEXT NOT NULL DEFAULT '',
+					decided_by     TEXT NOT NULL DEFAULT '',
+					decided_at     TEXT,
+					created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+				);`,
+				`CREATE INDEX IF NOT EXISTS idx_decision_log_subject ON decision_log (subject_kind, subject_id, advisor, id);`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {
@@ -1487,6 +1551,11 @@ func Open(dbPath string) (*Store, error) {
 		return nil, err
 	}
 	err = applyMigrations(dbPath, conn)
+	if err == nil {
+		// A ledger row says a migration ran, but a branch build can record a
+		// version whose DDL differed from main's: recreate missing tables.
+		_, err = RepairSchema(conn, nil)
+	}
 	unlock()
 	if err != nil {
 		conn.Close()
