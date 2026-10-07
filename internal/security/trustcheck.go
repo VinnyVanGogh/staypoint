@@ -802,11 +802,21 @@ func (a *trustAnalyzer) git(args []string, dir, baseDir string, depth int) {
 	case "config":
 		// A config write can set an alias, hook path, helper or push
 		// destination that a later command uses: hold every write.
+		// Read only when a read action comes before the first positional
+		// (`git config core.hooksPath list` sets the value "list").
 		read := false
-		for _, x := range rest {
-			switch x {
-			case "--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "get", "list":
+	cfg:
+		for j := 0; j < len(rest); j++ {
+			switch x := rest[j]; {
+			case x == "--get" || x == "--get-all" || x == "--get-regexp" || x == "--get-urlmatch" || x == "--list" || x == "-l":
 				read = true
+				break cfg
+			case x == "--file" || x == "-f" || x == "--blob" || x == "--type":
+				j++
+			case strings.HasPrefix(x, "-"):
+			default:
+				read = x == "get" || x == "list"
+				break cfg
 			}
 		}
 		if !read {

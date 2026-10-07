@@ -68,6 +68,9 @@ func TestAnalyzeForTrust_ProtectedAlwaysHeld(t *testing.T) {
 		"git config alias.ship '!git push origin main'",
 		"git config --local core.hooksPath /tmp/h",
 		"git config remote.origin.push HEAD:main",
+		"git config core.hooksPath list",
+		"git config remote.origin.pushurl get",
+		"git config --local alias.x '!sh' --get",
 		"git submodule foreach 'git push origin main'",
 		"git submodule --quiet foreach --recursive 'git push'",
 		"git -c core.sshCommand=x push origin feature",
@@ -135,6 +138,8 @@ func TestAnalyzeForTrust_NonProtectedPushAndSSHPass(t *testing.T) {
 		"gh pr create --title x --body y",
 		"gh pr view 12",
 		"git config --get remote.origin.url",
+		"git config --local --list",
+		"git config get user.name",
 	} {
 		if f := AnalyzeForTrust(c, tc); f.Protected || f.DeleteOutside {
 			t.Errorf("%q: held under trust: %+v", c, f)
