@@ -1293,21 +1293,13 @@ function buildGaugeCard(key, q) {
   const hdr = el('div', 'gauge-card-header');
   hdr.appendChild(el('span', 'gauge-provider-name', q.display_name || key));
 
-  let sCls = 'pill-green', sTxt = '✔ On Track';
-  if (q.is_locked || q.projection_status === 'locked_out') { sCls = 'pill-red'; sTxt = '✖ Locked Out'; }
-  else if (q.projection_status === 'overpaced') { sCls = 'pill-amber'; sTxt = '⚠ Overpaced'; }
-  hdr.appendChild(el('span', `pill ${sCls}`, sTxt));
+  const pill = quotaStatusPill(q);
+  hdr.appendChild(el('span', `pill ${pill.cls}`, pill.text));
   card.appendChild(hdr);
 
-  // 5-Hour Rolling
-  let remaining5h = q.five_hour_remaining_pct;
-  let used5h = q.five_hour_used_pct;
-  if (remaining5h == null && used5h != null) remaining5h = Math.max(0, 100 - used5h);
-  if (used5h == null && remaining5h != null) used5h = Math.max(0, 100 - remaining5h);
-  if (remaining5h == null && used5h == null) { remaining5h = 100; used5h = 0; }
-  if (remaining5h === 100 && used5h > 0) remaining5h = Math.max(0, 100 - used5h);
-  remaining5h = Math.max(0, Math.min(100, remaining5h));
-  used5h = Math.max(0, Math.min(100, used5h));
+  // 5-Hour Rolling. An unmeasured window renders "No data", never 0% used.
+  const v5h = quotaWindowView(q, 'five_hour');
+  const used5h = v5h.measured ? v5h.used : 0;
 
   const bar5hOuter = el('div', 'gauge-bar-outer');
   const bar5hInner = el('div', 'gauge-bar-inner');
@@ -1321,10 +1313,10 @@ function buildGaugeCard(key, q) {
   card.appendChild(bar5hOuter);
 
   const m5Row = el('div', 'gauge-metrics-row');
-  m5Row.appendChild(el('span', null, `${used5h.toFixed(1)}% used · ${remaining5h.toFixed(1)}% left`));
-  const count5h = formatCountdown(q.five_hour_resets_at);
-  const time5h = formatResetTime(q.five_hour_resets_at, false);
-  m5Row.appendChild(el('span', 'gauge-metric-val', count5h ? `resets ${count5h}` : 'rolling'));
+  m5Row.appendChild(el('span', null, v5h.text));
+  const count5h = v5h.measured ? formatCountdown(q.five_hour_resets_at) : '';
+  const time5h = v5h.measured ? formatResetTime(q.five_hour_resets_at, false) : '';
+  m5Row.appendChild(el('span', 'gauge-metric-val', count5h ? `resets ${count5h}` : (v5h.measured ? 'rolling' : 'not measured')));
   card.appendChild(m5Row);
   if (time5h) {
     const t5Row = el('div', 'gauge-metrics-row');
@@ -1339,14 +1331,8 @@ function buildGaugeCard(key, q) {
   card.appendChild(b5Row);
 
   // Weekly Budget
-  let remainingWk = q.weekly_remaining_pct;
-  let usedWk = q.weekly_used_pct;
-  if (remainingWk == null && usedWk != null) remainingWk = Math.max(0, 100 - usedWk);
-  if (usedWk == null && remainingWk != null) usedWk = Math.max(0, 100 - remainingWk);
-  if (remainingWk == null && usedWk == null) { remainingWk = 100; usedWk = 0; }
-  if (remainingWk === 100 && usedWk > 0) remainingWk = Math.max(0, 100 - usedWk);
-  remainingWk = Math.max(0, Math.min(100, remainingWk));
-  usedWk = Math.max(0, Math.min(100, usedWk));
+  const vWk = quotaWindowView(q, 'weekly');
+  const usedWk = vWk.measured ? vWk.used : 0;
 
   const labelWk = el('div', 'gauge-window-label', 'Weekly Budget');
   labelWk.style.marginTop = '10px';
@@ -1363,11 +1349,11 @@ function buildGaugeCard(key, q) {
   card.appendChild(barWkOuter);
 
   const mWkRow = el('div', 'gauge-metrics-row');
-  mWkRow.appendChild(el('span', null, `${usedWk.toFixed(1)}% used · ${remainingWk.toFixed(1)}% left`));
-  const countWk = formatCountdown(q.weekly_resets_at);
+  mWkRow.appendChild(el('span', null, vWk.text));
+  const countWk = vWk.measured ? formatCountdown(q.weekly_resets_at) : '';
   if (countWk) mWkRow.appendChild(el('span', 'gauge-metric-val', `resets ${countWk}`));
   card.appendChild(mWkRow);
-  const timeWk = formatResetTime(q.weekly_resets_at, true);
+  const timeWk = vWk.measured ? formatResetTime(q.weekly_resets_at, true) : '';
   if (timeWk) {
     const tWkRow = el('div', 'gauge-metrics-row');
     tWkRow.appendChild(el('span', null, ''));
@@ -1472,7 +1458,8 @@ function renderOrganizationsGrid(orgs) {
           const qRow = el('div');
           qRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;font-size:0.72rem;color:var(--muted);';
           qRow.appendChild(el('span', null, q.display_name));
-          qRow.appendChild(el('span', 'gauge-metric-val', `${q.five_hour_used_pct}% 5h`));
+          const v = quotaWindowView(q, 'five_hour');
+          qRow.appendChild(el('span', 'gauge-metric-val', v.measured ? `${v.used.toFixed(1)}% 5h` : 'No data'));
           qWrap.appendChild(qRow);
         }
         card.appendChild(qWrap);
@@ -3020,7 +3007,7 @@ function renderAgentsPage() {
 
     // ── Quota Consumption Headroom Gauge ──────────────────
     const quota = a.quota || getAgentQuota(f?.provider_quotas, a.provider, a.org || a.organization);
-    if (quota) {
+    if (quota && quotaWindowMeasured(quota, 'five_hour')) {
       const remaining = quota.five_hour_remaining_pct ?? (100 - (quota.five_hour_used_pct ?? 0));
       const used = 100 - remaining;
       const qSection = el('div', 'agent-quota-section');
@@ -4564,7 +4551,10 @@ function renderSettings() {
       cardHdr.appendChild(titleWrap);
 
       let sCls = 'pill-green', sTxt = '✔ Active · On Track';
-      if (q.is_locked || q.projection_status === 'locked_out') {
+      if (!(q.is_locked || q.projection_status === 'locked_out') && quotaStatusPill(q).text === 'No data') {
+        sCls = 'pill-stopped';
+        sTxt = 'No data';
+      } else if (q.is_locked || q.projection_status === 'locked_out') {
         sCls = 'pill-red';
         sTxt = '🔒 Locked Out';
       } else if (q.projection_status === 'overpaced') {
@@ -4590,23 +4580,19 @@ function renderSettings() {
       const body = el('div', 'settings-provider-body');
 
       // ── 5-Hour Rolling Pool ──
-      let rem5h = q.five_hour_remaining_pct;
-      let used5h = q.five_hour_used_pct;
-      if (rem5h == null && used5h != null) rem5h = Math.max(0, 100 - used5h);
-      if (used5h == null && rem5h != null) used5h = Math.max(0, 100 - rem5h);
-      if (rem5h == null && used5h == null) { rem5h = 100; used5h = 0; }
-      if (rem5h === 100 && used5h > 0) rem5h = Math.max(0, 100 - used5h);
-      rem5h = Math.max(0, Math.min(100, rem5h));
-      used5h = Math.max(0, Math.min(100, used5h));
-      const count5h = formatCountdown(q.five_hour_resets_at);
-      const time5h = formatResetTime(q.five_hour_resets_at, false);
+      const v5h = quotaWindowView(q, 'five_hour');
+      const rem5h = v5h.measured ? v5h.remaining : 100;
+      const used5h = v5h.measured ? v5h.used : 0;
+      const count5h = v5h.measured ? formatCountdown(q.five_hour_resets_at) : '';
+      const time5h = v5h.measured ? formatResetTime(q.five_hour_resets_at, false) : '';
       const limit5h = q.lockout_threshold_pct || 100;
 
       const pool5h = el('div', 'settings-pool-box');
       const pool5hHdr = el('div', 'settings-pool-hdr');
       pool5hHdr.appendChild(el('span', 'settings-pool-title', '5-Hour Rolling Window'));
-      const badge5h = el('span', `headroom-badge ${rem5h <= 10 ? 'badge-red' : rem5h <= 25 ? 'badge-amber' : 'badge-green'}`,
-        `${rem5h.toFixed(1)}% Headroom`);
+      const badge5h = v5h.measured
+        ? el('span', `headroom-badge ${rem5h <= 10 ? 'badge-red' : rem5h <= 25 ? 'badge-amber' : 'badge-green'}`, `${rem5h.toFixed(1)}% Headroom`)
+        : el('span', 'headroom-badge', 'No data');
       pool5hHdr.appendChild(badge5h);
       pool5h.appendChild(pool5hHdr);
 
@@ -4621,12 +4607,12 @@ function renderSettings() {
 
       const m5hHeadroom = el('div', 'settings-metric-item');
       m5hHeadroom.appendChild(el('span', 'settings-metric-lbl', 'Pool Headroom'));
-      m5hHeadroom.appendChild(el('span', 'settings-metric-val', `${rem5h.toFixed(1)}% remaining (${used5h.toFixed(1)}% used)`));
+      m5hHeadroom.appendChild(el('span', 'settings-metric-val', v5h.measured ? `${rem5h.toFixed(1)}% remaining (${used5h.toFixed(1)}% used)` : 'No data'));
       metrics5h.appendChild(m5hHeadroom);
 
       const m5hReset = el('div', 'settings-metric-item');
       m5hReset.appendChild(el('span', 'settings-metric-lbl', 'Reset Time'));
-      const resetText5h = count5h ? `${count5h}${time5h ? ' · ' + time5h : ''}` : 'Rolling window';
+      const resetText5h = count5h ? `${count5h}${time5h ? ' · ' + time5h : ''}` : (v5h.measured ? 'Rolling window' : '—');
       m5hReset.appendChild(el('span', 'settings-metric-val', resetText5h));
       metrics5h.appendChild(m5hReset);
 
@@ -4644,22 +4630,18 @@ function renderSettings() {
       body.appendChild(pool5h);
 
       // ── Weekly Budget Pool ──
-      let remWk = q.weekly_remaining_pct;
-      let usedWk = q.weekly_used_pct;
-      if (remWk == null && usedWk != null) remWk = Math.max(0, 100 - usedWk);
-      if (usedWk == null && remWk != null) usedWk = Math.max(0, 100 - remWk);
-      if (remWk == null && usedWk == null) { remWk = 100; usedWk = 0; }
-      if (remWk === 100 && usedWk > 0) remWk = Math.max(0, 100 - usedWk);
-      remWk = Math.max(0, Math.min(100, remWk));
-      usedWk = Math.max(0, Math.min(100, usedWk));
-      const countWk = formatCountdown(q.weekly_resets_at);
-      const timeWk = formatResetTime(q.weekly_resets_at, true);
+      const vWk = quotaWindowView(q, 'weekly');
+      const remWk = vWk.measured ? vWk.remaining : 100;
+      const usedWk = vWk.measured ? vWk.used : 0;
+      const countWk = vWk.measured ? formatCountdown(q.weekly_resets_at) : '';
+      const timeWk = vWk.measured ? formatResetTime(q.weekly_resets_at, true) : '';
 
       const poolWk = el('div', 'settings-pool-box');
       const poolWkHdr = el('div', 'settings-pool-hdr');
       poolWkHdr.appendChild(el('span', 'settings-pool-title', 'Weekly Budget Window'));
-      const badgeWk = el('span', `headroom-badge ${remWk <= 15 ? 'badge-red' : remWk <= 30 ? 'badge-amber' : 'badge-green'}`,
-        `${remWk.toFixed(1)}% Headroom`);
+      const badgeWk = vWk.measured
+        ? el('span', `headroom-badge ${remWk <= 15 ? 'badge-red' : remWk <= 30 ? 'badge-amber' : 'badge-green'}`, `${remWk.toFixed(1)}% Headroom`)
+        : el('span', 'headroom-badge', 'No data');
       poolWkHdr.appendChild(badgeWk);
       poolWk.appendChild(poolWkHdr);
 
@@ -4674,7 +4656,7 @@ function renderSettings() {
 
       const mWkHeadroom = el('div', 'settings-metric-item');
       mWkHeadroom.appendChild(el('span', 'settings-metric-lbl', 'Weekly Headroom'));
-      mWkHeadroom.appendChild(el('span', 'settings-metric-val', `${remWk.toFixed(1)}% remaining (${usedWk.toFixed(1)}% used)`));
+      mWkHeadroom.appendChild(el('span', 'settings-metric-val', vWk.measured ? `${remWk.toFixed(1)}% remaining (${usedWk.toFixed(1)}% used)` : 'No data'));
       metricsWk.appendChild(mWkHeadroom);
 
       const mWkReset = el('div', 'settings-metric-item');

@@ -16,6 +16,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/paperclip"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
+	"github.com/VinnyVanGogh/staypoint/internal/telemetry/quota"
 	_ "modernc.org/sqlite"
 )
 
@@ -157,96 +158,12 @@ func (a *Aggregator) gatherProviderQuotas(overview *FleetOverview, now time.Time
 		RunwayTurns:          25,
 	}
 
-	// 1a. Load from PacerState if available
+	// 1a. Load from PacerState if available. Each seat's card comes from its
+	// own pool; a window only counts as measured when the pool reported it.
 	if pacerState, err := router.LoadPacerState(); err == nil && pacerState != nil {
-		if gem := pacerState.Pools[router.PoolGeminiNative]; gem != nil {
-			g := overview.ProviderQuotas["gemini"]
-			if gem.FiveHour.Known {
-				g.FiveHourUsedPct = gem.FiveHour.UsedPct
-				g.FiveHourRemainingPct = gem.FiveHour.RemainingPct
-				if !gem.FiveHour.ResetsAt.IsZero() {
-					t := gem.FiveHour.ResetsAt
-					g.FiveHourResetsAt = &t
-				}
-			}
-			if gem.Weekly.Known {
-				g.WeeklyUsedPct = gem.Weekly.UsedPct
-				g.WeeklyRemainingPct = gem.Weekly.RemainingPct
-				if !gem.Weekly.ResetsAt.IsZero() {
-					t := gem.Weekly.ResetsAt
-					g.WeeklyResetsAt = &t
-				}
-			}
-			g.BurnRate5h = gem.BurnRate5h
-			g.BurnRateWeekly = gem.BurnRateW
-			g.IsLocked = gem.IsLocked
-			g.LockoutReason = gem.LockoutReason
-			if !gem.LockoutUntil.IsZero() {
-				t := gem.LockoutUntil
-				g.LockoutUntil = &t
-			}
-			g.RunwayTurns = gem.TurnsRunway
-		}
-
-		// Populate work Claude account separately
-		if workPool := pacerState.Pools[router.PoolWorkClaude]; workPool != nil {
-			cw := overview.ProviderQuotas["claude_work"]
-			if workPool.FiveHour.Known {
-				cw.FiveHourUsedPct = workPool.FiveHour.UsedPct
-				cw.FiveHourRemainingPct = workPool.FiveHour.RemainingPct
-				if !workPool.FiveHour.ResetsAt.IsZero() {
-					t := workPool.FiveHour.ResetsAt
-					cw.FiveHourResetsAt = &t
-				}
-			}
-			if workPool.Weekly.Known {
-				cw.WeeklyUsedPct = workPool.Weekly.UsedPct
-				cw.WeeklyRemainingPct = workPool.Weekly.RemainingPct
-				if !workPool.Weekly.ResetsAt.IsZero() {
-					t := workPool.Weekly.ResetsAt
-					cw.WeeklyResetsAt = &t
-				}
-			}
-			cw.BurnRate5h = workPool.BurnRate5h
-			cw.BurnRateWeekly = workPool.BurnRateW
-			cw.IsLocked = workPool.IsLocked
-			cw.LockoutReason = workPool.LockoutReason
-			if !workPool.LockoutUntil.IsZero() {
-				t := workPool.LockoutUntil
-				cw.LockoutUntil = &t
-			}
-			cw.RunwayTurns = workPool.TurnsRunway
-		}
-
-		// Populate personal Claude account separately
-		if persPool := pacerState.Pools[router.PoolPersonalClaude]; persPool != nil {
-			cp := overview.ProviderQuotas["claude_personal"]
-			if persPool.FiveHour.Known {
-				cp.FiveHourUsedPct = persPool.FiveHour.UsedPct
-				cp.FiveHourRemainingPct = persPool.FiveHour.RemainingPct
-				if !persPool.FiveHour.ResetsAt.IsZero() {
-					t := persPool.FiveHour.ResetsAt
-					cp.FiveHourResetsAt = &t
-				}
-			}
-			if persPool.Weekly.Known {
-				cp.WeeklyUsedPct = persPool.Weekly.UsedPct
-				cp.WeeklyRemainingPct = persPool.Weekly.RemainingPct
-				if !persPool.Weekly.ResetsAt.IsZero() {
-					t := persPool.Weekly.ResetsAt
-					cp.WeeklyResetsAt = &t
-				}
-			}
-			cp.BurnRate5h = persPool.BurnRate5h
-			cp.BurnRateWeekly = persPool.BurnRateW
-			cp.IsLocked = persPool.IsLocked
-			cp.LockoutReason = persPool.LockoutReason
-			if !persPool.LockoutUntil.IsZero() {
-				t := persPool.LockoutUntil
-				cp.LockoutUntil = &t
-			}
-			cp.RunwayTurns = persPool.TurnsRunway
-		}
+		applyPoolToGauge(overview.ProviderQuotas["gemini"], pacerState.Pools[router.PoolGeminiNative])
+		applyPoolToGauge(overview.ProviderQuotas["claude_work"], pacerState.Pools[router.PoolWorkClaude])
+		applyPoolToGauge(overview.ProviderQuotas["claude_personal"], pacerState.Pools[router.PoolPersonalClaude])
 
 		// Claude pool: prefer personal / 3p (backward-compat aggregate gauge)
 		claudePool := pacerState.Pools[router.PoolPersonalClaude]
@@ -256,189 +173,36 @@ func (a *Aggregator) gatherProviderQuotas(overview *FleetOverview, now time.Time
 		if claudePool == nil || (!claudePool.FiveHour.Known && !claudePool.Weekly.Known) {
 			claudePool = pacerState.Pools[router.Pool3PClaude]
 		}
-		if claudePool != nil {
-			c := overview.ProviderQuotas["claude"]
-			if claudePool.FiveHour.Known {
-				c.FiveHourUsedPct = claudePool.FiveHour.UsedPct
-				c.FiveHourRemainingPct = claudePool.FiveHour.RemainingPct
-				if !claudePool.FiveHour.ResetsAt.IsZero() {
-					t := claudePool.FiveHour.ResetsAt
-					c.FiveHourResetsAt = &t
-				}
-			}
-			if claudePool.Weekly.Known {
-				c.WeeklyUsedPct = claudePool.Weekly.UsedPct
-				c.WeeklyRemainingPct = claudePool.Weekly.RemainingPct
-				if !claudePool.Weekly.ResetsAt.IsZero() {
-					t := claudePool.Weekly.ResetsAt
-					c.WeeklyResetsAt = &t
-				}
-			}
-			c.BurnRate5h = claudePool.BurnRate5h
-			c.BurnRateWeekly = claudePool.BurnRateW
-			c.IsLocked = claudePool.IsLocked
-			c.LockoutReason = claudePool.LockoutReason
-			if !claudePool.LockoutUntil.IsZero() {
-				t := claudePool.LockoutUntil
-				c.LockoutUntil = &t
-			}
-			c.RunwayTurns = claudePool.TurnsRunway
-		}
+		applyPoolToGauge(overview.ProviderQuotas["claude"], claudePool)
 	}
 
-	// 1b. Check SQLite quota_windows table directly
+	// 1b. Check SQLite quota_windows table directly. Each Claude seat writes
+	// its own pool key (claude_personal, claude_work). The bare legacy
+	// "claude" key is written by the personal seat for older readers; it only
+	// backfills the personal card when no claude_personal rows exist. Rows
+	// older than quota.StaleAfter are ignored: a seat whose fetch keeps
+	// failing must read "no data", not its last good number.
 	if a.DB != nil {
-		rows, err := a.DB.Query(`
-			SELECT pool_key, window_type, used_percent, remaining_pct, is_locked, resets_at
-			FROM quota_windows;
-		`)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var poolKey, winType string
-				var usedPct, remPct float64
-				var isLockedInt int
-				var resetsAt sql.NullString
-				if err := rows.Scan(&poolKey, &winType, &usedPct, &remPct, &isLockedInt, &resetsAt); err == nil {
-					key := strings.ToLower(poolKey)
-					var gauges []*ProviderQuotaGauge
-					switch {
-					case strings.Contains(key, "gemini"):
-						gauges = append(gauges, overview.ProviderQuotas["gemini"])
-					case strings.Contains(key, "work") && strings.Contains(key, "claude"):
-						gauges = append(gauges, overview.ProviderQuotas["claude_work"])
-					case (strings.Contains(key, "personal") || strings.Contains(key, "3p")) && strings.Contains(key, "claude"):
-						gauges = append(gauges, overview.ProviderQuotas["claude_personal"])
-					case strings.Contains(key, "claude"):
-						gauges = append(gauges, overview.ProviderQuotas["claude"])
-						// Local Keychain credentials under "claude" default to the personal seat in StayPoint
-						gauges = append(gauges, overview.ProviderQuotas["claude_personal"])
-					case strings.Contains(key, "codex") || strings.Contains(key, "openai"):
-						gauges = append(gauges, overview.ProviderQuotas["openai"])
-					}
-					for _, gauge := range gauges {
-						if gauge == nil {
-							continue
-						}
-						var rTime *time.Time
-						if resetsAt.Valid && resetsAt.String != "" {
-							if t, err := time.Parse(time.RFC3339Nano, resetsAt.String); err == nil {
-								rTime = &t
-							} else if t, err := time.Parse(time.RFC3339, resetsAt.String); err == nil {
-								rTime = &t
-							}
-						}
-						if winType == "rolling_5h" {
-							gauge.FiveHourUsedPct = usedPct
-							gauge.FiveHourRemainingPct = remPct
-							gauge.FiveHourResetsAt = rTime
-							gauge.IsLocked = (isLockedInt != 0)
-							if isLockedInt != 0 {
-								gauge.LockoutReason = "5-hour quota locked"
-							} else {
-								gauge.LockoutReason = ""
-								gauge.LockoutUntil = nil
-							}
-						} else if winType == "weekly_7d" {
-							gauge.WeeklyUsedPct = usedPct
-							gauge.WeeklyRemainingPct = remPct
-							gauge.WeeklyResetsAt = rTime
-						}
-					}
-				}
-			}
-		}
+		a.applyQuotaWindowRows(overview, now)
 	}
 
 	// 1c. Overlay from state.json if present
 	if a.RateLimitsPath != "" {
-		if data, err := os.ReadFile(a.RateLimitsPath); err == nil {
-			var stateData struct {
-				Quotas map[string]struct {
-					FiveHourRemaining float64 `json:"five_hour_remaining"`
-					FiveHourUsed      float64 `json:"five_hour_used"`
-					FiveHourResetsAt  float64 `json:"five_hour_resets_at"`
-					WeeklyRemaining   float64 `json:"weekly_remaining"`
-					WeeklyUsed        float64 `json:"weekly_used"`
-					WeeklyResetsAt    float64 `json:"weekly_resets_at"`
-				} `json:"quotas"`
-				Lockouts map[string]struct {
-					Locked      bool   `json:"locked"`
-					ResetsAt    int64  `json:"resets_at"`
-					ResetTimeStr string `json:"reset_time_str"`
-				} `json:"lockouts"`
-			}
-			if json.Unmarshal(data, &stateData) == nil {
-				for qName, qVal := range stateData.Quotas {
-					var gauges []*ProviderQuotaGauge
-					lower := strings.ToLower(qName)
-					switch {
-					case strings.Contains(lower, "gemini"):
-						gauges = append(gauges, overview.ProviderQuotas["gemini"])
-					case strings.Contains(lower, "work") && strings.Contains(lower, "claude"):
-						gauges = append(gauges, overview.ProviderQuotas["claude_work"])
-					case (strings.Contains(lower, "personal") || strings.Contains(lower, "3p")) && strings.Contains(lower, "claude"):
-						gauges = append(gauges, overview.ProviderQuotas["claude_personal"])
-						gauges = append(gauges, overview.ProviderQuotas["claude"])
-					case strings.Contains(lower, "claude"):
-						gauges = append(gauges, overview.ProviderQuotas["claude"])
-						gauges = append(gauges, overview.ProviderQuotas["claude_personal"])
-					case strings.Contains(lower, "openai") || strings.Contains(lower, "codex"):
-						gauges = append(gauges, overview.ProviderQuotas["openai"])
-					}
-					for _, g := range gauges {
-						if g == nil {
-							continue
-						}
-						g.FiveHourUsedPct = qVal.FiveHourUsed
-						g.FiveHourRemainingPct = qVal.FiveHourRemaining
-						if qVal.FiveHourResetsAt > 0 {
-							t := time.Unix(int64(qVal.FiveHourResetsAt), 0).UTC()
-							g.FiveHourResetsAt = &t
-						}
-						g.WeeklyUsedPct = qVal.WeeklyUsed
-						g.WeeklyRemainingPct = qVal.WeeklyRemaining
-						if qVal.WeeklyResetsAt > 0 {
-							t := time.Unix(int64(qVal.WeeklyResetsAt), 0).UTC()
-							g.WeeklyResetsAt = &t
-						}
-					}
-				}
-				for lName, lVal := range stateData.Lockouts {
-					var gauges []*ProviderQuotaGauge
-					lower := strings.ToLower(lName)
-					switch {
-					case strings.Contains(lower, "gemini"):
-						gauges = append(gauges, overview.ProviderQuotas["gemini"])
-					case strings.Contains(lower, "work") && strings.Contains(lower, "claude"):
-						gauges = append(gauges, overview.ProviderQuotas["claude_work"])
-					case (strings.Contains(lower, "personal") || strings.Contains(lower, "3p")) && strings.Contains(lower, "claude"):
-						gauges = append(gauges, overview.ProviderQuotas["claude_personal"])
-						gauges = append(gauges, overview.ProviderQuotas["claude"])
-					case strings.Contains(lower, "claude"):
-						gauges = append(gauges, overview.ProviderQuotas["claude"])
-						gauges = append(gauges, overview.ProviderQuotas["claude_personal"])
-					case strings.Contains(lower, "openai") || strings.Contains(lower, "codex"):
-						gauges = append(gauges, overview.ProviderQuotas["openai"])
-					}
-					for _, g := range gauges {
-						if g != nil && lVal.Locked {
-							g.IsLocked = true
-							g.LockoutReason = "Rate limit lockout triggered"
-							if lVal.ResetsAt > 0 {
-								t := time.Unix(lVal.ResetsAt, 0).UTC()
-								g.LockoutUntil = &t
-							}
-						}
-					}
-				}
-			}
-		}
+		applyRateLimitsState(a.RateLimitsPath, overview, now)
 	}
 
 	// 1d. Calculate Projection Status and Burn Pacing Indicators
 	for _, g := range overview.ProviderQuotas {
-		if g.IsLocked || g.FiveHourRemainingPct <= 0.0 || g.FiveHourUsedPct >= 100.0 {
+		g.Measured = g.FiveHourMeasured || g.WeeklyMeasured || g.IsLocked
+		if !g.Measured {
+			// Nothing reported this provider/seat. The defaults above are
+			// placeholders, not readings; never present them as "0% used".
+			g.ProjectionStatus = "unknown"
+			g.ProjectionMessage = "No data: quota not measured"
+			g.RunwayTurns = 0
+			continue
+		}
+		if g.IsLocked || (g.FiveHourMeasured && (g.FiveHourRemainingPct <= 0.0 || g.FiveHourUsedPct >= 100.0)) {
 			g.IsLocked = true
 			g.ProjectionStatus = "locked_out"
 			if g.FiveHourResetsAt != nil && g.FiveHourResetsAt.After(now) {
@@ -461,6 +225,266 @@ func (a *Aggregator) gatherProviderQuotas(overview *FleetOverview, now time.Time
 				g.ProjectionMessage = "On Track: healthy 5-hour headroom"
 			}
 		}
+	}
+}
+
+// applyPoolToGauge copies a pacer pool's readings onto a dashboard gauge.
+func applyPoolToGauge(g *ProviderQuotaGauge, pool *router.QuotaPool) {
+	if g == nil || pool == nil {
+		return
+	}
+	if pool.FiveHour.Known {
+		g.FiveHourUsedPct = pool.FiveHour.UsedPct
+		g.FiveHourRemainingPct = pool.FiveHour.RemainingPct
+		g.FiveHourMeasured = true
+		if !pool.FiveHour.ResetsAt.IsZero() {
+			t := pool.FiveHour.ResetsAt
+			g.FiveHourResetsAt = &t
+		}
+	}
+	if pool.Weekly.Known {
+		g.WeeklyUsedPct = pool.Weekly.UsedPct
+		g.WeeklyRemainingPct = pool.Weekly.RemainingPct
+		g.WeeklyMeasured = true
+		if !pool.Weekly.ResetsAt.IsZero() {
+			t := pool.Weekly.ResetsAt
+			g.WeeklyResetsAt = &t
+		}
+	}
+	g.BurnRate5h = pool.BurnRate5h
+	g.BurnRateWeekly = pool.BurnRateW
+	g.IsLocked = pool.IsLocked
+	g.LockoutReason = pool.LockoutReason
+	if !pool.LockoutUntil.IsZero() {
+		t := pool.LockoutUntil
+		g.LockoutUntil = &t
+	}
+	g.RunwayTurns = pool.TurnsRunway
+	if pool.LastUpdated.After(g.measuredAt) {
+		g.measuredAt = pool.LastUpdated
+	}
+}
+
+type quotaWindowRow struct {
+	poolKey, winType string
+	usedPct, remPct  float64
+	locked           bool
+	resetsAt         *time.Time
+	updatedAt        time.Time
+}
+
+func parseQuotaTime(s string) (time.Time, bool) {
+	if s == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// applyQuotaWindowRows overlays fresh quota_windows rows onto the gauges.
+func (a *Aggregator) applyQuotaWindowRows(overview *FleetOverview, now time.Time) {
+	rows, err := a.DB.Query(`
+		SELECT pool_key, window_type, used_percent, remaining_pct, is_locked, resets_at, updated_at
+		FROM quota_windows;
+	`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	var fresh []quotaWindowRow
+	hasPersonal := false
+	for rows.Next() {
+		var r quotaWindowRow
+		var isLockedInt int
+		var resetsAt, updatedAt sql.NullString
+		if err := rows.Scan(&r.poolKey, &r.winType, &r.usedPct, &r.remPct, &isLockedInt, &resetsAt, &updatedAt); err != nil {
+			continue
+		}
+		r.poolKey = strings.ToLower(r.poolKey)
+		r.locked = isLockedInt != 0
+		if t, ok := parseQuotaTime(resetsAt.String); ok {
+			r.resetsAt = &t
+		}
+		if t, ok := parseQuotaTime(updatedAt.String); ok {
+			if now.Sub(t) > quota.StaleAfter {
+				continue
+			}
+			r.updatedAt = t
+		}
+		if r.poolKey == quota.ProviderClaudePersonal {
+			hasPersonal = true
+		}
+		fresh = append(fresh, r)
+	}
+
+	for _, r := range fresh {
+		key := r.poolKey
+		var gauges []*ProviderQuotaGauge
+		switch {
+		case strings.Contains(key, "gemini"):
+			gauges = append(gauges, overview.ProviderQuotas["gemini"])
+		case strings.Contains(key, "work") && strings.Contains(key, "claude"):
+			gauges = append(gauges, overview.ProviderQuotas["claude_work"])
+		case (strings.Contains(key, "personal") || strings.Contains(key, "3p")) && strings.Contains(key, "claude"):
+			gauges = append(gauges, overview.ProviderQuotas["claude_personal"])
+		case strings.Contains(key, "claude"):
+			gauges = append(gauges, overview.ProviderQuotas["claude"])
+			if !hasPersonal {
+				gauges = append(gauges, overview.ProviderQuotas["claude_personal"])
+			}
+		case strings.Contains(key, "codex") || strings.Contains(key, "openai"):
+			gauges = append(gauges, overview.ProviderQuotas["openai"])
+		}
+		for _, gauge := range gauges {
+			if gauge == nil {
+				continue
+			}
+			switch r.winType {
+			case quota.WindowFiveHour:
+				gauge.FiveHourUsedPct = r.usedPct
+				gauge.FiveHourRemainingPct = r.remPct
+				gauge.FiveHourResetsAt = r.resetsAt
+				gauge.FiveHourMeasured = true
+				gauge.IsLocked = r.locked
+				if r.locked {
+					gauge.LockoutReason = "5-hour quota locked"
+					gauge.LockoutUntil = r.resetsAt
+				} else {
+					gauge.LockoutReason = ""
+					gauge.LockoutUntil = nil
+				}
+			case quota.WindowWeekly:
+				gauge.WeeklyUsedPct = r.usedPct
+				gauge.WeeklyRemainingPct = r.remPct
+				gauge.WeeklyResetsAt = r.resetsAt
+				gauge.WeeklyMeasured = true
+			default:
+				continue
+			}
+			if r.updatedAt.After(gauge.measuredAt) {
+				gauge.measuredAt = r.updatedAt
+			}
+		}
+	}
+}
+
+// applyRateLimitsState overlays ~/.config/rate-limits/state.json (written by
+// the external notifier/poller). Fields it omits stay unmeasured, an entry
+// older than the gauge's live reading is skipped, and the generic "Claude"
+// key (whichever seat's statusline ran last) only backfills the personal card
+// when no seat-specific personal entry exists (STA-283).
+func applyRateLimitsState(path string, overview *FleetOverview, now time.Time) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var stateData struct {
+		Quotas map[string]struct {
+			FiveHourRemaining *float64 `json:"five_hour_remaining"`
+			FiveHourUsed      *float64 `json:"five_hour_used"`
+			FiveHourResetsAt  float64  `json:"five_hour_resets_at"`
+			WeeklyRemaining   *float64 `json:"weekly_remaining"`
+			WeeklyUsed        *float64 `json:"weekly_used"`
+			WeeklyResetsAt    float64  `json:"weekly_resets_at"`
+			LastUpdated       string   `json:"last_updated"`
+		} `json:"quotas"`
+		Lockouts map[string]struct {
+			Locked       bool   `json:"locked"`
+			ResetsAt     int64  `json:"resets_at"`
+			ResetTimeStr string `json:"reset_time_str"`
+		} `json:"lockouts"`
+	}
+	if json.Unmarshal(data, &stateData) != nil {
+		return
+	}
+	hasPersonal := false
+	for name := range stateData.Quotas {
+		lower := strings.ToLower(name)
+		if strings.Contains(lower, "personal") && strings.Contains(lower, "claude") {
+			hasPersonal = true
+		}
+	}
+	gaugesFor := func(name string) []*ProviderQuotaGauge {
+		lower := strings.ToLower(name)
+		switch {
+		case strings.Contains(lower, "gemini"):
+			return []*ProviderQuotaGauge{overview.ProviderQuotas["gemini"]}
+		case strings.Contains(lower, "work") && strings.Contains(lower, "claude"):
+			return []*ProviderQuotaGauge{overview.ProviderQuotas["claude_work"]}
+		case (strings.Contains(lower, "personal") || strings.Contains(lower, "3p")) && strings.Contains(lower, "claude"):
+			return []*ProviderQuotaGauge{overview.ProviderQuotas["claude_personal"], overview.ProviderQuotas["claude"]}
+		case strings.Contains(lower, "claude"):
+			if hasPersonal {
+				return nil
+			}
+			return []*ProviderQuotaGauge{overview.ProviderQuotas["claude"], overview.ProviderQuotas["claude_personal"]}
+		case strings.Contains(lower, "openai") || strings.Contains(lower, "codex"):
+			return []*ProviderQuotaGauge{overview.ProviderQuotas["openai"]}
+		}
+		return nil
+	}
+
+	for qName, qVal := range stateData.Quotas {
+		updated, hasUpdated := parseQuotaTime(qVal.LastUpdated)
+		for _, g := range gaugesFor(qName) {
+			if g == nil {
+				continue
+			}
+			if hasUpdated && !g.measuredAt.IsZero() && updated.Before(g.measuredAt) {
+				continue
+			}
+			if qVal.FiveHourUsed != nil || qVal.FiveHourRemaining != nil {
+				used, rem := pctPair(qVal.FiveHourUsed, qVal.FiveHourRemaining)
+				g.FiveHourUsedPct, g.FiveHourRemainingPct, g.FiveHourMeasured = used, rem, true
+				if qVal.FiveHourResetsAt > 0 {
+					t := time.Unix(int64(qVal.FiveHourResetsAt), 0).UTC()
+					g.FiveHourResetsAt = &t
+				}
+			}
+			if qVal.WeeklyUsed != nil || qVal.WeeklyRemaining != nil {
+				used, rem := pctPair(qVal.WeeklyUsed, qVal.WeeklyRemaining)
+				g.WeeklyUsedPct, g.WeeklyRemainingPct, g.WeeklyMeasured = used, rem, true
+				if qVal.WeeklyResetsAt > 0 {
+					t := time.Unix(int64(qVal.WeeklyResetsAt), 0).UTC()
+					g.WeeklyResetsAt = &t
+				}
+			}
+			if hasUpdated && updated.After(g.measuredAt) {
+				g.measuredAt = updated
+			}
+		}
+	}
+	for lName, lVal := range stateData.Lockouts {
+		if !lVal.Locked || (lVal.ResetsAt > 0 && !time.Unix(lVal.ResetsAt, 0).After(now)) {
+			continue // not locked, or the lockout already expired
+		}
+		for _, g := range gaugesFor(lName) {
+			if g == nil {
+				continue
+			}
+			g.IsLocked = true
+			g.LockoutReason = "Rate limit lockout triggered"
+			if lVal.ResetsAt > 0 {
+				t := time.Unix(lVal.ResetsAt, 0).UTC()
+				g.LockoutUntil = &t
+			}
+		}
+	}
+}
+
+// pctPair fills in whichever of used/remaining is missing from the other.
+func pctPair(used, remaining *float64) (float64, float64) {
+	switch {
+	case used != nil && remaining != nil:
+		return *used, *remaining
+	case used != nil:
+		return *used, math.Max(0, 100-*used)
+	default:
+		return math.Max(0, 100-*remaining), *remaining
 	}
 }
 
@@ -1232,6 +1256,7 @@ func (a *Aggregator) populateOrgQuotas(overview *FleetOverview, now time.Time) {
 			burn5h := fleetGauge.BurnRate5h
 			burnWeekly := fleetGauge.BurnRateWeekly
 			isLocked := fleetGauge.IsLocked
+			measured5h, measuredWk := fleetGauge.FiveHourMeasured, fleetGauge.WeeklyMeasured
 
 			// Organization-specific quota pool prioritization:
 			// Managed Solution prioritizes claude_work and does not burn personal quota.
@@ -1254,6 +1279,7 @@ func (a *Aggregator) populateOrgQuotas(overview *FleetOverview, now time.Time) {
 						burn5h = workGauge.BurnRate5h
 						burnWeekly = workGauge.BurnRateWeekly
 						isLocked = workGauge.IsLocked
+						measured5h, measuredWk = workGauge.FiveHourMeasured, workGauge.WeeklyMeasured
 					}
 				}
 			} else {
@@ -1274,6 +1300,7 @@ func (a *Aggregator) populateOrgQuotas(overview *FleetOverview, now time.Time) {
 						burn5h = persGauge.BurnRate5h
 						burnWeekly = persGauge.BurnRateWeekly
 						isLocked = persGauge.IsLocked
+						measured5h, measuredWk = persGauge.FiveHourMeasured, persGauge.WeeklyMeasured
 					}
 				}
 			}
@@ -1294,6 +1321,16 @@ func (a *Aggregator) populateOrgQuotas(overview *FleetOverview, now time.Time) {
 				LockoutReason:        fleetGauge.LockoutReason,
 				LockoutUntil:         fleetGauge.LockoutUntil,
 				RunwayTurns:          fleetGauge.RunwayTurns,
+				FiveHourMeasured:     measured5h,
+				WeeklyMeasured:       measuredWk,
+			}
+			orgGauge.Measured = measured5h || measuredWk || isLocked
+			if !orgGauge.Measured {
+				orgGauge.ProjectionStatus = "unknown"
+				orgGauge.ProjectionMessage = "No data: quota not measured"
+				orgGauge.RunwayTurns = 0
+				org.ProviderQuotas[key] = orgGauge
+				continue
 			}
 
 			if orgGauge.IsLocked {

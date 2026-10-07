@@ -237,6 +237,14 @@ func RenderStatusline(w io.Writer, r io.Reader) error {
 
 	// 4. Determine work vs personal repo
 	isWork, _, _ := IsWorkRepo(dir)
+	// The Claude seat this session is logged into comes from its
+	// CLAUDE_CONFIG_DIR, not the repo: a work repo can run on the personal
+	// seat and vice versa. Only a Claude session (piped payload) has one.
+	seatIsWork := isWork
+	if hasPipedInput {
+		home, _ := os.UserHomeDir()
+		seatIsWork = claudeSessionIsWorkSeat(os.Getenv("CLAUDE_CONFIG_DIR"), home, isWork)
+	}
 
 	// 5. Build Model badge
 	modelName := payload.Model.DisplayName
@@ -278,7 +286,7 @@ func RenderStatusline(w io.Writer, r io.Reader) error {
 	var accountBadge string
 	if payload.Email != "" {
 		accountBadge = fmt.Sprintf("🪪 %s%s%s", Gray, payload.Email, Reset)
-	} else if isWork {
+	} else if seatIsWork {
 		accountBadge = fmt.Sprintf("🪪 %swork%s", Teal, Reset)
 	} else {
 		accountBadge = fmt.Sprintf("🪪 %spersonal%s", Gray, Reset)
@@ -357,7 +365,7 @@ func RenderStatusline(w io.Writer, r io.Reader) error {
 
 	// Select matching pool
 	activePoolID := PoolPersonalClaude
-	if isWork {
+	if seatIsWork {
 		activePoolID = PoolWorkClaude
 	} else if strings.Contains(strings.ToLower(modelName), "gemini") {
 		activePoolID = PoolGeminiNative
@@ -399,7 +407,7 @@ func RenderStatusline(w io.Writer, r io.Reader) error {
 
 	if isLocked {
 		line2Parts = append(line2Parts, fmt.Sprintf("%s%s🔒 5H LOCKED (@%s)%s", Red, Bold, lockoutLabel, Reset))
-		if !isWork {
+		if !seatIsWork {
 			line2Parts = append(line2Parts, fmt.Sprintf("%s%s[⚡ Switch -> agy / Gemini]%s", Yellow, Bold, Reset))
 		}
 	}
@@ -482,6 +490,21 @@ func RenderStatusline(w io.Writer, r io.Reader) error {
 	}
 
 	return nil
+}
+
+// claudeSessionIsWorkSeat reports whether a Claude Code session runs on the
+// work seat. CLAUDE_CONFIG_DIR is authoritative: unset is the default
+// (personal) profile, ~/.claude-work is the work seat. Any other config dir is
+// not one StayPoint manages, so the repo classification decides.
+func claudeSessionIsWorkSeat(configDir, home string, isWorkRepo bool) bool {
+	configDir = strings.TrimSpace(configDir)
+	if configDir == "" {
+		return false
+	}
+	if home != "" && filepath.Clean(configDir) == filepath.Join(home, ".claude-work") {
+		return true
+	}
+	return isWorkRepo
 }
 
 func readPipedInput(r io.Reader, timeout time.Duration) []byte {

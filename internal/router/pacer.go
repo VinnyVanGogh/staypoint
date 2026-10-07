@@ -251,6 +251,9 @@ func FormatReset(t, now time.Time) string {
 	return t.Format("Mon ") + clock
 }
 
+// maxSampleAge is the oldest statusline sample readSamplesTail will use.
+const maxSampleAge = 7 * 24 * time.Hour
+
 // readSamplesTail performs a fast reverse-seek read on statusline-samples.ndjson
 // to capture the most recent samples for work and personal Claude accounts.
 func readSamplesTail(path string, state *PacerState) {
@@ -295,6 +298,13 @@ func readSamplesTail(path string, state *PacerState) {
 
 		var sample rawSampleJSON
 		if err := json.Unmarshal(line, &sample); err != nil {
+			continue
+		}
+		// A sample older than the weekly window says nothing about either
+		// window now. Using it let a seat that stopped sampling (e.g. work
+		// moved to its own config dir) show a stale or auto-reset 0% as if
+		// it were measured.
+		if ts, err := time.Parse(time.RFC3339, sample.Timestamp); err == nil && time.Since(ts) > maxSampleAge {
 			continue
 		}
 
