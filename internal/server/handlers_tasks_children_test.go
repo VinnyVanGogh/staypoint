@@ -36,7 +36,7 @@ func TestCreateTask_ChildInheritsParentAndStoresHandoff(t *testing.T) {
 	srv, token := startTestServer(t, database)
 	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
 
-	resp, parent := postTask(t, base, token, map[string]any{
+	resp, parent := postTaskAs(t, srv, token, map[string]any{
 		"name": "plan it", "repo_path": "/repo/x", "git_branch": "main",
 		"organization": "acme", "project": "core", "work_kind": "planning",
 	})
@@ -45,7 +45,7 @@ func TestCreateTask_ChildInheritsParentAndStoresHandoff(t *testing.T) {
 	}
 	parentID := parent["id"].(string)
 
-	resp, child := postTask(t, base, token, map[string]any{
+	resp, child := postTaskAs(t, srv, token, map[string]any{
 		"name": "code it", "parent_id": parentID, "work_kind": "coding", "handoff": "the plan text",
 		// Inherited fields win over anything the caller sends.
 		"repo_path": "/elsewhere",

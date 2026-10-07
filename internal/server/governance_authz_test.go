@@ -43,8 +43,11 @@ func TestServer_GovernanceAuthz(t *testing.T) {
 		return out
 	}
 
-	a := mustStatus(http.StatusCreated, "POST", "/api/tasks", map[string]any{"name": "authz A"})["id"].(string)
-	b := mustStatus(http.StatusCreated, "POST", "/api/tasks", map[string]any{"name": "authz B"})["id"].(string)
+	// Board-created tasks: agent-created ones cannot leave backlog by transition.
+	_, ta := postTaskAs(t, srv, token, map[string]any{"name": "authz A"})
+	a := ta["id"].(string)
+	_, tb := postTaskAs(t, srv, token, map[string]any{"name": "authz B"})
+	b := tb["id"].(string)
 
 	mustStatus(http.StatusOK, "POST", "/api/tasks/"+a+"/governance", map[string]any{"approval_threshold": 1, "require_review": true})
 	mustStatus(http.StatusCreated, "POST", "/api/tasks/"+a+"/reviewers", map[string]any{"reviewer_id": "rev-1"})

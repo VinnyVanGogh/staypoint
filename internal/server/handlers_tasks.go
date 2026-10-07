@@ -38,6 +38,9 @@ type TasksHandler struct {
 	hub *EventHub
 	// boardGate guards the Board override flags (STA-859); see SetBoardGate.
 	boardGate func(http.Handler) http.Handler
+	// boardSession recognises a Board session (cookie, no passkey); see
+	// SetBoardSession. Requests without one are treated as agent requests.
+	boardSession func(*http.Request) bool
 }
 
 func NewTasksHandler(db *sql.DB, hub *EventHub) *TasksHandler {
@@ -47,7 +50,7 @@ func NewTasksHandler(db *sql.DB, hub *EventHub) *TasksHandler {
 // ListTasks handles GET /api/tasks
 //
 // Query: status (active|done|soft_deleted|all), stage (an execution stage),
-// origin (native|paperclip_import|legacy), include_legacy / include_archive
+// origin (native|paperclip_import|legacy|agent), include_legacy / include_archive
 // (1/true; legacy tasks and archived imports are hidden unless set, or
 // origin=legacy), limit, offset.
 func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
@@ -55,7 +58,7 @@ func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 	stageFilter := strings.TrimSpace(r.URL.Query().Get("stage"))
 	originFilter := strings.TrimSpace(r.URL.Query().Get("origin"))
 	if originFilter != "" && !context.IsValidOrigin(originFilter) {
-		writeError(w, http.StatusBadRequest, "invalid origin: must be native, paperclip_import, or legacy")
+		writeError(w, http.StatusBadRequest, "invalid origin: must be native, paperclip_import, legacy, or agent")
 		return
 	}
 	// include_legacy and include_archive are one switch: legacy tasks and
@@ -261,7 +264,18 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 		if req.AllowDeep && !h.requireBoardForOverride(w, r, "allow_deep") {
 			return
 		}
-		h.createChildTask(w, req.ParentID, req.Name, req.WorkKind, req.Handoff, req.Description, req.MaxBudgetUSD, req.MaxTurns, req.AllowDeep)
+		h.createChildTask(w, context.ChildTaskOptions{
+			ParentID:       req.ParentID,
+			Name:           req.Name,
+			WorkKind:       req.WorkKind,
+			Handoff:        req.Handoff,
+			Description:    req.Description,
+			MaxBudgetUSD:   req.MaxBudgetUSD,
+			MaxTurns:       req.MaxTurns,
+			BoardOverride:  req.AllowDeep,
+			ExecutionStage: req.ExecutionStage,
+			Origin:         h.createOrigin(r),
+		})
 		return
 	}
 
@@ -278,6 +292,7 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 		WorkKind:        req.WorkKind,
 		Description:     req.Description,
 		ExecutionStage:  req.ExecutionStage,
+		Origin:          h.createOrigin(r),
 		Provider:        choice.Provider,
 		ModelOverride:   choice.Model,
 	}
@@ -796,8 +811,23 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 	if req.Override && !h.requireBoardForOverride(w, r, "override") {
 		return
 	}
+	task, err := context.GetTask(h.db, id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if !h.requireBoardToLeave(w, r, task, req.Stage) {
+		return
+	}
+	if req.Stage == governance.StageInProgress {
+		if held, org := governance.TaskOrgHeld(h.db, task.ID); held {
+			orchestrator.WakeHeld(h.db, task.ID, "run_now")
+			writeError(w, http.StatusConflict, "organization "+org+" is on hold; lift the hold in Settings before running its tasks")
+			return
+		}
+	}
 
-	if err := context.SetTaskExecutionStageWithOptions(h.db, id, req.Stage, context.DoneOptions{BoardOverride: req.Override}); err != nil {
+	if err := context.SetTaskExecutionStageWithOptions(h.db, id, req.Stage, context.DoneOptions{BoardOverride: req.Override, BoardStage: true}); err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, err.Error())
 		} else if errors.Is(err, context.ErrOpenChildren) {
@@ -806,6 +836,8 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 		} else if errors.Is(err, context.ErrNoRepo) {
 			writeError(w, http.StatusConflict, err.Error())
+		} else if errors.Is(err, context.ErrBoardRequired) {
+			writeBoardError(w, "board_session_required", err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "failed to update task stage: "+err.Error())
 		}

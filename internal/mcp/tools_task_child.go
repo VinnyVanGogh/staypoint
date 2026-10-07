@@ -18,7 +18,7 @@ func taskCreateChildTool() Tool {
 	return Tool{
 		Name: "staypoint_task_create_child",
 		Description: "Create a follow-up child task of the current task. The child inherits repo, branch, org and project, " +
-			"starts in todo, and is routed by its own work_kind (" + kinds + "). Put your plan in `handoff`: the daemon " +
+			"starts parked in backlog (only the Board can start it), and is routed by its own work_kind (" + kinds + "). Put your plan in `handoff`: the daemon " +
 			"stores it with a link to this task and your final message, and shows it in the child's first prompt.",
 		InputSchema: InputSchema{
 			Type: "object",
@@ -74,13 +74,15 @@ func (s *Server) handleTaskCreateChild(ctx context.Context, rawArgs json.RawMess
 	if err != nil {
 		return toolError(fmt.Sprintf("database error: %v", err))
 	}
-	// Agents never get the Board's depth override.
+	// Agents never get the Board's depth override, and an agent-created
+	// child always starts in backlog: only the Board can start it.
 	child, err := meshContext.CreateChildTask(dbConn, meshContext.ChildTaskOptions{
 		ParentID:    parentID,
 		Name:        args.Title,
 		WorkKind:    strings.TrimSpace(args.WorkKind),
 		Handoff:     args.Handoff,
 		Description: args.Description,
+		Origin:      meshContext.OriginAgent,
 	})
 	if err != nil {
 		return toolError(fmt.Sprintf("create child task: %v", err))

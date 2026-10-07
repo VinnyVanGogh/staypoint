@@ -80,6 +80,7 @@ func childTaskOptionsFromFlags(cmd *cobra.Command, args []string) (meshContext.C
 		MaxBudgetUSD:  budget,
 		MaxTurns:      maxTurns,
 		BoardOverride: allowDeep,
+		Origin:        cliTaskOrigin(os.Getenv),
 	}, nil
 }
 

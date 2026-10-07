@@ -347,6 +347,12 @@ func (sm *SecurityMiddleware) hasBoardCookie(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(c.Value), []byte(sm.boardToken)) == 1
 }
 
+// IsBoardSession reports whether r carries the Board session cookie. It does
+// not check a passkey; Board actions that need Touch ID use WrapBoardAction.
+func (sm *SecurityMiddleware) IsBoardSession(r *http.Request) bool {
+	return sm.hasBoardCookie(r)
+}
+
 // writeBoardError writes a JSON 403 with an error code field.
 func writeBoardError(w http.ResponseWriter, code, msg string) {
 	w.Header().Set("Content-Type", "application/json")

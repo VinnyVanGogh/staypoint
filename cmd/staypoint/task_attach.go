@@ -163,6 +163,7 @@ func createLocalOrgTaskWith(out io.Writer, conn *sql.DB, org, project, title, re
 		Provider:       choice.Provider,
 		ModelOverride:  choice.Model,
 		ExecutionStage: governance.StageBacklog,
+		Origin:         cliTaskOrigin(os.Getenv),
 	})
 	if err != nil {
 		return err

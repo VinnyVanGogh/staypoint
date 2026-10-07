@@ -35,7 +35,7 @@ type TaskItem struct {
 	UpdatedAt       time.Time `json:"updated_at"`
 	AssigneeAgentID string    `json:"assignee_agent_id,omitempty"`
 	CheckoutAgentID string    `json:"checkout_agent_id,omitempty"`
-	// Origin is the local task origin (native, paperclip_import, legacy);
+	// Origin is the local task origin (native, paperclip_import, legacy, agent);
 	// empty for live Paperclip issues.
 	Origin string `json:"origin,omitempty"`
 }

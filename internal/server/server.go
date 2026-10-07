@@ -138,6 +138,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		tasksH := NewTasksHandler(s.opts.DB, s.hub)
 		// STA-859: override / allow_deep are Board-only; they need the passkey gate.
 		tasksH.SetBoardGate(s.secMid.WrapBoardAction)
+		// Tasks created without a Board session are agent tasks (backlog,
+		// Board-only to start).
+		tasksH.SetBoardSession(s.secMid.IsBoardSession)
 		mux.HandleFunc("GET /api/tasks", tasksH.ListTasks)
 		mux.HandleFunc("POST /api/tasks", tasksH.CreateTask)
 		mux.HandleFunc("GET /api/tasks/{id}", tasksH.GetTask)
@@ -253,6 +256,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		// STA-854: per-company tracking gate; toggling is Board-only.
 		mux.HandleFunc("GET /api/settings/tracking-gate", gateH.GetTrackingGateSettings)
 		mux.Handle("POST /api/settings/tracking-gate", s.secMid.WrapBoardAction(http.HandlerFunc(gateH.UpdateTrackingGateSettings)))
+		// Org hold: Board-only (session + passkey); agents can read it, never set it.
+		mux.HandleFunc("GET /api/settings/org-hold", gateH.GetOrgHolds)
+		mux.Handle("POST /api/settings/org-hold", s.secMid.WrapBoardAction(http.HandlerFunc(gateH.UpdateOrgHold)))
 
 		// Ship Review REST API (Board-approval gate for agent branch merges)
 		shipH := NewShipReviewHandler(s.opts.DB, s.hub)

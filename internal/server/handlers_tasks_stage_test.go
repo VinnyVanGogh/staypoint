@@ -37,7 +37,7 @@ func TestSetStage_AcceptsBacklogAndCancelled(t *testing.T) {
 	srv, token := startTestServer(t, database)
 	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
 
-	resp, task := postTask(t, base, token, map[string]any{"name": "s", "repo_path": "/repo/x", "git_branch": "main"})
+	resp, task := postTaskAs(t, srv, token, map[string]any{"name": "s", "repo_path": "/repo/x", "git_branch": "main"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create: %d %v", resp.StatusCode, task)
 	}
@@ -68,7 +68,7 @@ func TestSetStage_RunNowFromBacklog(t *testing.T) {
 	srv, token := startTestServer(t, database)
 	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
 
-	resp, task := postTask(t, base, token, map[string]any{"name": "parked", "repo_path": "/repo/x", "git_branch": "main", "execution_stage": "backlog"})
+	resp, task := postTaskAs(t, srv, token, map[string]any{"name": "parked", "repo_path": "/repo/x", "git_branch": "main", "execution_stage": "backlog"})
 	if resp.StatusCode != http.StatusCreated || task["execution_stage"] != "backlog" {
 		t.Fatalf("create backlog: %d %v", resp.StatusCode, task)
 	}
@@ -91,8 +91,8 @@ func TestListTasks_HidesLegacyByDefault(t *testing.T) {
 	srv, token := startTestServer(t, database)
 	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
 
-	_, native := postTask(t, base, token, map[string]any{"name": "native", "repo_path": "/repo/x", "git_branch": "main"})
-	_, legacy := postTask(t, base, token, map[string]any{"name": "old", "repo_path": "/repo/x", "git_branch": "main"})
+	_, native := postTaskAs(t, srv, token, map[string]any{"name": "native", "repo_path": "/repo/x", "git_branch": "main"})
+	_, legacy := postTaskAs(t, srv, token, map[string]any{"name": "old", "repo_path": "/repo/x", "git_branch": "main"})
 	nativeID, legacyID := native["id"].(string), legacy["id"].(string)
 	if _, err := database.Exec(`UPDATE tasks SET origin = 'legacy' WHERE id = ?`, legacyID); err != nil {
 		t.Fatal(err)

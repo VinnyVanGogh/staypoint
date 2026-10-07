@@ -35,12 +35,16 @@ export type Interaction = {
 export class StayPointAPI {
   constructor(private readonly request: APIRequestContext) {}
 
-  private headers() {
-    return { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' };
+  private headers(asBoard = false) {
+    const h: Record<string, string> = { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' };
+    // Tasks created or started without a Board session are agent tasks
+    // (backlog, Board-only to start); seeding acts as the Board.
+    if (asBoard && BOARD_TOKEN) h.Cookie = `staypoint_board=${BOARD_TOKEN}`;
+    return h;
   }
 
-  private async json<T>(method: string, path: string, data?: unknown): Promise<T> {
-    const res = await this.request.fetch(path, { method, headers: this.headers(), data });
+  private async json<T>(method: string, path: string, data?: unknown, asBoard = false): Promise<T> {
+    const res = await this.request.fetch(path, { method, headers: this.headers(asBoard), data });
     const text = await res.text();
     if (!res.ok()) {
       throw new Error(`${method} ${path} -> ${res.status()}: ${text}`);
@@ -52,7 +56,7 @@ export class StayPointAPI {
   async createTask(label: string, extra: Record<string, unknown> = {}): Promise<Task> {
     const name = `${label} ${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const body = { name, organization: 'STA', project: 'ui-e2e', ...extra };
-    const created = await this.json<Task>('POST', '/api/tasks', body);
+    const created = await this.json<Task>('POST', '/api/tasks', body, true);
     // The create response omits organization/project; keep what was sent so
     // taskPagePath() builds the same URL the UI does.
     return { ...created, organization: body.organization, project: body.project };
@@ -96,7 +100,7 @@ export class StayPointAPI {
   }
 
   async setStage(id: string, stage: string) {
-    return this.json('POST', `/api/tasks/${encodeURIComponent(id)}/stage`, { stage });
+    return this.json('POST', `/api/tasks/${encodeURIComponent(id)}/stage`, { stage }, true);
   }
 
   async runControl(id: string, action: string) {

@@ -2,7 +2,10 @@ package context
 
 import (
 	"errors"
+	"regexp"
 	"strings"
+
+	"github.com/VinnyVanGogh/staypoint/internal/governance"
 )
 
 // Task origins (tasks.origin). See Task.Origin.
@@ -10,6 +13,10 @@ const (
 	OriginNative          = "native"
 	OriginPaperclipImport = "paperclip_import"
 	OriginLegacy          = "legacy"
+	// OriginAgent marks a task an agent created (MCP, the agent token on the
+	// API, or the CLI inside an agent session). It is created in backlog and
+	// only the Board can move it to a runnable stage.
+	OriginAgent = "agent"
 )
 
 var (
@@ -19,10 +26,34 @@ var (
 	ErrInvalidRepo   = errors.New("invalid repo path")
 )
 
+// ErrBoardRequired is returned when a stage change needs the Board.
+var ErrBoardRequired = errors.New("board required")
+
+// RequiresBoardToLeave reports whether moving t to stage needs the Board: t
+// was created by an agent, sits in a parked stage (backlog, cancelled,
+// stopped, ...) and stage is runnable. Moving it to done or cancelled, or
+// between runnable stages, does not.
+func RequiresBoardToLeave(t *Task, stage string) bool {
+	if t == nil || t.Origin != OriginAgent {
+		return false
+	}
+	return !governance.IsRunnableStage(t.ExecutionStage) && governance.IsRunnableStage(stage)
+}
+
+// prodWord matches "prod" / "production" as a word.
+var prodWord = regexp.MustCompile(`(?i)\bprod(uction)?\b`)
+
+// NameTargetsProd reports whether a task's name says it targets production
+// (e.g. "port X to prod"). Board surfaces add the repo's live_credentials
+// flag; either one makes leaving backlog a Touch ID action.
+func NameTargetsProd(name string) bool {
+	return prodWord.MatchString(name)
+}
+
 // IsValidOrigin reports whether origin is one of the task origins.
 func IsValidOrigin(origin string) bool {
 	switch origin {
-	case OriginNative, OriginPaperclipImport, OriginLegacy:
+	case OriginNative, OriginPaperclipImport, OriginLegacy, OriginAgent:
 		return true
 	}
 	return false

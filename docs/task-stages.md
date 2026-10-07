@@ -12,7 +12,7 @@ task is `in_progress`: `Harness.Claim` sets it when a run checks the task out.
 
 | Stage | Paperclip | status | Runnable | Who sets it |
 |---|---|---|---|---|
-| `backlog` | backlog | active | no | Board, `staypoint import paperclip`, ship-review "Add tests" tasks |
+| `backlog` | backlog | active | no | Board, `staypoint import paperclip`, ship-review "Add tests" tasks, every agent-created task |
 | `todo` | todo | active | yes | default for new tasks; Board; unblock; recovery after a restart |
 | `in_progress` | in_progress | active | yes (claimed) | `Harness.Claim` (a run started); Board (Run Now) |
 | `in_review` | in_review | active | yes | harness on completion; Board |
@@ -48,6 +48,39 @@ task in `backlog`, so the daemon never starts a run that duplicates the
 attached session's work. The Board's Run Now still runs it. A backlog task (or one with no repo) is also never
 "the active task" for a repo (`GetActiveTaskForRepo`: hooks, `staypoint
 context`, statusline) and never receives the watcher's token spend.
+
+### Surprise starts: agent-created tasks and org holds (2026-10-07)
+
+Creating a task in a runnable stage wakes it at once, so two rules keep
+tasks from starting without the Board:
+
+- **The requested stage is honoured on every create path**, children
+  included: `POST /api/tasks` with `parent_id` and `execution_stage: backlog`
+  creates a parked child that is never woken. `staypoint task create
+  --backlog` parks the local task too.
+- **Agent-created tasks always start in `backlog`** with origin `agent`,
+  whatever stage was asked for. Agent-created means: `staypoint_task_create_child`
+  (MCP), `POST /api/tasks` without a Board session (the agent token alone),
+  or `staypoint task create` inside an agent session (`CLAUDECODE`,
+  `STAYPOINT_TASK_ID`, ... set). Only the Board moves such a task from a
+  parked stage (`backlog`, `cancelled`, `stopped`) to a runnable one: the
+  stage endpoint needs the Board session cookie, `staypoint task stage`
+  refuses inside agent sessions or without a terminal, and
+  `POST /api/tasks/{id}/transition` refuses it outright. A prod-targeting
+  task (name says prod/production, or its repo is a `live_credentials`
+  project) also needs the passkey (Touch ID), so it can only leave backlog
+  from the Board UI. Closing (`done`, `cancelled`) needs no Board.
+
+**Org hold** is a Board-only switch per organization (`settings_kv`
+`org_hold.<lower(org)>`). While it is on, `Harness.Claim` refuses every
+task in that organization (`ErrOrgHeld`), so no wake can run one; the
+assignment, comment, blocker, MCP `staypoint_wake` and Run Now paths refuse
+it first and log a `wake_held` activity row. Set it from Settings or the
+organization card in the Board UI (`POST /api/settings/org-hold`, Board
+session + passkey), or place it with `staypoint org hold <org>` from the
+Board's own terminal. Lifting it needs Touch ID, so the CLI cannot; agents
+can read it (`GET /api/settings/org-hold`) but never set it. Held
+organizations show a `HELD` badge.
 
 ### Transitions
 

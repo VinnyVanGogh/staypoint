@@ -701,6 +701,10 @@ function handleEvent(evt) {
     }
     return;
   }
+  if (type === 'org_hold') {
+    loadOrgHolds();
+    return;
+  }
   if (type === 'security_gate_decided' && evt.data) {
     updateGatesBadge();
     if (document.getElementById('view-gates')?.classList.contains('active')) {
@@ -1479,6 +1483,73 @@ function renderQuotaGauges(quotas) {
   }
 }
 
+// ── Org hold (Board-only) ──
+// While an organization is held the daemon claims none of its tasks. Placing
+// or lifting a hold is a Board action (session + passkey); agents can read it.
+state.orgHolds = new Set();
+
+async function loadOrgHolds() {
+  try {
+    const r = await fetch('/api/settings/org-hold', { headers: authHeader() });
+    if (!r.ok) return;
+    const body = await r.json();
+    state.orgHolds = new Set((body.held || []).map(o => String(o).toLowerCase()));
+  } catch (_) {
+    return;
+  }
+  if (state.fleet) renderOrganizationsGrid(state.fleet.organizations);
+  if (document.getElementById('view-settings')?.classList.contains('active')) renderSettings();
+}
+
+function isOrgHeld(name) {
+  return !!name && state.orgHolds.has(String(name).trim().toLowerCase());
+}
+
+function orgHeldBadge() {
+  const b = el('span', 'org-held-badge', 'HELD');
+  b.title = 'On hold: no task in this organization is claimed or woken until the Board lifts the hold.';
+  return b;
+}
+
+async function setOrgHold(name, held) {
+  const verb = held ? 'putting' : 'lifting the hold on';
+  const res = await withBoardWebAuthn((sessionToken, assertion) =>
+    fetch('/api/settings/org-hold', {
+      method: 'POST',
+      headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+      body: JSON.stringify({ organization: name, held }),
+    }), `${verb} ${name}${held ? ' on hold' : ''}`,
+  );
+  if (res === null) return;
+  if (!res.ok) throw await boardActionError(res);
+  await loadOrgHolds();
+}
+
+// orgHoldControl is the Hold / Lift hold button for an organization.
+function orgHoldControl(name) {
+  const held = isOrgHeld(name);
+  const row = el('div', 'org-hold-row');
+  const btn = el('button', held ? 'org-hold-btn org-hold-btn-lift' : 'org-hold-btn', held ? 'Lift hold' : 'Hold');
+  btn.type = 'button';
+  btn.title = held
+    ? 'Lift the hold so this organization\'s tasks can run again (Touch ID)'
+    : 'Stop the daemon from claiming or waking any task in this organization (Touch ID)';
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    if (!held && !confirm(`Put ${name} on hold? No task in it will be claimed or woken until you lift the hold.`)) return;
+    btn.disabled = true;
+    try {
+      await setOrgHold(name, !held);
+    } catch (err) {
+      alert(`Org hold failed: ${err.message || err}`);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  row.appendChild(btn);
+  return row;
+}
+
 function renderOrganizationsGrid(orgs) {
   const container = document.getElementById('orgs-grid');
   if (!container || !orgs) return;
@@ -1491,7 +1562,9 @@ function renderOrganizationsGrid(orgs) {
     const top = el('div', 'org-card-title');
     top.appendChild(el('span', 'org-name', org.name));
     top.appendChild(el('span', 'org-prefix', `[${org.issue_prefix || 'ORG'}]`));
+    if (isOrgHeld(org.name)) top.appendChild(orgHeldBadge());
     card.appendChild(top);
+    card.appendChild(orgHoldControl(org.name));
 
     const sGrid = el('div', 'org-stats-grid');
     const stats = [
@@ -4713,6 +4786,36 @@ function renderSettings() {
     connSec.appendChild(row);
   }
   container.appendChild(connSec);
+
+  // Organization holds (Board-only, Touch ID)
+  const holdSec = el('div', 'settings-section');
+  const holdHdr = el('div', 'settings-section-header');
+  holdHdr.appendChild(el('div', 'settings-section-title', 'Organization holds'));
+  holdHdr.appendChild(el('div', 'settings-section-desc',
+    'A held organization runs nothing: the daemon claims none of its tasks and logs every wake as held. Board-only; saved with Touch ID.'));
+  holdSec.appendChild(holdHdr);
+  const holdOrgs = [...new Set([
+    ...(f?.organizations || []).map(o => o.name).filter(Boolean),
+    ...state.orgHolds,
+  ].map(n => String(n)))];
+  const seenHold = new Set();
+  for (const name of holdOrgs) {
+    const key = name.trim().toLowerCase();
+    if (seenHold.has(key)) continue;
+    seenHold.add(key);
+    const row = el('div', 'settings-row');
+    const label = el('div', 'settings-row-label', name);
+    if (isOrgHeld(name)) label.appendChild(orgHeldBadge());
+    row.appendChild(label);
+    row.appendChild(orgHoldControl(name));
+    holdSec.appendChild(row);
+  }
+  if (!holdOrgs.length) {
+    const row = el('div', 'settings-row');
+    row.appendChild(el('span', 'muted-text', 'No organizations yet.'));
+    holdSec.appendChild(row);
+  }
+  container.appendChild(holdSec);
 
   // Provider accounts
   const provSec = el('div', 'settings-section');
@@ -10796,18 +10899,31 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
       runBtn.disabled = true;
       runBtn.textContent = 'Starting…';
       try {
-        const res = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/stage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...authHeader() },
-          body: JSON.stringify({ stage: 'in_progress' }),
-        });
-        if (!res.ok) throw new Error(`${res.status}`);
+        const send = (sessionToken, assertion) => {
+          const headers = { 'Content-Type': 'application/json', ...authHeader() };
+          if (sessionToken) headers['X-WebAuthn-Session'] = sessionToken;
+          if (assertion) headers['X-WebAuthn-Assertion'] = assertion;
+          return fetch(`/api/tasks/${encodeURIComponent(task.id)}/stage`, {
+            method: 'POST', headers, body: JSON.stringify({ stage: 'in_progress' }),
+          });
+        };
+        let res = await send('', '');
+        // A prod-targeting agent task needs Touch ID to leave backlog.
+        if (res.status === 403) {
+          const err = await res.clone().json().catch(() => ({}));
+          if (err.error === 'board_passkey_assertion_required') {
+            res = await withBoardWebAuthn(send, 'running this prod-targeting task');
+            if (res === null) { runBtn.disabled = false; runBtn.textContent = '▶ Run Now'; return; }
+          }
+        }
+        if (!res.ok) throw await boardActionError(res);
         runBtn.textContent = '✓ Started';
         setTimeout(reopen, 800);
       } catch (err) {
         runBtn.disabled = false;
         runBtn.textContent = '▶ Run Now';
         console.error('run-now failed:', err);
+        alert(`Run Now failed: ${err.message || err}`);
       }
     });
     headerActions.prepend(runBtn);
@@ -12334,6 +12450,7 @@ document.getElementById('projects-org-filter')?.addEventListener('change', (e) =
   connectSSE();
   refreshBoardPasskeyStatus();
   refreshDevBuildBadge();
+  loadOrgHolds();
   const bannerEnrollBtn = document.getElementById('board-passkey-banner-enroll');
   bannerEnrollBtn?.addEventListener('click', async () => {
     bannerEnrollBtn.disabled = true;
