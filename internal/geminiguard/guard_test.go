@@ -17,8 +17,31 @@ func TestIsDocPath(t *testing.T) {
 		"README.md":               true,
 		"docs/x.md":               true,
 		"docs/diagram.png":        true,
-		"doc/api/thing.go":        true,
+		"doc/api/thing.go":        false,
 		".staypoint/plan.json":    true,
+		"docs/guide.pdf":          true,
+		"deck.pptx":               true,
+		"specs/report.docx":       true,
+		"talk.key":                true,
+		"notes.odt":               true,
+		"slides.odp":              true,
+		"docs/mkdocs.yml":         false,
+		"config.yaml":             false,
+		"app.json":                false,
+		"pyproject.toml":          false,
+		".env":                    false,
+		".env.local":              false,
+		"setup.ini":               false,
+		"db/migrations/001.sql":   false,
+		"scripts/deploy.sh":       false,
+		"Dockerfile":              false,
+		"docs/Dockerfile":         false,
+		".github/README.md":       false,
+		"main_test.go":            false,
+		"analysis.ipynb":          false,
+		"requirements.txt":        false,
+		"requirements-dev.txt":    false,
+		"CMakeLists.txt":          false,
 		"notes/CHANGELOG.MDX":     true,
 		"a/b/guide.rst":           true,
 		"manual.adoc":             true,
@@ -121,7 +144,7 @@ func TestEnforce_CodeEditIsRevertedAndBlocked(t *testing.T) {
 	if got := read(t, dir, "util.go"); got != "package main // earlier turn\n" {
 		t.Errorf("util.go = %q, want the pre-turn content", got)
 	}
-	want := "Blocked: Gemini edited code in a work repo: main.go, util.go (reverted)"
+	want := "Blocked: Gemini edited code: main.go, util.go (reverted)"
 	if res.Title() != want {
 		t.Errorf("title = %q, want %q", res.Title(), want)
 	}

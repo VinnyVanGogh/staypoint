@@ -112,10 +112,15 @@ type RunConfig struct {
 	// built from the same commit as the daemon.
 	HookBin string
 	// GeminiDocsOnly applies the Board rule router.GeminiCodeForbidden to this
-	// run (work repo, STA-856): after any turn that spawned Gemini, changes
-	// outside the documentation allowlist are reverted to the daemon's pre-turn
-	// checkpoint and the run fails. Not configurable off for work repos.
+	// run (every repo, STA-856 revised 2026-10-06): after any turn that
+	// spawned Gemini, changes outside the non-code allowlist are reverted to
+	// the daemon's pre-turn checkpoint and the run fails.
 	GeminiDocsOnly bool
+	// GeminiCodeApproved relaxes the guard for this one run after a Board
+	// Touch ID approval (personal repo only, router.GeminiCodeApprovalAllowed):
+	// code changes are allowed, .git tampering and paths outside the repo are
+	// still reverted. Requires GeminiDocsOnly (the guard still runs).
+	GeminiCodeApproved bool
 	// TurnUsedGemini reports whether a Gemini CLI was spawned since its last
 	// call, and resets. Nil falls back to the static Provider.
 	TurnUsedGemini func() bool
@@ -513,6 +518,9 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 				cpSHA = turnCP.CommitSHA
 			}
 			guardSnap, guardSnapErr = geminiguard.Take(ctx, wtPath, cpSHA)
+			if guardSnapErr == nil && cfg.GeminiCodeApproved {
+				guardSnap.AllowCode()
+			}
 			if cfg.TurnUsedGemini != nil {
 				_ = cfg.TurnUsedGemini() // clear spawns from before this turn
 			}

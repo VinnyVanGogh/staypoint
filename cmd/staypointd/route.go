@@ -40,13 +40,21 @@ func currentPacer() *router.PacerState {
 }
 
 // resolveTaskRoute picks the routing chain for one run of taskID from its
-// work_kind, its repo's seat (work vs personal) and current quota. An empty
-// repo_path resolves against repoRoot, matching the harness.
+// work_kind, the Board's explicit provider/model choice (STA-838), its repo's
+// seat (work vs personal) and current quota. An empty repo_path resolves
+// against repoRoot, matching the harness. Code kinds never get Gemini, even
+// with provider=gemini stored (router.GeminiCodeForbidden).
 func resolveTaskRoute(db *sql.DB, taskID, repoRoot string, pacer *router.PacerState, now time.Time) router.KindRoute {
-	var repoPath, workKind string
+	return resolveTaskRouteApproved(db, taskID, repoRoot, pacer, now, "")
+}
+
+// resolveTaskRouteApproved is resolveTaskRoute for a run that consumed the
+// Board Touch ID approval approvalID (geminiCodeGate); "" for none.
+func resolveTaskRouteApproved(db *sql.DB, taskID, repoRoot string, pacer *router.PacerState, now time.Time, approvalID string) router.KindRoute {
+	var repoPath, workKind, provider, model string
 	if err := db.QueryRowContext(context.Background(),
-		"SELECT COALESCE(repo_path,''), COALESCE(work_kind,'') FROM tasks WHERE id=?", taskID,
-	).Scan(&repoPath, &workKind); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		"SELECT COALESCE(repo_path,''), COALESCE(work_kind,''), COALESCE(provider,''), COALESCE(model_override,'') FROM tasks WHERE id=?", taskID,
+	).Scan(&repoPath, &workKind, &provider, &model); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		slog.Warn("route: task lookup failed; routing as coding on the personal seat",
 			slog.String("task", taskID), slog.Any("error", err))
 	}
@@ -57,7 +65,9 @@ func resolveTaskRoute(db *sql.DB, taskID, repoRoot string, pacer *router.PacerSt
 	if repoPath != "" {
 		isWork, _, _ = router.IsWorkRepo(repoPath)
 	}
-	return router.ResolveRoute(workKind, isWork, pacer, "", now)
+	choice := router.ChoiceFromStored(provider, model)
+	choice.CodeApprovalID = approvalID
+	return router.ResolveRouteChoice(workKind, isWork, pacer, choice, now)
 }
 
 // slotProvider is the adapter/stream-parser key for a routed slot.
@@ -124,9 +134,13 @@ func (t *routeTracker) Observe(a adapter.AttemptInfo) {
 	}
 }
 
-// geminiDocsOnly applies the Board rule (STA-856) to a run: in a work repo the
-// harness reverts any non-doc change a Gemini turn makes and fails the run.
-func geminiDocsOnly(r router.KindRoute) bool { return router.GeminiCodeForbidden(r.IsWork) }
+// geminiDocsOnly applies the Board rule (STA-856, all repos) to a run: the
+// harness reverts any code change a Gemini turn makes and fails the run. It
+// is on whenever the route can spawn Gemini; a Claude-only route skips the
+// per-turn snapshot. TurnUsedGemini still gates enforcement per turn.
+func geminiDocsOnly(r router.KindRoute) bool {
+	return router.GeminiCodeForbidden(r.IsWork) && r.HasGemini()
+}
 
 // TakeGeminiSpawned reports whether a Gemini CLI was spawned since the last
 // call, and resets the flag (RunConfig.TurnUsedGemini).

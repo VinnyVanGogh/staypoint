@@ -251,15 +251,19 @@ func isPoolLocked(pool *router.QuotaPool) bool {
 
 // BuildProviderChain constructs the ordered failover chain based on repo type and starting provider.
 //
+// Gemini is never a fallback (router.GeminiCodeForbidden): only an explicit
+// provider=gemini (or agy) starts on it. Every other provider, including an
+// empty or unknown one, is Claude only.
+//
 // Work repo chains:
 //
 //	provider=gemini: [gemini, work-claude, personal-claude]
-//	provider=claude: [work-claude, personal-claude, gemini]
+//	otherwise:       [work-claude, personal-claude]
 //
 // Personal repo chains:
 //
 //	provider=gemini: [gemini, personal-claude]
-//	provider=claude: [personal-claude, gemini]
+//	otherwise:       [personal-claude]
 //
 // Opt-in provider (no failover):
 //
@@ -299,19 +303,19 @@ func BuildProviderChain(isWork bool, provider string) []providerCandidate {
 		}}
 	}
 
+	explicitGemini := provider == "gemini" || provider == "agy"
 	if isWork {
-		if provider == "claude" {
-			return []providerCandidate{workClaude, personalClaude, gemini}
+		if explicitGemini {
+			return []providerCandidate{gemini, workClaude, personalClaude}
 		}
-		// provider == "gemini" (or default)
-		return []providerCandidate{gemini, workClaude, personalClaude}
+		return []providerCandidate{workClaude, personalClaude}
 	}
 
 	// Personal repo
-	if provider == "claude" {
-		return []providerCandidate{personalClaude, gemini}
+	if explicitGemini {
+		return []providerCandidate{gemini, personalClaude}
 	}
-	return []providerCandidate{gemini, personalClaude}
+	return []providerCandidate{personalClaude}
 }
 
 // RunAdapter executes the requested agent provider with chain-based failover.

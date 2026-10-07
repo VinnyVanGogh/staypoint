@@ -21,7 +21,7 @@ func init() {
 
 func addChildCreateFlags(cmd *cobra.Command) {
 	cmd.Flags().String("parent", "", "Create a child of this local task ID (skips AI inference and Paperclip)")
-	cmd.Flags().String("kind", "", "Child work_kind: "+strings.Join(meshContext.ValidWorkKinds(), ", ")+" (default coding)")
+	cmd.Flags().String("kind", "", "work_kind (with --parent or --org): "+strings.Join(meshContext.ValidWorkKinds(), ", ")+" (default coding)")
 	cmd.Flags().String("handoff", "", "Plan text handed to the child (defaults to the parent's latest plan document)")
 	cmd.Flags().String("handoff-file", "", "Read the handoff plan from this file")
 	cmd.Flags().Bool("allow-deep", false, "Board override: allow nesting past the child depth cap (Board terminal only; refused in agent sessions)")

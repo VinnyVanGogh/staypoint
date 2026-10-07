@@ -261,8 +261,15 @@ func TestShellWrapperGuardsAgy(t *testing.T) {
 	if i < 0 || !strings.Contains(s[i:i+200], `staypoint agy-guard "$PWD" || return 1`) {
 		t.Error("agy() wrapper must call agy-guard before the --force branch")
 	}
-	if !strings.Contains(s, "staypoint agy-guard \"$PWD\" || return 1\n    command agy --model") {
-		t.Error("ai() must guard before launching agy")
+	// ai() never launches agy at all (router.GeminiCodeForbidden): it runs
+	// Claude whatever the route says, so it has no agy branch to guard.
+	j := strings.Index(s, "ai() {")
+	k := strings.Index(s, "# claude [--work|--personal]")
+	if j < 0 || k < j {
+		t.Fatal("ai() wrapper not found")
+	}
+	if body := s[j:k]; strings.Contains(body, "command agy") || strings.Contains(body, ":-agy}") {
+		t.Errorf("ai() must never launch or default to agy:\n%s", body)
 	}
 }
 

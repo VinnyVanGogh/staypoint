@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/adapter"
+	"github.com/VinnyVanGogh/staypoint/internal/db"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 )
@@ -45,6 +46,23 @@ type wakeResult struct {
 	taskID              string
 	messages            []string // message row titles (status error)
 	stage               string   // final execution_stage
+}
+
+// wakeChoice is the provider/model stored on the next runWake task (STA-838).
+// Tests set it with withChoice.
+var wakeChoice struct{ provider, model string }
+
+// wakeReuse, when store is set, makes runWakeIn wake an existing task in an
+// existing store instead of creating both (multi-run tests).
+var wakeReuse struct {
+	store  *db.Store
+	taskID string
+}
+
+func withChoice(t *testing.T, provider, model string) {
+	t.Helper()
+	wakeChoice.provider, wakeChoice.model = provider, model
+	t.Cleanup(func() { wakeChoice.provider, wakeChoice.model = "", "" })
 }
 
 // runWake drives the production wake path (adapterOverride == nil) end to end:
@@ -82,11 +100,16 @@ func runWakeIn(t *testing.T, repoRoot, workKind string, pacer *router.PacerState
 	}
 
 	orchestrator.GlobalDispatcher = orchestrator.NewDispatcher()
-	store := openTestStore(t)
-	taskID := "route-" + strings.ReplaceAll(t.Name(), "/", "-")
-	if _, err := store.DB().Exec(
-		`INSERT INTO tasks (id, name, repo_path, execution_stage, assignee_agent_id, work_kind) VALUES (?, 'route test', '', 'todo', 'agent-route', ?)`,
-		taskID, workKind,
+	store, taskID := wakeReuse.store, wakeReuse.taskID
+	if store == nil {
+		store = openTestStore(t)
+		taskID = "route-" + strings.ReplaceAll(t.Name(), "/", "-")
+	}
+	if wakeReuse.store != nil {
+		// existing task: nothing to insert
+	} else if _, err := store.DB().Exec(
+		`INSERT INTO tasks (id, name, repo_path, execution_stage, assignee_agent_id, work_kind, provider, model_override) VALUES (?, 'route test', '', 'todo', 'agent-route', ?, ?, ?)`,
+		taskID, workKind, wakeChoice.provider, wakeChoice.model,
 	); err != nil {
 		t.Fatalf("insert task: %v", err)
 	}
@@ -196,10 +219,10 @@ func TestWake_WorkRepoPersonalLockedSpawnsWorkClaude(t *testing.T) {
 	}
 }
 
-// STA-856: a locked work seat falls back to the personal Claude seat (default
-// profile, no CLAUDE_CONFIG_DIR), never to Gemini.
+// STA-856: for a code kind a locked work seat falls back to the personal
+// Claude seat (default profile, no CLAUDE_CONFIG_DIR), never to Gemini.
 func TestWake_WorkRepoWorkLockedSpawnsPersonalClaudeNeverGemini(t *testing.T) {
-	for _, kind := range []string{"coding", "review", "qa", ""} {
+	for _, kind := range []string{"coding", "qa", "", "bogus"} {
 		t.Run("kind="+kind, func(t *testing.T) {
 			r := runWake(t, workRepo(t), kind, lockedPacer(map[router.PoolID]string{router.PoolWorkClaude: "5h limit"}), "")
 			cfgDir, args := mustOneSpawn(t, r)
@@ -217,35 +240,104 @@ func TestWake_WorkRepoWorkLockedSpawnsPersonalClaudeNeverGemini(t *testing.T) {
 	}
 }
 
-// STA-856: with both Claude seats locked a work coding run waits in the quota
-// queue. Gemini has quota but is never spawned.
-func TestWake_WorkRepoBothSeatsLockedQueuesNeverGemini(t *testing.T) {
-	slots := freshSlots(t, 3)
+// GeminiCodeForbidden (all repos): with every Claude seat locked a code-kind
+// run waits in the quota queue. Gemini has quota but is never spawned, even
+// when the task's stored provider is gemini.
+func TestWake_CodeKindAllSeatsLockedQueuesNeverGemini(t *testing.T) {
 	pacer := lockedPacer(map[router.PoolID]string{
 		router.PoolWorkClaude:     "weekly limit",
 		router.PoolPersonalClaude: "5h limit",
 	})
-	r := runWake(t, workRepo(t), "coding", pacer, "")
-	if len(r.spawns) != 0 {
-		t.Fatalf("spawned %q while both Claude seats were locked; want a queued run", r.spawns)
+	for _, c := range []struct {
+		name, repoKind, kind, provider string
+	}{
+		{"work coding", "work", "coding", ""},
+		{"personal coding", "personal", "coding", ""},
+		{"personal qa", "personal", "qa", ""},
+		{"personal coding stored gemini", "personal", "coding", "gemini"},
+		{"work qa stored gemini", "work", "qa", "gemini"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			slots := freshSlots(t, 3)
+			withChoice(t, c.provider, "")
+			repo := personalRepo(t)
+			if c.repoKind == "work" {
+				repo = workRepo(t)
+			}
+			r := runWake(t, repo, c.kind, pacer, "")
+			if len(r.spawns) != 0 {
+				t.Fatalf("spawned %q while every Claude seat was locked; want a queued run", r.spawns)
+			}
+			if len(r.routes) != 0 {
+				t.Errorf("a queued run must not write route rows, got %q", r.routes)
+			}
+			pos := slots.Position(r.taskID)
+			if !pos.Queued || pos.Wait != orchestrator.WaitQuota {
+				t.Fatalf("run not quota-queued: %+v", pos)
+			}
+			slots.Dequeue(r.taskID)
+		})
 	}
-	if len(r.routes) != 0 {
-		t.Errorf("a queued run must not write route rows, got %q", r.routes)
-	}
-	pos := slots.Position(r.taskID)
-	if !pos.Queued || pos.Wait != orchestrator.WaitQuota {
-		t.Fatalf("run not quota-queued: %+v", pos)
-	}
-	slots.Dequeue(r.taskID)
 }
 
-// Work planning may still run on Gemini (docs only; the harness guard
-// enforces it).
-func TestWake_WorkRepoPlanningMaySpawnGemini(t *testing.T) {
-	r := runWake(t, workRepo(t), "planning", openPacer(), "")
-	_, args := mustOneSpawn(t, r)
-	if isClaude(args) || !strings.Contains(args, "--model gemini-3.8-flash") {
-		t.Errorf("spawned %q, want agy gemini-3.8-flash", args)
+// Non-code kinds run Gemini first automatically in every repo (the harness
+// guard reverts any code a Gemini turn writes).
+func TestWake_NonCodeKindsSpawnGeminiEveryRepo(t *testing.T) {
+	for _, repoKind := range []string{"personal", "work"} {
+		for _, kind := range []string{"planning", "architecture", "review", "docs"} {
+			t.Run(repoKind+"/"+kind, func(t *testing.T) {
+				repo := personalRepo(t)
+				if repoKind == "work" {
+					repo = workRepo(t)
+				}
+				r := runWake(t, repo, kind, openPacer(), "")
+				_, args := mustOneSpawn(t, r)
+				if isClaude(args) || !strings.Contains(args, "--model gemini-") {
+					t.Errorf("spawned %q, want agy", args)
+				}
+				if len(r.routes) != 1 || !strings.HasPrefix(r.routes[0], "Ran on Gemini ") || strings.Contains(r.routes[0], "chosen by Board") {
+					t.Errorf("route rows = %q", r.routes)
+				}
+			})
+		}
+	}
+}
+
+// STA-838: the Board's explicit choice. provider=gemini on a non-code kind
+// runs Gemini with the "chosen by Board" label; provider=claude on a non-code
+// kind runs Claude; a stored gemini choice on a code kind in a work repo
+// still runs Claude (personal repos wait for Touch ID: gemini_code_gate_test).
+func TestWake_ExplicitProviderChoice(t *testing.T) {
+	cases := []struct {
+		name, kind, provider, model string
+		wantClaude                  bool
+		wantArgs, wantRoute         string
+	}{
+		{"gemini on docs", "docs", "gemini", "", false, "--model gemini-3.1-pro --effort high", "Ran on Gemini 3.1 Pro · chosen by Board"},
+		{"gemini flash on review", "review", "gemini", "gemini-3.8-flash-high", false, "--model gemini-3.8-flash --effort high", "Ran on Gemini 3.8 Flash · chosen by Board"},
+		{"claude on planning", "planning", "claude", "", true, "--model sonnet", "Ran on Claude Sonnet · personal seat"},
+		{"claude opus on architecture", "architecture", "claude", "opus", true, "--model opus", "Ran on Claude Opus · personal seat"},
+		{"gemini stored on work coding", "coding", "gemini", "", true, "--model opus", "Ran on Claude Opus · work seat"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			withChoice(t, c.provider, c.model)
+			repo := personalRepo(t)
+			if strings.Contains(c.name, "work") {
+				repo = workRepo(t)
+			}
+			r := runWake(t, repo, c.kind, openPacer(), "")
+			_, args := mustOneSpawn(t, r)
+			if isClaude(args) != c.wantClaude || !strings.Contains(args, c.wantArgs) {
+				t.Errorf("spawned %q, want claude=%v %s", args, c.wantClaude, c.wantArgs)
+			}
+			if len(r.routes) != 1 || r.routes[0] != c.wantRoute {
+				t.Errorf("route rows = %q, want %q", r.routes, c.wantRoute)
+			}
+			if c.kind == "coding" && !strings.Contains(r.bodies[0], "Gemini refused") {
+				t.Errorf("body %q should say the gemini choice was refused", r.bodies[0])
+			}
+		})
 	}
 }
 
@@ -272,10 +364,11 @@ func TestWake_EveryKindRouteMatchesSpawn(t *testing.T) {
 		claude                    bool
 	}{
 		{"coding", "--model opus", "Ran on Claude Opus · personal seat", true},
-		{"review", "--model opus", "Ran on Claude Opus · personal seat", true},
+		{"qa", "--model opus", "Ran on Claude Opus · personal seat", true},
+		{"review", "--model gemini-3.1-pro --effort high", "Ran on Gemini 3.1 Pro", false},
 		{"architecture", "--model gemini-3.1-pro --effort high", "Ran on Gemini 3.1 Pro", false},
 		{"planning", "--model gemini-3.8-flash --effort high", "Ran on Gemini 3.8 Flash", false},
-		{"qa", "--model gemini-3.8-flash --effort high", "Ran on Gemini 3.8 Flash", false},
+		{"docs", "--model gemini-3.8-flash --effort high", "Ran on Gemini 3.8 Flash", false},
 	}
 	for _, c := range cases {
 		t.Run(c.kind, func(t *testing.T) {
@@ -310,26 +403,42 @@ func TestWake_GeminiFirstKindFallsBackToClaudeWhenGeminiLocked(t *testing.T) {
 	}
 }
 
-// A Claude spawn that dies before output falls over to Gemini, and a second
-// route row says so: the timeline never claims Claude ran when Gemini did.
+// A Gemini spawn (non-code kind) that dies before output falls over to
+// Claude, and a second route row says so: the timeline never claims Gemini
+// ran when Claude did.
 func TestWake_RuntimeFailoverRelabelsRoute(t *testing.T) {
-	r := runWake(t, personalRepo(t), "coding", openPacer(), "--print")
-	if len(r.spawns) < 2 || !isClaude(r.spawns[0]) || isClaude(r.spawns[1]) {
-		t.Fatalf("want claude then gemini spawns, got %q", r.spawns)
+	r := runWake(t, personalRepo(t), "architecture", openPacer(), "gemini-3.1-pro")
+	if len(r.spawns) < 2 || isClaude(r.spawns[0]) || !isClaude(r.spawns[1]) {
+		t.Fatalf("want gemini then claude spawns, got %q", r.spawns)
 	}
 	if len(r.routes) != 2 {
 		t.Fatalf("want planned + fallback route rows, got %q", r.routes)
 	}
-	if r.routes[0] != "Ran on Claude Opus · personal seat" {
+	if r.routes[0] != "Ran on Gemini 3.1 Pro" {
 		t.Errorf("planned row = %q", r.routes[0])
 	}
-	if !strings.HasPrefix(r.routes[1], "Fell back to Gemini 3.1 Pro: Claude Opus · personal seat failed") {
+	if !strings.HasPrefix(r.routes[1], "Fell back to Claude Opus · personal seat: Gemini 3.1 Pro failed") {
 		t.Errorf("fallback row = %q", r.routes[1])
 	}
 }
 
+// A Claude coding spawn that dies never falls over to Gemini.
+func TestWake_CodingClaudeFailureNeverSpawnsGemini(t *testing.T) {
+	r := runWake(t, personalRepo(t), "coding", openPacer(), "--print")
+	for _, s := range r.spawns {
+		if !isClaude(s) {
+			t.Fatalf("coding run spawned a non-Claude CLI: %q", r.spawns)
+		}
+	}
+	for _, title := range r.routes {
+		if strings.Contains(title, "Gemini") {
+			t.Errorf("route row names Gemini: %q", title)
+		}
+	}
+}
+
 func TestRouteTracker_OnlyEmitsOnSwitch(t *testing.T) {
-	route := router.ResolveRoute("coding", false, openPacer(), "", time.Now())
+	route := router.ResolveRoute("planning", false, openPacer(), "opus", time.Now())
 	var titles []string
 	tr := newRouteTracker(route, func(title, _ string) { titles = append(titles, title) })
 	if tr.Provider() != "claude" {

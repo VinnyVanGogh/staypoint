@@ -1191,6 +1191,44 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		// 36: 35 is task_source_ref on main (e9d8685).
+		Version: 36,
+		Name:    "task_provider_choice",
+		Up: func(conn *sql.DB) error {
+			// Board rule GeminiRequiresExplicitChoice (STA-838): a task's
+			// explicit provider ("" = default Claude, "claude", "gemini") and
+			// model ("opus", "sonnet", "gemini-3.1-pro-high", ...). Gemini
+			// runs only when provider is 'gemini'.
+			for _, stmt := range []string{
+				`ALTER TABLE tasks ADD COLUMN provider       TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE tasks ADD COLUMN model_override TEXT NOT NULL DEFAULT '';`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
+	{
+		Version: 37,
+		Name:    "gemini_code_grant_uses",
+		Up: func(conn *sql.DB) error {
+			// Board rule (2026-10-06): a Board-approved "Gemini code" gate
+			// request (security_gate_requests.run_id = 'gemini-code') covers
+			// one daemon run in a personal repo. The run that consumes it (or
+			// the refusal that consumes a denial) is recorded here, so the
+			// next run needs a new approval.
+			_, err := conn.Exec(`CREATE TABLE IF NOT EXISTS gemini_code_grant_uses (
+				gate_request_id TEXT PRIMARY KEY,
+				task_id         TEXT NOT NULL DEFAULT '',
+				run_id          TEXT NOT NULL DEFAULT '',
+				used_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			);`)
+			return err
+		},
+	},
 }
 
 func copyFile(src, dst string) error {

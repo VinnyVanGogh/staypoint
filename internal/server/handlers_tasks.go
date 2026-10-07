@@ -18,6 +18,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/migration"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
+	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 	"github.com/google/uuid"
@@ -166,6 +167,7 @@ var validWorkKinds = map[string]bool{
 	"architecture": true,
 	"planning":     true,
 	"qa":           true,
+	"docs":         true,
 }
 
 // CreateTask handles POST /api/tasks
@@ -190,6 +192,11 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 		// ExecutionStage is the initial stage: todo (default) or backlog
 		// (parked: created without waking an agent).
 		ExecutionStage string `json:"execution_stage"`
+		// Provider / ModelOverride are the Board's explicit provider choice
+		// (STA-838): provider "", "claude" or "gemini"; gemini is refused
+		// for code kinds (router.GeminiCodeForbidden).
+		Provider      string `json:"provider"`
+		ModelOverride string `json:"model_override"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -203,7 +210,13 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.WorkKind != "" && !validWorkKinds[req.WorkKind] {
-		writeError(w, http.StatusBadRequest, "invalid work_kind: must be one of coding, review, architecture, planning, qa")
+		writeError(w, http.StatusBadRequest, "invalid work_kind: must be one of coding, review, architecture, planning, qa, docs")
+		return
+	}
+
+	choice, err := router.ValidateTaskChoice(req.WorkKind, repoIsWork(req.RepoPath), req.Provider, req.ModelOverride)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -236,6 +249,8 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 		WorkKind:        req.WorkKind,
 		Description:     req.Description,
 		ExecutionStage:  req.ExecutionStage,
+		Provider:        choice.Provider,
+		ModelOverride:   choice.Model,
 	}
 
 	task, err := context.CreateTaskWithOptions(h.db, opts)
@@ -795,6 +810,50 @@ func (h *TasksHandler) SetRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, task)
+}
+
+// repoIsWork classifies a task repo for the Gemini rules. An empty path is
+// the daemon's working directory, as task creation defaults it. Unreadable
+// classification counts as work (fail closed).
+func repoIsWork(repo string) bool {
+	if strings.TrimSpace(repo) == "" {
+		repo, _ = os.Getwd()
+	}
+	ok, _, err := router.IsWorkRepo(repo)
+	return err != nil || ok
+}
+
+// SetProvider handles PUT /api/tasks/{id}/provider: the Board's explicit
+// provider/model choice (STA-838). {"provider":"","model_override":""}
+// restores the default. provider=gemini is refused for a code kind.
+func (h *TasksHandler) SetProvider(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Provider      string `json:"provider"`
+		ModelOverride string `json:"model_override"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	task, err := context.GetTask(h.db, r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	choice, err := router.ValidateTaskChoice(task.WorkKind, repoIsWork(task.RepoPath), req.Provider, req.ModelOverride)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated, err := context.SetTaskProvider(h.db, task.ID, choice.Provider, choice.Model)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if h.hub != nil {
+		h.hub.Publish("task_updated", updated)
+	}
+	writeJSON(w, updated)
 }
 
 // GetRunSteps handles GET /api/tasks/{id}/run-steps

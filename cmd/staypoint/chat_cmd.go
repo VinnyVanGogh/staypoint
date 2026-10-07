@@ -64,7 +64,7 @@ Features:
 
 func init() {
 	chatCmd.Flags().StringP("session", "s", "", "Resume or specify a conversation session ID")
-	chatCmd.Flags().StringP("model", "m", "", "Initial model to chat with (defaults to gemini-2.5-flash)")
+	chatCmd.Flags().StringP("model", "m", "", "Initial model to chat with (defaults to opus; Gemini only when named)")
 	chatCmd.Flags().StringP("task", "t", "", "Bind chat session to a specific task ID")
 	chatCmd.Flags().String("socket", "", "Override staypointd IPC socket path")
 	chatCmd.Flags().Bool("in-process", false, "Force in-process mode without connecting to staypointd")

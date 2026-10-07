@@ -385,6 +385,15 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			idPrefix = taskID[:8]
 		}
 		runID := fmt.Sprintf("run-%s-%d", idPrefix, time.Now().UnixMilli())
+
+		// Board Touch ID gate (2026-10-06): provider=gemini on a code kind in
+		// a personal repo waits for a per-run approval; denied runs are
+		// refused. An approval is consumed here, by this run only.
+		codeGate := geminiCodeGate(dbStore.DB(), taskID, repoRoot, runID, publishFn)
+		if codeGate.Hold {
+			slog.Info("run held for Board Touch ID: Gemini code", slog.String("task", taskID))
+			return
+		}
 		sr := orchestrator.NewStepRecorder(dbStore.DB(), publishFn, runID, taskID)
 		// Wake and route steps are now emitted from inside harness.Run() after
 		// Claim() succeeds, so refused runs (ErrConcurrencyCap) never write steps.
@@ -392,7 +401,7 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 		// One routing decision per run (STA-772): work_kind + repo seat + quota
 		// pick the chain. The spawned CLI and the route row both come from it,
 		// and the tracker re-labels the row if a turn spawns a different slot.
-		route := resolveTaskRoute(dbStore.DB(), taskID, repoRoot, currentPacer(), time.Now())
+		route := resolveTaskRouteApproved(dbStore.DB(), taskID, repoRoot, currentPacer(), time.Now(), codeGate.ApprovalID)
 		tracker := newRouteTracker(route, sr.EmitRoute)
 
 		var adapterFn orchestrator.AdapterRunFunc
@@ -461,9 +470,11 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			RunControl:       orchestrator.GlobalRunControl,
 			SkipGitPreflight: adapterOverride != nil || testSkipGitPreflight,
 			HookBin:          resolveStaypointCLIBin(),
-			// Board rule (STA-856): Gemini may only edit docs in a work repo.
-			GeminiDocsOnly: geminiDocsOnly(route),
-			TurnUsedGemini: tracker.TakeGeminiSpawned,
+			// Board rule (STA-856, all repos): Gemini never writes code; a
+			// Board Touch ID approval (personal repo, this run) relaxes it.
+			GeminiDocsOnly:     geminiDocsOnly(route),
+			GeminiCodeApproved: route.GeminiCodeApprovalID != "",
+			TurnUsedGemini:     tracker.TakeGeminiSpawned,
 		})
 		if runErr != nil {
 			if errors.Is(runErr, orchestrator.ErrConcurrencyCap) {

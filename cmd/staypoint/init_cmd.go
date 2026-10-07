@@ -32,20 +32,17 @@ function ai-all     { staypoint report --pdf --type all }
 function ai {
     $routeOutput = staypoint route $PWD --eval 2>$null
     if ($routeOutput) { Invoke-Expression $routeOutput }
-    $model   = if ($env:STAYPOINT_ROUTE_MODEL)   { $env:STAYPOINT_ROUTE_MODEL }   else { 'gemini-3.8-flash-high' }
-    $cmd     = if ($env:STAYPOINT_ROUTE_COMMAND) { $env:STAYPOINT_ROUTE_COMMAND } else { 'agy' }
+    # Never defaults to agy: Gemini is launched only explicitly (agy / staypoint --gemini).
+    $model   = if ($env:STAYPOINT_ROUTE_MODEL)   { $env:STAYPOINT_ROUTE_MODEL }   else { 'claude-opus-5' }
+    $cmd     = if ($env:STAYPOINT_ROUTE_COMMAND) { $env:STAYPOINT_ROUTE_COMMAND } else { 'claude' }
     $reason  = if ($env:STAYPOINT_ROUTE_REASON)  { $env:STAYPOINT_ROUTE_REASON }  else { '' }
     Write-Host "[Staypoint] Target: $model ($cmd)" -ForegroundColor Cyan
     if ($reason) { Write-Host "[Context] $reason" -ForegroundColor Yellow }
     staypoint statusline
     if ($env:STAYPOINT_ROUTE_TARGET -eq 'remote-claude') {
         staypoint bridge launch $PWD @args
-    } elseif ($cmd -eq 'claude') {
-        & claude @args
     } else {
-        staypoint agy-guard $PWD
-        if ($LASTEXITCODE -ne 0) { return }
-        & agy --model $model @args
+        & claude @args
     }
 }
 
@@ -85,8 +82,9 @@ alias ai-scp="staypoint scp"
 
 ai() {
   eval "$(staypoint route "$PWD" --eval 2>/dev/null)"
-  local TARGET_MODEL="${STAYPOINT_ROUTE_MODEL:-${MESH_ROUTE_MODEL:-gemini-3.8-flash-high}}"
-  local TARGET_CMD="${STAYPOINT_ROUTE_COMMAND:-${MESH_ROUTE_COMMAND:-agy}}"
+  # Never defaults to agy: Gemini is launched only explicitly (agy / staypoint --gemini).
+  local TARGET_MODEL="${STAYPOINT_ROUTE_MODEL:-${MESH_ROUTE_MODEL:-claude-opus-5}}"
+  local TARGET_CMD="${STAYPOINT_ROUTE_COMMAND:-${MESH_ROUTE_COMMAND:-claude}}"
 
   echo -e "\033[1;36m[Staypoint]\033[0m Target: \033[1;32m$TARGET_MODEL\033[0m ($TARGET_CMD)"
   echo -e "\033[0;33m[Context]\033[0m ${STAYPOINT_ROUTE_REASON:-$MESH_ROUTE_REASON}"
@@ -97,11 +95,8 @@ ai() {
     staypoint bridge launch "$PWD" "$@"
   elif [[ "${STAYPOINT_ROUTE_TARGET:-$MESH_ROUTE_TARGET}" == "local-claude-work" ]]; then
     CLAUDE_CONFIG_DIR="$HOME/.claude-work" command claude "$@"
-  elif [[ "$TARGET_CMD" == "claude" ]]; then
-    env -u CLAUDE_CONFIG_DIR claude "$@"
   else
-    staypoint agy-guard "$PWD" || return 1
-    command agy --model "$TARGET_MODEL" "$@"
+    env -u CLAUDE_CONFIG_DIR claude "$@"
   fi
 }
 
