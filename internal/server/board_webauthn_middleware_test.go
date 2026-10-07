@@ -45,6 +45,7 @@ var boardActionEndpoints = []struct {
 	{"POST", "/api/security/gate-requests/nonexistent-id/decide", `{"decision":"approved"}`},
 	{"POST", "/api/settings/security-gate", `{"main_merge_approval":true}`},
 	{"POST", "/api/settings/ship-review", `{"ship_review":true}`},
+	{"POST", "/api/settings/tracking-gate", `{"company":"Managed Solution","enabled":false}`},
 }
 
 // seedBoardWebAuthnCredential registers one Board passkey. The schema mirrors

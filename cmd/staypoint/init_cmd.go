@@ -43,6 +43,8 @@ function ai {
     } elseif ($cmd -eq 'claude') {
         & claude @args
     } else {
+        staypoint agy-guard $PWD
+        if ($LASTEXITCODE -ne 0) { return }
         & agy --model $model @args
     }
 }
@@ -55,6 +57,9 @@ Set-Alias claude Invoke-Claude
 
 function Invoke-Agy {
     param([switch]$Force)
+    # Refused in Managed Solution work repos, -Force included (STA-854).
+    staypoint agy-guard $PWD
+    if ($LASTEXITCODE -ne 0) { return }
     if ($Force) { & agy @args } else { staypoint --gemini @args }
 }
 Set-Alias agy Invoke-Agy
@@ -95,6 +100,7 @@ ai() {
   elif [[ "$TARGET_CMD" == "claude" ]]; then
     env -u CLAUDE_CONFIG_DIR claude "$@"
   else
+    staypoint agy-guard "$PWD" || return 1
     command agy --model "$TARGET_MODEL" "$@"
   fi
 }
@@ -129,7 +135,9 @@ claude() {
   fi
 }
 
+# agy refuses in Managed Solution work repos, --force included (STA-854).
 agy() {
+  staypoint agy-guard "$PWD" || return 1
   local force=false
   local clean_args=()
   for arg in "$@"; do

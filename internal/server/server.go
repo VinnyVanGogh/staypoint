@@ -225,6 +225,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("GET /api/settings/security-gate", gateH.GetSecurityGateSettings)
 		// Board-only: toggling the gate itself requires the board token.
 		mux.Handle("POST /api/settings/security-gate", s.secMid.WrapBoardAction(http.HandlerFunc(gateH.UpdateSecurityGateSettings)))
+		// STA-854: per-company tracking gate; toggling is Board-only.
+		mux.HandleFunc("GET /api/settings/tracking-gate", gateH.GetTrackingGateSettings)
+		mux.Handle("POST /api/settings/tracking-gate", s.secMid.WrapBoardAction(http.HandlerFunc(gateH.UpdateTrackingGateSettings)))
 
 		// Ship Review REST API (Board-approval gate for agent branch merges)
 		shipH := NewShipReviewHandler(s.opts.DB, s.hub)

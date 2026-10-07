@@ -55,6 +55,9 @@ func runTaskCreate(cmd *cobra.Command, args []string) error {
 	if childCreateRequested(cmd) {
 		return runTaskCreateChild(cmd, args) // STA-820
 	}
+	if localOrgCreateRequested(cmd) {
+		return runTaskCreateLocalOrg(cmd, args) // STA-854
+	}
 	out := cmd.OutOrStdout()
 	tuiFlag, _ := cmd.Flags().GetBool("tui")
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
