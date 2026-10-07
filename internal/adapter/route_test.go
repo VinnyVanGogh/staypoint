@@ -107,7 +107,8 @@ func TestRunRoute_WorkRepoPersonalLockedSpawnsWorkClaude(t *testing.T) {
 	}
 }
 
-func TestRunRoute_WorkRepoWorkLockedSpawnsGemini(t *testing.T) {
+// STA-856: a locked work seat falls back to personal Claude, never Gemini.
+func TestRunRoute_WorkRepoWorkLockedSpawnsPersonalClaude(t *testing.T) {
 	pacer := &router.PacerState{Pools: map[router.PoolID]*router.QuotaPool{
 		router.PoolWorkClaude: {IsLocked: true, LockoutReason: "weekly limit"},
 	}}
@@ -119,15 +120,15 @@ func TestRunRoute_WorkRepoWorkLockedSpawnsGemini(t *testing.T) {
 	if len(spawns) != 1 {
 		t.Fatalf("locked work seat must not be spawned; got %v", spawns)
 	}
-	_, args, _ := strings.Cut(spawns[0], "|")
-	if isClaudeSpawn(args) || !strings.Contains(args, "--model gemini-3.1-pro --effort high") {
-		t.Errorf("want agy --model gemini-3.1-pro --effort high, got %q", args)
+	cfgDir, args, _ := strings.Cut(spawns[0], "|")
+	if !isClaudeSpawn(args) || !strings.Contains(args, "--model opus") || cfgDir != "" {
+		t.Errorf("want personal claude --model opus, got cfg=%q args=%q", cfgDir, args)
 	}
-	if !strings.HasPrefix(d.Title(), "Fell back to Gemini 3.1 Pro: work seat locked (weekly limit)") {
+	if d.Title() != "Fell back to Claude Opus · personal seat: work seat locked (weekly limit)" {
 		t.Errorf("title = %q", d.Title())
 	}
-	if len(log.attempts) != 1 || log.attempts[0].Slot.Family != router.FamilyGemini {
-		t.Errorf("observer must report Gemini, got %+v", log.attempts)
+	if len(log.attempts) != 1 || log.attempts[0].Slot.Seat != router.SeatPersonal {
+		t.Errorf("observer must report the personal seat, got %+v", log.attempts)
 	}
 }
 
@@ -176,8 +177,9 @@ func TestRunRoute_SeatLockedAtSpawnTimeReportsReason(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunRoute: %v", err)
 	}
-	if len(spawns) != 1 || isClaudeSpawn(spawns[0]) {
-		t.Fatalf("want only a gemini spawn, got %v", spawns)
+	// STA-856: the fallback is the personal Claude seat, never Gemini.
+	if len(spawns) != 1 || !isClaudeSpawn(spawns[0]) || !strings.HasPrefix(spawns[0], "|") {
+		t.Fatalf("want only a personal claude spawn, got %v", spawns)
 	}
 	if len(log.attempts) != 1 || log.attempts[0].FallbackReason != "work seat locked (5h limit)" {
 		t.Errorf("attempts = %+v", log.attempts)

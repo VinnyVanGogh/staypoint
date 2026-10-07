@@ -42,6 +42,9 @@ type wakeResult struct {
 	// interceptorComments counts completion-interceptor feedback rows. The
 	// harness writes one only when it saw [[TASK_COMPLETE]] in a turn.
 	interceptorComments int
+	taskID              string
+	messages            []string // message row titles (status error)
+	stage               string   // final execution_stage
 }
 
 // runWake drives the production wake path (adapterOverride == nil) end to end:
@@ -54,6 +57,12 @@ func runWake(t *testing.T, repoRoot, workKind string, pacer *router.PacerState, 
 
 // runWakeBin is runWake with a caller-supplied fake CLI.
 func runWakeBin(t *testing.T, repoRoot, workKind string, pacer *router.PacerState, bin, logPath string) wakeResult {
+	t.Helper()
+	return runWakeIn(t, repoRoot, workKind, pacer, bin, logPath, t.TempDir())
+}
+
+// runWakeIn is runWakeBin with the run's worktree at wtDir.
+func runWakeIn(t *testing.T, repoRoot, workKind string, pacer *router.PacerState, bin, logPath, wtDir string) wakeResult {
 	t.Helper()
 
 	origPacer, origRun, origSkip := loadPacer, runRoute, testSkipGitPreflight
@@ -82,7 +91,7 @@ func runWakeBin(t *testing.T, repoRoot, workKind string, pacer *router.PacerStat
 		t.Fatalf("insert task: %v", err)
 	}
 
-	wireOnWake(store, repoRoot, nil, nil, &stubWM{dir: t.TempDir()})
+	wireOnWake(store, repoRoot, nil, nil, &stubWM{dir: wtDir})
 	orchestrator.GlobalDispatcher.Wake(taskID, "test_route", "test:"+taskID)
 	done := make(chan struct{})
 	go func() { orchestrator.GlobalDispatcher.Drain(); close(done) }()
@@ -92,7 +101,20 @@ func runWakeBin(t *testing.T, repoRoot, workKind string, pacer *router.PacerStat
 		t.Fatal("dispatcher did not drain")
 	}
 
-	var res wakeResult
+	res := wakeResult{taskID: taskID}
+	msgRows, err := store.DB().Query(`SELECT title FROM run_steps WHERE task_id=? AND kind='message' AND status='error' ORDER BY seq`, taskID)
+	if err != nil {
+		t.Fatalf("query message steps: %v", err)
+	}
+	for msgRows.Next() {
+		var title string
+		if err := msgRows.Scan(&title); err != nil {
+			t.Fatal(err)
+		}
+		res.messages = append(res.messages, title)
+	}
+	msgRows.Close()
+	_ = store.DB().QueryRow(`SELECT COALESCE(execution_stage,'') FROM tasks WHERE id=?`, taskID).Scan(&res.stage)
 	if data, err := os.ReadFile(logPath); err == nil {
 		res.spawns = strings.Split(strings.TrimSpace(string(data)), "\n")
 	}
@@ -174,14 +196,56 @@ func TestWake_WorkRepoPersonalLockedSpawnsWorkClaude(t *testing.T) {
 	}
 }
 
-func TestWake_WorkRepoWorkLockedSpawnsGeminiWithReason(t *testing.T) {
-	r := runWake(t, workRepo(t), "coding", lockedPacer(map[router.PoolID]string{router.PoolWorkClaude: "weekly limit"}), "")
-	_, args := mustOneSpawn(t, r)
-	if isClaude(args) || !strings.Contains(args, "--model gemini-3.1-pro --effort high") {
-		t.Errorf("spawned %q, want agy --model gemini-3.1-pro --effort high", args)
+// STA-856: a locked work seat falls back to the personal Claude seat (default
+// profile, no CLAUDE_CONFIG_DIR), never to Gemini.
+func TestWake_WorkRepoWorkLockedSpawnsPersonalClaudeNeverGemini(t *testing.T) {
+	for _, kind := range []string{"coding", "review", "qa", ""} {
+		t.Run("kind="+kind, func(t *testing.T) {
+			r := runWake(t, workRepo(t), kind, lockedPacer(map[router.PoolID]string{router.PoolWorkClaude: "5h limit"}), "")
+			cfgDir, args := mustOneSpawn(t, r)
+			if !isClaude(args) {
+				t.Errorf("spawned %q, want personal Claude", args)
+			}
+			if cfgDir != "" {
+				t.Errorf("personal seat must not set CLAUDE_CONFIG_DIR, got %q", cfgDir)
+			}
+			if len(r.routes) != 1 || !strings.HasPrefix(r.routes[0], "Fell back to Claude ") ||
+				!strings.HasSuffix(r.routes[0], "· personal seat: work seat locked (5h limit)") {
+				t.Errorf("route rows = %q", r.routes)
+			}
+		})
 	}
-	if len(r.routes) != 1 || r.routes[0] != "Fell back to Gemini 3.1 Pro: work seat locked (weekly limit)" {
-		t.Errorf("route rows = %q", r.routes)
+}
+
+// STA-856: with both Claude seats locked a work coding run waits in the quota
+// queue. Gemini has quota but is never spawned.
+func TestWake_WorkRepoBothSeatsLockedQueuesNeverGemini(t *testing.T) {
+	slots := freshSlots(t, 3)
+	pacer := lockedPacer(map[router.PoolID]string{
+		router.PoolWorkClaude:     "weekly limit",
+		router.PoolPersonalClaude: "5h limit",
+	})
+	r := runWake(t, workRepo(t), "coding", pacer, "")
+	if len(r.spawns) != 0 {
+		t.Fatalf("spawned %q while both Claude seats were locked; want a queued run", r.spawns)
+	}
+	if len(r.routes) != 0 {
+		t.Errorf("a queued run must not write route rows, got %q", r.routes)
+	}
+	pos := slots.Position(r.taskID)
+	if !pos.Queued || pos.Wait != orchestrator.WaitQuota {
+		t.Fatalf("run not quota-queued: %+v", pos)
+	}
+	slots.Dequeue(r.taskID)
+}
+
+// Work planning may still run on Gemini (docs only; the harness guard
+// enforces it).
+func TestWake_WorkRepoPlanningMaySpawnGemini(t *testing.T) {
+	r := runWake(t, workRepo(t), "planning", openPacer(), "")
+	_, args := mustOneSpawn(t, r)
+	if isClaude(args) || !strings.Contains(args, "--model gemini-3.8-flash") {
+		t.Errorf("spawned %q, want agy gemini-3.8-flash", args)
 	}
 }
 

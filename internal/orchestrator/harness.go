@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
+	"github.com/VinnyVanGogh/staypoint/internal/geminiguard"
 	"github.com/VinnyVanGogh/staypoint/internal/gitgate"
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/logging"
@@ -110,6 +111,22 @@ type RunConfig struct {
 	// per-run --settings file (STA-525).  Should point to the staypoint CLI binary
 	// built from the same commit as the daemon.
 	HookBin string
+	// GeminiDocsOnly applies the Board rule router.GeminiCodeForbidden to this
+	// run (work repo, STA-856): after any turn that spawned Gemini, changes
+	// outside the documentation allowlist are reverted to the daemon's pre-turn
+	// checkpoint and the run fails. Not configurable off for work repos.
+	GeminiDocsOnly bool
+	// TurnUsedGemini reports whether a Gemini CLI was spawned since its last
+	// call, and resets. Nil falls back to the static Provider.
+	TurnUsedGemini func() bool
+}
+
+// turnUsedGemini reports whether the turn that just ran spawned Gemini.
+func (cfg RunConfig) turnUsedGemini() bool {
+	if cfg.TurnUsedGemini != nil {
+		return cfg.TurnUsedGemini()
+	}
+	return geminiguard.IsGeminiProvider(cfg.Provider)
 }
 
 // RunResult summarises a completed autonomous run.
@@ -460,6 +477,11 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	var lastExitCode int
 	var lastStderr string
 
+	// turnCP is the daemon-created checkpoint the next turn starts from. The
+	// Gemini guard (STA-856) restores from its in-memory commit SHA, never from
+	// refs the agent could move.
+	turnCP := preCP
+
 	for turn := 0; turn < maxTurns; turn++ {
 		if ctx.Err() != nil {
 			result.Disposition = "capped"
@@ -475,8 +497,26 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			if sr != nil && cp != nil {
 				sr.EmitCheckpoint(cp.ID, fmt.Sprintf("turn %d", turn))
 			}
+			if cp != nil {
+				turnCP = cp
+			}
 		}
 		lastTurnWasAdapterError = false
+
+		// Gemini guard (STA-856): record the worktree before the turn so a
+		// Gemini turn's changes can be checked and reverted afterwards.
+		var guardSnap *geminiguard.Snapshot
+		var guardSnapErr error
+		if cfg.GeminiDocsOnly && cfg.RunAdapter != nil {
+			cpSHA := ""
+			if turnCP != nil {
+				cpSHA = turnCP.CommitSHA
+			}
+			guardSnap, guardSnapErr = geminiguard.Take(ctx, wtPath, cpSHA)
+			if cfg.TurnUsedGemini != nil {
+				_ = cfg.TurnUsedGemini() // clear spawns from before this turn
+			}
+		}
 
 		// Drive one adapter turn. Tee stdout through StepRecorder line scanner if enabled.
 		var outBuf bytes.Buffer
@@ -515,6 +555,40 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			adapterRan = true
 			lastExitCode = exitCodeFrom(turnErr)
 			lastStderr = stderrBuf.String()
+
+			// Board rule (STA-856): Gemini never writes code in a work repo.
+			// Checked before error handling so a failed Gemini turn is checked too.
+			if cfg.GeminiDocsOnly && cfg.turnUsedGemini() {
+				gr := geminiguard.Result{Err: guardSnapErr}
+				if guardSnapErr == nil {
+					gCtx, gCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+					gr = geminiguard.Enforce(gCtx, guardSnap)
+					gCancel()
+				}
+				if gr.Violated() {
+					if stw, ok := stdout.(*stepTeeWriter); ok {
+						_ = stw.Close()
+					}
+					result.Turns++
+					sawOutput = true // the block row explains the run; not a silent run
+					result.Disposition = "error"
+					result.DiagnosticMsg = gr.Title()
+					runLog.Warn("gemini code guard blocked turn",
+						slog.Int("turn", turn),
+						slog.Any("blocked", gr.Blocked),
+						slog.Any("unresolved", gr.Unresolved),
+						slog.Any("error", gr.Err),
+					)
+					if sr != nil {
+						sr.EmitMessage(gr.Title(), gr.Body(), "error")
+					}
+					_, _ = h.DB.ExecContext(context.Background(),
+						`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'gemini_code_blocked', ?)`,
+						taskID, gr.Title(),
+					)
+					break
+				}
+			}
 
 			turnDuration := time.Since(turnStart)
 			if turnErr != nil {

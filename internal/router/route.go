@@ -101,6 +101,10 @@ type KindRoute struct {
 	Skipped []SkippedSlot
 	// Locked lists every locked slot (ahead of or behind the chosen one).
 	Locked []SkippedSlot
+	// GeminiBarred is set when GeminiCodeForbidden removed Gemini from the
+	// chain (work repo, kind that may write code): locked Claude seats mean
+	// waiting, never a Gemini fallback.
+	GeminiBarred bool
 }
 
 // Chosen returns the slot that runs first.
@@ -118,6 +122,12 @@ func (r KindRoute) AllLocked() bool { return len(r.Candidates) == 0 }
 func (r KindRoute) Title() string {
 	s, ok := r.Chosen()
 	if !ok {
+		if r.GeminiBarred && r.IsWork {
+			if len(r.Locked) > 0 {
+				return "Waiting for a Claude seat: " + joinReasons(r.Locked)
+			}
+			return "Waiting for a Claude seat"
+		}
 		return "All providers locked"
 	}
 	if len(r.Skipped) == 0 {
@@ -134,6 +144,9 @@ func (r KindRoute) Body() string {
 	}
 	if r.AllLocked() && len(r.Locked) > 0 {
 		parts = append(parts, joinReasons(r.Locked))
+	}
+	if r.GeminiBarred {
+		parts = append(parts, "Gemini barred: "+GeminiCodeRule)
 	}
 	return strings.Join(parts, " · ")
 }
@@ -184,7 +197,8 @@ func claudeSeat(isWork bool) (PoolID, Seat) {
 
 // ChainsForRepo returns DefaultKindChains with every local Claude slot bound
 // to the repo's seat: work repos bill the work seat (~/.claude-work), personal
-// repos the personal seat.
+// repos the personal seat. In a work repo Gemini is removed from every kind
+// that may write code (GeminiAllowed).
 func ChainsForRepo(isWork bool) map[WorkKind][]KindSlot {
 	pool, _ := claudeSeat(isWork)
 	chains := DefaultKindChains()
@@ -193,6 +207,9 @@ func ChainsForRepo(isWork bool) map[WorkKind][]KindSlot {
 			if isLocalClaudeSlot(chain[i]) {
 				chain[i].PoolID = pool
 			}
+		}
+		if !GeminiAllowed(kind, isWork) {
+			chain = claudeOnlyWorkChain(chain)
 		}
 		chains[kind] = chain
 	}
@@ -243,21 +260,29 @@ func PoolLockReason(pool *QuotaPool, now time.Time) (bool, string) {
 // kind is the stored work_kind (normalised; unknown → coding). isWork selects
 // the Claude seat. modelOverride ("opus"/"sonnet", invalid values ignored)
 // pins a Claude-first chain with that model, falling back to its Gemini pair.
+// GeminiCodeForbidden strips Gemini from work-repo kinds that may write code:
+// the chain is work Claude -> personal Claude, and with both seats locked the
+// route is all-locked so the run queue waits.
 func ResolveRoute(kind string, isWork bool, pacer *PacerState, modelOverride string, now time.Time) KindRoute {
 	r := KindRoute{
 		Kind:          NormalizeWorkKind(kind),
 		IsWork:        isWork,
 		ModelOverride: NormalizeModelOverride(modelOverride),
 	}
-	pool, seat := claudeSeat(isWork)
+	pool, _ := claudeSeat(isWork)
 
 	var chain []KindSlot
+	r.GeminiBarred = !GeminiAllowed(r.Kind, isWork)
 	if r.ModelOverride != "" {
 		chain = []KindSlot{
 			{Provider: "claude-" + r.ModelOverride, Model: r.ModelOverride, PoolID: pool, Enabled: true},
 			{Provider: "gemini", Model: PairModelBidirectional(r.ModelOverride), PoolID: PoolGeminiNative, Enabled: true},
 		}
+		if r.GeminiBarred {
+			chain = claudeOnlyWorkChain(chain)
+		}
 	} else {
+		// ChainsForRepo already applies GeminiCodeForbidden.
 		chain = ChainsForRepo(isWork)[r.Kind]
 	}
 
@@ -272,7 +297,7 @@ func ResolveRoute(kind string, isWork bool, pacer *PacerState, modelOverride str
 		}
 		slot := RouteSlot{Family: slotFamily(ks), Model: ks.Model, PoolID: ks.PoolID}
 		if slot.Family == FamilyClaude {
-			slot.Seat = seat
+			slot.Seat = seatForPool(ks.PoolID)
 		}
 		var p *QuotaPool
 		if pacer != nil && ks.PoolID != "" {
