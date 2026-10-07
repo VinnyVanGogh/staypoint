@@ -12575,8 +12575,8 @@ function renderLogsTable(container, errors, filter, adapterFilter) {
 // documents; the sidebar Artifacts page lists them across tasks.
 // Pure helpers (filtering, filter options, file names) live in lib/artifacts.js.
 
-// Doc key to select when the Artifacts tab next renders for a task, set when
-// a row on the Artifacts page opens the task.
+// Doc key the Artifacts tab shows for a task: the last one picked, or the one
+// a row on the Artifacts page opened, so a re-render (SSE) keeps it.
 let artifactFocus = { taskId: null, docKey: null };
 
 const artifactDate = (ts) => (ts ? new Date(ts).toLocaleString() : '');
@@ -12623,6 +12623,7 @@ async function renderTaskArtifacts(panel, taskId) {
   const buttons = {};
   let loadSeq = 0;
   const show = async (summary, version) => {
+    artifactFocus = { taskId, docKey: summary.doc_key };
     for (const [k, b] of Object.entries(buttons)) {
       const on = k === summary.doc_key;
       b.classList.toggle('active', on);
@@ -12683,7 +12684,6 @@ async function renderTaskArtifacts(panel, taskId) {
   }
 
   const focusKey = artifactFocus.taskId === taskId ? artifactFocus.docKey : null;
-  artifactFocus = { taskId: null, docKey: null };
   show(docs.find(d => d.doc_key === focusKey) || docs[0]);
   return docs.length;
 }
