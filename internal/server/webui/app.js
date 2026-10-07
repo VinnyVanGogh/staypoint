@@ -7124,9 +7124,16 @@ document.getElementById('panel-open')?.addEventListener('click', () => {
 async function fetchTaskDiff(taskId, checkpointId) {
   const qs = checkpointId ? `?checkpoint=${encodeURIComponent(checkpointId)}` : '';
   try {
-    return await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/diff${qs}`);
+    const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/diff${qs}`, { headers: authHeader() });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // STA-774: a base that failed verification (e.g. moved by the agent)
+      // must read as an error, never as "No changes".
+      return { diff: '', files: [], checkpoint_id: checkpointId || '', error: body.message || body.error || `${r.status} ${r.statusText}` };
+    }
+    return body;
   } catch {
-    return { diff: '', files: [], checkpoint_id: checkpointId || '' };
+    return { diff: '', files: [], checkpoint_id: checkpointId || '', error: 'Could not load the diff.' };
   }
 }
 
@@ -7372,6 +7379,11 @@ function renderDiffPane(container, task, checkpoints, diffData) {
   const fileStats = diffData.file_stats || (diffData.files || []).map(f => ({ path: f, added: 0, removed: 0 }));
 
   const fileList = el('ul', 'diff-file-list');
+  if (diffData.error) {
+    container.appendChild(el('div', 'diff-pane-error', diffData.error));
+  } else if (diffData.base_verified === false) {
+    container.appendChild(el('div', 'diff-pane-error', 'This task has no recorded base: the whole-run diff cannot be verified.'));
+  }
 
   const renderFiles = (statsArr, cpId) => {
     fileList.innerHTML = '';
@@ -8442,6 +8454,34 @@ function renderTestCoverageSection(taskId, onState, opts = {}) {
   };
   load();
   return { el: sec, state, apply, bypassBtn, reload: load };
+}
+
+// renderAnswerOnlyPanel replaces the ship review card for a run with no
+// changes against its base (STA-774): the agent's final message, and the
+// files it read instead of "files changed".
+function renderAnswerOnlyPanel(comments, filesRead) {
+  const section = el('div', 'ship-review-card answer-only-panel task-page-section');
+  const hdr = el('div', 'ship-review-header');
+  hdr.appendChild(el('span', 'ship-review-badge', 'No changes: answer-only run'));
+  section.appendChild(hdr);
+  const summary = [...comments].reverse().find((c) => (c.author || '') === 'agent-summary');
+  const msg = summary ? (summary.message || summary.body || '') : '';
+  if (msg) {
+    const body = el('div', 'ship-review-summary-body md-content');
+    body.innerHTML = renderMarkdown(msg.replace(/^\s*\[\[TASK_COMPLETE\]\]\s*$/gm, '').trim());
+    section.appendChild(body);
+  } else {
+    section.appendChild(el('p', 'panel-field-muted', 'The run made no changes and left no final message.'));
+  }
+  const readRow = el('div', 'ship-review-row');
+  readRow.appendChild(el('span', 'ship-review-row-label', `Files read: ${filesRead.length}`));
+  section.appendChild(readRow);
+  if (filesRead.length) {
+    const list = el('ul', 'answer-only-files-read');
+    for (const f of filesRead) list.appendChild(el('li', '', f));
+    section.appendChild(list);
+  }
+  return section;
 }
 
 function renderShipReviewCardFromData(container, taskId, card) {
@@ -10063,6 +10103,10 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   // Rendered synchronously from the pre-fetched shipCard so it appears
   // immediately with no extra round-trip; its action buttons go to the header.
   renderShipReviewCardFromData(reviewCardSlot, task.id || '', shipCard || null);
+  // STA-774: a run that changed nothing gets no card and no Approve.
+  if (!shipCard && diffData && diffData.answer_only) {
+    reviewCardSlot.appendChild(renderAnswerOnlyPanel(comments || [], diffData.files_read || []));
+  }
 
   // Migrations panel — lazy-loads migration files from the task's diff
   const migPanel = tabPanels.migrations;
