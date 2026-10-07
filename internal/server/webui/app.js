@@ -440,7 +440,9 @@ async function loadAll() {
   try {
     const [fleetResp, tasksResp, sessionsResp] = await Promise.all([
       apiFetch('/api/fleet/overview').catch(() => null),
-      apiFetch('/api/tasks?status=all').catch(() => ({ tasks: [] })),
+      // include_legacy: the board and lists hide legacy tasks behind their own
+      // toggle; task detail and history views still need them.
+      apiFetch('/api/tasks?status=all&include_legacy=1&limit=1000').catch(() => ({ tasks: [] })),
       apiFetch('/api/sessions').catch(() => ({ sessions: [] })),
     ]);
 
@@ -5848,20 +5850,72 @@ function renderOrgDetailView(org) {
 }
 
 // ── Render: Kanban ────────────────────────────────────────
-const KANBAN_COLS = ['todo', 'in_progress', 'blocked', 'done'];
+// Columns and grouping come from lib/taskboard.js. Board preferences (group by
+// company, show legacy) are per-viewer conveniences kept in localStorage.
+const STORAGE_KANBAN_GROUP_KEY = 'staypoint_kanban_group_company';
+const STORAGE_KANBAN_LEGACY_KEY = 'staypoint_kanban_show_legacy';
+
+function kanbanPref(key) {
+  try { return localStorage.getItem(key) === '1'; } catch { return false; }
+}
+
+function setKanbanPref(key, on) {
+  try { localStorage.setItem(key, on ? '1' : '0'); } catch { /* ignore */ }
+}
+
+function wireKanbanControls() {
+  for (const [id, key] of [['kanban-group-company', STORAGE_KANBAN_GROUP_KEY], ['kanban-show-legacy', STORAGE_KANBAN_LEGACY_KEY]]) {
+    const box = document.getElementById(id);
+    if (!box || box.dataset.wired) continue;
+    box.dataset.wired = '1';
+    box.checked = kanbanPref(key);
+    box.addEventListener('change', () => {
+      setKanbanPref(key, box.checked);
+      renderKanban();
+    });
+  }
+}
+
+function renderKanbanColumns(columns) {
+  const row = el('div', 'kanban-board');
+  for (const status of BOARD_COLUMNS) {
+    const col = el('div', 'kanban-col');
+    col.dataset.status = status;
+    const tasks = columns[status] || [];
+    col.appendChild(el('h2', 'col-title', `${BOARD_COLUMN_TITLES[status]} · ${tasks.length}`));
+    const list = el('div', 'card-list');
+    list.id = `col-${status}`;
+    for (const t of tasks) list.appendChild(makeTaskCard(t));
+    col.appendChild(list);
+    row.appendChild(col);
+  }
+  return row;
+}
 
 function renderKanban() {
-  const groups = { todo: [], in_progress: [], blocked: [], done: [] };
-  for (const t of Object.values(state.tasks)) {
-    const col = groups[t.status];
-    if (col) col.push(t);
+  const board = document.getElementById('kanban-board');
+  if (!board) return;
+  wireKanbanControls();
+  const groupByCompany = !!document.getElementById('kanban-group-company')?.checked;
+  const showLegacy = !!document.getElementById('kanban-show-legacy')?.checked;
+  const tasks = Object.values(state.tasks);
+  const legacyCount = document.getElementById('kanban-legacy-count');
+  if (legacyCount) legacyCount.textContent = `(${countLegacy(tasks)})`;
+
+  board.innerHTML = '';
+  const groups = buildBoard(tasks, { groupByCompany, showLegacy });
+  for (const g of groups) {
+    if (!groupByCompany) {
+      board.appendChild(renderKanbanColumns(g.columns));
+      continue;
+    }
+    const lane = el('section', 'kanban-lane');
+    lane.appendChild(el('h2', 'kanban-lane-title', `${g.company} · ${g.total}`));
+    lane.appendChild(renderKanbanColumns(g.columns));
+    board.appendChild(lane);
   }
-  for (const status of KANBAN_COLS) {
-    const list = document.getElementById(`col-${status}`);
-    if (!list) continue;
-    list.innerHTML = '';
-    const tasks = groups[status].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));
-    for (const t of tasks) list.appendChild(makeTaskCard(t));
+  if (groupByCompany && groups.length === 0) {
+    board.appendChild(el('div', 'muted-text', 'No tasks on the board.'));
   }
 }
 
@@ -5870,8 +5924,9 @@ function makeTaskCard(task) {
   card.dataset.id = task.id;
   card.appendChild(el('div', 'card-title', task.title || task.name || '(untitled)'));
   const meta = el('div', 'card-meta');
-  meta.appendChild(el('span', `card-status-dot dot-${task.status}`));
+  meta.appendChild(el('span', `card-status-dot dot-${boardColumnFor(task) || task.status}`));
   meta.appendChild(el('span', 'card-id', task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : '')));
+  if (isLegacy(task)) meta.appendChild(el('span', 'card-origin-badge', 'legacy'));
   card.appendChild(meta);
   card.addEventListener('click', () => openDetail(task.id));
   return card;

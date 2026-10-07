@@ -571,7 +571,8 @@ func (w *Watcher) ingest(line []byte, sourcePath string, record bool) {
 		var taskID string
 		err := w.meshDB.QueryRow(`
 			SELECT id FROM tasks
-			WHERE status = 'active' AND (repo_path = ? OR ? LIKE repo_path || '%')
+			WHERE status = 'active' AND execution_stage != 'backlog' AND repo_path != ''
+			  AND (repo_path = ? OR ? LIKE repo_path || '%')
 			ORDER BY updated_at DESC LIMIT 1;
 		`, cwd, cwd).Scan(&taskID)
 		if err == nil && taskID != "" {

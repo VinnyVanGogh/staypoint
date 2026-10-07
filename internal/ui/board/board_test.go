@@ -146,43 +146,44 @@ func TestBoard_NavigationAndColumnSwitching(t *testing.T) {
 	newModel, _ := m.Update(msg)
 	m = newModel.(*Model)
 
-	if m.activeCol != 0 {
-		t.Fatalf("expected initial activeCol=0, got %d", m.activeCol)
+	// The board opens on TODO; BACKLOG (index 0) sits to its left.
+	if m.activeCol != 1 || AllColumns[m.activeCol] != ColTodo {
+		t.Fatalf("expected initial activeCol=1 (todo), got %d", m.activeCol)
 	}
 
 	// Move cursor down within active column
 	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 	m = newModel.(*Model)
-	if m.columnCursor[0] != 1 {
-		t.Errorf("expected columnCursor[0]=1, got %d", m.columnCursor[0])
+	if m.columnCursor[1] != 1 {
+		t.Errorf("expected columnCursor[1]=1, got %d", m.columnCursor[1])
 	}
 
 	// Move cursor up
 	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
 	m = newModel.(*Model)
-	if m.columnCursor[0] != 0 {
-		t.Errorf("expected columnCursor[0]=0, got %d", m.columnCursor[0])
+	if m.columnCursor[1] != 0 {
+		t.Errorf("expected columnCursor[1]=0, got %d", m.columnCursor[1])
 	}
 
 	// Move column right ('l')
 	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
 	m = newModel.(*Model)
-	if m.activeCol != 1 {
-		t.Errorf("expected activeCol=1 after 'l', got %d", m.activeCol)
+	if m.activeCol != 2 {
+		t.Errorf("expected activeCol=2 after 'l', got %d", m.activeCol)
 	}
 
 	// Move column right again
 	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRight})
 	m = newModel.(*Model)
-	if m.activeCol != 2 {
-		t.Errorf("expected activeCol=2 after right arrow, got %d", m.activeCol)
+	if m.activeCol != 3 {
+		t.Errorf("expected activeCol=3 after right arrow, got %d", m.activeCol)
 	}
 
 	// Move column left ('h')
 	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
 	m = newModel.(*Model)
-	if m.activeCol != 1 {
-		t.Errorf("expected activeCol=1 after 'h', got %d", m.activeCol)
+	if m.activeCol != 2 {
+		t.Errorf("expected activeCol=2 after 'h', got %d", m.activeCol)
 	}
 }
 

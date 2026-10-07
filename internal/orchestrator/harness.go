@@ -13,6 +13,7 @@ import (
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/gitgate"
+	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/logging"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/VinnyVanGogh/staypoint/internal/workspace"
@@ -23,6 +24,9 @@ import (
 var (
 	ErrAlreadyClaimed = errors.New("Can't start run: this task is already checked out by another run in this session. Wait for it to finish or clear the stale checkout.")
 	ErrTaskNotFound   = errors.New("task not found")
+	// ErrNotRunnable: the task is parked (backlog) or closed (done,
+	// cancelled, rejected). Run Now moves a backlog task to todo first.
+	ErrNotRunnable    = errors.New("Can't start run: this task is not runnable in its current stage (backlog, done or cancelled). Move it to todo first.")
 	ErrConcurrencyCap = errors.New("Can't start run: the maximum number of parallel runs (max_concurrent_runs) is already active.")
 )
 
@@ -173,7 +177,8 @@ func NewHarness(db *sql.DB, repoRoot string) *Harness {
 // error matching errors.Is(err, ErrConcurrencyCap); callers queue the run and
 // RunSlots re-dispatches it when a slot frees. Across restarts, RecoveryScan clears stale checkout_run_id values so
 // the DB guard (checkout_run_id IS NULL) unblocks on the next wake.
-// Terminal tasks (execution_stage = 'done') are never re-claimed.
+// Parked (backlog) and closed (done, cancelled, rejected) tasks are never
+// claimed; see governance.IsRunnableStage.
 func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) error {
 	slots := h.slots()
 	if err := slots.Acquire(taskID, h.RepoKeyForTask(ctx, taskID)); err != nil {
@@ -184,7 +189,7 @@ func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) erro
 	res, err := h.DB.ExecContext(ctx,
 		`UPDATE tasks
 		    SET execution_stage='in_progress', checkout_run_id=?, checkout_agent_id=?, updated_at=?
-		  WHERE id=? AND checkout_run_id IS NULL AND execution_stage NOT IN ('done')`,
+		  WHERE id=? AND checkout_run_id IS NULL AND execution_stage NOT IN (`+governance.NonRunnableStagesSQL()+`)`,
 		runID, agentID, now, taskID,
 	)
 	if err != nil {
@@ -198,6 +203,9 @@ func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) erro
 		_ = h.DB.QueryRowContext(ctx, "SELECT execution_stage FROM tasks WHERE id=?", taskID).Scan(&stage)
 		if stage == "" {
 			return ErrTaskNotFound
+		}
+		if !governance.IsRunnableStage(stage) {
+			return ErrNotRunnable
 		}
 		return ErrAlreadyClaimed
 	}

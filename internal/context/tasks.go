@@ -47,6 +47,10 @@ type Task struct {
 	// WorkKind is the routing category for this task.
 	// Valid values: "coding" (default), "architecture", "planning", "qa".
 	WorkKind        string            `json:"work_kind"`
+	// Origin is where the task came from: native (created in StayPoint),
+	// paperclip_import (staypoint import paperclip) or legacy (existed before
+	// origins were tracked). Boards and lists hide legacy by default.
+	Origin string `json:"origin"`
 }
 
 // TaskBlockerInfo contains summarized info about an upstream or downstream related task.
@@ -105,6 +109,8 @@ type TaskCreateOptions struct {
 	// ExecutionStage overrides the initial stage (default "todo"). A
 	// "backlog" task is parked: it is created without waking an agent.
 	ExecutionStage string
+	// Origin defaults to OriginNative.
+	Origin string
 }
 
 // GetCurrentGitBranch returns the current active git branch for a directory.
@@ -173,9 +179,19 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 		workKind = "coding"
 	}
 
-	stage := strings.TrimSpace(opts.ExecutionStage)
+	stage := strings.ToLower(strings.TrimSpace(opts.ExecutionStage))
 	if stage == "" {
-		stage = "todo"
+		stage = governance.StageTodo
+	}
+	if !governance.IsBoardSettableStage(stage) && stage != governance.StageBlocked {
+		return nil, fmt.Errorf("%w %q", ErrInvalidStage, stage)
+	}
+	origin := strings.TrimSpace(opts.Origin)
+	if origin == "" {
+		origin = OriginNative
+	}
+	if !IsValidOrigin(origin) {
+		return nil, fmt.Errorf("%w %q", ErrInvalidOrigin, origin)
 	}
 
 	query := `
@@ -183,9 +199,9 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 			id, name, repo_path, git_branch, status, account_role,
 			max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 			organization, project, parent_id, assignee_agent_id, work_kind,
-			execution_stage, created_at, updated_at
+			execution_stage, origin, created_at, updated_at
 		)
-		VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+		VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 	`
 
 	var parentID interface{}
@@ -198,7 +214,7 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 		assigneeAgentID = opts.AssigneeAgentID
 	}
 
-	if _, err := db.Exec(query, taskID, name, repoPath, gitBranch, role, opts.MaxBudgetUSD, opts.MaxTurns, opts.Organization, opts.Project, parentID, assigneeAgentID, workKind, stage); err != nil {
+	if _, err := db.Exec(query, taskID, name, repoPath, gitBranch, role, opts.MaxBudgetUSD, opts.MaxTurns, opts.Organization, opts.Project, parentID, assigneeAgentID, workKind, stage, origin); err != nil {
 		return nil, fmt.Errorf("failed to insert task: %w", err)
 	}
 
@@ -210,7 +226,7 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 
 	// Waking the agent as the task is ready for assignment/pickup. Backlog
 	// tasks are parked, so nothing picks them up yet.
-	if stage != "backlog" {
+	if governance.IsRunnableStage(stage) {
 		_ = orchestrator.NotifyDaemon(taskID, "assignment", "")
 	}
 
@@ -330,7 +346,8 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 			SELECT id, name, repo_path, git_branch, status, account_role,
 			       max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 			       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
-			       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at
+			       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
+			       COALESCE(origin, 'native')
 			FROM tasks
 			WHERE status != 'soft_deleted'
 			ORDER BY created_at DESC
@@ -340,7 +357,8 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 			SELECT id, name, repo_path, git_branch, status, account_role,
 			       max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 			       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
-			       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at
+			       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
+			       COALESCE(origin, 'native')
 			FROM tasks
 			WHERE status = 'active'
 			ORDER BY created_at DESC
@@ -381,6 +399,7 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 			&t.CreatedAt,
 			&t.UpdatedAt,
 			&deletedAt,
+			&t.Origin,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan task row: %w", err)
 		}
@@ -459,7 +478,7 @@ func GetTask(db *sql.DB, id string) (*Task, error) {
 		       max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 		       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
 		       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
-		       COALESCE(work_kind, 'coding')
+		       COALESCE(work_kind, 'coding'), COALESCE(origin, 'native')
 		FROM tasks
 		WHERE id = ? OR id = ? OR id LIKE ?
 		ORDER BY created_at DESC
@@ -499,6 +518,7 @@ func GetTask(db *sql.DB, id string) (*Task, error) {
 		&t.UpdatedAt,
 		&deletedAt,
 		&t.WorkKind,
+		&t.Origin,
 	); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("task not found: %s", id)
@@ -730,6 +750,9 @@ func GetTaskDependencyGraph(db *sql.DB, taskID string) (*TaskDependencyGraph, er
 }
 
 // GetActiveTaskForRepo finds the most recently updated active task for a repo (or globally).
+// Parked (backlog) tasks and tasks with no repo are never "the active task":
+// a bulk import or a backlog edit must not take over hooks, context and the
+// statusline.
 func GetActiveTaskForRepo(db *sql.DB, repoPath string) (*Task, error) {
 	cleanPath := filepath.Clean(repoPath)
 
@@ -738,9 +761,11 @@ func GetActiveTaskForRepo(db *sql.DB, repoPath string) (*Task, error) {
 		SELECT id, name, repo_path, git_branch, status, account_role,
 		       max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 		       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
-		       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at
+		       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
+		       COALESCE(origin, 'native')
 		FROM tasks
-		WHERE status = 'active' AND (repo_path = ? OR repo_path LIKE ?)
+		WHERE status = 'active' AND execution_stage != 'backlog' AND repo_path != ''
+		  AND (repo_path = ? OR repo_path LIKE ?)
 		ORDER BY updated_at DESC
 		LIMIT 1
 	`
@@ -771,6 +796,7 @@ func GetActiveTaskForRepo(db *sql.DB, repoPath string) (*Task, error) {
 		&t.CreatedAt,
 		&t.UpdatedAt,
 		&deletedAt,
+		&t.Origin,
 	)
 	if err == nil {
 		if blockReason.Valid {
@@ -796,9 +822,10 @@ func GetActiveTaskForRepo(db *sql.DB, repoPath string) (*Task, error) {
 		SELECT id, name, repo_path, git_branch, status, account_role,
 		       max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 		       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
-		       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at
+		       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
+		       COALESCE(origin, 'native')
 		FROM tasks
-		WHERE status = 'active'
+		WHERE status = 'active' AND execution_stage != 'backlog' AND repo_path != ''
 		ORDER BY updated_at DESC
 		LIMIT 1
 	`
@@ -827,6 +854,7 @@ func GetActiveTaskForRepo(db *sql.DB, repoPath string) (*Task, error) {
 		&t.CreatedAt,
 		&t.UpdatedAt,
 		&deletedAt,
+		&t.Origin,
 	)
 	if err == nil {
 		if blockReason.Valid {
@@ -1375,26 +1403,52 @@ func SetTaskExecutionStage(db *sql.DB, taskID, stage string) error {
 }
 
 // SetTaskExecutionStageWithOptions is SetTaskExecutionStage with the Board override.
+//
+// Only governance.BoardSettableStages are accepted. status follows the stage:
+// done -> done, cancelled -> soft_deleted (as DeleteTask), anything else ->
+// active, which also reopens a cancelled task. A backlog task moved straight
+// to in_progress (Run Now) passes through todo first, and both steps are
+// logged, so a parked task is never run without leaving backlog.
 func SetTaskExecutionStageWithOptions(db *sql.DB, taskID, stage string, opts DoneOptions) error {
 	task, err := GetTask(db, taskID)
 	if err != nil {
 		return err
 	}
 	stage = strings.ToLower(strings.TrimSpace(stage))
-	if stage == "done" && !opts.BoardOverride {
+	if !governance.IsBoardSettableStage(stage) {
+		return fmt.Errorf("%w %q: must be one of %s", ErrInvalidStage, stage, strings.Join(governance.BoardSettableStages, ", "))
+	}
+	if stage == governance.StageDone && !opts.BoardOverride {
 		if err := checkOpenChildren(db, task.ID); err != nil {
 			return err
 		}
 	}
-	status := "active"
-	if stage == "done" {
-		status = "done"
+	if task.ExecutionStage == governance.StageBacklog && stage == governance.StageInProgress {
+		if err := writeStage(db, task.ID, governance.StageTodo); err != nil {
+			return err
+		}
+		_ = LogActivity(db, task.ID, "stage_change", "execution stage set to todo (left backlog for Run Now)")
 	}
-	query := `UPDATE tasks SET execution_stage = ?, status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`
-	if _, err := db.Exec(query, stage, status, task.ID); err != nil {
-		return fmt.Errorf("failed to set task execution stage: %w", err)
+	if err := writeStage(db, task.ID, stage); err != nil {
+		return err
 	}
 	_ = LogActivity(db, task.ID, "stage_change", fmt.Sprintf("execution stage set to %s", stage))
+	return nil
+}
+
+func writeStage(db *sql.DB, taskID, stage string) error {
+	var query string
+	switch stage {
+	case governance.StageDone:
+		query = `UPDATE tasks SET execution_stage = ?, status = 'done', deleted_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`
+	case governance.StageCancelled:
+		query = `UPDATE tasks SET execution_stage = ?, status = 'soft_deleted', deleted_at = COALESCE(deleted_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`
+	default:
+		query = `UPDATE tasks SET execution_stage = ?, status = 'active', deleted_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`
+	}
+	if _, err := db.Exec(query, stage, taskID); err != nil {
+		return fmt.Errorf("failed to set task execution stage: %w", err)
+	}
 	return nil
 }
 

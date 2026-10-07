@@ -400,7 +400,7 @@ body.has-passkey-banner { --passkey-banner-h: 40px; }
 
 /* ── Kanban ──────────────────────────────────────────────── */
 .kanban-board {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
   gap: 14px; align-items: start;
 }
 .kanban-col { background: var(--surface); border-radius: var(--radius); padding: 10px; }
@@ -409,10 +409,21 @@ body.has-passkey-banner { --passkey-banner-h: 40px; }
   color: var(--muted); margin-bottom: 10px;
 }
 [data-status="in_progress"] .col-title { color: var(--blue); }
+[data-status="in_review"]   .col-title { color: var(--accent-light); }
 [data-status="blocked"]     .col-title { color: var(--red); }
 [data-status="done"]        .col-title { color: var(--green); }
 
 .card-list { display: flex; flex-direction: column; gap: 7px; min-height: 40px; }
+.kanban-board-wrap { display: flex; flex-direction: column; gap: 18px; }
+.kanban-lane-title {
+  font-size: 13px; font-weight: 700; margin: 0 0 8px; color: var(--text);
+}
+.kanban-controls { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.kanban-toggle { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); cursor: pointer; }
+.card-origin-badge {
+  font-size: 10px; padding: 0 5px; border-radius: 3px; margin-left: auto;
+  background: rgba(255,255,255,.08); color: var(--muted); text-transform: uppercase; letter-spacing: .4px;
+}
 
 /* ── Task card ───────────────────────────────────────────── */
 .task-card {
@@ -429,6 +440,8 @@ body.has-passkey-banner { --passkey-banner-h: 40px; }
 .dot-in_progress { background: var(--blue); }
 .dot-blocked     { background: var(--red); }
 .dot-done        { background: var(--green); }
+.dot-backlog     { background: var(--muted); opacity: .6; }
+.dot-in_review   { background: var(--accent-light); }
 .dot-soft_deleted { background: var(--muted); opacity: .4; }
 
 /* ── Fleet grid ─────────────────────────────────────────── */

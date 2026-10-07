@@ -3,9 +3,15 @@ package governance
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
-// Execution stages for the full governance state machine.
+// Execution stages (tasks.execution_stage). The set mirrors Paperclip's issue
+// statuses (backlog, todo, in_progress, in_review, blocked, done, cancelled);
+// "running" is in_progress: Claim sets it when a run checks the task out.
+// paused, capped and stopped are StayPoint-only run sub-states of
+// in_progress written by the harness, and rejected is the governance
+// review outcome. See docs/task-stages.md for the full table.
 const (
 	StageBacklog    = "backlog"
 	StageTodo       = "todo"
@@ -13,18 +19,65 @@ const (
 	StageInReview   = "in_review"
 	StageDone       = "done"
 	StageBlocked    = "blocked"
+	StageCancelled  = "cancelled"
 	StageRejected   = "rejected"
+
+	// Run sub-states (harness-owned, never set from the API).
+	StagePaused  = "paused"
+	StageCapped  = "capped"
+	StageStopped = "stopped"
 )
 
 // validTransitions defines which transitions are structurally allowed.
+// backlog is parked: nothing claims or wakes it, and the only way to run it
+// is through todo (Run Now does backlog -> todo -> in_progress).
 var validTransitions = map[string][]string{
-	StageBacklog:    {StageTodo},
-	StageTodo:       {StageInProgress, StageBlocked},
-	StageInProgress: {StageInReview, StageBlocked, StageTodo},
-	StageInReview:   {StageDone, StageInProgress, StageBlocked, StageRejected},
-	StageBlocked:    {StageTodo, StageInProgress, StageInReview},
+	StageBacklog:    {StageTodo, StageCancelled},
+	StageTodo:       {StageInProgress, StageBlocked, StageBacklog, StageCancelled},
+	StageInProgress: {StageInReview, StageBlocked, StageTodo, StageCancelled},
+	StageInReview:   {StageDone, StageInProgress, StageBlocked, StageRejected, StageCancelled},
+	StageBlocked:    {StageTodo, StageInProgress, StageInReview, StageBacklog, StageCancelled},
+	StageCancelled:  {StageBacklog, StageTodo},
 	StageDone:       {},
 	StageRejected:   {},
+}
+
+// BoardSettableStages are the stages POST /api/tasks/{id}/stage, the CLI and
+// the board accept. blocked is set through the block endpoint (it needs a
+// reason); the run sub-states belong to the harness.
+var BoardSettableStages = []string{StageBacklog, StageTodo, StageInProgress, StageInReview, StageDone, StageCancelled}
+
+// IsBoardSettableStage reports whether stage is in BoardSettableStages.
+func IsBoardSettableStage(stage string) bool {
+	for _, s := range BoardSettableStages {
+		if s == stage {
+			return true
+		}
+	}
+	return false
+}
+
+// nonRunnableStages are never claimed by a run or woken by the dispatcher.
+var nonRunnableStages = []string{StageBacklog, StageDone, StageCancelled, StageRejected}
+
+// IsRunnableStage reports whether a task in stage may be claimed by a run.
+func IsRunnableStage(stage string) bool {
+	for _, s := range nonRunnableStages {
+		if s == stage {
+			return false
+		}
+	}
+	return true
+}
+
+// NonRunnableStagesSQL is nonRunnableStages as a quoted SQL list, for
+// "execution_stage NOT IN (...)" guards.
+func NonRunnableStagesSQL() string {
+	q := make([]string, len(nonRunnableStages))
+	for i, s := range nonRunnableStages {
+		q[i] = "'" + s + "'"
+	}
+	return strings.Join(q, ", ")
 }
 
 // TransitionError is returned when a gate blocks a transition.
@@ -85,10 +138,16 @@ func ExecuteTransition(db *sql.DB, taskID, from, to, actorID string) error {
 		return err
 	}
 
-	res, err := tx.Exec(
-		`UPDATE tasks SET execution_stage = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`,
-		to, taskID,
-	)
+	// cancelled closes the task (status soft_deleted, as DeleteTask does);
+	// leaving cancelled reopens it.
+	query := `UPDATE tasks SET execution_stage = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`
+	switch {
+	case to == StageCancelled:
+		query = `UPDATE tasks SET execution_stage = ?, status = 'soft_deleted', deleted_at = COALESCE(deleted_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`
+	case from == StageCancelled:
+		query = `UPDATE tasks SET execution_stage = ?, status = 'active', deleted_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`
+	}
+	res, err := tx.Exec(query, to, taskID)
 	if err != nil {
 		tx.Rollback()
 		return fmt.Errorf("governance: update execution_stage: %w", err)

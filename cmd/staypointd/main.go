@@ -477,6 +477,13 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 				slog.Info("run refused: task already running", slog.String("task", taskID))
 				return
 			}
+			if errors.Is(runErr, orchestrator.ErrNotRunnable) {
+				// Parked (backlog) or closed: a wake is not a reason to run it.
+				// Drop any queue place so it does not hold a slot.
+				slog.Info("run refused: task not runnable in its stage", slog.String("task", taskID))
+				orchestrator.GlobalRunSlots.Dequeue(taskID)
+				return
+			}
 			slog.Error("harness run failed", slog.String("task", taskID), slog.Any("error", runErr))
 			sr.EmitState("error")
 			return

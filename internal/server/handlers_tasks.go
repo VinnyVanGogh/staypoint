@@ -15,6 +15,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
+	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/migration"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
@@ -41,8 +42,19 @@ func NewTasksHandler(db *sql.DB, hub *EventHub) *TasksHandler {
 }
 
 // ListTasks handles GET /api/tasks
+//
+// Query: status (active|done|soft_deleted|all), stage (an execution stage),
+// origin (native|paperclip_import|legacy), include_legacy (1/true; legacy
+// tasks are hidden unless set or origin=legacy), limit, offset.
 func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
+	stageFilter := strings.TrimSpace(r.URL.Query().Get("stage"))
+	originFilter := strings.TrimSpace(r.URL.Query().Get("origin"))
+	if originFilter != "" && !context.IsValidOrigin(originFilter) {
+		writeError(w, http.StatusBadRequest, "invalid origin: must be native, paperclip_import, or legacy")
+		return
+	}
+	includeLegacy := parseBoolParam(r.URL.Query().Get("include_legacy")) || originFilter == context.OriginLegacy
 	limitStr := r.URL.Query().Get("limit")
 	offsetStr := r.URL.Query().Get("offset")
 
@@ -67,13 +79,21 @@ func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	tasks = context.FilterLegacy(tasks, includeLegacy)
 
 	// Filter by specific status if requested and not "all"
 	var filtered []context.Task
 	for _, t := range tasks {
-		if status == "" || status == "all" || strings.EqualFold(t.Status, status) {
-			filtered = append(filtered, t)
+		if !(status == "" || status == "all" || strings.EqualFold(t.Status, status)) {
+			continue
 		}
+		if stageFilter != "" && !strings.EqualFold(t.ExecutionStage, stageFilter) {
+			continue
+		}
+		if originFilter != "" && t.Origin != originFilter {
+			continue
+		}
+		filtered = append(filtered, t)
 	}
 
 	total := len(filtered)
@@ -99,6 +119,14 @@ func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 		"offset":   offset,
 		"has_more": end < total,
 	})
+}
+
+func parseBoolParam(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // GetTask handles GET /api/tasks/{id}
@@ -157,6 +185,9 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 		Handoff  string `json:"handoff"`
 		// AllowDeep is the Board override for the child depth cap.
 		AllowDeep bool `json:"allow_deep"`
+		// ExecutionStage is the initial stage: todo (default) or backlog
+		// (parked: created without waking an agent).
+		ExecutionStage string `json:"execution_stage"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -171,6 +202,14 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 
 	if req.WorkKind != "" && !validWorkKinds[req.WorkKind] {
 		writeError(w, http.StatusBadRequest, "invalid work_kind: must be one of coding, review, architecture, planning, qa")
+		return
+	}
+
+	req.ExecutionStage = strings.ToLower(strings.TrimSpace(req.ExecutionStage))
+	switch req.ExecutionStage {
+	case "", governance.StageTodo, governance.StageBacklog:
+	default:
+		writeError(w, http.StatusBadRequest, "invalid execution_stage: a new task starts in todo or backlog")
 		return
 	}
 
@@ -191,6 +230,7 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 		AssigneeAgentID: req.AssigneeAgentID,
 		WorkKind:        req.WorkKind,
 		Description:     req.Description,
+		ExecutionStage:  req.ExecutionStage,
 	}
 
 	task, err := context.CreateTaskWithOptions(h.db, opts)
@@ -676,10 +716,9 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch req.Stage {
-	case "todo", "in_progress", "in_review", "done":
-	default:
-		writeError(w, http.StatusBadRequest, "invalid stage: must be todo, in_progress, in_review, or done")
+	req.Stage = strings.ToLower(req.Stage)
+	if !governance.IsBoardSettableStage(req.Stage) {
+		writeError(w, http.StatusBadRequest, "invalid stage: must be one of "+strings.Join(governance.BoardSettableStages, ", "))
 		return
 	}
 
@@ -688,6 +727,8 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, err.Error())
 		} else if errors.Is(err, context.ErrOpenChildren) {
 			writeError(w, http.StatusConflict, err.Error())
+		} else if errors.Is(err, context.ErrInvalidStage) {
+			writeError(w, http.StatusBadRequest, err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "failed to update task stage: "+err.Error())
 		}
@@ -701,7 +742,9 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	if req.Stage == "in_progress" {
+	if req.Stage == governance.StageInProgress {
+		// Run Now. A backlog task was moved to todo first by
+		// SetTaskExecutionStageWithOptions, so the claim accepts it.
 		// Per-click key so each Run Now press can start a new run even within 24 h.
 		orchestrator.GlobalDispatcher.Wake(id, "run_now", "run_now:"+id+":"+uuid.New().String()[:8])
 	}
