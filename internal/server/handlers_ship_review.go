@@ -387,6 +387,7 @@ func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 		proposed.LiveCredentials = cfg.LiveCredentials
 		proposed.MergeMode = cfg.MergeMode
 		proposed.GHConfigDir = cfg.GHConfigDir
+		proposed.TargetBranch = cfg.TargetBranch
 		if uErr := shipreview.UpsertProjectDevConfig(h.db, proposed); uErr == nil {
 			cfg = proposed
 			h.hub.Publish("ship_review_dev_config_proposed", map[string]any{

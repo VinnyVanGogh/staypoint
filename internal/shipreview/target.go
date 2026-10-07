@@ -89,12 +89,13 @@ type cardSource struct {
 // work (a branch, or a same-repo pull request) for a task whose own
 // staypoint/<task> branch has no changes, e.g. work done on a branch cut from
 // dev-server. ok is false when the task registered none. A registered PR
-// also sets the target: Approve merges into the PR's base.
+// must be based on the task's target (the branch Approve merges into); an
+// agent cannot pick another target by opening its PR against it.
 //
 // The card is still measured against the task's recorded base, never
 // against a base derived from the registered branch: an agent-chosen branch
 // may over-report its changes but cannot hide any.
-func workProductSource(ctx context.Context, db *sql.DB, repo, taskID string) (src cardSource, ok bool, err error) {
+func workProductSource(ctx context.Context, db *sql.DB, repo, taskID, target string) (src cardSource, ok bool, err error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT product_type, reference FROM task_work_products
 		WHERE task_id = ? AND product_type IN ('branch', 'pull_request')
@@ -140,15 +141,15 @@ func workProductSource(ctx context.Context, db *sql.DB, repo, taskID string) (sr
 		if pr.State != "OPEN" {
 			return cardSource{}, false, fmt.Errorf("registered PR %s is %s", p.ref, strings.ToLower(pr.State))
 		}
-		src.branch, src.target = pr.HeadRefName, pr.BaseRefName
-	}
-	if err := checkWorkProductBranch(ctx, repo, taskID, src.branch); err != nil {
-		return cardSource{}, false, err
-	}
-	if src.target != "" {
-		if err := ValidTargetBranch(src.target); err != nil {
-			return cardSource{}, false, err
+		if pr.BaseRefName != target {
+			return cardSource{}, false, fmt.Errorf("registered PR %s targets %s, but this task merges into %s; retarget the PR to %s",
+				p.ref, pr.BaseRefName, target, target)
 		}
+		src.branch = pr.HeadRefName
+	}
+	src.target = target
+	if err := checkWorkProductBranch(ctx, db, repo, src.branch, target); err != nil {
+		return cardSource{}, false, err
 	}
 	if src.head, err = CurrentBranchHEAD(ctx, repo, src.branch); err != nil {
 		return cardSource{}, false, fmt.Errorf("registered branch %q: %w", src.branch, err)
@@ -158,16 +159,20 @@ func workProductSource(ctx context.Context, db *sql.DB, repo, taskID string) (sr
 
 // checkWorkProductBranch refuses registered branches a card must never ship
 // and Approve must never delete: protected and default branches, the task's
-// target, and other tasks' StayPoint branches.
-func checkWorkProductBranch(ctx context.Context, repo, taskID, branch string) error {
+// target, the project's configured target, and StayPoint task branches.
+func checkWorkProductBranch(ctx context.Context, db *sql.DB, repo, branch, target string) error {
 	if err := ValidTargetBranch(branch); err != nil {
 		return fmt.Errorf("registered branch %q cannot be reviewed: %w", branch, err)
 	}
 	if err := guardDeletableBranch(ctx, repo, branch); err != nil {
 		return fmt.Errorf("registered branch %q cannot be reviewed: %w", branch, err)
 	}
-	if branch == WorkTargetBranch {
-		return fmt.Errorf("registered branch %q cannot be reviewed: %w", branch, ErrProtectedBranch)
+	projectTarget, err := ProjectTargetBranch(ctx, db, repo)
+	if err != nil {
+		return err
+	}
+	if branch == target || branch == projectTarget {
+		return fmt.Errorf("registered branch %q is a merge target: %w", branch, ErrProtectedBranch)
 	}
 	return nil
 }

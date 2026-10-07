@@ -264,3 +264,20 @@ func TestBuildAndStartCard_ListsWhatLandsOnTarget(t *testing.T) {
 		t.Fatalf("files = %v, want dev-only.txt (lands on main) and lifecycle.go", card.FilesChanged)
 	}
 }
+
+// A registered branch that is the project's configured target is refused
+// even when the task itself targets another branch: Approve would delete it.
+func TestBuildAndStartCard_RefusesProjectTargetAsWorkProduct(t *testing.T) {
+	const taskID = "task-release"
+	db := openTestDB(t)
+	repo, _ := devServerRepo(t, db, taskID, true)
+	gitT(t, repo, "branch", "release", "fix/user-lifecycle-dev-wiring")
+	if err := shipreview.UpsertProjectDevConfig(db, &shipreview.ProjectDevConfig{RepoPath: repo, TargetBranch: "release"}); err != nil {
+		t.Fatal(err)
+	}
+	registerWorkProduct(t, db, taskID, "branch", "release")
+	_, err := shipreview.BuildAndStartCard(context.Background(), db, taskID, repo, []string{"1. Check"}, "", nil)
+	if !errors.Is(err, shipreview.ErrProtectedBranch) {
+		t.Fatalf("err = %v, want ErrProtectedBranch", err)
+	}
+}

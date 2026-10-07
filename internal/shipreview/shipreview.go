@@ -986,19 +986,13 @@ func BuildAndStartCard(ctx context.Context, db *sql.DB, taskID, repoPath string,
 	if headErr != nil || errors.Is(err, ErrNoChanges) {
 		// The task branch is missing or empty: ship the branch or PR the
 		// agent registered as its work, if any.
-		src, ok, srcErr := workProductSource(ctx, db, repoPath, taskID)
+		src, ok, srcErr := workProductSource(ctx, db, repoPath, taskID, target)
 		switch {
 		case srcErr != nil:
 			return nil, srcErr
 		case !ok && headErr != nil:
 			return nil, fmt.Errorf("cannot resolve branch HEAD for %q: %w", branch, headErr)
 		case ok:
-			if src.target == "" {
-				src.target = target
-			}
-			if src.branch == src.target {
-				return nil, fmt.Errorf("registered branch %q is the target branch: %w", src.branch, ErrProtectedBranch)
-			}
 			card, err = createCard(db, taskID, src.branch, src.head, src.target, testSteps, devURL, repoPath, checkRuns)
 		}
 	}
