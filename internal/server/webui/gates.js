@@ -203,6 +203,9 @@ async function renderGateRequestsTab() {
   gatesState.pending = pending.map(r => r.id);
   for (const id of [...gatesState.selected]) if (!gatesState.pending.includes(id)) gatesState.selected.delete(id);
 
+  const trustPanel = await renderTrustedTasksPanel();
+  if (seq !== gatesRenderSeq) return;
+  if (trustPanel) container.appendChild(trustPanel);
   container.appendChild(renderGateToolbar(pending.length));
   const reviewPanel = renderGateReviewPanel();
   if (reviewPanel) container.appendChild(reviewPanel);
@@ -212,7 +215,7 @@ async function renderGateRequestsTab() {
     empty.appendChild(el('div', 'gates-empty-icon', '🔒'));
     empty.appendChild(el('div', '', statusFilter === 'pending'
       ? 'No pending gate requests. All clear.'
-      : 'No gate requests found.'));
+      : statusFilter === 'deferred' ? 'Deferred queue is empty.' : 'No gate requests found.'));
     container.appendChild(empty);
     return;
   }
@@ -293,11 +296,18 @@ async function renderGateRequestsTab() {
     tr.appendChild(timeTd);
 
     const statusTd = document.createElement('td');
-    const statusCls = `gate-status-${gr.status || 'pending'}`;
+    const label = gateStatusLabel(gr);
+    const statusCls = `gate-status-${label === 'deferred' ? 'deferred' : (gr.status || 'pending')}`;
     const decidedInfo = gr.decided_at ? ` · ${fmtDateTime(gr.decided_at)}` : '';
-    statusTd.appendChild(el('span', statusCls, (gr.status || 'pending') + decidedInfo));
+    statusTd.appendChild(el('span', statusCls, label + decidedInfo));
     if (gr.decided_by && gr.decided_by.startsWith('rule:')) {
-      statusTd.appendChild(el('div', 'gate-context', `auto-approved by rule #${gr.decided_by.slice(5)}`));
+      const m = /^rule:(\d+)(:tev1)?$/.exec(gr.decided_by);
+      const what = m && m[2] ? `decided by tev1 under trust #${m[1]}` : `auto-approved by rule #${gr.decided_by.slice(5)}`;
+      statusTd.appendChild(el('div', 'gate-context', what));
+    }
+    if (label === 'deferred') {
+      statusTd.appendChild(el('div', 'gate-context',
+        'Skipped at its deadline, not run. Deciding it records your call; it is not replayed.'));
     }
     tr.appendChild(statusTd);
 
@@ -548,6 +558,31 @@ function renderGateSettings(settings) {
   advRow.append(adv, document.createTextNode(' Together advisory on every gate request'
     + (settings.advisor_configured ? '' : ' (not configured: no TOGETHER_API_KEY)')));
   box.appendChild(advRow);
+
+  // Task trust (task-6c1ed91f).
+  const deferRow = el('label', 'gates-setting-row', 'Under trust, a delete outside the worktree waits ');
+  const deferSel = el('select', 'select-filter gates-trust-defer');
+  for (const m of [1, 5, 10, 15, 30, 60, 120]) {
+    const o = el('option', '', `${m} min`);
+    o.value = String(m);
+    deferSel.appendChild(o);
+  }
+  deferSel.value = String(settings.trust_defer_minutes ?? 10);
+  deferSel.addEventListener('change', () => saveGateSetting({ trust_defer_minutes: Number(deferSel.value) }));
+  deferRow.append(deferSel, document.createTextNode(' for you, then is skipped (Deferred queue)'));
+  box.appendChild(deferRow);
+
+  const thRow = el('label', 'gates-setting-row', 'tev1 overnight mode approves only at p ≥ ');
+  const th = el('select', 'select-filter gates-tev1-threshold');
+  for (const v of [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]) {
+    const o = el('option', '', v.toFixed(2));
+    o.value = String(v);
+    th.appendChild(o);
+  }
+  th.value = String(settings.tev1_threshold ?? 0.7);
+  th.addEventListener('change', () => saveGateSetting({ tev1_threshold: Number(th.value) }));
+  thRow.append(th, document.createTextNode(' (applies to trusts created after the change)'));
+  box.appendChild(thRow);
   return box;
 }
 
@@ -627,4 +662,183 @@ async function renderPendingGatesForTask(container, runId) {
   box.appendChild(viewAllLink);
   sec.appendChild(box);
   container.insertBefore(sec, container.firstChild);
+}
+
+// ── Task trust: "Trust this task until…" (task-6c1ed91f) ────────────────────
+
+// trustSendRevoke ends a task's trust at once. Revoking only removes power,
+// so it needs the Board session but no Touch ID.
+async function trustRevoke(taskId) {
+  try {
+    const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/trust/revoke`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeader() },
+    });
+    if (!r.ok) { await gateActionFailed(r); return false; }
+    showToast('Trust revoked: Red requests wait for you again.', 'success');
+    return true;
+  } catch (e) {
+    alert(`Revoke failed: ${e.message}`);
+    return false;
+  }
+}
+
+// trustCreate asks for a fresh Touch ID (never the grace window) and creates
+// the trust. The body names a preset only; the server sets the expiry.
+async function trustCreate(taskId, spec) {
+  const r = await withBoardWebAuthn((sessionToken, assertion) => fetch(`/api/tasks/${encodeURIComponent(taskId)}/trust`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+    body: JSON.stringify(spec),
+  }), 'trusting this task');
+  if (r === null) return false;
+  if (!r.ok) { await gateActionFailed(r); return false; }
+  return true;
+}
+
+function trustTev1Banner(who) {
+  return el('div', 'trust-tev1-banner',
+    `⚠ tev1 decides ${who}'s Red requests. It is an unproven 4B model: expect false denials that park the task, and possible false approvals.`);
+}
+
+function trustRequestList(title, list, now) {
+  const box = el('div', 'trust-request-list');
+  box.appendChild(el('div', 'trust-list-title', `${title} (${list.length})`));
+  for (const gr of list) {
+    const row = el('div', 'trust-request-row');
+    row.appendChild(el('span', 'trust-request-time', gr.decided_at ? clockLabel(gr.decided_at, now) : ''));
+    row.appendChild(el('span', 'gate-cmdline', gr.cmdline || '—'));
+    box.appendChild(row);
+  }
+  return box;
+}
+
+function trustSummaryBox(trust, now) {
+  const lines = tev1SummaryLines(trust);
+  if (!lines.length) return null;
+  const box = el('div', 'trust-tev1-summary');
+  box.appendChild(el('div', 'trust-list-title', `tev1 summary: ${(trust.tev1_approved || []).length} approved, ${(trust.tev1_denied || []).length} denied`));
+  for (const l of lines) box.appendChild(el('div', `gate-advice-line ${l.cls}`, l.text));
+  return box;
+}
+
+function trustCreateForm(taskId, info, onDone) {
+  const form = el('div', 'trust-create');
+  form.appendChild(el('div', 'task-page-section-title', 'Trust this task until…'));
+  const row = el('div', 'trust-create-row');
+  const preset = el('select', 'select-filter trust-preset');
+  for (const [v, label] of TRUST_PRESETS) {
+    const o = el('option', '', label);
+    o.value = v;
+    preset.appendChild(o);
+  }
+  preset.value = 'overnight';
+  const mins = el('input', 'trust-custom-minutes');
+  mins.type = 'number';
+  mins.min = String(info.min_minutes || 15);
+  mins.max = String(info.max_minutes || 1440);
+  mins.placeholder = 'minutes';
+  mins.hidden = true;
+  preset.addEventListener('change', () => { mins.hidden = preset.value !== 'custom'; });
+  const tev1Label = el('label', 'trust-tev1-toggle');
+  const tev1 = el('input', '');
+  tev1.type = 'checkbox';
+  tev1Label.append(tev1, document.createTextNode(' tev1 decides overnight (off by default)'));
+  if (!info.tev1_configured) { tev1.disabled = true; tev1Label.title = 'No local tev1 advisor configured'; }
+  const go = el('button', 'gate-btn gate-approve-btn trust-create-btn', 'Trust (Touch ID)');
+  go.addEventListener('click', async () => {
+    let ack = false;
+    if (tev1.checked) {
+      ack = confirm(`Enable tev1 overnight mode?\n\n${info.tev1_warning || ''}\n\nOn a deny, low confidence or error the request is not run and the whole task is parked until you review it.`);
+      if (!ack) return;
+    }
+    const { spec, error } = trustSpec(preset.value, mins.value, tev1.checked, ack);
+    if (error) { alert(error); return; }
+    go.disabled = true;
+    const ok = await trustCreate(taskId, spec);
+    go.disabled = false;
+    if (ok && onDone) onDone();
+  });
+  row.append(preset, mins, tev1Label, go);
+  form.appendChild(row);
+  form.appendChild(el('div', 'muted-text trust-create-note',
+    `While trusted, this task's Red requests run without asking you, and each is logged here. Always excluded: `
+    + `merges and pushes to protected branches wait for you; deletes outside the task worktree wait ${info.defer_minutes || 10} min, `
+    + `then are skipped and queued for you. Ends early when the task leaves in progress.`));
+  return form;
+}
+
+// renderTaskTrust draws the trust section at the top of a task page: the
+// banner and auto-approved list when trusted, the create form otherwise, and
+// the latest trust's tev1 summary.
+async function renderTaskTrust(container, taskId) {
+  if (!taskId) return;
+  let info;
+  try {
+    info = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/trust`);
+  } catch (_) { return; }
+  const sec = el('div', 'task-page-section task-trust-section');
+  sec.dataset.taskId = taskId;
+  const now = Date.now();
+  const rerender = () => { sec.remove(); renderTaskTrust(container, taskId); };
+  const active = info.active;
+  if (active) {
+    if (active.tev1) sec.appendChild(trustTev1Banner('this task'));
+    const banner = el('div', 'trust-banner');
+    banner.appendChild(el('span', 'trust-banner-text', trustBannerText(active, now)));
+    const revoke = el('button', 'gate-btn gate-deny-btn trust-revoke-btn', 'Revoke');
+    revoke.addEventListener('click', async () => { if (await trustRevoke(taskId)) rerender(); });
+    banner.appendChild(revoke);
+    sec.appendChild(banner);
+    const approved = [...(active.auto_approved || []), ...(active.tev1_approved || [])]
+      .sort((a, b) => String(b.decided_at || '').localeCompare(String(a.decided_at || '')));
+    if (approved.length) sec.appendChild(trustRequestList('Auto-approved, newest first', approved, now));
+  } else {
+    sec.appendChild(trustCreateForm(taskId, info, rerender));
+    const last = info.latest;
+    if (last) {
+      sec.appendChild(el('div', 'muted-text trust-ended',
+        `Last trust ended ${last.ended_reason ? `(${last.ended_reason})` : `at ${clockLabel(last.expires_at, now)}`}: `
+        + `${last.auto_approved_count || 0} auto-approved.`));
+    }
+  }
+  const summary = info.latest && trustSummaryBox(info.latest, now);
+  if (summary) sec.appendChild(summary);
+  const held = info.held || [];
+  if (held.length && (active || (info.latest && info.latest.active))) {
+    sec.appendChild(trustRequestList('Waiting for you (merges, pushes, deferred deletes)', held, now));
+  }
+  container.insertBefore(sec, container.firstChild);
+}
+
+// renderTrustedTasksPanel is the Gates page's view of trusted tasks: an
+// amber banner while any tev1 mode is on, and per trust its auto-approvals
+// and the tev1 morning summary. Returns null when nothing is or was trusted.
+async function renderTrustedTasksPanel() {
+  let data;
+  try { data = await apiFetch('/api/security/trusts'); } catch (_) { return null; }
+  const trusts = data.trusts || [];
+  if (!trusts.length) return null;
+  const now = Date.now();
+  const panel = el('div', 'gates-trust-panel');
+  if (trusts.some(t => t.active && t.tev1)) panel.appendChild(trustTev1Banner('a trusted task'));
+  panel.appendChild(el('div', 'gates-stats-title', 'Trusted tasks (live and last 24 h)'));
+  for (const t of trusts) {
+    const row = el('div', `gates-trust-row${t.active ? '' : ' gates-trust-ended'}`);
+    const name = el('a', 'gate-run-link', t.task_name || t.scope_value);
+    name.href = '#';
+    name.addEventListener('click', e => { e.preventDefault(); openTaskPage(t.scope_value); });
+    row.appendChild(name);
+    row.appendChild(el('span', 'trust-banner-text', t.active
+      ? trustBannerText(t, now)
+      : `ended${t.ended_reason ? ` (${t.ended_reason})` : ''} · ${t.auto_approved_count || 0} auto-approved`));
+    if (t.active) {
+      const revoke = el('button', 'gate-btn gate-deny-btn trust-revoke-btn', 'Revoke');
+      revoke.addEventListener('click', async () => { if (await trustRevoke(t.scope_value)) renderGatesPage(); });
+      row.appendChild(revoke);
+    }
+    panel.appendChild(row);
+    const summary = trustSummaryBox(t, now);
+    if (summary) panel.appendChild(summary);
+  }
+  return panel;
 }

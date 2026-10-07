@@ -40,6 +40,9 @@ type Advice struct {
 	Error          string    `json:"error,omitempty"`
 	FinalDecision  string    `json:"final_decision,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
+	// Probability of the recommendation (tev1 /v1/systemone only, else 0).
+	// Not stored; the reason text carries it for the log.
+	Probability float64 `json:"probability,omitempty"`
 }
 
 // LogAdvice inserts a decision_log row. When the subject is already decided
@@ -190,7 +193,7 @@ func (t TogetherAdvisor) Advise(ctx context.Context, gr *security.GateRequest, s
 	if err != nil {
 		return a, err
 	}
-	a.Recommendation, a.Reason = res.SelectedKey, res.Reason
+	a.Recommendation, a.Reason, a.Probability = res.SelectedKey, res.Reason, res.Probability
 	return a, nil
 }
 

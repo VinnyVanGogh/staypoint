@@ -90,7 +90,11 @@ func (r *Resolver) Resolve(in *security.GateRequestInput) []security.ScriptRef {
 	refs := security.ScriptRefs(in.Cmdline, in.CWD, security.NewSnapshotter(), ScriptContentLimit)
 	in.Scripts = make([]security.ScriptHash, 0, len(refs))
 	for _, s := range refs {
-		in.Scripts = append(in.Scripts, security.ScriptHash{Path: s.Path, SHA256: s.SHA256, Content: s.Content})
+		content := s.Content
+		if len(s.Full) > len(content) {
+			content += "\n" + security.TruncatedMarker
+		}
+		in.Scripts = append(in.Scripts, security.ScriptHash{Path: s.Path, SHA256: s.SHA256, Content: content})
 	}
 	return refs
 }
