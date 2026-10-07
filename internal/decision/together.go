@@ -45,6 +45,8 @@ type DecisionResult struct {
 	SelectedKey    string // Option.Key of the chosen option
 	SelectedLetter string // single capital letter the model emitted
 	RawResponse    string // raw JSON response body for debugging
+	// Reason is the model's one-line justification (DecideWithReason only).
+	Reason string
 }
 
 // TogetherDecisionClient calls an OpenAI-compatible /v1/chat/completions endpoint
@@ -113,15 +115,62 @@ func NewTogether() (*TogetherDecisionClient, error) {
 	}, nil
 }
 
+// NewWithEndpoint returns a client for an explicit endpoint (tests, fakes).
+func NewWithEndpoint(baseURL, apiKey, model string, hc *http.Client) *TogetherDecisionClient {
+	if hc == nil {
+		hc = &http.Client{Timeout: 15 * time.Second}
+	}
+	return &TogetherDecisionClient{baseURL: baseURL, apiKey: apiKey, model: model, httpClient: hc}
+}
+
+// Model returns the model name requests are sent to.
+func (c *TogetherDecisionClient) Model() string { return c.model }
+
 // Decide sends req to the configured endpoint and returns the parsed single-letter pick.
 func (c *TogetherDecisionClient) Decide(ctx context.Context, req DecisionRequest) (DecisionResult, error) {
+	return c.call(ctx, buildPrompt(req), 8, req.Options)
+}
+
+// DecideWithReason is Decide plus a one-line reason after the letter
+// ("A - read-only du/git survey"), for advisories shown to the Board (STA-868).
+func (c *TogetherDecisionClient) DecideWithReason(ctx context.Context, req DecisionRequest) (DecisionResult, error) {
+	prompt := buildPrompt(req) + "\nReply as: <letter> - <one-line reason, at most 15 words>\n"
+	res, err := c.call(ctx, prompt, 60, req.Options)
+	if err != nil {
+		return res, err
+	}
+	res.Reason = parseReason(res.RawResponse)
+	return res, nil
+}
+
+// parseReason extracts the text after the option letter in a chat response.
+func parseReason(raw string) string {
+	var cr chatResponse
+	if json.Unmarshal([]byte(raw), &cr) != nil || len(cr.Choices) == 0 {
+		return ""
+	}
+	content := strings.TrimSpace(cr.Choices[0].Message.Content)
+	if r := []rune(content); len(r) > 0 {
+		content = string(r[1:])
+	}
+	content = strings.TrimLeft(content, " .):-\u2013\u2014\t")
+	if i := strings.IndexByte(content, '\n'); i >= 0 {
+		content = content[:i]
+	}
+	if r := []rune(content); len(r) > 200 {
+		content = string(r[:200])
+	}
+	return strings.TrimSpace(content)
+}
+
+func (c *TogetherDecisionClient) call(ctx context.Context, prompt string, maxTokens int, options []Option) (DecisionResult, error) {
 	body := map[string]any{
 		"model": c.model,
 		"messages": []map[string]string{
-			{"role": "user", "content": buildPrompt(req)},
+			{"role": "user", "content": prompt},
 		},
 		"temperature": 0,
-		"max_tokens":  8,
+		"max_tokens":  maxTokens,
 		"stream":      false,
 		"chat_template_kwargs": map[string]any{
 			"enable_thinking": false,
@@ -156,7 +205,7 @@ func (c *TogetherDecisionClient) Decide(ctx context.Context, req DecisionRequest
 		return DecisionResult{}, fmt.Errorf("decision: server %d: %s", resp.StatusCode, raw)
 	}
 
-	return parseResponse(raw, req.Options)
+	return parseResponse(raw, options)
 }
 
 // chatResponse is the minimal OpenAI chat completions shape we need.

@@ -222,12 +222,22 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 		// Security Gate REST API (Board approval for Red-tier agent commands)
 		gateH := NewSecurityGateHandler(s.opts.DB, s.hub)
+		gateH.advisor, gateH.reviewer, gateH.resolver = s.opts.GateAdvisor, s.opts.GateReviewer, s.opts.GateResolver
 		mux.HandleFunc("GET /api/security/gate-requests", gateH.ListGateRequests)
 		mux.HandleFunc("POST /api/security/gate-requests", gateH.CreateGateRequest)
 		mux.HandleFunc("GET /api/security/gate-requests/{id}", gateH.GetGateRequest)
 		mux.HandleFunc("GET /api/security/gate-requests/{id}/audit-log", gateH.ListGateAuditLog)
 		// Board-only: deciding a gate request requires the board token so agents cannot self-approve.
-		mux.Handle("POST /api/security/gate-requests/{id}/decide", s.secMid.WrapBoardAction(http.HandlerFunc(gateH.DecideGateRequest)))
+		// Gate actions accept the passkey grace window (STA-868).
+		mux.Handle("POST /api/security/gate-requests/{id}/decide", s.secMid.WrapBoardGateAction(http.HandlerFunc(gateH.DecideGateRequest)))
+		mux.Handle("POST /api/security/gate-requests/decide-batch", s.secMid.WrapBoardGateAction(http.HandlerFunc(gateH.DecideBatch)))
+		// AI review is advisory and spends quota: Board session, no passkey.
+		mux.Handle("POST /api/security/gate-requests/review", s.secMid.WrapBoardSession(http.HandlerFunc(gateH.ReviewPending)))
+		mux.HandleFunc("GET /api/security/gate-rules", gateH.ListRules)
+		mux.Handle("POST /api/security/gate-rules", s.secMid.WrapBoardGateAction(http.HandlerFunc(gateH.CreateRule)))
+		mux.Handle("DELETE /api/security/gate-rules/{id}", s.secMid.WrapBoardGateAction(http.HandlerFunc(gateH.DeleteRule)))
+		mux.HandleFunc("GET /api/security/gate-stats", gateH.Stats)
+		mux.Handle("GET /api/board/passkey-grace", s.secMid.WrapBoardSession(http.HandlerFunc(s.secMid.GraceStatus)))
 		mux.HandleFunc("GET /api/settings/security-gate", gateH.GetSecurityGateSettings)
 		// Board-only: toggling the gate itself requires the board token.
 		mux.Handle("POST /api/settings/security-gate", s.secMid.WrapBoardAction(http.HandlerFunc(gateH.UpdateSecurityGateSettings)))

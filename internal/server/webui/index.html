@@ -675,6 +675,11 @@
           <span class="refresh-indicator">Board-approval gate requests — Red-tier commands held for your decision</span>
         </div>
         <div class="table-controls">
+          <span id="gates-grace" class="gates-grace" hidden></span>
+          <div class="gates-tabs" role="tablist">
+            <button class="gates-tab sidebar-filter-btn active" data-tab="requests" role="tab">Requests</button>
+            <button class="gates-tab sidebar-filter-btn" data-tab="rules" role="tab">Rules &amp; stats</button>
+          </div>
           <select id="gates-status-filter" class="select-filter">
             <option value="pending">Pending</option>
             <option value="all">All</option>
@@ -823,6 +828,9 @@
 <script src="/ui/lib/diffsyntax.js"></script>
 <script src="/ui/lib/markdown.js"></script>
 <script src="/ui/lib/quotagauge.js"></script>
+<script src="/ui/lib/gates.js"></script>
+<!-- gates.js before app.js: app.js boot() may open /gates straight away. -->
+<script src="/ui/gates.js"></script>
 <script src="/ui/app.js"></script>
 </body>
 </html>

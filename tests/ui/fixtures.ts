@@ -143,8 +143,12 @@ export class StayPointAPI {
     });
   }
 
-  async createGateRequest(cmdline: string, reasons: string[] = [], runId = ''): Promise<{ id: string; cmdline: string; status: string }> {
-    return this.json('POST', '/api/security/gate-requests', { cmdline, reasons, run_id: runId });
+  async createGateRequest(cmdline: string, reasons: string[] = [], runId = '', taskId = ''): Promise<{ id: string; cmdline: string; status: string; decided_by?: string }> {
+    return this.json('POST', '/api/security/gate-requests', { cmdline, reasons, run_id: runId, task_id: taskId });
+  }
+
+  async listGateRules(): Promise<{ rules: Array<{ id: number; pattern: string; scope: string; scope_value: string; hit_count: number }> }> {
+    return this.json('GET', '/api/security/gate-rules');
   }
 
   async listGateRequests(status = 'pending'): Promise<{ gate_requests: Array<{ id: string; cmdline: string; status: string; reasons: string[]; run_id: string; created_at: string }> }> {
