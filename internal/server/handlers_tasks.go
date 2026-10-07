@@ -161,6 +161,8 @@ func (h *TasksHandler) GetTask(w http.ResponseWriter, r *http.Request) {
 		"work_kind":    task.WorkKind,
 		// Run queue position (STA-773): {queued, ahead, wait}.
 		"queue": orchestrator.GlobalRunSlots.Position(task.ID),
+		// Turn in flight, for the task page's turn timer; null when idle.
+		"turn": orchestrator.GlobalActiveTurns.Get(task.ID),
 	})
 }
 

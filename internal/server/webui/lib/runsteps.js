@@ -113,12 +113,28 @@
     const last = steps[steps.length - 1];
     if (last.kind === 'state' && /error$/i.test(String(last.title || ''))) {
       const why = [...steps].reverse().find(s => s.kind === 'message' && s.status === 'error' && s.title);
-      if (why) return `Failed: ${why.title}`;
+      // A turn the stall watch stopped already reads as the reason.
+      if (why) return /^Stopped:/.test(why.title) ? why.title : `Failed: ${why.title}`;
     }
     return last.title || 'idle';
   }
 
-  const api = { groupStepsByRun, isRealRunGroup, latestRunSteps, currentRunSteps, runElapsedMs, isStuck, routeModel, queueLabel, queuePositionIn, runStepLabel };
+  // Stats strip "Turn" value for the turn in flight: GET /api/tasks/{id}
+  // .turn or a run.turn SSE payload ({turn, started_at}). '' when idle.
+  function turnElapsedLabel(turn, nowMs) {
+    if (!turn || !turn.started_at) return '';
+    const start = new Date(turn.started_at).getTime();
+    if (isNaN(start)) return '';
+    const sec = Math.max(0, Math.floor((nowMs - start) / 1000));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    const elapsed = h > 0 ? `${h}h ${pad(m)}m` : `${m}m ${pad(s)}s`;
+    return `#${(turn.turn || 0) + 1} · ${elapsed}`;
+  }
+
+  const api = { turnElapsedLabel, groupStepsByRun, isRealRunGroup, latestRunSteps, currentRunSteps, runElapsedMs, isStuck, routeModel, queueLabel, queuePositionIn, runStepLabel };
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;
