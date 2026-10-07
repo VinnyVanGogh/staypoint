@@ -387,6 +387,11 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			)
 			return result, nil
 		}
+		// STA-774: the recorded task base is never moved from git state
+		// here. The preflight's fetch and fast-forward follow the worktree's
+		// remote config and refs, which the agent can rewrite (e.g. a fetch
+		// refspec that maps its own branch onto origin/main); commits a
+		// fast-forward brings in are listed as task changes instead.
 	} // end git preflight block
 
 	// Clear stale run control flags from previous runs.

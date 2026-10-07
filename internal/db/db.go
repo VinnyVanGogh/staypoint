@@ -1122,6 +1122,23 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version: 32,
+		Name:    "task_worktree_bases",
+		Up: func(conn *sql.DB) error {
+			// STA-774: the commit each task worktree branched from, recorded
+			// by the daemon. Git refs are writable by the agent in the
+			// worktree; this row is what ship review and the Diff tab trust.
+			_, err := conn.Exec(`CREATE TABLE IF NOT EXISTS task_worktree_bases (
+				task_id    TEXT PRIMARY KEY,
+				repo_path  TEXT NOT NULL DEFAULT '',
+				base_sha   TEXT NOT NULL,
+				created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+				updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			);`)
+			return err
+		},
+	},
 }
 
 func copyFile(src, dst string) error {
