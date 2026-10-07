@@ -135,7 +135,7 @@ func (e *gateEnv) create(t *testing.T, cmd, taskID string, reasons ...string) ma
 	}
 	// Like the hook: snapshot the scripts and say the command is pinned.
 	var scripts []map[string]string
-	for _, r := range security.ScriptRefs(cmd, "", os.ReadFile, 0) {
+	for _, r := range security.ScriptRefs(cmd, "", security.NewSnapshotter(), 0) {
 		scripts = append(scripts, map[string]string{"path": r.Path, "content": string(r.Full)})
 	}
 	b, _ := json.Marshal(map[string]any{"cmdline": cmd, "reasons": reasons, "run_id": "sess", "task_id": taskID,

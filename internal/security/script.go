@@ -3,6 +3,7 @@ package security
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -439,7 +440,7 @@ type scriptCall struct {
 // scriptVerdict judges a script call by the script's contents. It returns
 // false (the caller keeps its old verdict) when contents cannot be used.
 func (c *Classifier) scriptVerdict(call scriptCall, v *Verdict, depth int) bool {
-	if c.ReadFile == nil || c.inner || depth > maxDepth || call.tokenDyn {
+	if c.Snap == nil || c.inner || depth > maxDepth || call.tokenDyn {
 		return false
 	}
 	if !call.direct && (call.name != "bash" && call.name != "sh" || !strictShellFlags(call.flags)) {
@@ -451,7 +452,10 @@ func (c *Classifier) scriptVerdict(call scriptCall, v *Verdict, depth int) bool 
 	}
 	abs := call.token
 	if !filepath.IsAbs(abs) {
-		if lc.dirUncertain || c.CWD == "" {
+		// A relative script resolves against the shell's cwd at run time: only
+		// trust our idea of it when it came from the hook payload or an
+		// absolute cd earlier in the line.
+		if lc.dirUncertain || c.CWD == "" || !(c.CWDTrusted || c.cwdFromCd) {
 			return false
 		}
 		abs = absIn(c.CWD, call.token)
@@ -464,6 +468,7 @@ func (c *Classifier) scriptVerdict(call scriptCall, v *Verdict, depth int) bool 
 		return false
 	}
 	label := call.name + ": script " + abs
+	realPath := abs
 	if call.prefixed || lc.envTainted != "" {
 		v.raise(Red, label+" runs with a changed environment ("+firstNonEmptyStr(lc.envTainted, "prefix assignment")+")")
 		return true
@@ -484,20 +489,22 @@ func (c *Classifier) scriptVerdict(call scriptCall, v *Verdict, depth int) bool 
 			v.raise(Red, label+" may be changed by another part of the same command")
 			return true
 		}
-		resolved := resolveExisting(abs)
-		fi, err := os.Stat(resolved)
-		if err != nil || !fi.Mode().IsRegular() {
-			return false // not a plain file (FIFO, device, missing): opaque
-		}
-		if fi.Size() > maxScriptBytes {
+		// One read through one descriptor; where the file really is comes
+		// from that descriptor, not from another lookup of the path.
+		snap := c.Snap.Read(abs)
+		switch {
+		case errors.Is(snap.Err, ErrTooLarge):
 			v.raise(Red, label+" too large to analyse")
 			return true
+		case snap.Err != nil:
+			return false // missing, symlink swapped in, FIFO, device: opaque
 		}
-		data, err := c.ReadFile(resolved)
-		if err != nil {
-			return false
+		if c.scratchRootFor(snap.Real) == "" {
+			v.raise(Red, label+" resolves outside the scratch dirs ("+snap.Real+")")
+			return true
 		}
-		content = data
+		realPath = snap.Real
+		content = snap.Data
 	}
 	if p := contentProblem(content); p != "" {
 		v.raise(Red, label+" "+p)
@@ -510,7 +517,7 @@ func (c *Classifier) scriptVerdict(call scriptCall, v *Verdict, depth int) bool 
 			return true
 		}
 	}
-	confine := scriptConfine(abs)
+	confine := scriptConfine(realPath)
 	ok, detail := c.scriptReadOnly(string(content), confine, depth+1)
 	if ok {
 		v.raise(Yellow, "")
@@ -1325,8 +1332,24 @@ type PinScript struct {
 	Content []byte
 }
 
+// shellQuote single-quotes s for bash and zsh. Pieces between apostrophes
+// are quoted separately and joined with \' so the result never contains ”
+// (which zsh's RC_QUOTES would read as a literal apostrophe inside a string).
 func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+	parts := strings.Split(s, "'")
+	var b strings.Builder
+	for i, p := range parts {
+		if i > 0 {
+			b.WriteString(`\'`)
+		}
+		if p != "" {
+			b.WriteString("'" + p + "'")
+		}
+	}
+	if b.Len() == 0 {
+		return "''"
+	}
+	return b.String()
 }
 
 func isWordBoundary(b byte) bool {
@@ -1436,9 +1459,9 @@ func PinsFromRefs(refs []ScriptRef) ([]PinScript, error) {
 }
 
 // ScriptRefs lists the script files that line runs (bash x.sh, ./x.sh),
-// resolved against cwd, with their current sha256 read via readFile. It is
-// what an allow rule pins (STA-868).
-func ScriptRefs(line, cwd string, readFile func(string) ([]byte, error), contentLimit int) []ScriptRef {
+// resolved against cwd, with their sha256 read once through snap (nil: no
+// reads). It is what an allow rule pins (STA-868).
+func ScriptRefs(line, cwd string, snap *Snapshotter, contentLimit int) []ScriptRef {
 	c := &Classifier{CWD: cwd}
 	var out []ScriptRef
 	var walk func(line, cwd string, depth int)
@@ -1480,19 +1503,18 @@ func ScriptRefs(line, cwd string, readFile func(string) ([]byte, error), content
 					ref.Path = filepath.Clean(abs)
 					ref.Trusted = !lc.writes[ref.Path] && lc.heredocWrites[ref.Path] == nil &&
 						lc.opaqueWriter == "" && lc.scriptRuns <= 1
-					if readFile != nil {
-						if fi, err := os.Stat(resolveExisting(ref.Path)); err == nil && fi.Mode().IsRegular() && fi.Size() <= maxScriptBytes {
-							if data, err := readFile(resolveExisting(ref.Path)); err == nil {
-								sum := sha256.Sum256(data)
-								ref.SHA256 = hex.EncodeToString(sum[:])
-								ref.Full = data
-								shown := data
-								if contentLimit > 0 && len(shown) > contentLimit {
-									shown = shown[:contentLimit]
-								}
-								if contentLimit != 0 {
-									ref.Content = string(shown)
-								}
+					if snap != nil {
+						if sn := snap.Read(ref.Path); sn.Err == nil {
+							data := sn.Data
+							sum := sha256.Sum256(data)
+							ref.SHA256 = hex.EncodeToString(sum[:])
+							ref.Full = data
+							shown := data
+							if contentLimit > 0 && len(shown) > contentLimit {
+								shown = shown[:contentLimit]
+							}
+							if contentLimit != 0 {
+								ref.Content = string(shown)
 							}
 						}
 					}

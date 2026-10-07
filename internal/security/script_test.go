@@ -235,11 +235,11 @@ func TestParseHeredoc(t *testing.T) {
 func TestScriptRefs(t *testing.T) {
 	_, dir := scratchClassifier(t)
 	p := writeScript(t, dir, "s.sh", "ls\n")
-	refs := ScriptRefs("cd "+dir+" && bash ./s.sh > out.tsv", "/", os.ReadFile, 100)
+	refs := ScriptRefs("cd "+dir+" && bash ./s.sh > out.tsv", "/", NewSnapshotter(), 100)
 	if len(refs) != 1 || refs[0].Path != p || refs[0].SHA256 == "" || !refs[0].Trusted || refs[0].Content != "ls\n" {
 		t.Fatalf("refs: %+v", refs)
 	}
-	refs = ScriptRefs("echo x > "+p+"; bash "+p, "/", os.ReadFile, 0)
+	refs = ScriptRefs("echo x > "+p+"; bash "+p, "/", NewSnapshotter(), 0)
 	if len(refs) != 1 || refs[0].Trusted {
 		t.Fatalf("rewritten script must be untrusted: %+v", refs)
 	}

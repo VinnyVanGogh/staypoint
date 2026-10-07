@@ -23,7 +23,7 @@ func pinFixture(t *testing.T, body string) (*security.Classifier, string, string
 	if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return &security.Classifier{Home: t.TempDir(), CWD: dir, ReadFile: os.ReadFile, ScratchDirs: []string{dir}}, dir, p
+	return &security.Classifier{Home: t.TempDir(), CWD: dir, CWDTrusted: true, Snap: security.NewSnapshotter(), ScratchDirs: []string{dir}}, dir, p
 }
 
 func TestPinJudged_RewritesToJudgedBytes(t *testing.T) {
@@ -68,7 +68,7 @@ func TestPinJudged_UnpinnableIsRed(t *testing.T) {
 
 func TestSnapshotScripts_PinsHeldCommand(t *testing.T) {
 	_, dir, p := pinFixture(t, "git push origin HEAD\n")
-	scripts, pinned := snapshotScripts("bash "+p, dir)
+	scripts, pinned := snapshotScripts("bash "+p, dir, security.NewSnapshotter())
 	if len(scripts) != 1 || scripts[0].Content != "git push origin HEAD\n" || pinned != "bash -c 'git push origin HEAD\n' "+p {
 		t.Fatalf("snapshot %+v pinned %q", scripts, pinned)
 	}
@@ -79,7 +79,25 @@ func TestSnapshotScripts_PinsHeldCommand(t *testing.T) {
 	if strings.Contains(pinned, "rm -rf") {
 		t.Fatal("pinned command depends on the file")
 	}
-	if s, pn := snapshotScripts("ls", dir); s != nil || pn != "" {
+	if s, pn := snapshotScripts("ls", dir, security.NewSnapshotter()); s != nil || pn != "" {
 		t.Fatalf("no scripts: %+v %q", s, pn)
+	}
+}
+
+// One read per hook run: the bytes the classifier judged are the bytes the
+// gate request snapshots and pins, even if the file changes in between.
+func TestHook_JudgedAndSnapshottedBytesAreOneRead(t *testing.T) {
+	c, dir, p := pinFixture(t, "ls\n")
+	cmd := "bash " + p + " > /etc/hosts.bak" // Red overall (sensitive path), script judged on the way
+	v := c.Classify(cmd)
+	if v.Tier != security.Red {
+		t.Fatalf("setup: %s", v.Tier)
+	}
+	if err := os.WriteFile(p, []byte("rm -rf ~\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scripts, pinned := snapshotScripts(cmd, dir, c.Snap)
+	if len(scripts) != 1 || scripts[0].Content != "ls\n" || strings.Contains(pinned, "rm -rf") {
+		t.Fatalf("snapshot re-read the file: %+v %q", scripts, pinned)
 	}
 }

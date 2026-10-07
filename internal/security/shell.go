@@ -2,6 +2,7 @@ package security
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -114,9 +115,10 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 			(n >= '0' && n <= '9') || strings.ContainsRune("@*#?$!-", n)
 	}
 
-	if strings.ContainsRune(line, '\r') && strings.Contains(line, "<<") {
-		// bash keeps \r in words and delimiter lines; we cannot match it.
-		return nil, nil, fmt.Errorf("carriage return in a command with a here-document")
+	if strings.ContainsRune(line, '\r') {
+		// bash keeps \r inside words (so "x\r#" is not a comment there, and
+		// "EOF\r" is not a delimiter); we would split differently. Refuse.
+		return nil, nil, fmt.Errorf("carriage return in command")
 	}
 	if strings.ContainsRune(line, 0) {
 		return nil, nil, fmt.Errorf("NUL byte in command")
@@ -152,6 +154,9 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 						tok.WriteRune(rs[j])
 					}
 				case rs[j] == '$' && expands(rs, j):
+					if e := checkBraceExpansion(rs, j); e != nil {
+						return nil, nil, e
+					}
 					dyn = true
 					if rs[j+1] != '(' {
 						tok.WriteRune(rs[j])
@@ -195,7 +200,28 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 			for i+1 < len(rs) && rs[i+1] != '\n' {
 				i++
 			}
+		case c == '$' && i+1 < len(rs) && rs[i+1] == '\'':
+			// $'...' (ANSI-C quoting): \' does not end it, unlike '...'.
+			// The value after escape processing is unknown to us: dynamic.
+			inTok, dyn, udyn, quoted = true, true, true, true
+			j := i + 2
+			for ; j < len(rs) && rs[j] != '\''; j++ {
+				if rs[j] == '\\' {
+					j++
+				}
+				if j < len(rs) {
+					tok.WriteRune(rs[j])
+				}
+			}
+			if j >= len(rs) {
+				return nil, nil, fmt.Errorf("unterminated $'...' quote")
+			}
+			tok.WriteString("$ANSI")
+			i = j
 		case c == '$' && expands(rs, i):
+			if e := checkBraceExpansion(rs, i); e != nil {
+				return nil, nil, e
+			}
 			inTok, dyn, udyn = true, true, true
 			tok.WriteRune(c)
 		case c == '$' && i+1 < len(rs) && rs[i+1] == '(':
@@ -258,6 +284,11 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 				return nil, nil, err
 			}
 			for _, r := range pendingDocs {
+				if !r.quoted && unquotedContinuationRe.MatchString(r.body) {
+					// bash joins "\<newline>" in an unquoted body, which can
+					// move where the document ends.
+					return nil, nil, fmt.Errorf("line continuation in an unquoted here-document")
+				}
 				if !r.quoted {
 					// An unquoted body still expands $(...) and `...`.
 					s, err := heredocSubs(r.body)
@@ -295,6 +326,36 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 		return nil, nil, fmt.Errorf("unterminated here-document")
 	}
 	return segs, subs, nil
+}
+
+var unquotedContinuationRe = regexp.MustCompile(`(?m)\\$`)
+
+// checkBraceExpansion refuses ${...} (starting at rs[k] == '$') whose body
+// contains quotes, backticks or $(: bash parses nested quoting inside ${...}
+// that our tokenizer does not, so where the word ends could differ.
+func checkBraceExpansion(rs []rune, k int) error {
+	if k+1 >= len(rs) || rs[k+1] != '{' {
+		return nil
+	}
+	depth := 0
+	for j := k + 1; j < len(rs); j++ {
+		switch rs[j] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return nil
+			}
+		case '\'', '"', '`', '\\', '\n':
+			return fmt.Errorf("quoting or escapes inside ${...}")
+		case '(':
+			if rs[j-1] == '$' {
+				return fmt.Errorf("command substitution inside ${...}")
+			}
+		}
+	}
+	return fmt.Errorf("unterminated ${...}")
 }
 
 // readHeredocs fills each document's body from the lines starting at rs[start]
