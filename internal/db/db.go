@@ -1415,6 +1415,23 @@ var Migrations = []Migration{
 			return tx.Commit()
 		},
 	},
+	{
+		// 43: main ends at 41; 42 is left free so an in-flight migration PR
+		// can renumber into it (PR #247 currently uses 40, which collides
+		// with main's 40 and must move). task-d4145d27 / #245-2.
+		Version: 43,
+		Name:    "work_product_provenance",
+		Up: func(conn *sql.DB) error {
+			// #245-2: who created a registered branch. Approve deletes only
+			// a branch StayPoint made (staypoint) or the task created first
+			// (task); existing rows stay '' (unknown) and are never deleted.
+			_, err := conn.Exec(`ALTER TABLE task_work_products ADD COLUMN provenance TEXT NOT NULL DEFAULT '';`)
+			if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+				return err
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {

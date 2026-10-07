@@ -1127,28 +1127,28 @@ func DeleteBranch(ctx context.Context, repoDir, branch string) error {
 	if err := guardDeletableBranch(ctx, repoDir, branch); err != nil {
 		return err
 	}
-	// Use refs/heads/ form so the arg can never be misinterpreted as a flag.
-	_, err := gitOutput(ctx, repoDir, "push", "origin", "--delete", "refs/heads/"+branch)
-	return err
+	tip, err := remoteBranchTip(ctx, repoDir, branch)
+	if err != nil || tip == "" {
+		return err
+	}
+	return deleteRemoteBranchLeased(ctx, repoDir, branch, tip)
 }
 
 // guardDeletableBranch rejects branch names that must never be deleted:
-// malformed names, main, master, and the remote default branch.
+// malformed names; main, master, dev-server and the remote default branch in
+// any letter case; and names that git resolves only through a ref of another
+// name (#245: on a case-insensitive filesystem refs/heads/Main is main).
 func guardDeletableBranch(ctx context.Context, repoDir, branch string) error {
 	if err := validateBranch(branch); err != nil {
 		return err
 	}
-	if branch == "main" || branch == "master" || branch == WorkTargetBranch {
+	if protectedName(branch) {
 		return fmt.Errorf("%w: %q", ErrProtectedBranch, branch)
 	}
-	// Detect remote default branch (e.g. "origin/main" → "main").
-	if remoteRef, err := gitOutput(ctx, repoDir, "rev-parse", "--abbrev-ref", "origin/HEAD"); err == nil {
-		defaultBranch := strings.TrimPrefix(remoteRef, "origin/")
-		if defaultBranch != "" && branch == defaultBranch {
-			return fmt.Errorf("%w: %q is the remote default branch", ErrProtectedBranch, branch)
-		}
+	if protectedName(branch, defaultBranchNames(ctx, repoDir)...) {
+		return fmt.Errorf("%w: %q is the remote default branch", ErrProtectedBranch, branch)
 	}
-	return nil
+	return requireExactRefs(ctx, repoDir, branch)
 }
 
 // CleanupMergedBranch removes what is left of a task once its review has been
@@ -1171,7 +1171,7 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 	if err := guardDeletableBranch(ctx, repoDir, branch); err != nil {
 		return err
 	}
-	if card.TargetBranch != "" && branch == card.TargetBranch {
+	if card.TargetBranch != "" && strings.EqualFold(branch, card.TargetBranch) {
 		return fmt.Errorf("%w: %q is the merge target", ErrProtectedBranch, branch)
 	}
 	if mainSHA == "" {
@@ -1184,7 +1184,7 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 	}
 	// git refuses to delete a branch that is checked out, so never touch the
 	// branch repoDir itself is on (the merge leaves it on main).
-	if cur, err := gitOutput(ctx, repoDir, "symbolic-ref", "--short", "-q", "HEAD"); err == nil && cur == branch {
+	if cur, err := gitOutput(ctx, repoDir, "symbolic-ref", "--short", "-q", "HEAD"); err == nil && strings.EqualFold(cur, branch) {
 		return fmt.Errorf("%w: %q is checked out in %s", ErrProtectedBranch, branch, repoDir)
 	}
 
@@ -1232,12 +1232,12 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 		}
 		// Ask the remote directly rather than trusting the tracking ref, which
 		// a narrow fetch refspec may not maintain.
-		out, err := gitOutput(ctx, repoDir, "ls-remote", "--heads", "origin", "refs/heads/"+branch)
-		if err != nil {
+		// Only exactly refs/heads/<branch> (ls-remote matches name tails),
+		// and never a symbolic ref on the remote (deleting it deletes its
+		// target).
+		var err error
+		if remoteTip, err = remoteBranchTip(ctx, repoDir, branch); err != nil {
 			return fmt.Errorf("read remote branch %s: %w; nothing deleted", branch, err)
-		}
-		if fields := strings.Fields(out); len(fields) > 0 {
-			remoteTip = fields[0]
 		}
 		// A tip missing locally cannot be part of main's history, so the
 		// ancestor check fails closed for it too.
@@ -1262,6 +1262,25 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 
 	var errs []error
 
+	// Immediately before deleting: the branch must still be a plain ref of
+	// exactly its name (an agent may have swapped it for a symref since the
+	// checks), and every protected ref is recorded so a delete that reached
+	// one anyway is caught and undone.
+	if err := requireExactRefs(ctx, repoDir, branch); err != nil {
+		return fmt.Errorf("%w; nothing deleted", err)
+	}
+	protected := protectedNames(ctx, repoDir, card.TargetBranch)
+	localBefore, err := localRefSnapshot(ctx, repoDir, protected)
+	if err != nil {
+		return fmt.Errorf("snapshot protected refs: %w; nothing deleted", err)
+	}
+	var remoteBefore map[string]string
+	if hasOrigin && remoteTip != "" {
+		if remoteBefore, err = remoteRefSnapshot(ctx, repoDir, protected); err != nil {
+			return fmt.Errorf("snapshot protected remote refs: %w; nothing deleted", err)
+		}
+	}
+
 	if localTip != "" {
 		// update-ref skips branch -D's "checked out in a worktree" refusal,
 		// so check that ourselves: the task's own worktrees are gone by now,
@@ -1270,8 +1289,9 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 			errs = append(errs, fmt.Errorf("delete local branch: %w", err))
 		} else if wt != "" {
 			errs = append(errs, fmt.Errorf("local branch %s is checked out in %s; not deleted", branch, wt))
-		} else if _, err := gitOutput(ctx, repoDir, "update-ref", "-d", "refs/heads/"+branch, localTip); err != nil {
-			// Like the remote lease: only delete the tip that was checked.
+		} else if _, err := gitOutput(ctx, repoDir, "update-ref", "--no-deref", "-d", "refs/heads/"+branch, localTip); err != nil {
+			// Like the remote lease: only delete the tip that was checked;
+			// --no-deref: never the ref a symref points to.
 			errs = append(errs, fmt.Errorf("delete local branch: %w", err))
 		} else {
 			// branch -D would have dropped the branch's config too.
@@ -1282,6 +1302,18 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 	if hasOrigin && remoteTip != "" {
 		if err := deleteRemoteBranchLeased(ctx, repoDir, branch, remoteTip); err != nil {
 			errs = append(errs, fmt.Errorf("delete remote branch: %w", err))
+		}
+	}
+
+	// After: fail loudly if any protected ref vanished or moved.
+	if err := checkLocalProtected(ctx, repoDir, protected, localBefore); err != nil {
+		errs = append(errs, err)
+	}
+	if remoteBefore != nil {
+		if after, err := remoteRefSnapshot(ctx, repoDir, protected); err != nil {
+			errs = append(errs, fmt.Errorf("re-check protected remote refs: %w", err))
+		} else if err := compareSnapshots("origin", remoteBefore, after, nil); err != nil {
+			errs = append(errs, err)
 		}
 	}
 
@@ -1365,19 +1397,35 @@ func SetBranchCleanup(db *sql.DB, cardID string, deleted bool, errMsg string) er
 
 // CurrentBranchHEAD resolves the HEAD SHA for a branch in repoDir: the local
 // branch, else origin's copy (a registered branch the agent pushed from
-// another checkout), else whatever git resolves the name to (e.g. HEAD).
+// another checkout), else HEAD or a commit name. A name that resolves only
+// through a ref of another name (refs/heads/Main opening refs/heads/main on
+// a case-insensitive filesystem) is refused, never resolved (#245).
 func CurrentBranchHEAD(ctx context.Context, repoDir, branch string) (string, error) {
 	if err := validateBranch(branch); err != nil {
 		return "", err
 	}
-	sha, err := gitOutput(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch+"^{commit}")
-	if err == nil && sha != "" {
-		return sha, nil
+	if err := requireExactRefs(ctx, repoDir, branch); err != nil {
+		return "", err
 	}
-	if remote, rErr := gitOutput(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch+"^{commit}"); rErr == nil && remote != "" {
-		return remote, nil
+	found, err := exactRefs(ctx, repoDir, branch)
+	if err != nil {
+		return "", err
 	}
-	// Anything else git resolves (HEAD, a commit) as before.
+	if found["refs/heads/"+branch] {
+		if sha, err := gitOutput(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch+"^{commit}"); err == nil && sha != "" {
+			return sha, nil
+		}
+	}
+	if found["refs/remotes/origin/"+branch] {
+		if remote, err := gitOutput(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch+"^{commit}"); err == nil && remote != "" {
+			return remote, nil
+		}
+	}
+	// HEAD or a commit name, as before; never another branch-like name,
+	// which git would look up through refs/heads and refs/remotes again.
+	if branch != "HEAD" && !hexObjectRe.MatchString(branch) {
+		return "", fmt.Errorf("branch %q not found", branch)
+	}
 	return gitOutput(ctx, repoDir, "rev-parse", "--verify", "--quiet", branch+"^{commit}")
 }
 

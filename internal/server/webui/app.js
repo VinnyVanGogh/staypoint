@@ -9358,14 +9358,27 @@ function renderShipReviewCardFromData(container, taskId, card) {
       clearErr();
       rjSubmit.disabled = true;
       try {
-        const r = await withBoardWebAuthn((sessionToken, assertion) =>
+        const sendReject = (confirmUnmerged) => withBoardWebAuthn((sessionToken, assertion) =>
           fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/reject`, {
             method: 'POST',
             headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
-            body: JSON.stringify({ comment, delete_branch: delBranch }),
+            body: JSON.stringify({ comment, delete_branch: delBranch,
+              ...(confirmUnmerged ? { confirm_delete_unmerged: confirmUnmerged } : {}) }),
           }), 'rejecting the review',
         );
+        let r = await sendReject('');
         if (r === null) { rjSubmit.disabled = false; return; }
+        if (r.status === 409 && delBranch) {
+          // The branch holds work not in the target: deleting it needs the
+          // Board to name the branch (a separate, explicit override).
+          const body = await r.clone().json().catch(() => ({}));
+          if (body.error === 'unmerged_branch') {
+            const typed = prompt(`${body.message}\n\nType the branch name (${body.branch}) to delete it and discard that work, or Cancel to keep it.`);
+            if (typed === null) { rjSubmit.disabled = false; return; }
+            r = await sendReject(typed.trim());
+            if (r === null) { rjSubmit.disabled = false; return; }
+          }
+        }
         if (!r.ok) throw await boardActionError(r);
         clearShipReviewHeaderActions(taskId);
         section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'rejected', '', comment));

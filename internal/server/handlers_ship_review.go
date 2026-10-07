@@ -893,7 +893,9 @@ func (h *ShipReviewHandler) cleanupMergedBranch(reqCtx gocontext.Context, card *
 	// commands halfway through.
 	ctx := gocontext.WithoutCancel(reqCtx)
 	errMsg := ""
-	if err := shipreview.CleanupMergedBranch(ctx, task.RepoPath, card, mainSHA); err != nil {
+	// #245-2: only a branch the task owns is deleted; anything else stays,
+	// with the reason shown on the card.
+	if err := shipreview.CleanupTaskBranch(ctx, h.db, task.RepoPath, card, mainSHA); err != nil {
 		errMsg = err.Error()
 	}
 	_ = shipreview.SetBranchCleanup(h.db, card.ID, errMsg == "", errMsg)
@@ -966,8 +968,38 @@ func (h *ShipReviewHandler) Reject(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Comment      string `json:"comment"`
 		DeleteBranch bool   `json:"delete_branch"`
+		// ConfirmDeleteUnmerged must name card.Branch exactly to delete a
+		// branch whose work is not in the target (a separate Board override).
+		ConfirmDeleteUnmerged string `json:"confirm_delete_unmerged"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	// #249 F2: the delete goes through the same owned + guarded checks as
+	// post-merge cleanup, and is checked before the review is rejected so a
+	// refused delete leaves the card as it was.
+	var plan *shipreview.RejectBranchDelete
+	ctx := r.Context()
+	if req.DeleteBranch {
+		if card.PRNumber > 0 {
+			auth, ok := h.requireGHAuth(w, task)
+			if !ok {
+				return
+			}
+			ctx = auth.WithAuth(ctx)
+		}
+		var err error
+		if plan, err = shipreview.PlanRejectBranchDelete(ctx, h.db, task.RepoPath, card, req.ConfirmDeleteUnmerged); err != nil {
+			code := "branch_delete_refused"
+			switch {
+			case errors.Is(err, shipreview.ErrBranchNotOwned):
+				code = "branch_not_owned"
+			case errors.Is(err, shipreview.ErrUnmergedBranch):
+				code = "unmerged_branch"
+			}
+			writeJSONStatus(w, http.StatusConflict, map[string]any{"error": code, "message": "delete branch refused: " + err.Error(), "branch": card.Branch})
+			return
+		}
+	}
 
 	if err := shipreview.Reject(h.db, card, req.Comment); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -976,17 +1008,9 @@ func (h *ShipReviewHandler) Reject(w http.ResponseWriter, r *http.Request) {
 
 	shipreview.StopDevServer(h.db, card)
 
-	if req.DeleteBranch {
-		ctx := r.Context()
-		if card.PRNumber > 0 {
-			auth, ok := h.requireGHAuth(w, task)
-			if !ok {
-				return
-			}
-			ctx = auth.WithAuth(ctx)
-		}
-		if err := shipreview.DeleteBranch(ctx, task.RepoPath, card.Branch); err != nil {
-			writeError(w, http.StatusConflict, "delete branch failed: "+err.Error())
+	if plan != nil {
+		if err := shipreview.DeleteRejectedBranch(ctx, task.RepoPath, plan); err != nil {
+			writeError(w, http.StatusConflict, "rejected; delete branch failed: "+err.Error())
 			return
 		}
 	}

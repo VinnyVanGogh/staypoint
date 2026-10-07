@@ -14,6 +14,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
+	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 	"github.com/google/uuid"
 )
 
@@ -1493,7 +1494,19 @@ func RegisterWorkProduct(db *sql.DB, taskID, productType, reference string) (*Ta
 	if reference == "" {
 		return nil, fmt.Errorf("%w: a reference (--ref) is required", ErrInvalidWorkProduct)
 	}
-	res, err := db.Exec(`INSERT INTO task_work_products (task_id, product_type, reference) VALUES (?, ?, ?)`, task.ID, typ, reference)
+	provenance := ""
+	if typ == "branch" {
+		// #245: refuse case variants of protected branches and names that
+		// resolve through another ref, and record whether the task created
+		// the branch (only then may Approve delete it).
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		provenance, err = shipreview.ClassifyRegisteredBranch(ctx, db, task.RepoPath, task.ID, reference)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidWorkProduct, err)
+		}
+	}
+	res, err := db.Exec(`INSERT INTO task_work_products (task_id, product_type, reference, provenance) VALUES (?, ?, ?, ?)`, task.ID, typ, reference, provenance)
 	if err != nil {
 		return nil, fmt.Errorf("register work product: %w", err)
 	}

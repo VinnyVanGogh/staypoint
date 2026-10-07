@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -136,15 +137,66 @@ func NewLocal() *TogetherDecisionClient {
 	return &TogetherDecisionClient{
 		baseURL:    baseURL,
 		model:      firstNonEmpty(os.Getenv("DECISION_LOCAL_MODEL"), defaultLocalModel),
-		httpClient: &http.Client{Timeout: 15 * time.Second},
+		httpClient: newLoopbackHTTPClient(),
+	}
+}
+
+// newLoopbackHTTPClient is an http.Client that cannot leave this machine
+// (#243-1): it never follows redirects (a 3xx is returned as the response),
+// uses no proxy, and its dialer resolves the host and refuses to connect
+// unless every address is loopback.
+func newLoopbackHTTPClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	return &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			Proxy: nil,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+				if err != nil {
+					return nil, fmt.Errorf("decision: resolve %q: %w", host, err)
+				}
+				if len(ips) == 0 {
+					return nil, fmt.Errorf("decision: refusing non-loopback host %q: no addresses", host)
+				}
+				for _, ip := range ips {
+					if !ip.IP.IsLoopback() {
+						return nil, fmt.Errorf("decision: refusing non-loopback address %s for host %q", ip.IP, host)
+					}
+				}
+				// Dial the checked addresses, not the name, so a second
+				// lookup cannot answer differently. "localhost" may resolve
+				// to ::1 first while the server listens on 127.0.0.1 only.
+				var lastErr error
+				for _, ip := range ips {
+					conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.IP.String(), port))
+					if err == nil {
+						return conn, nil
+					}
+					lastErr = err
+				}
+				return nil, lastErr
+			},
+			ForceAttemptHTTP2:   false,
+			TLSHandshakeTimeout: 5 * time.Second,
+			MaxIdleConns:        2,
+			IdleConnTimeout:     30 * time.Second,
+		},
 	}
 }
 
 // isLoopbackURL reports whether raw is an http(s) URL whose host is
-// localhost or a loopback IP.
+// localhost or a loopback IP, with no userinfo.
 func isLoopbackURL(raw string) bool {
 	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.Opaque != "" {
 		return false
 	}
 	h := u.Hostname()
@@ -385,6 +437,9 @@ func (c *TogetherDecisionClient) callSystemOne(ctx context.Context, req Decision
 	if !ok || ans.Choice == "" {
 		return DecisionResult{RawResponse: string(raw)}, fmt.Errorf("decision: no answer in response")
 	}
+	if err := validateSystemOneAnswer(ans.Choice, ans.Probabilities, req.Options); err != nil {
+		return DecisionResult{RawResponse: string(raw)}, err
+	}
 	for _, o := range req.Options {
 		if o.Key == ans.Choice {
 			return DecisionResult{
@@ -397,4 +452,46 @@ func (c *TogetherDecisionClient) callSystemOne(ctx context.Context, req Decision
 		}
 	}
 	return DecisionResult{RawResponse: string(raw)}, fmt.Errorf("decision: unknown choice %q", ans.Choice)
+}
+
+// validateSystemOneAnswer rejects a /v1/systemone answer that is not a
+// probability distribution over the options with the choice as its mode
+// (#243-2): every probability finite and in [0,1], one per option and no
+// others, summing to 1 within 0.05, and the chosen option an option with the
+// highest probability. Callers compare the probability to a trust threshold,
+// so an unchecked p=7 would clear any threshold.
+func validateSystemOneAnswer(choice string, probs map[string]float64, options []Option) error {
+	if len(probs) == 0 {
+		return fmt.Errorf("decision: answer has no probabilities")
+	}
+	known := make(map[string]bool, len(options))
+	for _, o := range options {
+		known[o.Key] = true
+	}
+	if !known[choice] {
+		return fmt.Errorf("decision: unknown choice %q", choice)
+	}
+	sum, maxP := 0.0, math.Inf(-1)
+	for k, p := range probs {
+		if !known[k] {
+			return fmt.Errorf("decision: probability for unknown option %q", k)
+		}
+		if math.IsNaN(p) || math.IsInf(p, 0) || p < 0 || p > 1 {
+			return fmt.Errorf("decision: probability %v for %q is outside [0,1]", p, k)
+		}
+		sum += p
+		maxP = math.Max(maxP, p)
+	}
+	for k := range known {
+		if _, ok := probs[k]; !ok {
+			return fmt.Errorf("decision: no probability for option %q", k)
+		}
+	}
+	if sum < 0.95 || sum > 1.05 {
+		return fmt.Errorf("decision: probabilities sum to %.3f, not 1", sum)
+	}
+	if probs[choice] < maxP {
+		return fmt.Errorf("decision: choice %q (p=%.2f) is not the most probable option (p=%.2f)", choice, probs[choice], maxP)
+	}
+	return nil
 }
