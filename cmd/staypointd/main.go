@@ -432,6 +432,13 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 				queueRun(h, taskID, reason, orchestrator.WaitFor(runErr))
 				return
 			}
+			if errors.Is(runErr, orchestrator.ErrAlreadyClaimed) {
+				// The task is already running (e.g. Run Now pressed again). With
+				// parallel slots this no longer hits the global cap first; it must
+				// stay quiet and not post an error state over the live run.
+				slog.Info("run refused: task already running", slog.String("task", taskID))
+				return
+			}
 			slog.Error("harness run failed", slog.String("task", taskID), slog.Any("error", runErr))
 			sr.EmitState("error")
 			return

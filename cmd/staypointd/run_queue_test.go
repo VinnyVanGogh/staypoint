@@ -139,6 +139,39 @@ func TestWireOnWake_QuotaLockedRunWaits(t *testing.T) {
 	}
 }
 
+// TestWireOnWake_DuplicateWakeOfRunningTaskIsQuiet: with a cap of 1, a second
+// Run Now on a running task hit the global cap and was dropped quietly. With
+// parallel slots it reaches ErrAlreadyClaimed instead; that must not post a
+// "Finished: error" state (and run.state SSE) over the live run.
+func TestWireOnWake_DuplicateWakeOfRunningTaskIsQuiet(t *testing.T) {
+	orchestrator.GlobalDispatcher = orchestrator.NewDispatcher()
+	slots := freshSlots(t, 3)
+	var locked atomic.Bool
+	stubQuota(t, &locked)
+	store := openTestStore(t)
+	dir := t.TempDir()
+	const taskID = "queue-dup-task-1"
+	insertWakeTask(t, store.DB(), taskID)
+	var calls atomic.Int32
+	wireOnWake(store, dir, nil, completingAdapter(&calls), &stubWM{dir: dir})
+
+	// The task's live run holds its slot.
+	if err := slots.Acquire(taskID, orchestrator.RepoKey(dir)); err != nil {
+		t.Fatal(err)
+	}
+	orchestrator.GlobalDispatcher.Wake(taskID, "run_now", "")
+	drain(t)
+	if calls.Load() != 0 {
+		t.Fatal("duplicate wake started a second run")
+	}
+	var n int
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM run_steps WHERE task_id=?`, taskID).Scan(&n)
+	if n != 0 {
+		t.Fatalf("duplicate wake wrote %d timeline steps, want 0", n)
+	}
+	slots.Release(taskID)
+}
+
 // TestWireOnWake_MissingQueuedTaskLeavesQueue: a queued task deleted before
 // its turn must not keep its place (it would block its repo forever).
 func TestWireOnWake_MissingQueuedTaskLeavesQueue(t *testing.T) {
