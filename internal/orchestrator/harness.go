@@ -1058,15 +1058,24 @@ func buildRunID(agentID string) string {
 }
 
 // stepTeeWriter tees all writes to dst AND feeds each newline-delimited line to StepRecorder.
-// textDetected is set only when [[TASK_COMPLETE]] appears in an assistant text block,
-// never in thinking/tool/user blocks or echoed prompts.
+// textDetected is set only when [[TASK_COMPLETE]] appears on its own line in the
+// agent's own answer text, never in thinking/tool/user blocks or echoed prompts.
+// The provider's parser decides what counts as answer text, so every output
+// format works: Claude text blocks, the agy/Gemini final response (event=result),
+// token-streamed text, and plain non-JSON output.
 type stepTeeWriter struct {
 	dst          io.Writer
 	rec          *StepRecorder
 	parse        func([]byte) ([]StepDelta, error)
 	buf          []byte
 	textDetected bool
+	// agentText accumulates this turn's answer text so a marker split across
+	// token-streamed deltas (or plain-text lines) is still seen on its own line.
+	agentText []byte
 }
+
+// agentTextMax bounds agentText; past it only the most recent tail is kept.
+const agentTextMax = 1 << 20
 
 func (w *stepTeeWriter) Write(p []byte) (int, error) {
 	n, err := w.dst.Write(p)
@@ -1088,28 +1097,50 @@ func (w *stepTeeWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// checkTextMarker scans text deltas from assistant messages only.
-// It ignores thinking blocks, tool inputs, tool results, and user-turn echoes
-// (the continuation prompt itself contains the literal marker and must not fire).
+// checkTextMarker scans the agent's answer text for the completion marker.
+// Text deltas from input events (FromUser: the continuation prompt itself
+// contains the literal marker), thinking, tool input/output and failed results
+// are ignored.
 func (w *stepTeeWriter) checkTextMarker(line []byte) {
 	if w.textDetected {
 		return
 	}
 	line = bytes.TrimSpace(line)
-	// Quick guard: only assistant events can contain the agent's own text output.
-	// User-turn events carry echoed prompts, tool_result blocks, etc. — never agent output.
-	if !bytes.Contains(line, []byte(`"type":"assistant"`)) {
+	if len(line) == 0 {
 		return
 	}
 	deltas, err := w.parse(line)
 	if err != nil {
+		// Not a stream event. Plain-text output is the agent's answer; a
+		// malformed JSON event is not.
+		if line[0] != '{' {
+			w.addAgentText(line)
+			w.addAgentText([]byte{'\n'})
+			w.textDetected = markerOnOwnLine(string(w.agentText))
+		}
 		return
 	}
 	for _, d := range deltas {
-		if d.Kind == StepDeltaText && markerOnOwnLine(d.Text) {
+		switch {
+		case d.Kind == StepDeltaText && !d.FromUser:
+			w.addAgentText([]byte(d.Text))
+		case d.Kind == StepDeltaResult && !d.IsError:
+			// The final answer (agy result.response, Claude result.result).
+		default:
+			continue
+		}
+		if markerOnOwnLine(d.Text) {
 			w.textDetected = true
 			return
 		}
+	}
+	w.textDetected = markerOnOwnLine(string(w.agentText))
+}
+
+func (w *stepTeeWriter) addAgentText(p []byte) {
+	w.agentText = append(w.agentText, p...)
+	if over := len(w.agentText) - agentTextMax; over > 0 {
+		w.agentText = append(w.agentText[:0], w.agentText[over:]...)
 	}
 }
 
