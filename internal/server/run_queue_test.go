@@ -64,8 +64,8 @@ func TestServer_GetTaskReportsQueuePosition(t *testing.T) {
 	if q := get(second); q["queued"] != false {
 		t.Fatalf("unqueued task: %v", q)
 	}
-	slots.Enqueue(first, "/r1", "run_now", orchestrator.WaitSlots)
-	slots.Enqueue(second, "/r2", "run_now", orchestrator.WaitRepo)
+	slots.Enqueue(first, orchestrator.SlotKey{Dir: "/r1"}, "run_now", orchestrator.WaitSlots)
+	slots.Enqueue(second, orchestrator.SlotKey{Dir: "/r2"}, "run_now", orchestrator.WaitRepo)
 	q := get(second)
 	if q["queued"] != true || q["ahead"] != float64(1) || q["wait"] != "repo" {
 		t.Fatalf("queued task: %v, want queued with 1 ahead waiting on repo", q)

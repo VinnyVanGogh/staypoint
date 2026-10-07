@@ -33,9 +33,19 @@ type Config struct {
 	MaxHandoffsPerRepo    int     `json:"max_handoffs_per_repo" toml:"max_handoffs_per_repo"`
 	PreferredPersonalTool string  `json:"preferred_personal_tool" toml:"preferred_personal_tool"` // "auto" (default), "claude", or "agy"
 	// MaxConcurrentRuns caps how many agent runs the daemon runs in parallel
-	// (STA-773). Each repo still runs one at a time. Zero or unset = 3.
+	// (STA-773). Zero or unset = 9 (3 organizations x 3 runs).
 	// Top-level key: it must appear before any [table] in config.toml.
 	MaxConcurrentRuns int `json:"max_concurrent_runs" toml:"max_concurrent_runs"`
+	// MaxRunsPerRepo caps parallel runs in one git repo; each run has its own
+	// task worktree (STA-867). Zero or unset = 3. A plain (non-git) folder
+	// always runs one at a time. Top-level key.
+	MaxRunsPerRepo int `json:"max_runs_per_repo" toml:"max_runs_per_repo"`
+	// MaxRunsPerOrg caps parallel runs per task organization; tasks with no
+	// organization share the "Unassigned" bucket (STA-867). Zero or unset = 3.
+	// [run_limits.orgs] overrides it per organization. Top-level key.
+	MaxRunsPerOrg int `json:"max_runs_per_org" toml:"max_runs_per_org"`
+	// RunLimits holds the optional [run_limits] table.
+	RunLimits RunLimitsConfig `json:"run_limits,omitempty" toml:"run_limits"`
 	// TurnTimeout caps one agent turn's wall-clock time, as a Go duration
 	// ("2h"). Empty or "0" = no limit (the default). Top-level key.
 	TurnTimeout string `json:"turn_timeout" toml:"turn_timeout"`
@@ -83,17 +93,56 @@ type GatesConfig struct {
 	ShipReview *bool `json:"ship_review,omitempty" toml:"ship_review"`
 }
 
-// DefaultMaxConcurrentRuns is the parallel-run cap when config.toml does not
-// set max_concurrent_runs.
-const DefaultMaxConcurrentRuns = 3
+// Parallel-run caps used when config.toml does not set them (STA-773,
+// STA-867). Keep in sync with the orchestrator defaults.
+const (
+	DefaultMaxConcurrentRuns = 9
+	DefaultMaxRunsPerRepo    = 3
+	DefaultMaxRunsPerOrg     = 3
+)
 
-// MaxConcurrentRunsOrDefault returns max_concurrent_runs, or 3 when unset or
+// RunLimitsConfig is the [run_limits] table of config.toml.
+type RunLimitsConfig struct {
+	// Orgs overrides max_runs_per_org for named organizations
+	// ([run_limits.orgs] "Managed Solution" = 3). Names match
+	// case-insensitively; "Unassigned" is the bucket for tasks with no
+	// organization. Non-positive values are ignored.
+	Orgs map[string]int `json:"orgs,omitempty" toml:"orgs"`
+}
+
+// MaxConcurrentRunsOrDefault returns max_concurrent_runs, or 9 when unset or
 // not positive.
 func (c *Config) MaxConcurrentRunsOrDefault() int {
 	if c == nil || c.MaxConcurrentRuns <= 0 {
 		return DefaultMaxConcurrentRuns
 	}
 	return c.MaxConcurrentRuns
+}
+
+// MaxRunsPerRepoOrDefault returns max_runs_per_repo, or 3 when unset or not
+// positive.
+func (c *Config) MaxRunsPerRepoOrDefault() int {
+	if c == nil || c.MaxRunsPerRepo <= 0 {
+		return DefaultMaxRunsPerRepo
+	}
+	return c.MaxRunsPerRepo
+}
+
+// MaxRunsPerOrgOrDefault returns max_runs_per_org, or 3 when unset or not
+// positive.
+func (c *Config) MaxRunsPerOrgOrDefault() int {
+	if c == nil || c.MaxRunsPerOrg <= 0 {
+		return DefaultMaxRunsPerOrg
+	}
+	return c.MaxRunsPerOrg
+}
+
+// OrgRunLimits returns the [run_limits.orgs] overrides (may be nil).
+func (c *Config) OrgRunLimits() map[string]int {
+	if c == nil {
+		return nil
+	}
+	return c.RunLimits.Orgs
 }
 
 // DefaultStallTimeout is the stall_timeout used when config.toml does not set it.

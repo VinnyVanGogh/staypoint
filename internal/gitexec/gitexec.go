@@ -126,22 +126,39 @@ func Command(ctx context.Context, args ...string) *Cmd {
 	return &Cmd{Cmd: cmd, ctx: ctx, cancel: cancel, args: args, start: time.Now()}
 }
 
-// Run starts git and waits for it.
+// Run starts git and waits for it. A git call that writes the repo's shared
+// state holds that repo's lock while it runs (see repolock.go).
 func (c *Cmd) Run() error {
 	defer c.cancel()
+	unlock, err := lockRepo(c.ctx, c.Dir, c.args)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return c.wrap(c.Cmd.Run())
 }
 
-// Output runs git and returns its stdout.
+// Output runs git and returns its stdout, locking like Run.
 func (c *Cmd) Output() ([]byte, error) {
 	defer c.cancel()
+	unlock, err := lockRepo(c.ctx, c.Dir, c.args)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	out, err := c.Cmd.Output()
 	return out, c.wrap(err)
 }
 
-// CombinedOutput runs git and returns stdout and stderr together.
+// CombinedOutput runs git and returns stdout and stderr together, locking
+// like Run.
 func (c *Cmd) CombinedOutput() ([]byte, error) {
 	defer c.cancel()
+	unlock, err := lockRepo(c.ctx, c.Dir, c.args)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	out, err := c.Cmd.CombinedOutput()
 	return out, c.wrap(err)
 }

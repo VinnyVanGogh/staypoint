@@ -75,7 +75,7 @@ func TestWireOnWake_RefusedRunIsQueuedAndAutoStarts(t *testing.T) {
 	wireOnWake(store, dir, nil, completingAdapter(&calls), &stubWM{dir: dir})
 
 	// Another run elsewhere holds the only slot.
-	if err := slots.Acquire("blocker", "/elsewhere"); err != nil {
+	if err := slots.Acquire("blocker", orchestrator.SlotKey{Dir: "/elsewhere"}); err != nil {
 		t.Fatal(err)
 	}
 	orchestrator.GlobalDispatcher.Wake(taskID, "run_now", "")
@@ -156,7 +156,7 @@ func TestWireOnWake_DuplicateWakeOfRunningTaskIsQuiet(t *testing.T) {
 	wireOnWake(store, dir, nil, completingAdapter(&calls), &stubWM{dir: dir})
 
 	// The task's live run holds its slot.
-	if err := slots.Acquire(taskID, orchestrator.RepoKey(dir)); err != nil {
+	if err := slots.Acquire(taskID, orchestrator.SlotKey{Dir: orchestrator.RepoKey(dir)}); err != nil {
 		t.Fatal(err)
 	}
 	orchestrator.GlobalDispatcher.Wake(taskID, "run_now", "")
@@ -183,7 +183,7 @@ func TestWireOnWake_MissingQueuedTaskLeavesQueue(t *testing.T) {
 	dir := t.TempDir()
 	wireOnWake(store, dir, nil, completingAdapter(new(atomic.Int32)), &stubWM{dir: dir})
 
-	slots.Enqueue("gone-task", dir, "run_now", orchestrator.WaitRepo)
+	slots.Enqueue("gone-task", orchestrator.SlotKey{Dir: dir}, "run_now", orchestrator.WaitRepo)
 	slots.Pump()
 	drain(t)
 	if slots.Position("gone-task").Queued {

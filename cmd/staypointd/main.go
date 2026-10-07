@@ -295,7 +295,7 @@ func runDaemon(ctx context.Context) error {
 	// HarnessRepoRoot comes from STAYPOINT_REPO_ROOT env or harness_repo_root config key.
 	// work_repo_root is intentionally NOT used here — it belongs to billing/bridge.
 	orchestrator.GlobalRunControl.SetDB(dbStore.DB())
-	wireRunQueue(ctx, cfg.MaxConcurrentRunsOrDefault(), httpServer)
+	wireRunQueue(ctx, runLimitsFrom(cfg), httpServer)
 	setTurnLimits(cfg)
 
 	repoRoot := cfg.HarnessRepoRoot

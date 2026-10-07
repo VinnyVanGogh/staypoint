@@ -4,13 +4,21 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
 
-// DefaultMaxConcurrentRuns is the global parallel-run cap used when
-// config.toml does not set max_concurrent_runs (STA-773).
-const DefaultMaxConcurrentRuns = 3
+// Default parallel-run caps (STA-773, STA-867), used when config.toml does
+// not set max_concurrent_runs, max_runs_per_repo or max_runs_per_org.
+const (
+	DefaultMaxConcurrentRuns = 9 // 3 organizations x 3 runs
+	DefaultMaxRunsPerRepo    = 3
+	DefaultMaxRunsPerOrg     = 3
+)
+
+// UnassignedOrg is the organization bucket for tasks with no organization.
+const UnassignedOrg = "Unassigned"
 
 // capError is a refusal that callers should treat as "queue and retry later".
 // errors.Is(err, ErrConcurrencyCap) is true for every capError so callers that
@@ -20,35 +28,111 @@ type capError struct{ msg string }
 func (e *capError) Error() string        { return e.msg }
 func (e *capError) Is(target error) bool { return target == ErrConcurrencyCap }
 
-// ErrRepoBusy is returned by Claim when another run already holds the task's
-// repo. Each repo runs one agent at a time so two runs never fight over the
-// same repo's worktrees, index lock or branches.
-var ErrRepoBusy error = &capError{msg: "Can't start run: another run is already working in this repo."}
+// ErrRepoBusy is returned by Claim when the task's repo already has
+// max_runs_per_repo runs, or its plain (non-git) folder already has its one
+// run.
+var ErrRepoBusy error = &capError{msg: "Can't start run: this repo already has the most parallel runs allowed (max_runs_per_repo)."}
+
+// ErrPlainDirBusy is returned by Claim when another run is working in the
+// same non-git folder. A plain folder has no worktrees, so runs in it share
+// every file and run one at a time.
+var ErrPlainDirBusy error = &capError{msg: "Can't start run: another run is already working in this folder (not a git repo, so one run at a time)."}
+
+// ErrOrgBusy is returned by Claim when the task's organization already has
+// max_runs_per_org runs.
+var ErrOrgBusy error = &capError{msg: "Can't start run: this organization already has the most parallel runs allowed (max_runs_per_org)."}
 
 // Queue wait reasons, shown on the task page.
 const (
-	WaitSlots = "slots" // every parallel-run slot is taken
-	WaitRepo  = "repo"  // another run holds this task's repo
-	WaitQuota = "quota" // every provider for this task's pool is quota-locked
+	WaitSlots = "slots"  // the global cap (max_concurrent_runs) is reached
+	WaitRepo  = "repo"   // the task's repo is at max_runs_per_repo
+	WaitDir   = "folder" // another run holds the task's plain (non-git) folder
+	WaitOrg   = "org"    // the task's organization is at max_runs_per_org
+	WaitQuota = "quota"  // every provider for this task's pool is quota-locked
 )
 
 // WaitFor maps a capacity refusal from Claim to its queue wait reason.
 func WaitFor(err error) string {
-	if errors.Is(err, ErrRepoBusy) {
+	switch {
+	case errors.Is(err, ErrPlainDirBusy):
+		return WaitDir
+	case errors.Is(err, ErrRepoBusy):
 		return WaitRepo
+	case errors.Is(err, ErrOrgBusy):
+		return WaitOrg
 	}
 	return WaitSlots
 }
 
+// SlotKey says which caps a run counts against.
+type SlotKey struct {
+	// Dir is the RepoKey of the task's git repo, or of its plain folder when
+	// Plain is set. Empty counts against no repo cap.
+	Dir string
+	// Plain marks a non-git folder: one run at a time in it.
+	Plain bool
+	// Org is the task's organization; empty is the "Unassigned" bucket.
+	Org string
+}
+
+// OrgBucket returns the organization bucket org counts against.
+func OrgBucket(org string) string {
+	if o := strings.TrimSpace(org); o != "" {
+		return o
+	}
+	return UnassignedOrg
+}
+
+// RunLimits are the parallel-run caps. Zero or negative values use the
+// defaults.
+type RunLimits struct {
+	Global  int            // max_concurrent_runs
+	PerRepo int            // max_runs_per_repo (git repos)
+	PerOrg  int            // max_runs_per_org
+	Orgs    map[string]int // [run_limits.orgs] per-organization overrides
+}
+
+func (l RunLimits) normalized() RunLimits {
+	if l.Global <= 0 {
+		l.Global = DefaultMaxConcurrentRuns
+	}
+	if l.PerRepo <= 0 {
+		l.PerRepo = DefaultMaxRunsPerRepo
+	}
+	if l.PerOrg <= 0 {
+		l.PerOrg = DefaultMaxRunsPerOrg
+	}
+	orgs := make(map[string]int, len(l.Orgs))
+	for k, v := range l.Orgs {
+		if v > 0 {
+			orgs[strings.ToLower(OrgBucket(k))] = v
+		}
+	}
+	l.Orgs = orgs
+	return l
+}
+
+// orgCap returns the cap for an org bucket (overrides match case-insensitively).
+func (l RunLimits) orgCap(bucket string) int {
+	if v, ok := l.Orgs[strings.ToLower(bucket)]; ok {
+		return v
+	}
+	return l.PerOrg
+}
+
 // QueuedRun is a run refused for capacity that will be re-dispatched when a
-// slot (or its repo, or its quota pool) frees up.
+// slot (or its repo, org or quota pool) frees up.
 type QueuedRun struct {
 	TaskID   string    `json:"task_id"`
 	RepoKey  string    `json:"repo"`
+	Plain    bool      `json:"plain,omitempty"`
+	Org      string    `json:"org"`
 	Reason   string    `json:"reason"`
-	Wait     string    `json:"wait"` // WaitSlots | WaitRepo | WaitQuota
+	Wait     string    `json:"wait"` // WaitSlots | WaitRepo | WaitDir | WaitOrg | WaitQuota
 	QueuedAt time.Time `json:"queued_at"`
 }
+
+func (q QueuedRun) key() SlotKey { return SlotKey{Dir: q.RepoKey, Plain: q.Plain, Org: q.Org} }
 
 // QueuePosition describes where a task sits in the run queue.
 type QueuePosition struct {
@@ -57,13 +141,27 @@ type QueuePosition struct {
 	Wait   string `json:"wait,omitempty"`
 }
 
-// RunSlots enforces the global parallel-run cap and the per-repo cap of one,
-// and holds the FIFO queue of runs refused by either cap.
+// usage counts runs per cap.
+type usage struct {
+	total int
+	dirs  map[string]int
+	orgs  map[string]int
+}
+
+func (u *usage) add(k SlotKey) {
+	u.total++
+	if k.Dir != "" {
+		u.dirs[k.Dir]++
+	}
+	u.orgs[OrgBucket(k.Org)]++
+}
+
+// RunSlots enforces the parallel-run caps (global, per repo, per plain
+// folder, per organization) and holds the FIFO queue of runs they refused.
 type RunSlots struct {
 	mu     sync.Mutex
-	max    int
-	active map[string]string // taskID -> repoKey
-	repos  map[string]string // repoKey -> taskID
+	limits RunLimits
+	active map[string]SlotKey // taskID -> key
 	queue  []QueuedRun
 	// dispatched holds queued tasks Pump has woken whose dispatch has not yet
 	// reached Acquire, Enqueue or Dequeue, so back-to-back pumps wake them once.
@@ -80,26 +178,34 @@ type RunSlots struct {
 // Harness.Slots is nil.
 var GlobalRunSlots = NewRunSlots(DefaultMaxConcurrentRuns)
 
-// NewRunSlots returns a limiter allowing max parallel runs (<=0 = default).
+// NewRunSlots returns a limiter allowing max parallel runs (<=0 = default)
+// with the default per-repo and per-org caps.
 func NewRunSlots(max int) *RunSlots {
-	if max <= 0 {
-		max = DefaultMaxConcurrentRuns
-	}
+	return NewRunSlotsWithLimits(RunLimits{Global: max})
+}
+
+// NewRunSlotsWithLimits returns a limiter with the given caps.
+func NewRunSlotsWithLimits(l RunLimits) *RunSlots {
 	return &RunSlots{
-		max:        max,
-		active:     make(map[string]string),
-		repos:      make(map[string]string),
+		limits:     l.normalized(),
+		active:     make(map[string]SlotKey),
 		dispatched: make(map[string]bool),
 	}
 }
 
 // SetMax changes the global cap (<=0 = default). Raising it pumps the queue.
 func (s *RunSlots) SetMax(max int) {
-	if max <= 0 {
-		max = DefaultMaxConcurrentRuns
-	}
 	s.mu.Lock()
-	s.max = max
+	l := s.limits
+	s.mu.Unlock()
+	l.Global = max
+	s.SetLimits(l)
+}
+
+// SetLimits replaces every cap and pumps the queue.
+func (s *RunSlots) SetLimits(l RunLimits) {
+	s.mu.Lock()
+	s.limits = l.normalized()
 	s.mu.Unlock()
 	s.Pump()
 }
@@ -108,7 +214,19 @@ func (s *RunSlots) SetMax(max int) {
 func (s *RunSlots) Max() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.max
+	return s.limits.Global
+}
+
+// Limits returns the current caps.
+func (s *RunSlots) Limits() RunLimits {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l := s.limits
+	l.Orgs = make(map[string]int, len(s.limits.Orgs))
+	for k, v := range s.limits.Orgs {
+		l.Orgs[k] = v
+	}
+	return l
 }
 
 // Active returns the number of runs currently holding a slot.
@@ -130,45 +248,29 @@ func RepoKey(repoPath string) string {
 	return p
 }
 
-// Acquire takes a slot for taskID in repoKey, or returns ErrRepoBusy /
-// ErrConcurrencyCap. A run that is not queued may not jump ahead of queued
-// runs: neither one queued for its repo, nor ones waiting for a global slot.
-// On success the task leaves the queue.
-func (s *RunSlots) Acquire(taskID, repoKey string) error {
+// Acquire takes a slot for taskID, or returns ErrPlainDirBusy, ErrRepoBusy,
+// ErrOrgBusy or ErrConcurrencyCap (checked in that order). A run that is not
+// queued may not take capacity a queued run could start with now; a queued
+// run is checked only against running ones (Pump already dispatches queued
+// runs oldest first). On success the task leaves the queue.
+func (s *RunSlots) Acquire(taskID string, key SlotKey) error {
 	s.mu.Lock()
 	delete(s.dispatched, taskID)
 	if _, ok := s.active[taskID]; ok {
 		s.mu.Unlock()
 		return ErrAlreadyClaimed
 	}
-	queued := s.queuedLocked(taskID)
-	if repoKey != "" {
-		if _, busy := s.repos[repoKey]; busy {
-			s.mu.Unlock()
-			return ErrRepoBusy
-		}
-		if !queued {
-			for _, q := range s.queue {
-				if q.RepoKey == repoKey {
-					s.mu.Unlock()
-					return ErrRepoBusy
-				}
-			}
-		}
+	var u usage
+	if s.queuedLocked(taskID) {
+		u = s.activeUsageLocked()
+	} else {
+		u, _ = s.planLocked(false)
 	}
-	limit := s.max
-	if !queued {
-		// Queued runs that could start now hold their slots against newcomers.
-		limit -= s.startableLocked()
-	}
-	if len(s.active) >= limit {
+	if err := s.refusalLocked(key, &u); err != nil {
 		s.mu.Unlock()
-		return ErrConcurrencyCap
+		return err
 	}
-	s.active[taskID] = repoKey
-	if repoKey != "" {
-		s.repos[repoKey] = taskID
-	}
+	s.active[taskID] = key
 	changed := s.removeLocked(taskID)
 	q := s.snapshotLocked()
 	s.mu.Unlock()
@@ -181,13 +283,8 @@ func (s *RunSlots) Acquire(taskID, repoKey string) error {
 // Release frees taskID's slot (no-op when it holds none) and pumps the queue.
 func (s *RunSlots) Release(taskID string) {
 	s.mu.Lock()
-	repoKey, ok := s.active[taskID]
-	if ok {
-		delete(s.active, taskID)
-		if repoKey != "" && s.repos[repoKey] == taskID {
-			delete(s.repos, repoKey)
-		}
-	}
+	_, ok := s.active[taskID]
+	delete(s.active, taskID)
 	s.mu.Unlock()
 	if ok {
 		s.Pump()
@@ -195,24 +292,27 @@ func (s *RunSlots) Release(taskID string) {
 }
 
 // Enqueue adds a refused run to the back of the queue. Re-enqueueing a task
-// already queued keeps its place (and refreshes its wait reason).
-func (s *RunSlots) Enqueue(taskID, repoKey, reason, wait string) QueuePosition {
+// already queued keeps its place (and refreshes its wait reason and key).
+func (s *RunSlots) Enqueue(taskID string, key SlotKey, reason, wait string) QueuePosition {
 	s.mu.Lock()
 	delete(s.dispatched, taskID)
 	found := false
 	for i := range s.queue {
 		if s.queue[i].TaskID == taskID {
 			s.queue[i].Wait = wait
-			if repoKey != "" {
-				s.queue[i].RepoKey = repoKey
+			if key.Dir != "" {
+				s.queue[i].RepoKey = key.Dir
+				s.queue[i].Plain = key.Plain
 			}
+			s.queue[i].Org = OrgBucket(key.Org)
 			found = true
 			break
 		}
 	}
 	if !found {
 		s.queue = append(s.queue, QueuedRun{
-			TaskID: taskID, RepoKey: repoKey, Reason: reason, Wait: wait, QueuedAt: time.Now().UTC(),
+			TaskID: taskID, RepoKey: key.Dir, Plain: key.Plain, Org: OrgBucket(key.Org),
+			Reason: reason, Wait: wait, QueuedAt: time.Now().UTC(),
 		})
 	}
 	pos := s.positionLocked(taskID)
@@ -248,32 +348,20 @@ func (s *RunSlots) Queue() []QueuedRun {
 	return s.snapshotLocked()
 }
 
-// Pump re-dispatches every queued run that could start now: its repo is free
-// and a global slot is available. Entries stay queued (keeping their place)
-// until their Acquire succeeds, so a dispatch that is refused again (for
-// example its quota pool is still locked) does not lose its position.
+// Pump re-dispatches every queued run that could start now, oldest first.
+// A run blocked by its repo, folder or organization cap is skipped, so later
+// runs from other repos and organizations still start (one organization at
+// its cap never starves the rest); the global cap stops the walk. Entries
+// stay queued (keeping their place) until their Acquire succeeds, so a
+// dispatch that is refused again (for example its quota pool is still
+// locked) does not lose its position.
 func (s *RunSlots) Pump() {
 	s.mu.Lock()
-	free := s.max - len(s.active)
+	_, startable := s.planLocked(true)
 	var toWake []QueuedRun
-	claimedRepos := make(map[string]bool)
-	for _, q := range s.queue {
-		if free <= 0 {
-			break
-		}
-		if q.RepoKey != "" {
-			if _, busy := s.repos[q.RepoKey]; busy || claimedRepos[q.RepoKey] {
-				continue
-			}
-			claimedRepos[q.RepoKey] = true
-		}
-		if q.Wait != WaitQuota {
-			// A quota-waiting run is only probed: it usually re-queues, so it
-			// must not keep a later run from being dispatched in this pump.
-			free--
-		}
+	for _, q := range startable {
 		if s.dispatched[q.TaskID] {
-			continue // already woken; its slot is counted, not re-dispatched
+			continue // already woken; its capacity is counted, not re-dispatched
 		}
 		s.dispatched[q.TaskID] = true
 		toWake = append(toWake, q)
@@ -285,30 +373,68 @@ func (s *RunSlots) Pump() {
 		wake = func(taskID, reason string) { GlobalDispatcher.Wake(taskID, reason, "") }
 	}
 	for _, r := range toWake {
-		slog.Info("run queue: dispatching queued run", slog.String("task", r.TaskID), slog.String("repo", r.RepoKey))
+		slog.Info("run queue: dispatching queued run", slog.String("task", r.TaskID), slog.String("repo", r.RepoKey), slog.String("org", r.Org))
 		wake(r.TaskID, r.Reason)
 	}
 }
 
-// startableLocked counts queued runs that could take a slot right now (their
-// repo is free; one per repo). Runs waiting on a quota-locked pool are not
-// counted: they must not hold slots from runs on other pools.
-func (s *RunSlots) startableLocked() int {
-	n := 0
-	seen := make(map[string]bool)
+// planLocked walks the queue oldest first, assigning capacity to every queued
+// run that fits next to the running ones and the queued runs before it. It
+// returns that usage (running + planned) and the runs that fit. Runs waiting
+// on a quota-locked pool never take planned capacity (they usually re-queue,
+// so they must not hold slots from runs on other pools); withQuotaProbes
+// still lists the ones that fit, so Pump retries them.
+func (s *RunSlots) planLocked(withQuotaProbes bool) (usage, []QueuedRun) {
+	u := s.activeUsageLocked()
+	var fit []QueuedRun
 	for _, q := range s.queue {
-		if q.Wait == WaitQuota {
-			continue
-		}
-		if q.RepoKey != "" {
-			if _, busy := s.repos[q.RepoKey]; busy || seen[q.RepoKey] {
+		k := q.key()
+		err := s.refusalLocked(k, &u)
+		if err == nil {
+			if q.Wait == WaitQuota {
+				if withQuotaProbes {
+					fit = append(fit, q)
+				}
 				continue
 			}
-			seen[q.RepoKey] = true
+			u.add(k)
+			fit = append(fit, q)
+			continue
 		}
-		n++
+		if !errors.Is(err, ErrOrgBusy) && !errors.Is(err, ErrRepoBusy) && !errors.Is(err, ErrPlainDirBusy) {
+			break // global cap: nothing later fits either
+		}
 	}
-	return n
+	return u, fit
+}
+
+func (s *RunSlots) activeUsageLocked() usage {
+	u := usage{dirs: make(map[string]int), orgs: make(map[string]int)}
+	for _, k := range s.active {
+		u.add(k)
+	}
+	return u
+}
+
+// refusalLocked returns the first cap key would exceed given usage u, or nil.
+func (s *RunSlots) refusalLocked(k SlotKey, u *usage) error {
+	if k.Dir != "" {
+		if k.Plain {
+			if u.dirs[k.Dir] >= 1 {
+				return ErrPlainDirBusy
+			}
+		} else if u.dirs[k.Dir] >= s.limits.PerRepo {
+			return ErrRepoBusy
+		}
+	}
+	bucket := OrgBucket(k.Org)
+	if u.orgs[bucket] >= s.limits.orgCap(bucket) {
+		return ErrOrgBusy
+	}
+	if u.total >= s.limits.Global {
+		return ErrConcurrencyCap
+	}
+	return nil
 }
 
 func (s *RunSlots) queuedLocked(taskID string) bool {

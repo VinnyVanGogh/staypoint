@@ -21,54 +21,55 @@ func useSlots(t *testing.T, max int) *RunSlots {
 	return s
 }
 
-func TestRunSlots_DefaultCapIsThree(t *testing.T) {
-	if got := NewRunSlots(0).Max(); got != 3 {
-		t.Fatalf("default max = %d, want 3", got)
+func TestRunSlots_DefaultCaps(t *testing.T) {
+	l := NewRunSlots(0).Limits()
+	if l.Global != 9 || l.PerRepo != 3 || l.PerOrg != 3 {
+		t.Fatalf("default limits = %+v, want global 9, per repo 3, per org 3", l)
 	}
 }
 
 func TestRunSlots_GlobalCapHonored(t *testing.T) {
 	s := NewRunSlots(2)
 	s.Wake = func(string, string) {}
-	if err := s.Acquire("a", "/r1"); err != nil {
+	if err := s.Acquire("a", SlotKey{Dir: "/r1"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Acquire("b", "/r2"); err != nil {
+	if err := s.Acquire("b", SlotKey{Dir: "/r2"}); err != nil {
 		t.Fatal(err)
 	}
-	err := s.Acquire("c", "/r3")
+	err := s.Acquire("c", SlotKey{Dir: "/r3"})
 	if !errors.Is(err, ErrConcurrencyCap) {
 		t.Fatalf("third run in a third repo: got %v, want ErrConcurrencyCap", err)
 	}
 	s.Release("a")
-	if err := s.Acquire("c", "/r3"); err != nil {
+	if err := s.Acquire("c", SlotKey{Dir: "/r3"}); err != nil {
 		t.Fatalf("after release: %v", err)
 	}
 }
 
 func TestRunSlots_PerRepoCapOfOne(t *testing.T) {
-	s := NewRunSlots(3)
+	s := NewRunSlotsWithLimits(RunLimits{Global: 3, PerRepo: 1})
 	s.Wake = func(string, string) {}
-	if err := s.Acquire("a", "/repo"); err != nil {
+	if err := s.Acquire("a", SlotKey{Dir: "/repo"}); err != nil {
 		t.Fatal(err)
 	}
-	err := s.Acquire("b", "/repo")
+	err := s.Acquire("b", SlotKey{Dir: "/repo"})
 	if !errors.Is(err, ErrRepoBusy) || !errors.Is(err, ErrConcurrencyCap) {
 		t.Fatalf("same repo: got %v, want ErrRepoBusy (matching ErrConcurrencyCap)", err)
 	}
 }
 
 func TestRunSlots_QueuedRunKeepsItsPlaceInRepo(t *testing.T) {
-	s := NewRunSlots(3)
+	s := NewRunSlotsWithLimits(RunLimits{Global: 3, PerRepo: 1})
 	s.Wake = func(string, string) {}
-	_ = s.Acquire("a", "/repo")
-	s.Enqueue("b", "/repo", "run_now", "repo")
+	_ = s.Acquire("a", SlotKey{Dir: "/repo"})
+	s.Enqueue("b", SlotKey{Dir: "/repo"}, "run_now", "repo")
 	s.Release("a")
 	// A newcomer must not jump the queued run for the same repo.
-	if err := s.Acquire("c", "/repo"); !errors.Is(err, ErrRepoBusy) {
+	if err := s.Acquire("c", SlotKey{Dir: "/repo"}); !errors.Is(err, ErrRepoBusy) {
 		t.Fatalf("newcomer jumped queue: %v", err)
 	}
-	if err := s.Acquire("b", "/repo"); err != nil {
+	if err := s.Acquire("b", SlotKey{Dir: "/repo"}); err != nil {
 		t.Fatalf("queued run should start: %v", err)
 	}
 	if s.Position("b").Queued {
@@ -81,14 +82,14 @@ func TestRunSlots_PositionAndPumpOrder(t *testing.T) {
 	var mu sync.Mutex
 	var woke []string
 	s.Wake = func(id, _ string) { mu.Lock(); woke = append(woke, id); mu.Unlock() }
-	_ = s.Acquire("a", "/r1")
-	s.Enqueue("b", "/r2", "x", "slots")
-	s.Enqueue("c", "/r3", "x", "slots")
+	_ = s.Acquire("a", SlotKey{Dir: "/r1"})
+	s.Enqueue("b", SlotKey{Dir: "/r2"}, "x", "slots")
+	s.Enqueue("c", SlotKey{Dir: "/r3"}, "x", "slots")
 	if p := s.Position("c"); !p.Queued || p.Ahead != 1 {
 		t.Fatalf("position c = %+v, want queued with 1 ahead", p)
 	}
 	// Re-enqueue keeps the place.
-	s.Enqueue("b", "/r2", "x", "slots")
+	s.Enqueue("b", SlotKey{Dir: "/r2"}, "x", "slots")
 	if p := s.Position("b"); p.Ahead != 0 {
 		t.Fatalf("re-enqueue moved b to %d", p.Ahead)
 	}
@@ -105,7 +106,7 @@ func TestRunSlots_OnChangeReportsQueue(t *testing.T) {
 	s.Wake = func(string, string) {}
 	var last []QueuedRun
 	s.OnChange = func(q []QueuedRun) { last = q }
-	s.Enqueue("b", "/r2", "x", "slots")
+	s.Enqueue("b", SlotKey{Dir: "/r2"}, "x", "slots")
 	if len(last) != 1 || last[0].TaskID != "b" {
 		t.Fatalf("OnChange queue = %+v", last)
 	}
@@ -116,11 +117,12 @@ func TestRunSlots_OnChangeReportsQueue(t *testing.T) {
 }
 
 // TestParallelRuns_ThreeTasksTwoRepos is the STA-773 acceptance test: three
-// tasks across two repos with a cap of 3 → two run at once; the third (same
-// repo as the first) is refused, queued, and starts automatically when its
-// repo frees up.
+// tasks across two repos with a cap of 3 and max_runs_per_repo = 1 → two run
+// at once; the third (same repo as the first) is refused, queued, and starts
+// automatically when its repo frees up.
 func TestParallelRuns_ThreeTasksTwoRepos(t *testing.T) {
 	slots := useSlots(t, 3)
+	slots.SetLimits(RunLimits{Global: 3, PerRepo: 1})
 	db := openTestDB(t)
 	insertTask(t, db, "p-a1", "/tmp/sta773-repo-a")
 	insertTask(t, db, "p-b1", "/tmp/sta773-repo-b")
@@ -145,7 +147,7 @@ func TestParallelRuns_ThreeTasksTwoRepos(t *testing.T) {
 		runID := "run-" + taskID
 		err := h.Claim(context.Background(), taskID, runID, "agent")
 		if errors.Is(err, ErrConcurrencyCap) {
-			slots.Enqueue(taskID, h.RepoKeyForTask(context.Background(), taskID), "test", "repo")
+			slots.Enqueue(taskID, h.SlotKeyForTask(context.Background(), taskID), "test", "repo")
 			return
 		}
 		if err != nil {

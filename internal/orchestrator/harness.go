@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/geminiguard"
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/gitgate"
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/logging"
@@ -184,15 +186,27 @@ func (h *Harness) slots() *RunSlots {
 	return GlobalRunSlots
 }
 
-// RepoKeyForTask returns the slot key for the repo a task runs in: its
-// repo_path, or the harness default repo when unset.
-func (h *Harness) RepoKeyForTask(ctx context.Context, taskID string) string {
-	var repoPath string
-	_ = h.DB.QueryRowContext(ctx, "SELECT COALESCE(repo_path,'') FROM tasks WHERE id=?", taskID).Scan(&repoPath)
+// SlotKeyForTask returns the caps a task's run counts against (STA-867): its
+// plain non-git folder (a repo_path that is not in a repo, or the per-task
+// scratch dir when repo_path is empty), else its git repo, keyed by the
+// repo's main checkout so every path inside one repo shares its cap; and its
+// organization.
+func (h *Harness) SlotKeyForTask(ctx context.Context, taskID string) SlotKey {
+	var repoPath, org string
+	_ = h.DB.QueryRowContext(ctx, "SELECT COALESCE(repo_path,''), COALESCE(organization,'') FROM tasks WHERE id=?", taskID).Scan(&repoPath, &org)
+	key := SlotKey{Org: OrgBucket(org)}
+	if td, err := workspace.DescribeTaskDir(repoPath, taskID); err == nil && !td.Git {
+		key.Dir, key.Plain = RepoKey(td.Dir), true
+		return key
+	}
 	if repoPath == "" {
 		repoPath = h.RepoRoot
 	}
-	return RepoKey(repoPath)
+	key.Dir = RepoKey(repoPath)
+	if common := gitexec.CommonDir(key.Dir); filepath.Base(common) == ".git" {
+		key.Dir = RepoKey(filepath.Dir(common))
+	}
+	return key
 }
 
 // NewHarness creates a Harness backed by the given SQLite DB and repo root.
@@ -212,8 +226,10 @@ const closedStageGuard = " AND execution_stage NOT IN ('done', 'cancelled')"
 
 // Claim atomically checks out a task for the given runID.
 //
-// Parallelism is bounded by RunSlots (STA-773): a global cap
-// (max_concurrent_runs, default 3) and one run per repo. A refusal returns an
+// Parallelism is bounded by RunSlots (STA-773, STA-867): a global cap
+// (max_concurrent_runs, default 9), a per-repo cap (max_runs_per_repo,
+// default 3; one run per plain non-git folder) and a per-organization cap
+// (max_runs_per_org, default 3). A refusal returns an
 // error matching errors.Is(err, ErrConcurrencyCap); callers queue the run and
 // RunSlots re-dispatches it when a slot frees. Across restarts, RecoveryScan clears stale checkout_run_id values so
 // the DB guard (checkout_run_id IS NULL) unblocks on the next wake.
@@ -221,7 +237,7 @@ const closedStageGuard = " AND execution_stage NOT IN ('done', 'cancelled')"
 // claimed; see governance.IsRunnableStage.
 func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) error {
 	slots := h.slots()
-	if err := slots.Acquire(taskID, h.RepoKeyForTask(ctx, taskID)); err != nil {
+	if err := slots.Acquire(taskID, h.SlotKeyForTask(ctx, taskID)); err != nil {
 		return err
 	}
 
