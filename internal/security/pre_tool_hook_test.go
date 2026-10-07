@@ -25,7 +25,13 @@ func openTestDB(t *testing.T) *sql.DB {
 			status       TEXT NOT NULL DEFAULT 'pending'
 			             CHECK (status IN ('pending','approved','denied')),
 			created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-			decided_at   TEXT
+			decided_at   TEXT,
+			task_id      TEXT NOT NULL DEFAULT '',
+			repo         TEXT NOT NULL DEFAULT '',
+			org          TEXT NOT NULL DEFAULT '',
+			cwd          TEXT NOT NULL DEFAULT '',
+			scripts_json TEXT NOT NULL DEFAULT '[]',
+			decided_by   TEXT NOT NULL DEFAULT ''
 		);
 	`)
 	if err != nil {

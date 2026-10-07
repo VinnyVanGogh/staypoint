@@ -21,6 +21,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
 	"github.com/VinnyVanGogh/staypoint/internal/trackgate"
 	"github.com/VinnyVanGogh/staypoint/internal/wire"
+	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 	"github.com/spf13/cobra"
 )
 
@@ -482,7 +483,9 @@ func handleHookPreTool() {
 
 	// CWD enables bare-push branch resolution inside the classifier so the
 	// same parsed argv handles `git -C /dir push` correctly.
-	c := &security.Classifier{CWD: cwd}
+	// ReadFile + ScratchDirs let a script in /tmp or the run's scratch dir be
+	// judged by its contents instead of held as opaque (STA-868).
+	c := &security.Classifier{CWD: cwd, ReadFile: os.ReadFile, ScratchDirs: hookScratchDirs(os.Getenv("STAYPOINT_TASK_ID"))}
 	verdict := c.Classify(bashInput.Command)
 
 	if verdict.Tier < security.Red {
@@ -507,9 +510,17 @@ func handleHookPreTool() {
 	}
 
 	// Create a pending gate request in the daemon.
-	gr := createGateRequest(daemonURL, token, bashInput.Command, verdict.Reasons, payload.SessionID)
+	gr := createGateRequest(daemonURL, token, gateRequestBody{
+		Cmdline: bashInput.Command, Reasons: verdict.Reasons, RunID: payload.SessionID,
+		TaskID: os.Getenv("STAYPOINT_TASK_ID"), CWD: cwd,
+	})
 	if gr == nil {
 		preToolBlock(fmt.Sprintf("could not register gate request; command blocked (%s)", strings.Join(verdict.Reasons, "; ")))
+		return
+	}
+	if gr.Status == "approved" {
+		// A Board allow rule matched (STA-868); the daemon logged it.
+		preToolAllow()
 		return
 	}
 
@@ -547,15 +558,33 @@ func resolveDaemonConn() (daemonURL, token string) {
 }
 
 type gateRequestRef struct {
-	ID string `json:"id"`
+	ID     string `json:"id"`
+	Status string `json:"status"`
 }
 
-func createGateRequest(daemonURL, token, cmdline string, reasons []string, runID string) *gateRequestRef {
-	body, _ := json.Marshal(map[string]any{
-		"cmdline": cmdline,
-		"reasons": reasons,
-		"run_id":  runID,
-	})
+// gateRequestBody is POST /api/security/gate-requests. TaskID and CWD let the
+// daemon match Board allow rules scoped to a task, repo or organization.
+type gateRequestBody struct {
+	Cmdline string   `json:"cmdline"`
+	Reasons []string `json:"reasons"`
+	RunID   string   `json:"run_id"`
+	TaskID  string   `json:"task_id,omitempty"`
+	CWD     string   `json:"cwd,omitempty"`
+}
+
+// hookScratchDirs are the system temp dirs plus the task's scratch dir.
+func hookScratchDirs(taskID string) []string {
+	dirs := security.DefaultScratchDirs()
+	if taskID != "" {
+		if d, err := workspace.ScratchDir(taskID); err == nil {
+			dirs = append(dirs, d)
+		}
+	}
+	return dirs
+}
+
+func createGateRequest(daemonURL, token string, in gateRequestBody) *gateRequestRef {
+	body, _ := json.Marshal(in)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
 		daemonURL+"/api/security/gate-requests", bytes.NewReader(body))
 	if err != nil {

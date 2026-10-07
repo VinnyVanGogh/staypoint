@@ -81,6 +81,12 @@ func stateChangesSegment(s segment, cwd string, depth int, out *[]StateChange) s
 			stateChangesSegment(segment{argv: inner}, cwd, depth+1, out)
 		}
 	case shells[name]:
+		for _, r := range s.redirects {
+			if r.heredoc {
+				// bash <<EOF ... EOF: the body is the script (STA-868).
+				stateChangesLine(r.body, cwd, depth+1, out)
+			}
+		}
 		for i, a := range args {
 			if strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.Contains(a, "c") && i+1 < len(args) {
 				stateChangesLine(args[i+1], cwd, depth+1, out)

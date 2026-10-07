@@ -173,13 +173,13 @@ func TestParseShellRedirections(t *testing.T) {
 		name          string
 		line          string
 		wantArgv      []string
-		wantRedirects []redirect
+		wantRedirects []*redirect
 	}{
 		{
 			name:     "output redirect",
 			line:     "echo hello > out.txt",
 			wantArgv: []string{"echo", "hello"},
-			wantRedirects: []redirect{
+			wantRedirects: []*redirect{
 				{op: ">", target: "out.txt"},
 			},
 		},
@@ -187,7 +187,7 @@ func TestParseShellRedirections(t *testing.T) {
 			name:     "append and input redirect",
 			line:     "cat < input.txt >> out.log",
 			wantArgv: []string{"cat"},
-			wantRedirects: []redirect{
+			wantRedirects: []*redirect{
 				{op: "<", target: "input.txt"},
 				{op: ">>", target: "out.log"},
 			},
@@ -196,7 +196,7 @@ func TestParseShellRedirections(t *testing.T) {
 			name:     "fd redirect stderr",
 			line:     "go test 2> errors.txt",
 			wantArgv: []string{"go", "test"},
-			wantRedirects: []redirect{
+			wantRedirects: []*redirect{
 				{op: ">", target: "errors.txt"},
 			},
 		},
@@ -204,7 +204,7 @@ func TestParseShellRedirections(t *testing.T) {
 			name:     "all-output redirect ampersand",
 			line:     "build_cmd &> build.log",
 			wantArgv: []string{"build_cmd"},
-			wantRedirects: []redirect{
+			wantRedirects: []*redirect{
 				{op: "&>", target: "build.log"},
 			},
 		},
@@ -212,7 +212,7 @@ func TestParseShellRedirections(t *testing.T) {
 			name:     "all-output append redirect",
 			line:     "build_cmd &>> build.log",
 			wantArgv: []string{"build_cmd"},
-			wantRedirects: []redirect{
+			wantRedirects: []*redirect{
 				{op: "&>>", target: "build.log"},
 			},
 		},

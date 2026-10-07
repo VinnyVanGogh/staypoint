@@ -155,7 +155,7 @@ func requestTrackingOverride(out io.Writer, daemonURL, token, company string, mi
 	if r := strings.TrimSpace(reason); r != "" {
 		reasons = append(reasons, "Reason: "+r)
 	}
-	gr := createGateRequest(daemonURL, token, trackgate.OverrideCmdline(company, minutes), reasons, trackgate.OverrideRunID)
+	gr := createGateRequest(daemonURL, token, gateRequestBody{Cmdline: trackgate.OverrideCmdline(company, minutes), Reasons: reasons, RunID: trackgate.OverrideRunID})
 	if gr == nil {
 		return fmt.Errorf("gate override: could not file the request with staypointd at %s (is it running?)", daemonURL)
 	}

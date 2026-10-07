@@ -8,11 +8,17 @@ import (
 type redirect struct {
 	op     string // ">", ">>", "<", "<<", ">&" ...
 	target string
+	// heredoc is true for "<<" and "<<-": target is the delimiter and body
+	// the document text (STA-868). quoted is true when the delimiter was
+	// quoted, so the body is literal (no expansion or substitution).
+	heredoc bool
+	quoted  bool
+	body    string
 }
 
 type segment struct {
 	argv      []string
-	redirects []redirect
+	redirects []*redirect
 	// piped is true when this segment's stdout feeds the next segment.
 	piped bool
 }
@@ -28,7 +34,10 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 		cur     segment
 		tok     strings.Builder
 		inTok   bool
+		quoted  bool   // the current token contained quoting
 		pending string // redirect operator awaiting its target
+		// heredocs whose body starts after the next newline, in order.
+		pendingDocs []*redirect
 	)
 	flushTok := func() {
 		if !inTok {
@@ -37,8 +46,15 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 		t := tok.String()
 		tok.Reset()
 		inTok = false
+		q := quoted
+		quoted = false
 		if pending != "" {
-			cur.redirects = append(cur.redirects, redirect{op: pending, target: t})
+			r := &redirect{op: pending, target: t}
+			if pending == "<<" || pending == "<<-" {
+				r.heredoc, r.quoted = true, q
+				pendingDocs = append(pendingDocs, r)
+			}
+			cur.redirects = append(cur.redirects, r)
 			pending = ""
 			return
 		}
@@ -64,7 +80,7 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 		c := rs[i]
 		switch {
 		case c == '\'':
-			inTok = true
+			inTok, quoted = true, true
 			j := i + 1
 			for j < len(rs) && rs[j] != '\'' {
 				tok.WriteRune(rs[j])
@@ -75,7 +91,7 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 			}
 			i = j
 		case c == '"':
-			inTok = true
+			inTok, quoted = true, true
 			j := i + 1
 			for ; j < len(rs) && rs[j] != '"'; j++ {
 				switch {
@@ -108,9 +124,15 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 			if i+1 < len(rs) {
 				i++
 				if rs[i] != '\n' {
-					inTok = true
+					inTok, quoted = true, true
 					tok.WriteRune(rs[i])
 				}
+			}
+		case c == '#' && !inTok:
+			// A word starting with # is a comment to end of line. Without
+			// this a "#!/bin/bash" shebang read as a bash call (STA-868).
+			for i+1 < len(rs) && rs[i+1] != '\n' {
+				i++
 			}
 		case c == '$' && i+1 < len(rs) && rs[i+1] == '(':
 			body, end, e := scanParen(rs, i+1)
@@ -147,6 +169,10 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 				i++
 				op += string(rs[i])
 			}
+			if op == "<<" && i+1 < len(rs) && rs[i+1] == '-' {
+				i++
+				op = "<<-"
+			}
 			pending = op
 		case c == '&' && i+1 < len(rs) && rs[i+1] == '>':
 			flushTok()
@@ -157,6 +183,24 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 				op = "&>>"
 			}
 			pending = op
+		case c == '\n' && (len(pendingDocs) > 0 || (inTok && (pending == "<<" || pending == "<<-"))):
+			endSeg(false) // flushes the delimiter word first
+			next, err := readHeredocs(rs, i+1, pendingDocs)
+			if err != nil {
+				return nil, nil, err
+			}
+			for _, r := range pendingDocs {
+				if !r.quoted {
+					// An unquoted body still expands $(...) and `...`.
+					s, err := heredocSubs(r.body)
+					if err != nil {
+						return nil, nil, err
+					}
+					subs = append(subs, s...)
+				}
+			}
+			pendingDocs = nil
+			i = next - 1
 		case c == ';' || c == '\n' || c == '(' || c == ')':
 			endSeg(false)
 		case c == '&' || c == '|':
@@ -173,7 +217,76 @@ func parseShell(line string) (segs []segment, subs []string, err error) {
 		}
 	}
 	endSeg(false)
+	if len(pendingDocs) > 0 {
+		return nil, nil, fmt.Errorf("unterminated here-document")
+	}
 	return segs, subs, nil
+}
+
+// readHeredocs fills each document's body from the lines starting at rs[start]
+// and returns the index just past the last delimiter line.
+func readHeredocs(rs []rune, start int, docs []*redirect) (int, error) {
+	j := start
+	for _, r := range docs {
+		var body strings.Builder
+		found := false
+		for j <= len(rs) {
+			k := j
+			for k < len(rs) && rs[k] != '\n' {
+				k++
+			}
+			line := string(rs[j:k])
+			j = k + 1
+			cmp := line
+			if r.op == "<<-" {
+				cmp = strings.TrimLeft(line, "\t")
+			}
+			if cmp == r.target {
+				found = true
+				break
+			}
+			body.WriteString(line)
+			body.WriteByte('\n')
+			if k >= len(rs) {
+				break
+			}
+		}
+		if !found {
+			return 0, fmt.Errorf("unterminated here-document (%s)", r.target)
+		}
+		r.body = body.String()
+	}
+	if j > len(rs) {
+		j = len(rs)
+	}
+	return j, nil
+}
+
+// heredocSubs returns the command substitutions in an unquoted heredoc body.
+func heredocSubs(body string) ([]string, error) {
+	var out []string
+	rs := []rune(body)
+	for i := 0; i < len(rs); i++ {
+		switch {
+		case rs[i] == '\\':
+			i++
+		case rs[i] == '$' && i+1 < len(rs) && rs[i+1] == '(':
+			b, end, err := scanParen(rs, i+1)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, b)
+			i = end
+		case rs[i] == '`':
+			b, end, err := scanBacktick(rs, i)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, b)
+			i = end
+		}
+	}
+	return out, nil
 }
 
 func isDigits(s string) bool {
