@@ -722,6 +722,7 @@ func (m *Model) handleSlashCommand(line string) tea.Cmd {
 				// Query recent tasks
 				if m.cfg.DB != nil {
 					tasks, err := meshContext.ListTasks(m.cfg.DB, false)
+					tasks = meshContext.FilterLegacy(tasks, false)
 					if err == nil && len(tasks) > 0 {
 						var sb strings.Builder
 						sb.WriteString("Active Tasks:\n")

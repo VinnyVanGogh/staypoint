@@ -60,8 +60,7 @@ func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	// include_legacy and include_archive are one switch: legacy tasks and
 	// archived (done/cancelled) Paperclip imports.
-	includeLegacy := parseBoolParam(r.URL.Query().Get("include_legacy")) ||
-		parseBoolParam(r.URL.Query().Get("include_archive")) || originFilter == context.OriginLegacy
+	includeLegacy := includeHiddenTasks(r) || originFilter == context.OriginLegacy
 	limitStr := r.URL.Query().Get("limit")
 	offsetStr := r.URL.Query().Get("offset")
 
@@ -126,6 +125,14 @@ func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 		"offset":   offset,
 		"has_more": end < total,
 	})
+}
+
+// includeHiddenTasks reports whether a list request asked for legacy tasks
+// and archived imports: include_legacy or include_archive (one switch). Every
+// task-listing endpoint and aggregator hides them unless this is set.
+func includeHiddenTasks(r *http.Request) bool {
+	q := r.URL.Query()
+	return parseBoolParam(q.Get("include_legacy")) || parseBoolParam(q.Get("include_archive"))
 }
 
 func parseBoolParam(v string) bool {

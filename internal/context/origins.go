@@ -42,6 +42,28 @@ func IsHiddenByDefault(t Task) bool {
 	return t.Origin == OriginLegacy || IsArchived(t)
 }
 
+// HiddenByDefaultSQL is the SQL form of IsHiddenByDefault for a tasks row
+// aliased as alias ("" for an unaliased tasks table). SQL aggregators (fleet
+// overview, spend totals) use VisibleTasksSQL so they hide the same rows the
+// slice filters do.
+func HiddenByDefaultSQL(alias string) string {
+	p := ""
+	if alias != "" {
+		p = alias + "."
+	}
+	return "(COALESCE(" + p + "origin,'native') = '" + OriginLegacy + "' OR (COALESCE(" + p + "origin,'native') = '" +
+		OriginPaperclipImport + "' AND COALESCE(" + p + "execution_stage,'') IN ('done','cancelled')))"
+}
+
+// VisibleTasksSQL is a WHERE fragment keeping the rows list surfaces show by
+// default; with includeHidden it is the always-true "1=1".
+func VisibleTasksSQL(alias string, includeHidden bool) string {
+	if includeHidden {
+		return "1=1"
+	}
+	return "NOT " + HiddenByDefaultSQL(alias)
+}
+
 // FilterLegacy drops legacy tasks and archived imports unless includeHidden
 // is set. Every list surface (API, CLI, MCP, board) hides them by default
 // behind one "archive & legacy" switch.

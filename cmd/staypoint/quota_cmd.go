@@ -83,6 +83,8 @@ var quotaCmd = &cobra.Command{
 				fmt.Printf("Warning: Could not list tasks: %v\n", err)
 				return
 			}
+			// Legacy tasks and archived imports are hidden like every list.
+			tasks = meshContext.FilterLegacy(tasks, false)
 
 			if len(tasks) == 0 {
 				fmt.Println("No tasks found.")
