@@ -70,6 +70,10 @@ type StreamDelta struct {
 	Usage     *Usage `json:"usage,omitempty"`
 	// Raw is the provider event type, kept for DeltaOther and debugging.
 	Raw string `json:"raw,omitempty"`
+	// FromUser marks a DeltaText that came from an input (user) event rather
+	// than the agent's own output, e.g. a Claude "user" message echoing the
+	// prompt. Completion detection ignores it.
+	FromUser bool `json:"from_user,omitempty"`
 }
 
 // Usage is normalized token accounting.
