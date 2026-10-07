@@ -51,6 +51,9 @@ type Snapshot struct {
 	// repo, one run): code changes are allowed, but .git tampering and paths
 	// escaping the repo are still blocked and reverted.
 	allowCode bool
+	// nogit is the full record TakeNoGit keeps for a folder that is not a
+	// git repository (nil for Take).
+	nogit *noGitState
 }
 
 // AllowCode switches the snapshot to the Board-approved code policy (see

@@ -636,7 +636,12 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 				turnOut = &activityWriter{dst: stdout, w: watch}
 				turnErrOut = &activityWriter{dst: &stderrBuf, w: watch}
 			}
-			turnErr := cfg.RunAdapter(turnCtx, wtPath, cfg.Provider, rawArgs, providerEnv, turnOut, turnErrOut)
+			// A panic inside the turn (stream parser, writers) must not unwind
+			// past the Gemini guard below: it is turned into a turn error, the
+			// guard runs, and the run then stops (see turnPanic).
+			turnErr, turnPanic := runAdapterTurn(func() error {
+				return cfg.RunAdapter(turnCtx, wtPath, cfg.Provider, rawArgs, providerEnv, turnOut, turnErrOut)
+			})
 			watchStop := watch.Stop()
 			endTurn(taskID, sr)
 			turnCancel()
@@ -689,6 +694,12 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 					)
 					break
 				}
+			}
+
+			if turnPanic != nil {
+				h.stopTurnForPanic(result, turnPanic, taskID, turn, stdout, sr, runLog)
+				sawOutput = true // the stop row explains the run
+				break
 			}
 
 			if watchStop != "" {
