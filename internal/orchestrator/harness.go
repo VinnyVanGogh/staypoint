@@ -786,6 +786,8 @@ type taskBrief struct {
 	GitBranch       string
 	Description     string
 	ShipReviewGate  bool // true when gates.ship_review is enabled
+	// Handoff is the daemon-stored handoff from the parent task (STA-820).
+	Handoff string
 }
 
 // harnessComment is a non-harness comment visible to the agent.
@@ -807,10 +809,56 @@ func fetchTaskBrief(ctx context.Context, db *sql.DB, taskID string) taskBrief {
 		`SELECT content FROM task_documents WHERE task_id = ? AND doc_key = 'description' ORDER BY version DESC LIMIT 1`,
 		taskID,
 	).Scan(&b.Description)
+	b.Handoff = fetchHandoff(ctx, db, taskID)
 	var gateVal string
 	_ = db.QueryRowContext(ctx, `SELECT value FROM settings_kv WHERE key='gates.ship_review'`).Scan(&gateVal)
 	b.ShipReviewGate = gateVal != "false"
 	return b
+}
+
+// handoffMaxBytes caps the parent handoff block separately from the brief so a
+// long description cannot push the plan out of the first prompt.
+const handoffMaxBytes = 16 * 1024
+
+// fetchHandoff returns a child task's stored handoff document (STA-820). When
+// the parent posted a final message after the child was created (the child
+// was spawned mid-run), that message is appended so the child sees it too.
+func fetchHandoff(ctx context.Context, db *sql.DB, taskID string) string {
+	var handoff string
+	_ = db.QueryRowContext(ctx,
+		`SELECT content FROM task_documents WHERE task_id = ? AND doc_key = 'handoff' ORDER BY version DESC LIMIT 1`,
+		taskID,
+	).Scan(&handoff)
+	if handoff == "" {
+		return ""
+	}
+	var parentID string
+	_ = db.QueryRowContext(ctx, `SELECT COALESCE(parent_id,'') FROM tasks WHERE id = ?`, taskID).Scan(&parentID)
+	if parentID == "" {
+		return handoff
+	}
+	var finalMsg string
+	_ = db.QueryRowContext(ctx,
+		`SELECT message FROM task_comments WHERE task_id = ? AND author = 'agent-summary' ORDER BY id DESC LIMIT 1`,
+		parentID,
+	).Scan(&finalMsg)
+	finalMsg = strings.TrimSpace(finalMsg)
+	if finalMsg != "" && !strings.Contains(handoff, finalMsg) {
+		handoff = strings.TrimRight(handoff, "\n") + "\n--- Parent's latest final message ---\n" + finalMsg + "\n"
+	}
+	return handoff
+}
+
+// buildHandoffBlock wraps the parent handoff for the first-turn prompt.
+func buildHandoffBlock(handoff string) string {
+	if handoff == "" {
+		return ""
+	}
+	body := safeField(handoff)
+	if len(body) > handoffMaxBytes {
+		body = body[:handoffMaxBytes] + "\n[...handoff truncated at 16 KB...]"
+	}
+	return "<<<PARENT_HANDOFF_BEGIN>>>\n" + body + "\n<<<PARENT_HANDOFF_END>>>\n"
 }
 
 // fetchUserComments returns board/user comments for taskID with id > afterID, ordered ascending.
@@ -892,6 +940,8 @@ func safeField(s string) string {
 	s = strings.ReplaceAll(s, "<<<TASK_BRIEF_END>>>", "(TASK_BRIEF_END)")
 	s = strings.ReplaceAll(s, "<<<NEW_COMMENTS_BEGIN>>>", "(NEW_COMMENTS_BEGIN)")
 	s = strings.ReplaceAll(s, "<<<NEW_COMMENTS_END>>>", "(NEW_COMMENTS_END)")
+	s = strings.ReplaceAll(s, "<<<PARENT_HANDOFF_BEGIN>>>", "(PARENT_HANDOFF_BEGIN)")
+	s = strings.ReplaceAll(s, "<<<PARENT_HANDOFF_END>>>", "(PARENT_HANDOFF_END)")
 	return s
 }
 
@@ -903,6 +953,11 @@ func buildRawArgs(taskID string, turn int, cfg RunConfig, brief taskBrief, newCo
 
 	if briefBlock != "" {
 		prompt = briefBlock + "\n"
+	}
+	if turn == 0 {
+		if hb := buildHandoffBlock(brief.Handoff); hb != "" {
+			prompt += hb + "\n"
+		}
 	}
 	prompt += fmt.Sprintf(
 		"Continue work on task %s (turn %d). When you are finished, emit %s on its own line.",
