@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"time"
 
@@ -94,11 +95,16 @@ func (h *SecurityGateHandler) runTev1(gr *security.GateRequest, scripts []securi
 	if err != nil {
 		a.Recommendation, a.Error = "", err.Error()
 	}
-	approve := err == nil && a.Recommendation == gates.RecApprove && a.Probability >= trust.Tev1Threshold
+	// Fail closed (#243-2): an error, or a probability that is not a
+	// probability, never approves, whatever the advisor recommended.
+	validP := !math.IsNaN(a.Probability) && !math.IsInf(a.Probability, 0) && a.Probability >= 0 && a.Probability <= 1
+	approve := err == nil && validP && a.Recommendation == gates.RecApprove && a.Probability >= trust.Tev1Threshold
 	why := ""
 	switch {
 	case err != nil:
 		why = "tev1 error: " + err.Error()
+	case !validP:
+		why = fmt.Sprintf("tev1 probability %v is outside [0,1]", a.Probability)
 	case a.Recommendation != gates.RecApprove:
 		why = fmt.Sprintf("tev1 said %q", a.Recommendation)
 	case !approve:
