@@ -81,6 +81,15 @@ func TestAnalyzeForTrust_ProtectedAlwaysHeld(t *testing.T) {
 		"ssh host bash -s < deploy.sh",
 		"ssh localhost 'git push origin main'",
 		"ssh -o= host 'gh pr merge 1'",
+		"ssh -vF ./cfg host true",
+		"ssh -4oProxyCommand=x host true",
+		"ssh -p22 -oLocalCommand=x host",
+		"ssh 127.0.0.2 'git push origin main'",
+		"ssh '[::1]' 'git push origin main'",
+		"ssh localhost. 'git push origin main'",
+		"sudo GIT_DIR=/o/.git git push",
+		"GIT_DIR=/o/.git sudo git push",
+		"GIT_DIR=/o/.git timeout 5 git push",
 	}
 	for _, c := range cases {
 		if f := AnalyzeForTrust(c, tc); !f.Protected {
@@ -173,6 +182,10 @@ func TestAnalyzeForTrust_DeleteOutsideWorktree(t *testing.T) {
 		"cp -ft/etc out.txt",
 		"install -m 755 tool /usr/local/bin/",
 		"ssh me@127.0.0.1 'rm -rf ~/Documents'",
+		"cp -pt /etc out.txt",
+		"cp -S .bak x.txt /etc/hosts",
+		"install -m755 tool /usr/local/bin/tool",
+		"ln -s target /usr/local/bin/x",
 	}
 	for _, c := range outside {
 		if f := AnalyzeForTrust(c, tc); !f.DeleteOutside {

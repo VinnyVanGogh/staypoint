@@ -1,6 +1,8 @@
 package security
 
 import (
+	"net"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -202,16 +204,10 @@ func (a *trustAnalyzer) segment(s segment, dir, baseDir string, depth int) {
 		}
 		// Keep env-style assignments (env GIT_DIR=x git ...) in front of
 		// the inner command, where segment() sees them as prefixes.
-		var assigns []string
-		for _, x := range args[:len(args)-len(inner)] {
-			if isAssign(x) {
-				assigns = append(assigns, x)
-			}
-		}
-		a.segment(segment{argv: append(assigns, inner...)}, dir, baseDir, depth+1)
+		a.segment(segment{argv: carryAssigns(s.argv[:off], args[:len(args)-len(inner)], inner)}, dir, baseDir, depth+1)
 	case name == "sudo" || name == "doas":
 		if inner := skipPrivFlags(args); len(inner) > 0 {
-			a.segment(segment{argv: inner}, dir, baseDir, depth+1)
+			a.segment(segment{argv: carryAssigns(s.argv[:off], args[:len(args)-len(inner)], inner)}, dir, baseDir, depth+1)
 		}
 	case shells[name]:
 		for i, x := range args {
@@ -298,59 +294,49 @@ func hasFlag(args []string, flags ...string) bool {
 	return false
 }
 
-// sshValueFlags are ssh options that take a separate value.
-var sshValueFlags = map[string]bool{"-b": true, "-c": true, "-D": true, "-E": true, "-e": true, "-F": true, "-I": true,
-	"-i": true, "-J": true, "-L": true, "-l": true, "-m": true, "-O": true, "-o": true, "-p": true, "-Q": true,
-	"-R": true, "-S": true, "-W": true, "-w": true, "-B": true}
-
-// sshRemoteCommand returns the command ssh runs on the remote host, "" for a
-// login shell.
-func sshRemoteCommand(args []string) string {
-	i := 0
-	for i < len(args) && strings.HasPrefix(args[i], "-") {
-		if sshValueFlags[args[i]] {
-			i++
-		}
-		i++
-	}
-	if i+1 >= len(args) {
-		return ""
-	}
-	return strings.Join(args[i+1:], " ")
-}
-
 // sshCommandOptions run a command on this machine.
 var sshCommandOptions = map[string]bool{"proxycommand": true, "localcommand": true, "knownhostscommand": true,
 	"permitlocalcommand": true, "proxyusefdpass": true, "remotecommand": true, "match": true, "include": true}
+
+// sshValueLetters are the ssh options that take a value (ssh's getopt
+// string "B:b:c:D:E:e:F:I:i:J:L:l:m:O:o:P:p:Q:R:S:W:w:").
+var sshValueLetters = map[byte]bool{'B': true, 'b': true, 'c': true, 'D': true, 'E': true, 'e': true, 'F': true,
+	'I': true, 'i': true, 'J': true, 'L': true, 'l': true, 'm': true, 'O': true, 'o': true, 'P': true, 'p': true,
+	'Q': true, 'R': true, 'S': true, 'W': true, 'w': true}
 
 // ssh: SSH is allowed under trust, but a remote command may still merge or
 // push to a protected branch, an option can run a local command, and an
 // ssh to this machine is local execution.
 func (a *trustAnalyzer) ssh(s segment, args []string, depth int) {
 	i := 0
-	for i < len(args) && strings.HasPrefix(args[i], "-") {
+	for ; i < len(args) && strings.HasPrefix(args[i], "-"); i++ {
 		x := args[i]
-		opt := ""
-		switch {
-		case x == "-o" && i+1 < len(args):
-			opt = args[i+1]
-		case strings.HasPrefix(x, "-o") && len(x) > 2:
-			opt = x[2:]
-		case x == "-F" || strings.HasPrefix(x, "-F"):
-			a.unsure("ssh with a custom config file")
-		}
-		if opt != "" {
-			fields := strings.FieldsFunc(opt, func(r rune) bool { return r == '=' || r == ' ' || r == '\t' })
-			if len(fields) == 0 {
-				a.unsure("ssh option is empty: " + opt)
-			} else if key := strings.ToLower(fields[0]); sshCommandOptions[key] {
-				a.unsure("ssh option " + key + " runs a command")
-			}
-		}
-		if sshValueFlags[x] {
+		if x == "--" {
 			i++
+			break
 		}
-		i++
+		for c := 1; c < len(x); c++ {
+			if !sshValueLetters[x[c]] {
+				continue
+			}
+			v := x[c+1:]
+			if v == "" && i+1 < len(args) {
+				i++
+				v = args[i]
+			}
+			switch x[c] {
+			case 'o':
+				fields := strings.FieldsFunc(v, func(r rune) bool { return r == '=' || r == ' ' || r == '\t' })
+				if len(fields) == 0 {
+					a.unsure("ssh -o without an option")
+				} else if key := strings.ToLower(fields[0]); sshCommandOptions[key] {
+					a.unsure("ssh option " + key + " runs a command")
+				}
+			case 'F':
+				a.unsure("ssh with a custom config file")
+			}
+			break
+		}
 	}
 	if i >= len(args) {
 		return
@@ -369,8 +355,7 @@ func (a *trustAnalyzer) ssh(s segment, args []string, depth int) {
 		}
 		return
 	}
-	switch strings.ToLower(host) {
-	case "localhost", "127.0.0.1", "::1", "0.0.0.0":
+	if isLocalHost(host) {
 		a.line(rc, "", depth+1)
 		return
 	}
@@ -380,51 +365,102 @@ func (a *trustAnalyzer) ssh(s segment, args []string, depth int) {
 	if pushTextRe.MatchString(rc) {
 		a.f.protect("ssh remote command may run git push")
 	}
-	if strings.Contains(rc, " -s") || strings.HasSuffix(rc, "sh") {
-		for _, r := range s.redirects {
-			if strings.HasPrefix(r.op, "<") {
-				a.unsure("ssh remote shell reads a script from stdin")
-			}
+	for _, r := range s.redirects {
+		if strings.HasPrefix(r.op, "<") {
+			a.unsure("ssh remote command reads stdin, which may be a script")
 		}
 	}
 }
 
-// copyLike checks mv (sources removed, destination overwritten) and
-// cp/ln/install (destination overwritten), including every -t form.
-func (a *trustAnalyzer) copyLike(name string, args []string, dynAt func(int) bool, dir, baseDir string) {
-	what := name + " overwrites"
-	valueFlags := map[string]bool{"-t": true, "--target-directory": true, "-S": true, "--suffix": true,
-		"-m": true, "-o": true, "-g": true, "--mode": true, "--owner": true, "--group": true}
-	targetSet := false
-flags:
-	for i, x := range args {
-		switch {
-		case x == "--":
-			break flags
-		case x == "-t" || x == "--target-directory":
-			targetSet = true
-			if i+1 < len(args) {
-				a.deleteArg(plainArg{v: args[i+1], i: i + 1}, dynAt, dir, baseDir, what)
-			} else {
-				a.f.deleteOut(name + " -t without a value")
-			}
-		case strings.HasPrefix(x, "--target-directory="):
-			targetSet = true
-			a.deletePath(strings.TrimPrefix(x, "--target-directory="), dir, baseDir, what)
-		case len(x) > 2 && x[0] == '-' && x[1] != '-' && strings.Contains(x[1:], "t"):
-			// -tDIR or a cluster like -ft/etc: the value follows the t.
-			targetSet = true
-			v := x[strings.Index(x, "t")+1:]
-			if v == "" {
-				if i+1 < len(args) {
-					a.deleteArg(plainArg{v: args[i+1], i: i + 1}, dynAt, dir, baseDir, what)
-				}
-			} else {
-				a.deletePath(v, dir, baseDir, what)
-			}
+// isLocalHost reports whether an ssh target is this machine: a loopback or
+// unspecified address, localhost, or this host's name. (An ~/.ssh/config
+// alias pointing here is not visible.)
+func isLocalHost(host string) bool {
+	h := strings.ToLower(strings.TrimSuffix(strings.Trim(host, "[]"), "."))
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback() || ip.IsUnspecified()
+	}
+	if name, err := os.Hostname(); err == nil {
+		name = strings.ToLower(strings.TrimSuffix(name, "."))
+		short, _, _ := strings.Cut(name, ".")
+		if h == name || h == short || h == short+".local" {
+			return true
 		}
 	}
-	pos := plainArgs(args, valueFlags)
+	return false
+}
+
+// copyLike checks mv (sources removed, destination overwritten) and
+// cp/ln/install (destination overwritten). Short options are walked
+// getopt-style, so -t in any cluster form (-tDIR, -ft DIR, -ft/etc) is found.
+func (a *trustAnalyzer) copyLike(name string, args []string, dynAt func(int) bool, dir, baseDir string) {
+	what := name + " overwrites"
+	shortValue := map[byte]bool{'t': true, 'S': true, 'm': true, 'o': true, 'g': true}
+	longValue := map[string]bool{"--target-directory": true, "--suffix": true, "--mode": true, "--owner": true, "--group": true}
+	targetSet := false
+	target := func(v string, i int) {
+		targetSet = true
+		if i >= 0 {
+			a.deleteArg(plainArg{v: v, i: i}, dynAt, dir, baseDir, what)
+		} else {
+			a.deletePath(v, dir, baseDir, what)
+		}
+	}
+	var pos []plainArg
+	for i := 0; i < len(args); i++ {
+		x := args[i]
+		switch {
+		case x == "--":
+			for j := i + 1; j < len(args); j++ {
+				pos = append(pos, plainArg{v: args[j], i: j})
+			}
+			i = len(args)
+		case strings.HasPrefix(x, "--"):
+			k, v, hasV := strings.Cut(x, "=")
+			if !longValue[k] {
+				continue
+			}
+			if !hasV {
+				if i+1 >= len(args) {
+					a.f.deleteOut(name + " " + k + " without a value")
+					continue
+				}
+				i++
+				v = args[i]
+			}
+			if k == "--target-directory" {
+				if hasV {
+					target(v, -1)
+				} else {
+					target(v, i)
+				}
+			}
+		case len(x) > 1 && x[0] == '-':
+			for c := 1; c < len(x); c++ {
+				if !shortValue[x[c]] {
+					continue
+				}
+				v, vi := x[c+1:], -1
+				if v == "" {
+					if i+1 >= len(args) {
+						a.f.deleteOut(name + " -" + string(x[c]) + " without a value")
+						break
+					}
+					i++
+					v, vi = args[i], i
+				}
+				if x[c] == 't' {
+					target(v, vi)
+				}
+				break
+			}
+		default:
+			pos = append(pos, plainArg{v: x, i: i})
+		}
+	}
 	if name == "mv" {
 		for _, p := range pos {
 			a.deleteArg(p, dynAt, dir, baseDir, "mv")
@@ -434,6 +470,19 @@ flags:
 	if len(pos) > 0 && !targetSet {
 		a.deleteArg(pos[len(pos)-1], dynAt, dir, baseDir, what)
 	}
+}
+
+// carryAssigns puts the VAR=x prefixes of the outer command and of a
+// wrapper's own arguments in front of the command it runs, so env overrides
+// (GIT_DIR=..., env GIT_SSH_COMMAND=...) stay visible.
+func carryAssigns(outer, wrapperArgs, inner []string) []string {
+	out := append([]string{}, outer...)
+	for _, x := range wrapperArgs {
+		if isAssign(x) {
+			out = append(out, x)
+		}
+	}
+	return append(out, inner...)
 }
 
 // gitBuiltins are git subcommands; anything else may be an alias that runs
