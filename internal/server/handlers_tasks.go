@@ -163,7 +163,23 @@ func (h *TasksHandler) GetTask(w http.ResponseWriter, r *http.Request) {
 		"queue": orchestrator.GlobalRunSlots.Position(task.ID),
 		// Turn in flight, for the task page's turn timer; null when idle.
 		"turn": orchestrator.GlobalActiveTurns.Get(task.ID),
+		// Where the task runs; git=false shows the non-git warning banner (STA-864).
+		"workspace": taskWorkspace(task.RepoPath, task.ID),
 	})
+}
+
+// taskWorkspace describes where a task runs for the task page. Read-only: it
+// never creates the scratch dir or runs git.
+func taskWorkspace(repoPath, taskID string) map[string]any {
+	td, err := workspace.DescribeTaskDir(repoPath, taskID)
+	if err != nil {
+		return nil
+	}
+	out := map[string]any{"git": td.Git, "dir": td.Dir, "scratch": td.Scratch}
+	if !td.Git {
+		out["warning"] = workspace.NonGitWarning
+	}
+	return out
 }
 
 // validWorkKinds is the set of accepted work_kind values.

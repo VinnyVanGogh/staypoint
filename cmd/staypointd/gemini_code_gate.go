@@ -37,6 +37,11 @@ var geminiCodeGate = func(conn *sql.DB, taskID, repoRoot, runID string, publish 
 	).Scan(&repoPath, &workKind, &provider, &model, &blockReason); err != nil {
 		return geminiCodeGateResult{} // no task row: the run path reports it
 	}
+	if !taskDirIsGit(repoPath, taskID) {
+		// Non-git dir (STA-864): an approval cannot apply (nothing to revert
+		// to), so none is asked for; the route keeps Gemini off code work.
+		return geminiCodeGateResult{}
+	}
 	if repoPath == "" {
 		repoPath = repoRoot
 	}

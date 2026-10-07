@@ -108,8 +108,8 @@ func runWakeIn(t *testing.T, repoRoot, workKind string, pacer *router.PacerState
 	if wakeReuse.store != nil {
 		// existing task: nothing to insert
 	} else if _, err := store.DB().Exec(
-		`INSERT INTO tasks (id, name, repo_path, execution_stage, assignee_agent_id, work_kind, provider, model_override) VALUES (?, 'route test', '', 'todo', 'agent-route', ?, ?, ?)`,
-		taskID, workKind, wakeChoice.provider, wakeChoice.model,
+		`INSERT INTO tasks (id, name, repo_path, execution_stage, assignee_agent_id, work_kind, provider, model_override) VALUES (?, 'route test', ?, 'todo', 'agent-route', ?, ?, ?)`,
+		taskID, repoRoot, workKind, wakeChoice.provider, wakeChoice.model,
 	); err != nil {
 		t.Fatalf("insert task: %v", err)
 	}
