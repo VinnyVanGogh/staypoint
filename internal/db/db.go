@@ -1416,9 +1416,30 @@ var Migrations = []Migration{
 		},
 	},
 	{
-		// 43: main ends at 41; 42 is left free so an in-flight migration PR
-		// can renumber into it (PR #247 currently uses 40, which collides
-		// with main's 40 and must move). task-d4145d27 / #245-2.
+		Version: 42,
+		Name:    "decision_log_shadow_columns",
+		Up: func(conn *sql.DB) error {
+			// STA-433.1: shadow decisions (docs/rfc/003) log the current
+			// and local pick for any decision type in decision_log. Gate
+			// advice rows read '' in the new columns.
+			for _, stmt := range []string{
+				`ALTER TABLE decision_log ADD COLUMN decision_key TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE decision_log ADD COLUMN task_id      TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE decision_log ADD COLUMN question     TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE decision_log ADD COLUMN options_json TEXT NOT NULL DEFAULT '';`,
+				`ALTER TABLE decision_log ADD COLUMN pick         TEXT NOT NULL DEFAULT '';`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+					return err
+				}
+			}
+			_, err := conn.Exec(`CREATE INDEX IF NOT EXISTS idx_decision_log_kind_created ON decision_log (subject_kind, created_at);`)
+			return err
+		},
+	},
+	{
+		// 43: task-d4145d27 / #245-2. (42 is PR #247's decision_log
+		// shadow columns.)
 		Version: 43,
 		Name:    "work_product_provenance",
 		Up: func(conn *sql.DB) error {
