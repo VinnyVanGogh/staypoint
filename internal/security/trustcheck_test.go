@@ -193,6 +193,7 @@ func TestAnalyzeForTrust_DeleteOutsideWorktree(t *testing.T) {
 		"cp --target /etc a.txt b.txt",
 		"cp --target-dir=/etc a.txt",
 		"cp --t=/etc a.txt",
+		"install --strip-program=./evil -s tool bin/tool",
 		"cp a.txt -t /etc b.txt",
 	}
 	for _, c := range outside {
@@ -219,6 +220,7 @@ func TestAnalyzeForTrust_DeleteInsideAllowed(t *testing.T) {
 		"cp " + "/etc/hosts" + " ./hosts.copy",
 		"cp --recursive --force src dst",
 		"mv --verbose a.txt b.txt",
+		"cp --reflink=auto --sparse=always a.txt b.txt",
 		"ssh build-host 'rm -rf /tmp/build && make'",
 	}
 	for _, c := range inside {

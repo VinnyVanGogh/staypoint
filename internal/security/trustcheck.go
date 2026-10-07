@@ -436,17 +436,15 @@ func (a *trustAnalyzer) copyLike(name string, args []string, dynAt func(int) boo
 			a.f.deleteOut(name + ": option after an operand: " + x)
 		case strings.HasPrefix(x, "--"):
 			k, v, hasV := strings.Cut(x, "=")
-			full := longOpt(k, longValue)
-			abbrev := false
-			for o := range longValue {
-				abbrev = abbrev || (o != k && len(k) > 2 && strings.HasPrefix(o, k))
+			if k == "--strip-program" || strings.HasPrefix("--strip-program", k) && len(k) > 8 {
+				a.unsure(name + " --strip-program runs a program")
 			}
-			if abbrev {
-				// Abbreviations resolve against each tool's full option
-				// table, which we do not model: do not guess.
-				a.f.deleteOut(name + ": abbreviated long option " + k)
-			}
-			if k = full; k == "" {
+			if !longValue[k] {
+				// Only exact, known flags pass; abbreviations and unknown
+				// options resolve against tables we do not model.
+				if !copyLikeFlags[k] {
+					a.f.deleteOut(name + ": unrecognised long option " + k)
+				}
 				continue
 			}
 			if !hasV {
@@ -513,22 +511,16 @@ func numericHost(host string) bool {
 	return strings.ContainsAny(h, "0123456789")
 }
 
-// longOpt resolves a possibly abbreviated long option (getopt_long accepts
-// any unambiguous prefix) against the known value-taking options.
-func longOpt(k string, known map[string]bool) string {
-	if known[k] {
-		return k
-	}
-	match := ""
-	for o := range known {
-		if len(k) > 2 && strings.HasPrefix(o, k) {
-			if match != "" {
-				return "" // ambiguous: getopt refuses it too
-			}
-			match = o
-		}
-	}
-	return match
+// copyLikeFlags are flag-only long options of mv/cp/ln/install (GNU).
+var copyLikeFlags = map[string]bool{
+	"--archive": true, "--attributes-only": true, "--backup": true, "--copy-contents": true, "--debug": true,
+	"--dereference": true, "--force": true, "--interactive": true, "--link": true, "--no-clobber": true,
+	"--no-dereference": true, "--no-target-directory": true, "--one-file-system": true, "--parents": true,
+	"--preserve": true, "--no-preserve": true, "--recursive": true, "--remove-destination": true,
+	"--strip-trailing-slashes": true, "--symbolic-link": true, "--symbolic": true, "--update": true,
+	"--verbose": true, "--help": true, "--version": true, "--logical": true, "--physical": true,
+	"--relative": true, "--directory": true, "--compare": true, "--preserve-timestamps": true,
+	"--preserve-context": true, "--context": true, "--reflink": true, "--sparse": true, "--exchange": true, "--keep-directory-symlink": true,
 }
 
 // carryAssigns puts the VAR=x prefixes of the outer command and of a
