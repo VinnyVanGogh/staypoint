@@ -47,8 +47,15 @@ type GateRequest struct {
 	Org     string       `json:"org,omitempty"`
 	CWD     string       `json:"cwd,omitempty"`
 	Scripts []ScriptHash `json:"scripts,omitempty"`
-	// DecidedBy is "board", "rule:<id>", or "" while pending.
+	// DecidedBy is "board", "rule:<id>", "rule:<id>:tev1", or "" while pending.
 	DecidedBy string `json:"decided_by,omitempty"`
+
+	// DeferAt is when an under-trust delete outside the worktree stops
+	// waiting for the Board; DeferredAt is when it was skipped (task-6c1ed91f).
+	// A deferred request stays pending in the Deferred queue, but the hook
+	// that asked has given up: deciding it later never runs the command.
+	DeferAt    *time.Time `json:"defer_at,omitempty"`
+	DeferredAt *time.Time `json:"deferred_at,omitempty"`
 }
 
 // GateRequestInput is everything a new gate request records.
@@ -64,7 +71,10 @@ type GateRequestInput struct {
 }
 
 const gateRequestCols = `id, cmdline, reasons_json, run_id, status, created_at, decided_at,
-	task_id, repo, org, cwd, scripts_json, decided_by`
+	task_id, repo, org, cwd, scripts_json, decided_by, defer_at, deferred_at`
+
+// DeferTimeFormat is fixed-width so defer_at compares correctly as text.
+const DeferTimeFormat = "2006-01-02T15:04:05.000000000Z"
 
 // Execer is satisfied by *sql.DB and *sql.Tx.
 type Execer interface {
@@ -122,14 +132,73 @@ func GetGateRequest(db Execer, id string) (*GateRequest, error) {
 	return scanGateRequest(db.QueryRow(`SELECT `+gateRequestCols+` FROM security_gate_requests WHERE id = ?`, id))
 }
 
-// ListPendingGateRequests returns all requests still awaiting a decision.
+// ListPendingGateRequests returns all requests still awaiting a decision,
+// except deferred ones (see ListDeferredGateRequests).
 func ListPendingGateRequests(db *sql.DB) ([]*GateRequest, error) {
 	return queryGateRequests(db, `SELECT `+gateRequestCols+`
-		 FROM security_gate_requests WHERE status = 'pending' ORDER BY created_at ASC`)
+		 FROM security_gate_requests WHERE status = 'pending' AND deferred_at IS NULL ORDER BY created_at ASC`)
 }
 
-// ListGateRequests returns the newest 100 requests with status ("all" for any).
+// ListDeferredGateRequests is the Deferred queue: skipped requests the Board
+// has not decided yet, in the order they were deferred (newest at the end).
+func ListDeferredGateRequests(db *sql.DB) ([]*GateRequest, error) {
+	return queryGateRequests(db, `SELECT `+gateRequestCols+`
+		 FROM security_gate_requests WHERE status = 'pending' AND deferred_at IS NOT NULL ORDER BY deferred_at ASC, created_at ASC`)
+}
+
+// SetDeferAt makes a pending request defer at t unless decided first.
+func SetDeferAt(db Execer, id string, t time.Time) error {
+	_, err := db.Exec(`UPDATE security_gate_requests SET defer_at = ? WHERE id = ? AND status = 'pending'`,
+		t.UTC().Format(DeferTimeFormat), id)
+	return err
+}
+
+// DeferDue marks every pending request whose defer_at has passed as deferred
+// and returns their ids. The update is conditional, so a Board decision that
+// lands first wins and the request is never both approved and skipped.
+func DeferDue(db Execer, now time.Time) ([]string, error) {
+	q, ok := db.(interface {
+		Query(string, ...any) (*sql.Rows, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("defer due: db cannot query")
+	}
+	ts := now.UTC().Format(DeferTimeFormat)
+	rows, err := q.Query(`SELECT id FROM security_gate_requests
+		WHERE status = 'pending' AND deferred_at IS NULL AND defer_at IS NOT NULL AND defer_at <= ?`, ts)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	var out []string
+	for _, id := range ids {
+		res, err := db.Exec(`UPDATE security_gate_requests SET deferred_at = ?
+			WHERE id = ? AND status = 'pending' AND deferred_at IS NULL`, now.UTC().Format(time.RFC3339Nano), id)
+		if err != nil {
+			return out, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			out = append(out, id)
+		}
+	}
+	return out, nil
+}
+
+// ListGateRequests returns the newest 100 requests with status ("all" for
+// any, "deferred" for the Deferred queue).
 func ListGateRequests(db *sql.DB, status string) ([]*GateRequest, error) {
+	if status == "deferred" {
+		return ListDeferredGateRequests(db)
+	}
 	if status == "all" {
 		return queryGateRequests(db, `SELECT `+gateRequestCols+`
 			 FROM security_gate_requests ORDER BY created_at DESC LIMIT 100`)
@@ -193,9 +262,11 @@ func scanGateRequest(row scanner) (*GateRequest, error) {
 		runID     sql.NullString
 		createdAt string
 		decidedAt sql.NullString
+		deferAt   sql.NullString
+		deferred  sql.NullString
 	)
 	if err := row.Scan(&r.ID, &r.Cmdline, &rj, &runID, &r.Status, &createdAt, &decidedAt,
-		&r.TaskID, &r.Repo, &r.Org, &r.CWD, &sj, &r.DecidedBy); err != nil {
+		&r.TaskID, &r.Repo, &r.Org, &r.CWD, &sj, &r.DecidedBy, &deferAt, &deferred); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -207,9 +278,14 @@ func scanGateRequest(row scanner) (*GateRequest, error) {
 	if t, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {
 		r.CreatedAt = t
 	}
-	if decidedAt.Valid {
-		if t, err := time.Parse(time.RFC3339Nano, decidedAt.String); err == nil {
-			r.DecidedAt = &t
+	for _, f := range []struct {
+		ns  sql.NullString
+		dst **time.Time
+	}{{decidedAt, &r.DecidedAt}, {deferAt, &r.DeferAt}, {deferred, &r.DeferredAt}} {
+		if f.ns.Valid {
+			if t, err := time.Parse(time.RFC3339Nano, f.ns.String); err == nil {
+				*f.dst = &t
+			}
 		}
 	}
 	return &r, nil

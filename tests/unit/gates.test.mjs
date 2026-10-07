@@ -70,3 +70,41 @@ test('remember spec needs a value for the scope', () => {
   assert.equal(g.rememberSpec({ repo: '/r' }, 'repo', '').spec.expires_in_minutes, 0);
   assert.match(g.rememberSpec({}, 'bogus', '').error, /scope/);
 });
+
+// ── Task trust (task-6c1ed91f) ─────────────────────────────────────────────
+
+test('trust spec: never carries an expiry or exclusions', () => {
+  assert.deepEqual(g.trustSpec('4h', '', false, false), { spec: { preset: '4h' } });
+  assert.deepEqual(g.trustSpec('custom', '90', false, false), { spec: { preset: 'custom', minutes: 90 } });
+  const s = g.trustSpec('overnight', '', true, true).spec;
+  assert.deepEqual(Object.keys(s).sort(), ['preset', 'tev1', 'tev1_ack']);
+});
+
+test('trust spec: rejects bad windows and unconfirmed tev1', () => {
+  assert.match(g.trustSpec('forever', '', false, false).error, /Pick/);
+  assert.match(g.trustSpec('custom', '5', false, false).error, /15 to 1440/);
+  assert.match(g.trustSpec('custom', '99999', false, false).error, /15 to 1440/);
+  assert.match(g.trustSpec('1h', '', true, false).error, /warning/);
+});
+
+test('trust banner: until, count, tev1 and waiting', () => {
+  const now = new Date(2026, 9, 7, 18, 0).getTime();
+  const exp = new Date(2026, 9, 7, 21, 30).toISOString();
+  assert.equal(g.trustBannerText({ expires_at: exp, auto_approved_count: 3 }, now), 'Trusted until 21:30 · 3 auto-approved');
+  assert.equal(g.trustBannerText({ expires_at: exp, auto_approved_count: 0, tev1: true, tev1_threshold: 0.7, held_count: 1, deferred_count: 1 }, now),
+    'Trusted until 21:30 · 0 auto-approved · tev1 decides (p ≥ 0.70) · 2 waiting for you');
+  assert.equal(g.trustBannerText(null, now), '');
+});
+
+test('tev1 morning summary lists approvals then denials', () => {
+  const lines = g.tev1SummaryLines({ tev1_approved: [{ id: 'a', cmdline: 'go test ./...' }], tev1_denied: [{ id: 'b', cmdline: 'sqlite3 x.db' }] });
+  assert.deepEqual(lines.map(l => l.text), ['tev1 approved: go test ./...', 'tev1 denied: sqlite3 x.db']);
+  assert.deepEqual(g.tev1SummaryLines({}), []);
+});
+
+test('gate status label: deferred and tev1', () => {
+  assert.equal(g.gateStatusLabel({ status: 'pending', deferred_at: '2026-10-07T10:00:00Z' }), 'deferred');
+  assert.equal(g.gateStatusLabel({ status: 'denied', decided_by: 'rule:4:tev1' }), 'denied by tev1');
+  assert.equal(g.gateStatusLabel({ status: 'approved', decided_by: 'rule:4' }), 'approved');
+  assert.equal(g.ruleScopeLabel({ match_kind: 'any', scope: 'task', scope_value: 'task-1', tev1: true }), 'Trust (tev1): task task-1');
+});

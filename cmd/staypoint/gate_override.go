@@ -165,7 +165,7 @@ func requestTrackingOverride(out io.Writer, daemonURL, token, company string, mi
 	}
 	fmt.Fprintln(out, "Waiting for the Board decision (Ctrl-C to stop waiting; the request stays pending)...")
 	for {
-		switch status := pollGateRequest(daemonURL, token, gr.ID); status {
+		switch status, _ := pollGateRequest(daemonURL, token, gr.ID); status {
 		case "approved":
 			fmt.Fprintf(out, "Approved. Tracking gate for %s is overridden until %s.\n", company,
 				time.Now().Add(time.Duration(minutes)*time.Minute).Format("15:04"))

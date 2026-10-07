@@ -609,16 +609,25 @@ func handleHookPreTool() {
 		return
 	}
 
-	// Block indefinitely until the Board decides (no timeout).
+	// Block until the Board decides. Only a trusted task's delete outside its
+	// worktree has a deadline, kept by the daemon: then it reports "deferred"
+	// and the command is skipped, not run (task-6c1ed91f).
 	// The hook process sits here; Claude Code cannot call the tool while we hold.
 	for {
-		status := pollGateRequest(daemonURL, token, gr.ID)
+		status, decidedBy := pollGateRequest(daemonURL, token, gr.ID)
 		switch status {
 		case "approved":
 			allow()
 			return
 		case "denied":
+			if strings.HasSuffix(decidedBy, ":tev1") {
+				preToolBlock(fmt.Sprintf("tev1 denied this command, so it was not run, and this task is parked until the Board reviews it in the morning (gate %s). Stop here; do not retry or work around it.", gr.ID))
+				return
+			}
 			preToolBlock(fmt.Sprintf("Board denied: %s", strings.Join(verdict.Reasons, "; ")))
+			return
+		case "deferred":
+			preToolBlock(fmt.Sprintf("deferred: Board will review later. This delete outside the task worktree was not approved in time, so it was skipped and NOT run (gate %s). Continue with other work; do not retry it. A follow-up run can redo it once the Board approves.", gr.ID))
 			return
 		case "":
 			// daemon unreachable mid-poll — fail-closed
@@ -698,13 +707,14 @@ func createGateRequest(daemonURL, token string, in gateRequestBody) *gateRequest
 	return &gr
 }
 
-// pollGateRequest long-polls the gate request and returns "approved", "denied",
-// "pending" (still waiting), or "" (connection error).
-func pollGateRequest(daemonURL, token, id string) string {
+// pollGateRequest long-polls the gate request and returns its status —
+// "approved", "denied", "deferred" (skipped at its deadline), "pending"
+// (still waiting), or "" (connection error) — and who decided it.
+func pollGateRequest(daemonURL, token, id string) (status, decidedBy string) {
 	url := fmt.Sprintf("%s/api/security/gate-requests/%s?wait=true", daemonURL, id)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	client := &http.Client{Timeout: 35 * time.Second} // slightly longer than server 29s
@@ -712,19 +722,20 @@ func pollGateRequest(daemonURL, token, id string) string {
 	if err != nil {
 		// Daemon may be restarting; wait briefly then retry (still no timeout).
 		time.Sleep(2 * time.Second)
-		return "pending"
+		return "pending", ""
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return ""
+		return "", ""
 	}
 	var gr struct {
-		Status string `json:"status"`
+		Status    string `json:"status"`
+		DecidedBy string `json:"decided_by"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&gr); err != nil {
-		return ""
+		return "", ""
 	}
-	return gr.Status
+	return gr.Status, gr.DecidedBy
 }
 
 // waitForStepResume blocks until the pause flag is cleared or stop is requested.
