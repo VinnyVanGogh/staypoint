@@ -142,6 +142,33 @@ func TestAttachedSessionAllowed(t *testing.T) {
 	}
 }
 
+func TestAttachedToOtherCompanyTaskBlocked(t *testing.T) {
+	for _, tc := range []struct {
+		org   string
+		block bool
+	}{
+		{"StayPoint", true},
+		{"", true},
+		{"Research", true},
+		{"MAN", false},
+		{"managed solution", false},
+		{CompanyManagedSolution, false},
+	} {
+		conn := openStore(t)
+		insertTask(t, conn, "task-1", workRepo, tc.org, "active")
+		if err := Attach(conn, "sess-1", "task-1", ClientClaude, workRepo); err != nil {
+			t.Fatalf("attach: %v", err)
+		}
+		d := gateFor(conn, time.Now()).Evaluate(editReq(workRepo + "/main.go"))
+		if d.Block != tc.block {
+			t.Errorf("org %q: block = %v, want %v (%s)", tc.org, d.Block, tc.block, d.Reason)
+		}
+		if tc.block && !strings.Contains(d.Reason, "attach a Managed Solution task") {
+			t.Errorf("org %q: reason missing guidance:\n%s", tc.org, d.Reason)
+		}
+	}
+}
+
 func TestAttachRejectsUnknownOrInactiveTask(t *testing.T) {
 	conn := openStore(t)
 	if err := Attach(conn, "s", "task-missing", ClientClaude, ""); err == nil {

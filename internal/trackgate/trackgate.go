@@ -203,6 +203,14 @@ func (g *Gate) Evaluate(req Request) Decision {
 				fmt.Sprintf("session attachment could not be read (%v); failing closed", err))
 		}
 		if taskID != "" {
+			// The attached task must belong to the company being gated, so
+			// work in a Managed Solution repo is tracked under Managed Solution
+			// and not under whatever task happened to be handy.
+			org := taskOrganization(conn, taskID)
+			if !sameCompany(org, company) {
+				return g.block(req, hit, hitPath, company,
+					fmt.Sprintf("this session is attached to task %s, which belongs to %q, not %q; attach a %s task", taskID, org, company, company))
+			}
 			return Decision{Company: company, Repo: hitPath}
 		}
 	}
@@ -493,4 +501,32 @@ func ActiveOverride(conn *sql.DB, company string, now time.Time) (*Override, err
 		}
 	}
 	return nil, rows.Err()
+}
+
+// taskOrganization returns a task's organization, or "" when unset or unreadable.
+func taskOrganization(conn *sql.DB, taskID string) string {
+	var org sql.NullString
+	if err := conn.QueryRow(`SELECT organization FROM tasks WHERE id = ?`, taskID).Scan(&org); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(org.String)
+}
+
+// companyAliases maps Paperclip issue prefixes still found on older tasks to
+// their company names.
+var companyAliases = map[string]string{"man": "managed solution", "sta": "staypoint"}
+
+// sameCompany compares a task organization with a gated company name,
+// case-insensitively and allowing the old prefixes. An empty organization
+// never matches.
+func sameCompany(org, company string) bool {
+	norm := func(s string) string {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if a, ok := companyAliases[s]; ok {
+			return a
+		}
+		return s
+	}
+	o := norm(org)
+	return o != "" && o == norm(company)
 }
