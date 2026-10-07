@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"time"
 )
 
@@ -26,11 +27,19 @@ type Poller struct {
 	Now      func() time.Time
 }
 
-// NewPoller returns a Poller over the four production fetchers.
+// legacyProvider is implemented by fetchers whose snapshot is also saved under
+// an older pool key (the personal Claude seat also writes "claude").
+type legacyProvider interface {
+	LegacyProvider() string
+}
+
+// NewPoller returns a Poller over the production fetchers: one per Claude
+// seat on this machine, then Codex, Cursor and Gemini.
 func NewPoller(s Store) *Poller {
-	return &Poller{Store: s, Now: time.Now, Fetchers: []Fetcher{
-		NewClaudeFetcher(), NewCodexFetcher(), NewCursorFetcher(), NewGeminiFetcher(),
-	}}
+	home, _ := os.UserHomeDir()
+	fetchers := NewClaudeSeatFetchers(home)
+	fetchers = append(fetchers, NewCodexFetcher(), NewCursorFetcher(), NewGeminiFetcher())
+	return &Poller{Store: s, Now: time.Now, Fetchers: fetchers}
 }
 
 // PollOnce fetches every provider whose throttle has elapsed. It returns the
@@ -67,6 +76,15 @@ func (p *Poller) PollOnce(ctx context.Context) []string {
 				break
 			}
 			st.LastSuccess, st.Status, st.NextAttempt = now, "ok", now.Add(MinInterval)
+			if lp, ok := f.(legacyProvider); ok {
+				if legacy := lp.LegacyProvider(); legacy != "" && legacy != name {
+					alias := *snap
+					alias.Provider = legacy
+					if serr := p.Store.Save(&alias); serr != nil {
+						slog.Debug("quota legacy save failed", slog.String("provider", legacy), slog.Any("error", serr))
+					}
+				}
+			}
 		case errors.Is(ferr, ErrUnauthorized), errors.Is(ferr, ErrNoCredentials):
 			st.Status, st.NextAttempt = "rejected", now.Add(RejectedBackoff)
 		default:
