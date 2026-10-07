@@ -348,6 +348,7 @@ func TestSetDevState_AppendsLog(t *testing.T) {
 
 	taskID := "t-state"
 	repoDir, branch, sha := setupGitRepo(t)
+	recordMainBase(t, db, repoDir, taskID)
 	card, err := shipreview.CreateCard(db, taskID, branch, sha, []string{"check"}, "", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -383,6 +384,7 @@ func TestRunShellStep_ShellExpansion(t *testing.T) {
 	_, _ = db.Exec(`INSERT INTO tasks (id, name) VALUES ('t-shell', 'shell test')`)
 
 	repoDir, branch, sha := setupGitRepo(t)
+	recordMainBase(t, db, repoDir, "t-shell")
 	card, err := shipreview.CreateCard(db, "t-shell", branch, sha, []string{"check"}, "", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)

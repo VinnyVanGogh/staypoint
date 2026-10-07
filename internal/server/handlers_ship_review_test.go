@@ -10,6 +10,7 @@ package server_test
 
 import (
 	"bytes"
+	gocontext "context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
+	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 )
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -66,7 +68,7 @@ func shipDoReq(t *testing.T, client *http.Client, token, method, urlStr string, 
 // UpsertCard (post-STA-533) always resolves branch "staypoint/<taskID>", so after
 // creating the task we create that branch in the repo and push it.
 // Returns taskID and repoDir.
-func createShipTask(t *testing.T, baseURL, token string, client *http.Client) (taskID, repoDir string) {
+func createShipTask(t *testing.T, database *sql.DB, baseURL, token string, client *http.Client) (taskID, repoDir string) {
 	t.Helper()
 
 	// Set up a minimal bare + work git repo.
@@ -132,6 +134,12 @@ func createShipTask(t *testing.T, baseURL, token string, client *http.Client) (t
 
 	// UpsertCard always resolves "staypoint/<taskID>" — create that branch now.
 	branch := "staypoint/" + taskResp.ID
+	// The daemon records the task's base when it creates the worktree
+	// (STA-774); cards and Approve are measured from it.
+	mainTip := gitOut(t, work, "rev-parse", "main")
+	if err := workspace.RecordTaskBase(gocontext.Background(), database, work, taskResp.ID, mainTip); err != nil {
+		t.Fatalf("RecordTaskBase: %v", err)
+	}
 	run(work, "checkout", "-b", branch)
 	_ = os.WriteFile(filepath.Join(work, "task.txt"), []byte("task work\n"), 0644)
 	run(work, "add", ".")
@@ -155,7 +163,7 @@ func TestShipReview_DevURLPersistedAfterUpsert(t *testing.T) {
 	_ = boardToken
 	client := &http.Client{}
 
-	taskID, _ := createShipTask(t, baseURL, token, client)
+	taskID, _ := createShipTask(t, database, baseURL, token, client)
 
 	// Upsert card WITH an explicit dev_url.
 	upsertBody, _ := json.Marshal(map[string]any{
@@ -200,7 +208,7 @@ func TestShipReview_ApproveReturns409WithBodyOnMovedHead(t *testing.T) {
 	boardToken := srv.BoardToken()
 	client := &http.Client{}
 
-	taskID, repoDir := createShipTask(t, baseURL, token, client)
+	taskID, repoDir := createShipTask(t, database, baseURL, token, client)
 
 	// Upsert card — get the real HEAD pinned.
 	upsertBody, _ := json.Marshal(map[string]any{
@@ -267,7 +275,7 @@ func TestShipReview_ApproveMovesTaskToDone(t *testing.T) {
 	boardToken := srv.BoardToken()
 	client := &http.Client{}
 
-	taskID, _ := createShipTask(t, baseURL, token, client)
+	taskID, _ := createShipTask(t, database, baseURL, token, client)
 
 	// Upsert card.
 	upsertBody, _ := json.Marshal(map[string]any{
@@ -332,7 +340,7 @@ func shipApproveServer(t *testing.T) (database *sql.DB, baseURL, token, boardTok
 	boardToken = srv.BoardToken()
 	client = &http.Client{}
 
-	taskID, repoDir = createShipTask(t, baseURL, token, client)
+	taskID, repoDir = createShipTask(t, database, baseURL, token, client)
 	upsertBody, _ := json.Marshal(map[string]any{"test_steps": []string{"1. Open /"}})
 	resp, rb := shipDoReq(t, client, token, "PUT", baseURL+"/api/tasks/"+taskID+"/ship-review", upsertBody)
 	if resp.StatusCode != http.StatusCreated {

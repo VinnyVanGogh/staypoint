@@ -239,6 +239,7 @@ func TestApproveAndMergeHashPin(t *testing.T) {
 
 	repoDir, branch, featureSHA := setupGitRepo(t)
 
+	recordMainBase(t, db, repoDir, "t4")
 	card, err := shipreview.CreateCard(db, "t4", branch, featureSHA, []string{"1. Verify"}, "", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -287,6 +288,7 @@ func TestFilesChangedPopulated(t *testing.T) {
 
 	repoDir, branch, featureSHA := setupGitRepo(t)
 
+	recordMainBase(t, db, repoDir, "t6")
 	card, err := shipreview.CreateCard(db, "t6", branch, featureSHA, []string{"1. Verify feature.txt exists"}, "", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -482,6 +484,7 @@ func TestApproveAndMergeFromRepoRoot(t *testing.T) {
 
 	repoDir, branch, featureSHA := setupGitRepo(t)
 	// Repo root is on main after setupGitRepo — this is the condition we test.
+	recordMainBase(t, db, repoDir, "t6")
 	card, err := shipreview.CreateCard(db, "t6", branch, featureSHA, []string{"1. Verify"}, "", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -510,6 +513,7 @@ func TestStartDevServerCreatesWorktreeAtPinnedSHA(t *testing.T) {
 
 	repoDir, branch, featureSHA := setupGitRepo(t)
 
+	recordMainBase(t, db, repoDir, "t7")
 	card, err := shipreview.CreateCard(db, "t7", branch, featureSHA, []string{"1. Check"}, "http://127.0.0.1:9999", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -594,6 +598,7 @@ func TestApproveAndMerge_MainSHAStored(t *testing.T) {
 
 	repoDir, branch, featureSHA := setupGitRepo(t)
 
+	recordMainBase(t, db, repoDir, "t9")
 	card, err := shipreview.CreateCard(db, "t9", branch, featureSHA, []string{"1. Verify"}, "", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -828,6 +833,7 @@ func TestBuildAndStartCard_IgnoresGitBranch(t *testing.T) {
 		t.Fatalf("insert task: %v", err)
 	}
 
+	recordMainBase(t, db, repoDir, taskID)
 	card, err := shipreview.BuildAndStartCard(
 		context.Background(), db,
 		taskID, repoDir,
@@ -903,6 +909,7 @@ func TestStartDevServerRecoversStalWorktree(t *testing.T) {
 	// Create the card using the feature branch and call StartDevServer.
 	// Without the fix this fails:
 	//   fatal: '<path>' is a missing but already registered worktree
+	recordMainBase(t, db, repoDir, taskID)
 	card, err := shipreview.CreateCard(db, taskID, featureBranch, featureSHA, []string{"1. Check"}, "http://127.0.0.1:9997", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -943,6 +950,7 @@ func TestStartDevServerReusesSameWorktree(t *testing.T) {
 		t.Fatalf("insert task: %v", err)
 	}
 
+	recordMainBase(t, db, repoDir, taskID)
 	card, err := shipreview.CreateCard(db, taskID, featureBranch, featureSHA, []string{"1. Check"}, "http://127.0.0.1:9996", repoDir, nil)
 	if err != nil {
 		t.Fatalf("CreateCard: %v", err)
@@ -997,6 +1005,7 @@ func TestBuildAndStartCard_AutoStartsDevServer(t *testing.T) {
 		t.Fatalf("UpsertProjectDevConfig: %v", err)
 	}
 
+	recordMainBase(t, db, repoDir, taskID)
 	card, err := shipreview.BuildAndStartCard(
 		context.Background(), db,
 		taskID, repoDir,

@@ -251,6 +251,12 @@ func (h *ShipReviewHandler) MergePR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// STA-774: the head being merged is re-verified against the recorded
+	// task base, as at Approve.
+	if !h.verifyCardBase(w, r, card, task) {
+		return
+	}
+
 	// The head being merged may be a re-push the Board has not Approved (the
 	// fix after "Send failures to agent"), so the migration gate Approve
 	// applies runs again here, fail-closed.

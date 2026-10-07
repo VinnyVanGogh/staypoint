@@ -22,6 +22,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 	"github.com/VinnyVanGogh/staypoint/internal/testgate"
+	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 	"github.com/google/uuid"
 )
 
@@ -140,6 +141,9 @@ func (h *ShipReviewHandler) UpsertCard(w http.ResponseWriter, r *http.Request) {
 
 	card, err := shipreview.BuildAndStartCard(r.Context(), h.db, task.ID, task.RepoPath, req.TestSteps, req.DevURL, req.CheckRuns)
 	if err != nil {
+		if writeTaskBaseError(w, err) {
+			return
+		}
 		code := http.StatusInternalServerError
 		if errors.Is(err, shipreview.ErrTestStepsRequired) || errors.Is(err, shipreview.ErrInvalidBranch) || errors.Is(err, shipreview.ErrInvalidDevURL) {
 			code = http.StatusBadRequest
@@ -160,6 +164,45 @@ func (h *ShipReviewHandler) UpsertCard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(card)
+}
+
+// writeTaskBaseError answers a card or Approve request whose task base could
+// not be verified (STA-774) and reports whether err was such an error. The
+// caller refuses the request either way when err is non-nil.
+func writeTaskBaseError(w http.ResponseWriter, err error) bool {
+	var code string
+	switch {
+	case errors.Is(err, shipreview.ErrNoChanges):
+		code = "no_changes"
+	case errors.Is(err, workspace.ErrTaskBaseTampered):
+		code = "base_tampered"
+	case errors.Is(err, workspace.ErrNoTaskBase):
+		code = "base_unverified"
+	default:
+		return false
+	}
+	writeErrorJSON(w, http.StatusConflict, map[string]any{
+		"error":   code,
+		"message": err.Error(),
+	})
+	return true
+}
+
+// verifyCardBase runs shipreview.VerifyCardChanges for Approve and writes
+// the refusal when it fails. Any failure, including a git or DB error, blocks.
+func (h *ShipReviewHandler) verifyCardBase(w http.ResponseWriter, r *http.Request, card *shipreview.Card, task *context.Task) bool {
+	ctx, cancel := gitRequestContext(r)
+	defer cancel()
+	if _, err := shipreview.VerifyCardChanges(ctx, h.db, card, task.RepoPath); err != nil {
+		if !writeTaskBaseError(w, err) {
+			writeErrorJSON(w, gitErrorStatus(err), map[string]any{
+				"error":   "base_unverified",
+				"message": "could not verify the task base: " + err.Error(),
+			})
+		}
+		return false
+	}
+	return true
 }
 
 // liveDevWarning is the warning the Board confirms before starting a dev
@@ -617,6 +660,14 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 			"override_reason": req.MigrationOverrideReason,
 		})
 		_ = context.LogActivity(h.db, taskID, "migration_override", string(logPayload))
+	}
+
+	// STA-774: re-verify the pinned head against the task's recorded base,
+	// before any merge mode, test gate or merge runs. Fail closed: a base
+	// that is missing or was moved by the agent, a git error, or a head with
+	// nothing to merge is never approved.
+	if !h.verifyCardBase(w, r, card, task) {
+		return
 	}
 
 	// STA-717: projects in a PR mode land through GitHub instead.

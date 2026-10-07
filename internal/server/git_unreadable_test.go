@@ -8,6 +8,7 @@ package server_test
 // checkpoint yet, no task branch, not a git repo) still pass through.
 
 import (
+	gocontext "context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
+	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 )
 
 const deniedMsg = "fatal: cannot open '.git/HEAD': Operation not permitted"
@@ -371,7 +373,7 @@ func TestMigrationGate_MigrationPathWithSpaces(t *testing.T) {
 // Deleting a migration does not count as an unverified migration, so it does not
 // block approve or appear in unverified_migrations. Regression for STA-755.
 func TestMigrationGate_DeletedMigrationNotUnverified(t *testing.T) {
-	_, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	database, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
 
 	// Commit migrations/005_to_delete.sql on main first
 	if err := os.MkdirAll(filepath.Join(repoDir, "migrations"), 0o755); err != nil {
@@ -384,8 +386,12 @@ func TestMigrationGate_DeletedMigrationNotUnverified(t *testing.T) {
 	gitOut(t, repoDir, "add", ".")
 	gitOut(t, repoDir, "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "main: 005_to_delete.sql")
 
-	// Baseline checkpoint at main
+	// Baseline checkpoint at main, which is also the task's recorded base
+	// (STA-774): the migration existed when the task started.
 	gitOut(t, repoDir, "update-ref", "refs/staypoint/checkpoints/latest", "main")
+	if err := workspace.RecordTaskBase(gocontext.Background(), database, repoDir, taskID, gitOut(t, repoDir, "rev-parse", "main")); err != nil {
+		t.Fatalf("RecordTaskBase: %v", err)
+	}
 
 	// Branch task and delete the migration file
 	gitOut(t, repoDir, "checkout", "staypoint/"+taskID)

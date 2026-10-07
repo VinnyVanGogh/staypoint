@@ -69,15 +69,46 @@ func (w *WorktreeManager) CreateContext(ctx context.Context, taskID string, sess
 		}
 	}
 
-	// Try with -b first; fall back to existing branch.
-	if _, err := runGit(ctx, w.RepoRoot, "worktree", "add", "-b", branch, wtPath, "HEAD"); err != nil {
-		if strings.Contains(err.Error(), "already exists") {
-			if _, err2 := runGit(ctx, w.RepoRoot, "worktree", "add", wtPath, branch); err2 != nil {
-				return "", fmt.Errorf("git worktree add: %w (original: %v)", err2, err)
-			}
-		} else {
+	// Every task worktree sits on a base the daemon recorded and can verify
+	// (STA-774). Without a DB there is nowhere the agent cannot write to
+	// record one, so no worktree is made at all.
+	if w.DB == nil {
+		return "", fmt.Errorf("create task worktree %s: %w", taskID, ErrNoTaskBase)
+	}
+
+	// A re-run reuses the task branch, and with it the base recorded when the
+	// branch was first created. A branch with no recorded base (made before
+	// STA-774, or by something other than the daemon) or a moved pin is
+	// refused rather than reviewed against a base guessed from git.
+	if commitOf(ctx, w.RepoRoot, "refs/heads/"+branch) != "" {
+		if _, err := TaskBase(ctx, w.DB, w.RepoRoot, taskID, "refs/heads/"+branch); err != nil {
+			return "", fmt.Errorf("re-run task %s on existing branch %s: %w (delete the branch to restart the task from the default branch)", taskID, branch, err)
+		}
+		if _, err := runGit(ctx, w.RepoRoot, "worktree", "add", wtPath, branch); err != nil {
 			return "", fmt.Errorf("git worktree add: %w", err)
 		}
+		return wtPath, nil
+	}
+
+	// A new task branches from origin/<default>, never from whatever the
+	// user's checkout has on HEAD: a feature branch there would otherwise be
+	// carried into the task and merged by its Approve (STA-774). The base is
+	// recorded in the daemon DB, which the agent cannot rewrite, before the
+	// branch exists; the branch is made from that SHA so it tracks no
+	// upstream. Any failure leaves no worktree.
+	baseSHA, err := resolveNewTaskBase(ctx, w.RepoRoot)
+	if err != nil {
+		return "", err
+	}
+	if err := RecordTaskBase(ctx, w.DB, w.RepoRoot, taskID, baseSHA); err != nil {
+		DeleteTaskBase(ctx, w.DB, w.RepoRoot, taskID)
+		return "", err
+	}
+	if _, err := runGit(ctx, w.RepoRoot, "worktree", "add", "--no-track", "-b", branch, wtPath, baseSHA); err != nil {
+		// Including "already exists": a branch that appeared since the check
+		// above was not made from the recorded base.
+		DeleteTaskBase(ctx, w.DB, w.RepoRoot, taskID)
+		return "", fmt.Errorf("git worktree add: %w", err)
 	}
 
 	return wtPath, nil
@@ -101,6 +132,7 @@ func (w *WorktreeManager) PruneContext(ctx context.Context, taskID string) error
 	}
 	branch := fmt.Sprintf("staypoint/%s", taskID)
 	_, _ = runGit(ctx, w.RepoRoot, "branch", "-D", branch)
+	DeleteTaskBase(ctx, w.DB, w.RepoRoot, taskID)
 	return nil
 }
 

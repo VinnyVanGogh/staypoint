@@ -1,6 +1,7 @@
 package server
 
 import (
+	gocontext "context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -782,12 +783,16 @@ func (h *TasksHandler) GetTaskDiff(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := gitRequestContext(r)
 	defer cancel()
 
-	// "Whole run" (empty checkpoint) should diff against the task's pre-run
-	// baseline, not refs/staypoint/checkpoints/latest (which is the newest
-	// turn checkpoint and shows "No changes" after a run completes).
-	if cpID == "" {
-		if preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID); preRunID != "" {
-			cpID = preRunID
+	// "Whole run" (empty checkpoint) diffs against the task's base: the same
+	// verified commit the ship review card and Approve use (STA-774).
+	wholeRun := cpID == ""
+	baseVerified := false
+	if wholeRun {
+		var err error
+		cpID, baseVerified, err = wholeRunBase(ctx, h.db, task)
+		if err != nil {
+			writeWholeRunBaseError(w, err)
+			return
 		}
 	}
 
@@ -824,13 +829,74 @@ func (h *TasksHandler) GetTaskDiff(w http.ResponseWriter, r *http.Request) {
 		files[i] = s.Path
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	resp := map[string]any{
 		"diff":          stat,
 		"files":         files,
 		"file_stats":    fileStats,
 		"checkpoint_id": cpID,
-	})
+	}
+	if wholeRun {
+		resp["base_verified"] = baseVerified
+		// An answer-only run: nothing differs from the verified base, so
+		// there is no card and the UI shows the final message instead.
+		answerOnly := baseVerified && statErr == nil && filesErr == nil && len(fileStats) == 0
+		resp["answer_only"] = answerOnly
+		if answerOnly {
+			resp["files_read"] = taskFilesRead(ctx, h.db, task.ID)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// wholeRunBase returns the commit the Diff tab's whole-run view compares
+// against: the task's recorded base, verified (workspace.VerifiedBase), the
+// same one the ship card and Approve use. A task with no recorded base
+// (created before STA-774) falls back to its pre-run checkpoint for display
+// only, reported as verified=false: such a task can never get a card or an
+// Approve. A moved pin or a git/DB error is returned.
+func wholeRunBase(ctx gocontext.Context, db *sql.DB, task *context.Task) (cpID string, verified bool, err error) {
+	base, err := workspace.VerifiedBase(ctx, db, task.RepoPath, task.ID)
+	if err == nil {
+		return base, true, nil
+	}
+	if !errors.Is(err, workspace.ErrNoTaskBase) {
+		return "", false, err
+	}
+	preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID)
+	return preRunID, false, nil
+}
+
+// writeWholeRunBaseError answers a whole-run diff whose base failed
+// verification: 409 when the pin was moved, the git status otherwise. It
+// never returns a diff measured from an unverified commit.
+func writeWholeRunBaseError(w http.ResponseWriter, err error) {
+	if errors.Is(err, workspace.ErrTaskBaseTampered) {
+		writeErrorJSON(w, http.StatusConflict, map[string]any{"error": "base_tampered", "message": err.Error()})
+		return
+	}
+	writeError(w, gitErrorStatus(err), "could not verify the task base: "+err.Error())
+}
+
+// taskFilesRead lists the distinct files the task's runs read, from the
+// timeline's "Read <path>" steps (STA-774: shown for runs with no edits).
+func taskFilesRead(ctx gocontext.Context, db *sql.DB, taskID string) []string {
+	files := []string{}
+	rows, err := db.QueryContext(ctx,
+		`SELECT DISTINCT substr(title, 6) FROM run_steps
+		 WHERE task_id = ? AND kind = 'read' AND title LIKE 'Read %'
+		 ORDER BY 1`, taskID)
+	if err != nil {
+		return files
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p string
+		if rows.Scan(&p) == nil && p != "" {
+			files = append(files, p)
+		}
+	}
+	return files
 }
 
 // GetTaskFileDiff handles GET /api/tasks/{id}/diff/file?path={path}&checkpoint={id}
@@ -857,9 +923,12 @@ func (h *TasksHandler) GetTaskFileDiff(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := gitRequestContext(r)
 	defer cancel()
 	if cpID == "" {
-		if preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID); preRunID != "" {
-			cpID = preRunID
+		base, _, baseErr := wholeRunBase(ctx, h.db, task)
+		if baseErr != nil {
+			writeWholeRunBaseError(w, baseErr)
+			return
 		}
+		cpID = base
 	}
 
 	workDir, hasWorktree := taskCheckpointWorkDir(task)
@@ -1088,9 +1157,10 @@ func (h *TasksHandler) GetTaskMigrations(w http.ResponseWriter, r *http.Request)
 	// Get the full diff file list.
 	ctx, cancel := gitRequestContext(r)
 	defer cancel()
-	cpID := ""
-	if preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID); preRunID != "" {
-		cpID = preRunID
+	cpID, _, baseErr := wholeRunBase(ctx, h.db, task)
+	if baseErr != nil {
+		writeWholeRunBaseError(w, baseErr)
+		return
 	}
 	workDir, hasWorktree := taskCheckpointWorkDir(task)
 	var fileStats []checkpoint.FileDiffStat

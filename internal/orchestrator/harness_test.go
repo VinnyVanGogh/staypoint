@@ -125,6 +125,13 @@ CREATE TABLE IF NOT EXISTS settings_kv (
     value      TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+CREATE TABLE IF NOT EXISTS task_worktree_bases (
+    task_id    TEXT PRIMARY KEY,
+    repo_path  TEXT NOT NULL DEFAULT '',
+    base_sha   TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 CREATE TABLE IF NOT EXISTS ship_review_cards (
     id                  TEXT PRIMARY KEY,
     task_id             TEXT NOT NULL,
