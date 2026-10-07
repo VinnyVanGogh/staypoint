@@ -6,9 +6,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/VinnyVanGogh/staypoint/internal/adapter"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
-	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/server"
 )
 
@@ -42,18 +40,16 @@ func wireRunQueue(ctx context.Context, maxRuns int, srv *server.Server) {
 	}()
 }
 
-// taskQuotaLocked reports whether every provider in the task's quota pool
-// chain is locked by the pacer, so a run would only fail. Swappable in tests.
-var taskQuotaLocked = func(dbConn *sql.DB, taskID string) bool {
-	var repoPath string
-	_ = dbConn.QueryRowContext(context.Background(),
-		"SELECT COALESCE(repo_path,'') FROM tasks WHERE id=?", taskID).Scan(&repoPath)
-	isWork, _, _ := router.IsWorkRepo(repoPath)
-	pacer, err := router.LoadPacerState()
-	if err != nil {
+// taskQuotaLocked reports whether every slot of the task's routed chain
+// (work_kind + repo seat, STA-772) is locked by the pacer, so a run would only
+// fail. A work-repo coding run with both Claude seats locked waits here: Gemini
+// is never in its chain (router.GeminiCodeForbidden, STA-856). Swappable in tests.
+var taskQuotaLocked = func(dbConn *sql.DB, taskID, repoRoot string) bool {
+	pacer, err := loadPacer()
+	if err != nil || pacer == nil {
 		return false // unknown quota state: let the run try
 	}
-	return adapter.ResolveProviderChain(isWork, "", pacer).AllLocked
+	return resolveTaskRoute(dbConn, taskID, repoRoot, pacer, time.Now()).AllLocked()
 }
 
 // queueRun records a run refused for capacity (or quota) so it starts on its

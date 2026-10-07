@@ -186,7 +186,8 @@ func TestBalancedPeerPacingRouting(t *testing.T) {
 func TestDynamicQuotaAwareFallback(t *testing.T) {
 	ctx := context.Background()
 
-	// 1. When Claude (Work) is locked out -> Opus tier falls back to Gemini 3.1 Pro
+	// 1. When Claude (Work) is locked out -> personal Claude seat, never agy
+	//    (STA-856: Gemini never writes code in a work repo).
 	lockedWorkPacer := &PacerState{
 		Pools: map[PoolID]*QuotaPool{
 			PoolWorkClaude: {
@@ -206,8 +207,22 @@ func TestDynamicQuotaAwareFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Route failed: %v", err)
 	}
-	if decWork.Tool != "agy" || decWork.Model != "gemini-3.1-pro" {
-		t.Errorf("expected agy / gemini-3.1-pro for locked work Opus tier, got tool=%s, model=%s", decWork.Tool, decWork.Model)
+	if decWork.Tool != "claude" || decWork.Target != TargetClaudePersonal || decWork.Waiting {
+		t.Errorf("expected personal Claude for locked work seat, got tool=%s target=%s waiting=%v", decWork.Tool, decWork.Target, decWork.Waiting)
+	}
+
+	// 1b. Both seats locked -> wait on the work seat, still never agy.
+	bothLocked := &PacerState{Pools: map[PoolID]*QuotaPool{
+		PoolWorkClaude:     {IsLocked: true, LockoutReason: "weekly limit"},
+		PoolPersonalClaude: {IsLocked: true, LockoutReason: "5h limit"},
+		PoolGeminiNative:   {TurnsRunway: 100, FiveHour: QuotaWindow{RemainingPct: 80}, Weekly: QuotaWindow{RemainingPct: 60}},
+	}}
+	decWait, err := Route(ctx, "/Users/vincevasile/Documents/dev/mansol-apps-server/github_repo-prod", bothLocked, RouteOptions{PreferredPersonalTool: "agy"})
+	if err != nil {
+		t.Fatalf("Route failed: %v", err)
+	}
+	if decWait.Tool == "agy" || !decWait.Waiting || decWait.Target != TargetLocalClaudeWork {
+		t.Errorf("expected waiting on work Claude, got tool=%s target=%s waiting=%v", decWait.Tool, decWait.Target, decWait.Waiting)
 	}
 
 	// 2. Personal repo: Preferred Claude (Opus) locked -> falls back to Gemini 3.1 Pro

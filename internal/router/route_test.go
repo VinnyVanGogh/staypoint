@@ -62,15 +62,80 @@ func TestResolveRoute_WorkRepoPersonalLockedStillRunsWorkClaude(t *testing.T) {
 	}
 }
 
-func TestResolveRoute_WorkRepoWorkLockedFallsBackToGeminiWithReason(t *testing.T) {
-	p := lockedPacer(map[PoolID]string{PoolWorkClaude: "weekly limit"})
-	d := ResolveRoute("coding", true, p, "", time.Now())
-	s := mustChosen(t, d)
-	if s.Family != FamilyGemini || s.Model != "gemini-3.1-pro-high" {
-		t.Fatalf("got %+v, want Gemini 3.1 Pro", s)
+// STA-856: for work that may write code, a locked work seat falls back to the
+// personal Claude seat (same model), never Gemini; with both seats locked the
+// route is all-locked so the run waits.
+func TestResolveRoute_WorkRepoWorkLockedFallsBackToPersonalClaude(t *testing.T) {
+	p := lockedPacer(map[PoolID]string{PoolWorkClaude: "5h limit"})
+	for _, kind := range []string{"coding", "review", "qa", "", "bogus"} {
+		d := ResolveRoute(kind, true, p, "", time.Now())
+		s := mustChosen(t, d)
+		if s.Family != FamilyClaude || s.Seat != SeatPersonal || s.PoolID != PoolPersonalClaude {
+			t.Fatalf("kind %q: got %+v, want personal Claude", kind, s)
+		}
+		for _, c := range d.Candidates {
+			if c.Family == FamilyGemini {
+				t.Fatalf("kind %q: Gemini in work chain: %+v", kind, d.Candidates)
+			}
+		}
+		if !strings.HasPrefix(d.Title(), "Fell back to Claude ") || !strings.HasSuffix(d.Title(), "personal seat: work seat locked (5h limit)") {
+			t.Errorf("kind %q: title = %q", kind, d.Title())
+		}
 	}
-	if got, want := d.Title(), "Fell back to Gemini 3.1 Pro: work seat locked (weekly limit)"; got != want {
-		t.Errorf("title = %q, want %q", got, want)
+}
+
+func TestResolveRoute_WorkRepoBothSeatsLockedWaitsNeverGemini(t *testing.T) {
+	p := lockedPacer(map[PoolID]string{PoolWorkClaude: "weekly limit", PoolPersonalClaude: "5h limit"})
+	for _, kind := range []string{"coding", "review", "qa", "", "bogus"} {
+		d := ResolveRoute(kind, true, p, "", time.Now())
+		if !d.AllLocked() || !d.GeminiBarred {
+			t.Fatalf("kind %q: want all-locked with Gemini barred, got %+v", kind, d)
+		}
+		if got, want := d.Title(), "Waiting for a Claude seat: work seat locked (weekly limit); personal seat locked (5h limit)"; got != want {
+			t.Errorf("kind %q: title = %q, want %q", kind, got, want)
+		}
+		if !strings.Contains(d.Body(), GeminiCodeRule) {
+			t.Errorf("kind %q: body %q should name the rule", kind, d.Body())
+		}
+	}
+	// Model overrides do not reopen the Gemini pair either.
+	d := ResolveRoute("coding", true, p, "opus", time.Now())
+	if !d.AllLocked() {
+		t.Fatalf("override: want all-locked, got %+v", d.Candidates)
+	}
+}
+
+// Planning and architecture in a work repo may still run on Gemini (docs only;
+// the harness guard reverts any code it writes).
+func TestResolveRoute_WorkRepoPlanningMayUseGemini(t *testing.T) {
+	for _, kind := range []string{"planning", "architecture"} {
+		d := ResolveRoute(kind, true, openPacer(), "", time.Now())
+		s := mustChosen(t, d)
+		if s.Family != FamilyGemini || d.GeminiBarred {
+			t.Errorf("%s: got %+v barred=%v, want Gemini first", kind, s, d.GeminiBarred)
+		}
+	}
+}
+
+func TestGeminiCodeForbidden(t *testing.T) {
+	if !GeminiCodeForbidden(true) || GeminiCodeForbidden(false) {
+		t.Fatal("rule must hold for work repos only")
+	}
+	for _, k := range []WorkKind{WorkKindCoding, WorkKindReview, WorkKindQA, "", "bogus"} {
+		if GeminiAllowed(k, true) {
+			t.Errorf("Gemini allowed for %q in a work repo", k)
+		}
+		if !GeminiAllowed(k, false) {
+			t.Errorf("Gemini barred for %q in a personal repo", k)
+		}
+	}
+	for _, k := range []WorkKind{WorkKindPlanning, WorkKindArchitecture} {
+		if !GeminiAllowed(k, true) {
+			t.Errorf("Gemini barred for %q in a work repo", k)
+		}
+	}
+	if len(GeminiDocAllowlist()) == 0 {
+		t.Error("allowlist empty")
 	}
 }
 
@@ -118,24 +183,24 @@ func TestResolveRoute_FiveHourExhaustedCountsAsLocked(t *testing.T) {
 }
 
 func TestResolveRoute_AllLocked(t *testing.T) {
-	p := lockedPacer(map[PoolID]string{PoolWorkClaude: "a", PoolGeminiNative: "b"})
-	d := ResolveRoute("coding", true, p, "", time.Now())
+	p := lockedPacer(map[PoolID]string{PoolPersonalClaude: "a", PoolGeminiNative: "b"})
+	d := ResolveRoute("coding", false, p, "", time.Now())
 	if !d.AllLocked() {
 		t.Fatalf("expected all locked, got %+v", d)
 	}
 	if !strings.HasPrefix(d.Title(), "All providers locked") {
 		t.Errorf("title = %q", d.Title())
 	}
-	if !strings.Contains(d.Body(), "work seat locked (a)") || !strings.Contains(d.Body(), "Gemini locked (b)") {
+	if !strings.Contains(d.Body(), "personal seat locked (a)") || !strings.Contains(d.Body(), "Gemini locked (b)") {
 		t.Errorf("body %q should list every lock reason", d.Body())
 	}
 }
 
 func TestResolveRoute_ModelOverrideSonnet(t *testing.T) {
-	d := ResolveRoute("qa", true, openPacer(), "sonnet", time.Now())
+	d := ResolveRoute("qa", false, openPacer(), "sonnet", time.Now())
 	s := mustChosen(t, d)
-	if s.Family != FamilyClaude || s.Model != "sonnet" || s.PoolID != PoolWorkClaude {
-		t.Fatalf("override: got %+v, want work Claude sonnet", s)
+	if s.Family != FamilyClaude || s.Model != "sonnet" || s.PoolID != PoolPersonalClaude {
+		t.Fatalf("override: got %+v, want personal Claude sonnet", s)
 	}
 	if len(d.Candidates) < 2 || d.Candidates[1].Model != "gemini-3.8-flash-high" {
 		t.Errorf("override fallback should pair sonnet with Gemini 3.8 Flash, got %+v", d.Candidates)
@@ -171,7 +236,12 @@ func TestChainsForRepo_MapsClaudeSlotsToSeat(t *testing.T) {
 			want = PoolWorkClaude
 		}
 		for kind, chain := range ChainsForRepo(isWork) {
-			for _, s := range chain {
+			for i, s := range chain {
+				// STA-856: work chains that may write code end in personal-seat
+				// fallbacks; the leading Claude slots stay on the repo's seat.
+				if isWork && !GeminiAllowed(kind, true) && i > 0 && s.PoolID == PoolPersonalClaude {
+					continue
+				}
 				if strings.HasPrefix(s.Provider, "claude-") && s.Provider != "claude-cloud" && s.PoolID != want {
 					t.Errorf("isWork=%v kind=%s slot %s pool=%s, want %s", isWork, kind, s.Provider, s.PoolID, want)
 				}
@@ -229,6 +299,16 @@ func TestResolveRoute_EveryKindFirstAndFallback(t *testing.T) {
 			d := ResolveRoute(c.kind, isWork, openPacer(), "", time.Now())
 			if d.Kind != WorkKind(c.kind) {
 				t.Errorf("%s: kind normalised to %q", c.kind, d.Kind)
+			}
+			if isWork && !GeminiAllowed(WorkKind(c.kind), true) {
+				// STA-856: Gemini removed; work Claude then personal Claude, same model.
+				if len(d.Candidates) != 2 ||
+					d.Candidates[0].PoolID != PoolWorkClaude || d.Candidates[0].Seat != SeatWork ||
+					d.Candidates[1].PoolID != PoolPersonalClaude || d.Candidates[1].Seat != SeatPersonal ||
+					d.Candidates[0].Model != d.Candidates[1].Model {
+					t.Errorf("%s work: want work then personal Claude, got %+v", c.kind, d.Candidates)
+				}
+				continue
 			}
 			if len(d.Candidates) != 2 {
 				t.Fatalf("%s work=%v: want 2 candidates, got %+v", c.kind, isWork, d.Candidates)

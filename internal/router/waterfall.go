@@ -53,7 +53,11 @@ type RouteDecision struct {
 	AccountEmail   string      `json:"account_email"`
 	Reason         string      `json:"reason"`
 	Warnings       []string    `json:"warnings,omitempty"`
-	PacerState     *PacerState `json:"pacer_state,omitempty"`
+	// Waiting is set when the decision's seat is locked and there is no
+	// permitted fallback: the caller should wait for it (work repos never fall
+	// back to Gemini, GeminiCodeForbidden).
+	Waiting    bool        `json:"waiting,omitempty"`
+	PacerState *PacerState `json:"pacer_state,omitempty"`
 }
 
 type scanReposFile struct {
@@ -275,8 +279,10 @@ func FallbackPairingMatrix(claudeModel, effort string) (geminiModel, geminiEffor
 
 // Route executes the dynamic waterfall routing engine:
 //  1. Check if cwd is an enterprise work repo.
-//  2. If work repo: check if Claude Work is locked (falls back to Gemini 3.1 Pro per STA-12);
-//     otherwise check SSH connectivity to remote node -> route to remote Claude, or fallback to local Claude work seat.
+//  2. If work repo: always Claude, never agy (GeminiCodeForbidden, STA-856). A
+//     locked work seat falls back to the personal Claude seat; with both locked
+//     the decision sets Waiting instead of falling back to Gemini. Otherwise check SSH connectivity to the remote node
+//     -> route to remote Claude, or fall back to the local Claude work seat.
 //  3. If personal repo: balanced peer pacing between Claude Code and Antigravity,
 //     with dynamic quota-aware fallback to Gemini 3.1 Pro (Opus) / Gemini 3.8 Flash (Sonnet) when Claude is locked out.
 func Route(ctx context.Context, cwd string, pacerState *PacerState, opts RouteOptions) (*RouteDecision, error) {
@@ -316,16 +322,36 @@ func Route(ctx context.Context, cwd string, pacerState *PacerState, opts RouteOp
 
 	if isWork {
 		decision.AccountRole = "work"
+		now := opts.Now
+		if now.IsZero() {
+			now = time.Now()
+		}
 		poolWork := pacerState.Pools[PoolWorkClaude]
-		if poolWork != nil && poolWork.IsLocked {
-			// Dynamic Fallback Pairing Matrix (STA-12): Opus tier routes to Gemini 3.1 Pro
-			decision.Target = TargetGeminiNative
-			decision.Tool = "agy"
-			decision.Model = "gemini-3.1-pro"
-			decision.Command = "agy --model gemini-3.1-pro --effort high"
-			decision.Reason = fmt.Sprintf("Enterprise work repo (%s); Claude Work Opus locked until %s, dynamically falling back to Gemini 3.1 Pro (STA-12)",
-				workSrc, poolWork.LockoutUntil.Format("03:04pm"))
-			decision.Warnings = append(decision.Warnings, fmt.Sprintf("Claude Work locked out until %s; routed to Gemini 3.1 Pro", poolWork.LockoutUntil.Format("03:04pm")))
+		if locked, why := PoolLockReason(poolWork, now); locked && GeminiCodeForbidden(true) {
+			// Board rule (STA-856): Gemini never writes code in a work repo.
+			// Fall back to the personal Claude seat; if it is locked too, wait.
+			until := ""
+			if poolWork != nil && !poolWork.LockoutUntil.IsZero() {
+				until = " until " + poolWork.LockoutUntil.Format("03:04pm")
+			}
+			decision.Tool = "claude"
+			decision.Model = "claude-opus-5"
+			if pLocked, _ := PoolLockReason(pacerState.Pools[PoolPersonalClaude], now); !pLocked {
+				decision.Target = TargetClaudePersonal
+				decision.AccountRole = "personal"
+				decision.Command = "claude"
+				decision.Reason = fmt.Sprintf("Enterprise work repo (%s); fell back to personal Claude: work seat locked (%s%s). %s",
+					workSrc, why, until, GeminiCodeRule)
+				decision.Warnings = append(decision.Warnings, fmt.Sprintf("Work Claude seat locked (%s%s); using the personal Claude seat. Gemini is not used in work repos.", why, until))
+				return decision, nil
+			}
+			_, pWhy := PoolLockReason(pacerState.Pools[PoolPersonalClaude], now)
+			decision.Target = TargetLocalClaudeWork
+			decision.Command = "CLAUDE_CONFIG_DIR=~/.claude-work claude"
+			decision.Waiting = true
+			decision.Reason = fmt.Sprintf("Enterprise work repo (%s); waiting for a Claude seat: work seat locked (%s%s), personal seat locked (%s). %s, so there is no Gemini fallback",
+				workSrc, why, until, pWhy, GeminiCodeRule)
+			decision.Warnings = append(decision.Warnings, "Both Claude seats are locked; waiting. Gemini is not used in work repos.")
 			return decision, nil
 		}
 

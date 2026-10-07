@@ -25,7 +25,7 @@ func freshSlots(t *testing.T, max int) *orchestrator.RunSlots {
 func stubQuota(t *testing.T, locked *atomic.Bool) {
 	t.Helper()
 	prev := taskQuotaLocked
-	taskQuotaLocked = func(*sql.DB, string) bool { return locked.Load() }
+	taskQuotaLocked = func(*sql.DB, string, string) bool { return locked.Load() }
 	t.Cleanup(func() { taskQuotaLocked = prev })
 }
 
