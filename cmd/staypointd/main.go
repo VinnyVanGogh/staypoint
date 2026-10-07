@@ -366,11 +366,15 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 		// Claim() succeeds, so refused runs (ErrConcurrencyCap) never write steps.
 
 		parseDelta := func(line []byte) ([]orchestrator.StepDelta, error) {
-			prov := resolvedProv
-			if prov == "" {
-				prov = "claude"
+			parse := adapter.ParseChainStreamDelta
+			switch resolvedProv {
+			case "", "claude", "gemini":
+				// These run a failover chain (gemini > claude or the reverse),
+				// so only the output shows which CLI answered (STA-775).
+			default:
+				parse = adapter.AdapterFor(resolvedProv).ParseStreamDelta
 			}
-			raw, err := adapter.AdapterFor(prov).ParseStreamDelta(line)
+			raw, err := parse(line)
 			if err != nil {
 				return nil, err
 			}

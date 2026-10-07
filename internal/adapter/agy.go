@@ -159,3 +159,17 @@ func buildAgyArgs(opts ParsedOptions) []string {
 	}
 	return args
 }
+
+// ParseChainStreamDelta parses one line from a failover-chain run (gemini >
+// claude …), where only the output shows which provider answered: agy lines
+// carry a top-level "event" key, Claude lines a "type" key. Parsing a Gemini
+// run as Claude drops every event, leaving an empty timeline (STA-775).
+func ParseChainStreamDelta(line []byte) ([]StreamDelta, error) {
+	var probe struct {
+		Event string `json:"event"`
+	}
+	if json.Unmarshal(bytes.TrimSpace(line), &probe) == nil && probe.Event != "" {
+		return AgyAdapter{}.ParseStreamDelta(line)
+	}
+	return ClaudeAdapter{}.ParseStreamDelta(line)
+}
