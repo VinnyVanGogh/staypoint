@@ -151,6 +151,11 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 		AssigneeAgentID string  `json:"assignee_agent_id"`
 		WorkKind        string  `json:"work_kind"`
 		Description     string  `json:"description"`
+		// STA-820: child task fields. Repo/org/project are inherited from the parent.
+		ParentID string `json:"parent_id"`
+		Handoff  string `json:"handoff"`
+		// AllowDeep is the Board override for the child depth cap.
+		AllowDeep bool `json:"allow_deep"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -165,6 +170,11 @@ func (h *TasksHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 
 	if req.WorkKind != "" && !validWorkKinds[req.WorkKind] {
 		writeError(w, http.StatusBadRequest, "invalid work_kind: must be one of coding, review, architecture, planning, qa")
+		return
+	}
+
+	if strings.TrimSpace(req.ParentID) != "" {
+		h.createChildTask(w, req.ParentID, req.Name, req.WorkKind, req.Handoff, req.Description, req.MaxBudgetUSD, req.MaxTurns, req.AllowDeep)
 		return
 	}
 
@@ -303,17 +313,24 @@ func (h *TasksHandler) AddComment(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// MarkDone handles POST /api/tasks/{id}/done
+// MarkDone handles POST /api/tasks/{id}/done. A parent with open child tasks
+// is refused with 409 unless the Board passes {"override": true}.
 func (h *TasksHandler) MarkDone(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "task id is required")
 		return
 	}
+	var req struct {
+		Override bool `json:"override"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req) // body is optional
 
-	if err := context.MarkTaskDone(h.db, id); err != nil {
+	if err := context.MarkTaskDoneWithOptions(h.db, id, context.DoneOptions{BoardOverride: req.Override}); err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, err.Error())
+		} else if errors.Is(err, context.ErrOpenChildren) {
+			writeError(w, http.StatusConflict, err.Error())
 		} else if strings.Contains(err.Error(), "without a registered work product") {
 			writeError(w, http.StatusConflict, err.Error())
 		} else {
@@ -644,7 +661,8 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Stage string `json:"stage"`
+		Stage    string `json:"stage"`
+		Override bool   `json:"override"` // Board override: done with open children
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -664,9 +682,11 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := context.SetTaskExecutionStage(h.db, id, req.Stage); err != nil {
+	if err := context.SetTaskExecutionStageWithOptions(h.db, id, req.Stage, context.DoneOptions{BoardOverride: req.Override}); err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, err.Error())
+		} else if errors.Is(err, context.ErrOpenChildren) {
+			writeError(w, http.StatusConflict, err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "failed to update task stage: "+err.Error())
 		}

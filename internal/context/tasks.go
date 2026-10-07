@@ -850,11 +850,22 @@ func GetActiveTaskForRepo(db *sql.DB, repoPath string) (*Task, error) {
 	return nil, fmt.Errorf("no active tasks found")
 }
 
-// MarkTaskDone updates the task's status to 'done'.
+// MarkTaskDone updates the task's status to 'done'. A task with open child
+// tasks is refused (ErrOpenChildren); see MarkTaskDoneWithOptions.
 func MarkTaskDone(db *sql.DB, id string) error {
+	return MarkTaskDoneWithOptions(db, id, DoneOptions{})
+}
+
+// MarkTaskDoneWithOptions is MarkTaskDone with the Board override.
+func MarkTaskDoneWithOptions(db *sql.DB, id string, opts DoneOptions) error {
 	task, err := GetTask(db, id)
 	if err != nil {
 		return err
+	}
+	if !opts.BoardOverride {
+		if err := checkOpenChildren(db, task.ID); err != nil {
+			return err
+		}
 	}
 
 	var count int
@@ -1358,12 +1369,23 @@ func ListTaskDocuments(db *sql.DB, taskID string) ([]TaskDocument, error) {
 }
 
 // SetTaskExecutionStage updates the execution stage of a task and sets status accordingly.
+// Moving a task with open child tasks to "done" is refused (ErrOpenChildren).
 func SetTaskExecutionStage(db *sql.DB, taskID, stage string) error {
+	return SetTaskExecutionStageWithOptions(db, taskID, stage, DoneOptions{})
+}
+
+// SetTaskExecutionStageWithOptions is SetTaskExecutionStage with the Board override.
+func SetTaskExecutionStageWithOptions(db *sql.DB, taskID, stage string, opts DoneOptions) error {
 	task, err := GetTask(db, taskID)
 	if err != nil {
 		return err
 	}
 	stage = strings.ToLower(strings.TrimSpace(stage))
+	if stage == "done" && !opts.BoardOverride {
+		if err := checkOpenChildren(db, task.ID); err != nil {
+			return err
+		}
+	}
 	status := "active"
 	if stage == "done" {
 		status = "done"

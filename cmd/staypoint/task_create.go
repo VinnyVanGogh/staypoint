@@ -52,6 +52,9 @@ func init() {
 }
 
 func runTaskCreate(cmd *cobra.Command, args []string) error {
+	if childCreateRequested(cmd) {
+		return runTaskCreateChild(cmd, args) // STA-820
+	}
 	out := cmd.OutOrStdout()
 	tuiFlag, _ := cmd.Flags().GetBool("tui")
 	dryRun, _ := cmd.Flags().GetBool("dry-run")

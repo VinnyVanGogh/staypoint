@@ -255,6 +255,7 @@ func (s *Server) getToolsList() []Tool {
 				Required: []string{"test_steps"},
 			},
 		},
+		taskCreateChildTool(),
 	}
 }
 
@@ -282,6 +283,8 @@ func (s *Server) handleCallTool(ctx context.Context, params CallToolParams) *Too
 		return s.handleTaskGet(ctx, params.Arguments)
 	case "staypoint_ship_review":
 		return s.handleShipReview(ctx, params.Arguments)
+	case "staypoint_task_create_child":
+		return s.handleTaskCreateChild(ctx, params.Arguments)
 	default:
 		return toolError(fmt.Sprintf("unknown tool: %s", params.Name))
 	}
