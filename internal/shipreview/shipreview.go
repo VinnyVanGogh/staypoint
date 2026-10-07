@@ -1127,9 +1127,11 @@ func DeleteBranch(ctx context.Context, repoDir, branch string) error {
 	if err := guardDeletableBranch(ctx, repoDir, branch); err != nil {
 		return err
 	}
-	// Use refs/heads/ form so the arg can never be misinterpreted as a flag.
-	_, err := gitOutput(ctx, repoDir, "push", "origin", "--delete", "refs/heads/"+branch)
-	return err
+	tip, err := remoteBranchTip(ctx, repoDir, branch)
+	if err != nil || tip == "" {
+		return err
+	}
+	return deleteRemoteBranchLeased(ctx, repoDir, branch, tip)
 }
 
 // guardDeletableBranch rejects branch names that must never be deleted:
@@ -1230,12 +1232,13 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 		}
 		// Ask the remote directly rather than trusting the tracking ref, which
 		// a narrow fetch refspec may not maintain.
-		out, err := gitOutput(ctx, repoDir, "ls-remote", "--heads", "origin", "refs/heads/"+branch)
-		if err != nil {
+		// Only exactly refs/heads/<branch> (ls-remote matches name tails),
+		// and never a symbolic ref on the remote (deleting it deletes its
+		// target).
+		var err error
+		if remoteTip, err = remoteBranchTip(ctx, repoDir, branch); err != nil {
 			return fmt.Errorf("read remote branch %s: %w; nothing deleted", branch, err)
 		}
-		// Only exactly refs/heads/<branch>: ls-remote matches name tails.
-		remoteTip = lsRemoteTip(out, branch)
 		// A tip missing locally cannot be part of main's history, so the
 		// ancestor check fails closed for it too.
 		if remoteTip != "" && verifyAncestor(ctx, repoDir, remoteTip, mainSHA) != nil {
@@ -1259,6 +1262,25 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 
 	var errs []error
 
+	// Immediately before deleting: the branch must still be a plain ref of
+	// exactly its name (an agent may have swapped it for a symref since the
+	// checks), and every protected ref is recorded so a delete that reached
+	// one anyway is caught and undone.
+	if err := requireExactRefs(ctx, repoDir, branch); err != nil {
+		return fmt.Errorf("%w; nothing deleted", err)
+	}
+	protected := protectedNames(ctx, repoDir, card.TargetBranch)
+	localBefore, err := localRefSnapshot(ctx, repoDir, protected)
+	if err != nil {
+		return fmt.Errorf("snapshot protected refs: %w; nothing deleted", err)
+	}
+	var remoteBefore map[string]string
+	if hasOrigin && remoteTip != "" {
+		if remoteBefore, err = remoteRefSnapshot(ctx, repoDir, protected); err != nil {
+			return fmt.Errorf("snapshot protected remote refs: %w; nothing deleted", err)
+		}
+	}
+
 	if localTip != "" {
 		// update-ref skips branch -D's "checked out in a worktree" refusal,
 		// so check that ourselves: the task's own worktrees are gone by now,
@@ -1267,8 +1289,9 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 			errs = append(errs, fmt.Errorf("delete local branch: %w", err))
 		} else if wt != "" {
 			errs = append(errs, fmt.Errorf("local branch %s is checked out in %s; not deleted", branch, wt))
-		} else if _, err := gitOutput(ctx, repoDir, "update-ref", "-d", "refs/heads/"+branch, localTip); err != nil {
-			// Like the remote lease: only delete the tip that was checked.
+		} else if _, err := gitOutput(ctx, repoDir, "update-ref", "--no-deref", "-d", "refs/heads/"+branch, localTip); err != nil {
+			// Like the remote lease: only delete the tip that was checked;
+			// --no-deref: never the ref a symref points to.
 			errs = append(errs, fmt.Errorf("delete local branch: %w", err))
 		} else {
 			// branch -D would have dropped the branch's config too.
@@ -1279,6 +1302,18 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 	if hasOrigin && remoteTip != "" {
 		if err := deleteRemoteBranchLeased(ctx, repoDir, branch, remoteTip); err != nil {
 			errs = append(errs, fmt.Errorf("delete remote branch: %w", err))
+		}
+	}
+
+	// After: fail loudly if any protected ref vanished or moved.
+	if err := checkLocalProtected(ctx, repoDir, protected, localBefore); err != nil {
+		errs = append(errs, err)
+	}
+	if remoteBefore != nil {
+		if after, err := remoteRefSnapshot(ctx, repoDir, protected); err != nil {
+			errs = append(errs, fmt.Errorf("re-check protected remote refs: %w", err))
+		} else if err := compareSnapshots("origin", remoteBefore, after, nil); err != nil {
+			errs = append(errs, err)
 		}
 	}
 

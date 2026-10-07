@@ -1416,7 +1416,9 @@ var Migrations = []Migration{
 		},
 	},
 	{
-		// 43, not 42: PR #247 claims 42 (task-d4145d27 / #245-2).
+		// 43: main ends at 41; 42 is left free so an in-flight migration PR
+		// can renumber into it (PR #247 currently uses 40, which collides
+		// with main's 40 and must move). task-d4145d27 / #245-2.
 		Version: 43,
 		Name:    "work_product_provenance",
 		Up: func(conn *sql.DB) error {

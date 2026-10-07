@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os/exec"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -88,5 +90,48 @@ func TestBranchOwnedByTask(t *testing.T) {
 	err = CleanupTaskBranch(ctx, db, t.TempDir(), card, "abc")
 	if !errors.Is(err, ErrBranchNotOwned) || err.Error() != "branch fix/theirs is not owned by this task; not deleted" {
 		t.Fatalf("CleanupTaskBranch = %v", err)
+	}
+}
+
+// The after-delete check catches a protected ref that vanished, puts it back
+// and fails loudly; a moved one is reported.
+func TestCheckLocalProtected_RestoresAndFailsLoudly(t *testing.T) {
+	repo := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "i"},
+		{"branch", "dev-server"},
+		{"checkout", "-q", "--detach"},
+	} {
+		if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	ctx := context.Background()
+	names := protectedNames(ctx, repo, "")
+	before, err := localRefSnapshot(ctx, repo, names)
+	if err != nil || before["refs/heads/main"] == "" || before["refs/heads/dev-server"] == "" {
+		t.Fatalf("snapshot %v %v", before, err)
+	}
+	if out, err := exec.Command("git", "-C", repo, "update-ref", "-d", "refs/heads/main").CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	err = checkLocalProtected(ctx, repo, names, before)
+	if err == nil || !strings.Contains(err.Error(), "PROTECTED REF DELETED") || !strings.Contains(err.Error(), "restored") {
+		t.Fatalf("checkLocalProtected = %v", err)
+	}
+	after, _ := localRefSnapshot(ctx, repo, names)
+	if after["refs/heads/main"] != before["refs/heads/main"] {
+		t.Fatalf("main not restored: %v", after)
+	}
+	if err := compareSnapshots("origin", map[string]string{"refs/heads/main": "a"}, map[string]string{"refs/heads/main": "b"}, nil); err == nil || !strings.Contains(err.Error(), "PROTECTED REF MOVED") {
+		t.Fatalf("moved ref not reported: %v", err)
+	}
+}
+
+func TestLsRemoteSymref(t *testing.T) {
+	out := "ref: refs/heads/main\trefs/heads/fix/sym\nabc\trefs/heads/fix/sym\n"
+	if !lsRemoteSymref(out, "fix/sym") || lsRemoteSymref(out, "main") {
+		t.Fatal("lsRemoteSymref")
 	}
 }
