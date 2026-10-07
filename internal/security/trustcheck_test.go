@@ -90,6 +90,10 @@ func TestAnalyzeForTrust_ProtectedAlwaysHeld(t *testing.T) {
 		"sudo GIT_DIR=/o/.git git push",
 		"GIT_DIR=/o/.git sudo git push",
 		"GIT_DIR=/o/.git timeout 5 git push",
+		"ssh -o HostName=127.0.0.1 build 'git push origin main'",
+		"ssh -J jump host true",
+		"ssh 127.1 'git push origin main'",
+		"ssh 0x7f000001 'gh pr merge 1'",
 	}
 	for _, c := range cases {
 		if f := AnalyzeForTrust(c, tc); !f.Protected {
@@ -186,6 +190,9 @@ func TestAnalyzeForTrust_DeleteOutsideWorktree(t *testing.T) {
 		"cp -S .bak x.txt /etc/hosts",
 		"install -m755 tool /usr/local/bin/tool",
 		"ln -s target /usr/local/bin/x",
+		"cp --target /etc a.txt b.txt",
+		"cp --target-dir=/etc a.txt",
+		"cp a.txt -t /etc b.txt",
 	}
 	for _, c := range outside {
 		if f := AnalyzeForTrust(c, tc); !f.DeleteOutside {

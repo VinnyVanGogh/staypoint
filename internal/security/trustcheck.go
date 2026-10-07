@@ -295,8 +295,10 @@ func hasFlag(args []string, flags ...string) bool {
 }
 
 // sshCommandOptions run a command on this machine.
+// HostName and ProxyJump change where the command runs, so they count too.
 var sshCommandOptions = map[string]bool{"proxycommand": true, "localcommand": true, "knownhostscommand": true,
-	"permitlocalcommand": true, "proxyusefdpass": true, "remotecommand": true, "match": true, "include": true}
+	"permitlocalcommand": true, "proxyusefdpass": true, "remotecommand": true, "match": true, "include": true,
+	"hostname": true, "proxyjump": true}
 
 // sshValueLetters are the ssh options that take a value (ssh's getopt
 // string "B:b:c:D:E:e:F:I:i:J:L:l:m:O:o:P:p:Q:R:S:W:w:").
@@ -334,6 +336,8 @@ func (a *trustAnalyzer) ssh(s segment, args []string, depth int) {
 				}
 			case 'F':
 				a.unsure("ssh with a custom config file")
+			case 'J':
+				a.unsure("ssh -J jump host")
 			}
 			break
 		}
@@ -355,7 +359,9 @@ func (a *trustAnalyzer) ssh(s segment, args []string, depth int) {
 		}
 		return
 	}
-	if isLocalHost(host) {
+	if isLocalHost(host) || numericHost(host) {
+		// This machine, or an address form (127.1, 0x7f000001) we do not
+		// normalise: analyse the command as local.
 		a.line(rc, "", depth+1)
 		return
 	}
@@ -377,6 +383,9 @@ func (a *trustAnalyzer) ssh(s segment, args []string, depth int) {
 // alias pointing here is not visible.)
 func isLocalHost(host string) bool {
 	h := strings.ToLower(strings.TrimSuffix(strings.Trim(host, "[]"), "."))
+	if i := strings.IndexByte(h, '%'); i >= 0 {
+		h = h[:i]
+	}
 	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
 		return true
 	}
@@ -418,9 +427,13 @@ func (a *trustAnalyzer) copyLike(name string, args []string, dynAt func(int) boo
 				pos = append(pos, plainArg{v: args[j], i: j})
 			}
 			i = len(args)
+		case len(pos) > 0 && strings.HasPrefix(x, "-"):
+			// An option after an operand: GNU reads it as an option, BSD as a
+			// file. Do not guess which.
+			a.f.deleteOut(name + ": option after an operand: " + x)
 		case strings.HasPrefix(x, "--"):
 			k, v, hasV := strings.Cut(x, "=")
-			if !longValue[k] {
+			if k = longOpt(k, longValue); k == "" {
 				continue
 			}
 			if !hasV {
@@ -470,6 +483,39 @@ func (a *trustAnalyzer) copyLike(name string, args []string, dynAt func(int) boo
 	if len(pos) > 0 && !targetSet {
 		a.deleteArg(pos[len(pos)-1], dynAt, dir, baseDir, what)
 	}
+}
+
+// numericHost reports a host that is an address but not one ParseIP reads
+// (inet_aton short, decimal, hex or octal forms).
+func numericHost(host string) bool {
+	h := strings.ToLower(strings.Trim(host, "[]"))
+	if h == "" || net.ParseIP(h) != nil {
+		return false
+	}
+	for _, r := range h {
+		if !(r >= '0' && r <= '9' || r == '.' || r == 'x' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return strings.ContainsAny(h, "0123456789")
+}
+
+// longOpt resolves a possibly abbreviated long option (getopt_long accepts
+// any unambiguous prefix) against the known value-taking options.
+func longOpt(k string, known map[string]bool) string {
+	if known[k] {
+		return k
+	}
+	match := ""
+	for o := range known {
+		if len(k) >= 4 && strings.HasPrefix(o, k) {
+			if match != "" {
+				return "" // ambiguous: getopt refuses it too
+			}
+			match = o
+		}
+	}
+	return match
 }
 
 // carryAssigns puts the VAR=x prefixes of the outer command and of a
