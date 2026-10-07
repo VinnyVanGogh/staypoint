@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func tableExists(t *testing.T, s *Store, name string) bool {
+func repairTableExists(t *testing.T, s *Store, name string) bool {
 	t.Helper()
 	var n int
 	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&n); err != nil {
@@ -34,7 +34,7 @@ func TestRepairSchema_RecreatesTableRecordedButMissing(t *testing.T) {
 	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM schema_versions WHERE version = 20`).Scan(&v); err != nil || v != 1 {
 		t.Fatalf("migration 20 should stay recorded: %d %v", v, err)
 	}
-	if tableExists(t, s, "security_gate_audit_log") {
+	if repairTableExists(t, s, "security_gate_audit_log") {
 		t.Fatal("setup: table should be gone")
 	}
 
@@ -49,7 +49,7 @@ func TestRepairSchema_RecreatesTableRecordedButMissing(t *testing.T) {
 	if len(logs) != 1 || !strings.Contains(logs[0], "schema repair: created security_gate_audit_log (migration 20 recorded but table missing)") {
 		t.Fatalf("log: %v", logs)
 	}
-	if !tableExists(t, s, "security_gate_audit_log") {
+	if !repairTableExists(t, s, "security_gate_audit_log") {
 		t.Fatal("table not recreated")
 	}
 	var idx int
@@ -86,7 +86,7 @@ func TestRepairSchema_RunsOnOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if !tableExists(t, s, "security_gate_audit_log") {
+	if !repairTableExists(t, s, "security_gate_audit_log") {
 		t.Fatal("Open did not repair the missing table")
 	}
 }
