@@ -217,6 +217,8 @@ func TestAnalyzeForTrust_DeleteInsideAllowed(t *testing.T) {
 		"echo x | tee -a /etc/hosts",
 		"mv a.txt b.txt",
 		"cp " + "/etc/hosts" + " ./hosts.copy",
+		"cp --recursive --force src dst",
+		"mv --verbose a.txt b.txt",
 		"ssh build-host 'rm -rf /tmp/build && make'",
 	}
 	for _, c := range inside {

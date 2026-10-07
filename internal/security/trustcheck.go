@@ -437,7 +437,11 @@ func (a *trustAnalyzer) copyLike(name string, args []string, dynAt func(int) boo
 		case strings.HasPrefix(x, "--"):
 			k, v, hasV := strings.Cut(x, "=")
 			full := longOpt(k, longValue)
-			if full != k && len(k) > 2 {
+			abbrev := false
+			for o := range longValue {
+				abbrev = abbrev || (o != k && len(k) > 2 && strings.HasPrefix(o, k))
+			}
+			if abbrev {
 				// Abbreviations resolve against each tool's full option
 				// table, which we do not model: do not guess.
 				a.f.deleteOut(name + ": abbreviated long option " + k)
