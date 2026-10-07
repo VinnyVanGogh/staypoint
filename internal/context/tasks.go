@@ -1206,7 +1206,7 @@ func BlockTaskWithBlockers(db *sql.DB, taskID, reason string, blockers []Blocker
 		return err
 	}
 
-	query := `UPDATE tasks SET is_blocked = 1, block_reason = ?, execution_stage = 'blocked', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`
+	query := `UPDATE tasks SET is_blocked = 1, block_reason = ?, execution_stage = `+blockedStageSQL()+`, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`
 	if _, err := tx.Exec(query, cleanReason, task.ID); err != nil {
 		tx.Rollback()
 		return err
@@ -1317,7 +1317,7 @@ func AddTaskBlocker(db *sql.DB, taskID, blockerID, rationale string) error {
 	}
 	if _, err := tx.Exec(`
 		UPDATE tasks
-		SET is_blocked = 1, block_reason = ?, execution_stage = 'blocked', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		SET is_blocked = 1, block_reason = ?, execution_stage = `+blockedStageSQL()+`, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 		WHERE id = ?
 	`, reason, task.ID); err != nil {
 		tx.Rollback()

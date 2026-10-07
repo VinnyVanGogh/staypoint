@@ -23,9 +23,22 @@ const OrgHoldPrefix = "org_hold."
 // ErrOrgHeld is returned when a task's organization is on hold.
 var ErrOrgHeld = errors.New("organization is on hold")
 
-// OrgHoldKey is the settings_kv key for org's hold.
+// OrgHoldKey is the settings_kv key for org's hold. It normalizes exactly as
+// OrgNotHeldSQL does (SQLite trim: spaces only; lower: ASCII only), so the
+// key written here is the key Claim looks up for any organization name.
 func OrgHoldKey(org string) string {
-	return OrgHoldPrefix + strings.ToLower(strings.TrimSpace(org))
+	return OrgHoldPrefix + sqliteLower(strings.Trim(org, " "))
+}
+
+// sqliteLower folds ASCII A-Z only, like SQLite's built-in lower().
+func sqliteLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
 }
 
 // OrgHeld reports whether org is on hold. An empty org is never held. A read
@@ -59,7 +72,7 @@ func TaskOrgHeld(db *sql.DB, taskID string) (bool, string) {
 // SetOrgHold places (held) or lifts the hold on org. Callers must have passed
 // the Board gate.
 func SetOrgHold(db *sql.DB, org string, held bool) error {
-	org = strings.TrimSpace(org)
+	org = strings.Trim(org, " ")
 	if org == "" {
 		return fmt.Errorf("organization is required")
 	}

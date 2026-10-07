@@ -40,6 +40,15 @@ func RequiresBoardToLeave(t *Task, stage string) bool {
 	return !governance.IsRunnableStage(t.ExecutionStage) && governance.IsRunnableStage(stage)
 }
 
+// blockedStageSQL is the execution_stage a block writes: blocked, except
+// that a parked agent-created task keeps its stage. blocked is runnable and
+// unblocking moves it to todo, so blocking would otherwise be a way for an
+// agent to move its own backlog task out of backlog without the Board.
+func blockedStageSQL() string {
+	return `CASE WHEN COALESCE(origin, 'native') = '` + OriginAgent + `' AND execution_stage IN (` +
+		governance.NonRunnableStagesSQL() + `) THEN execution_stage ELSE 'blocked' END`
+}
+
 // prodWord matches "prod" / "production" as a word.
 var prodWord = regexp.MustCompile(`(?i)\bprod(uction)?\b`)
 

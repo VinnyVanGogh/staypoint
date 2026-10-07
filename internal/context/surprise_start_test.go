@@ -112,6 +112,59 @@ func TestCommentWakes_HeldOrgStaysQuiet(t *testing.T) {
 	}
 }
 
+// Blocking then unblocking must not move a parked agent task to todo.
+func TestBlockUnblock_ParkedAgentTaskStaysParked(t *testing.T) {
+	database := setupTestDB(t)
+	task, err := CreateTaskWithOptions(database, TaskCreateOptions{Name: "a", RepoPath: "/tmp/r", GitBranch: "main", AccountRole: "personal", Origin: OriginAgent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := BlockTask(database, task.ID, "waiting on review"); err != nil {
+		t.Fatalf("block: %v", err)
+	}
+	got, _ := GetTask(database, task.ID)
+	if got.ExecutionStage != governance.StageBacklog || !got.IsBlocked {
+		t.Fatalf("after block: stage %s blocked %v, want backlog/true", got.ExecutionStage, got.IsBlocked)
+	}
+	if err := UnblockTask(database, task.ID); err != nil {
+		t.Fatalf("unblock: %v", err)
+	}
+	if got, _ := GetTask(database, task.ID); got.ExecutionStage != governance.StageBacklog {
+		t.Fatalf("after unblock: stage %s, want backlog", got.ExecutionStage)
+	}
+	// A native todo task still goes blocked -> todo.
+	native, _ := CreateTaskWithOptions(database, TaskCreateOptions{Name: "n", RepoPath: "/tmp/r", GitBranch: "main", AccountRole: "personal"})
+	_ = BlockTask(database, native.ID, "x")
+	if got, _ := GetTask(database, native.ID); got.ExecutionStage != governance.StageBlocked {
+		t.Errorf("native block: stage %s, want blocked", got.ExecutionStage)
+	}
+}
+
+// The hold key matches the Claim SQL for any org name, including non-ASCII
+// letters SQLite's lower() does not fold.
+func TestOrgHold_KeyMatchesSQL(t *testing.T) {
+	database := setupTestDB(t)
+	for _, org := range []string{"Managed Solution", "Société Générale", "  ÉQUIPE  "} {
+		task, err := CreateTaskWithOptions(database, TaskCreateOptions{Name: "t", RepoPath: "/tmp/r", GitBranch: "main", AccountRole: "personal", Organization: org})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := governance.SetOrgHold(database, org, true); err != nil {
+			t.Fatal(err)
+		}
+		var n int
+		if err := database.QueryRow(`SELECT COUNT(*) FROM tasks WHERE id = ? AND `+governance.OrgNotHeldSQL("tasks"), task.ID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Errorf("org %q: SQL does not see the hold", org)
+		}
+		if held, _ := governance.TaskOrgHeld(database, task.ID); !held {
+			t.Errorf("org %q: TaskOrgHeld false", org)
+		}
+	}
+}
+
 func TestNameTargetsProd(t *testing.T) {
 	for name, want := range map[string]bool{
 		"port the fix to prod":     true,
