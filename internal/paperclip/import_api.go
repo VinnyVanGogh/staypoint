@@ -12,9 +12,14 @@ import (
 
 // Read-only endpoints used by `staypoint import paperclip`.
 
-// OpenIssueStatuses are the Paperclip statuses an import brings over:
-// everything except done and cancelled.
+// OpenIssueStatuses are the Paperclip statuses imported as backlog work.
 var OpenIssueStatuses = []string{"backlog", "todo", "in_progress", "in_review", "blocked"}
+
+// ClosedIssueStatuses are imported into the per-company archive.
+var ClosedIssueStatuses = []string{"done", "cancelled"}
+
+// AllIssueStatuses is every Paperclip issue status.
+var AllIssueStatuses = append(append([]string{}, OpenIssueStatuses...), ClosedIssueStatuses...)
 
 // IssuePageSize is the page size ListIssues requests. The issue list
 // endpoint defaults to (and caps at) 500 rows when no limit is given, so a
@@ -34,6 +39,19 @@ type ImportIssue struct {
 	ProjectID            string `json:"projectId"`
 	ParentID             string `json:"parentId"`
 	IssueNumber          int    `json:"issueNumber"`
+	CompletedAt          string `json:"completedAt"`
+	CancelledAt          string `json:"cancelledAt"`
+}
+
+// ClosedAt is when a done or cancelled issue was closed, or "".
+func (i ImportIssue) ClosedAt() string {
+	switch i.Status {
+	case "done":
+		return i.CompletedAt
+	case "cancelled":
+		return i.CancelledAt
+	}
+	return ""
 }
 
 // ImportProject is a Paperclip project with the fields that locate its repo.

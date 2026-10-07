@@ -66,3 +66,17 @@ test('an empty board still renders one ungrouped set of columns', () => {
   assert.equal(groups[0].company, null);
   assert.equal(groups[0].total, 0);
 });
+
+test('archived Paperclip imports share the archive & legacy toggle', () => {
+  const tasks = [
+    { id: 'o', execution_stage: 'backlog', status: 'active', origin: 'paperclip_import', organization: 'StayPoint' },
+    { id: 'd', execution_stage: 'done', status: 'done', origin: 'paperclip_import', organization: 'StayPoint' },
+    { id: 'n', execution_stage: 'done', status: 'done', origin: 'native', organization: 'StayPoint' },
+  ];
+  const [hidden] = buildBoard(tasks, {});
+  assert.deepEqual(hidden.columns.done.map(t => t.id), ['n']);
+  assert.deepEqual(hidden.columns.backlog.map(t => t.id), ['o']);
+  const [shown] = buildBoard(tasks, { showLegacy: true });
+  assert.deepEqual(shown.columns.done.map(t => t.id).sort(), ['d', 'n']);
+  assert.equal(countLegacy(tasks), 1);
+});

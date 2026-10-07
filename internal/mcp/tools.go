@@ -128,7 +128,7 @@ func (s *Server) getToolsList() []Tool {
 		},
 		{
 			Name:        "staypoint_task_list",
-			Description: "list active tasks and budget spend meters. Legacy tasks (created before task origins were tracked) are hidden unless include_legacy is set. Stages: backlog (parked, never run), todo, in_progress (running; paused/capped/stopped are run sub-states), in_review, blocked, done, cancelled",
+			Description: "list active tasks and budget spend meters. Legacy tasks (created before task origins were tracked) and archived Paperclip imports are hidden unless include_legacy is set. Stages: backlog (parked, never run), todo, in_progress (running; paused/capped/stopped are run sub-states), in_review, blocked, done, cancelled",
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]Property{
@@ -138,7 +138,11 @@ func (s *Server) getToolsList() []Tool {
 					},
 					"include_legacy": {
 						Type:        "boolean",
-						Description: "Include legacy tasks (origin=legacy)",
+						Description: "Include legacy tasks and archived Paperclip imports (done/cancelled)",
+					},
+					"include_archive": {
+						Type:        "boolean",
+						Description: "Same switch as include_legacy",
 					},
 					"stage": {
 						Type:        "string",
@@ -461,6 +465,7 @@ func (s *Server) handleTaskList(ctx context.Context, rawArgs json.RawMessage) *T
 	var args struct {
 		All           bool   `json:"all"`
 		IncludeLegacy bool   `json:"include_legacy"`
+		IncludeArch   bool   `json:"include_archive"`
 		Stage         string `json:"stage"`
 		Origin        string `json:"origin"`
 	}
@@ -481,7 +486,7 @@ func (s *Server) handleTaskList(ctx context.Context, rawArgs json.RawMessage) *T
 	if err != nil {
 		return toolError(fmt.Sprintf("task list error: %v", err))
 	}
-	all = meshContext.FilterLegacy(all, args.IncludeLegacy || args.Origin == meshContext.OriginLegacy)
+	all = meshContext.FilterLegacy(all, args.IncludeLegacy || args.IncludeArch || args.Origin == meshContext.OriginLegacy)
 	tasks := []meshContext.Task{}
 	for _, t := range all {
 		if args.Stage != "" && !strings.EqualFold(t.ExecutionStage, strings.TrimSpace(args.Stage)) {

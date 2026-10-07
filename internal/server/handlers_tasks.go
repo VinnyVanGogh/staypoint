@@ -47,8 +47,9 @@ func NewTasksHandler(db *sql.DB, hub *EventHub) *TasksHandler {
 // ListTasks handles GET /api/tasks
 //
 // Query: status (active|done|soft_deleted|all), stage (an execution stage),
-// origin (native|paperclip_import|legacy), include_legacy (1/true; legacy
-// tasks are hidden unless set or origin=legacy), limit, offset.
+// origin (native|paperclip_import|legacy), include_legacy / include_archive
+// (1/true; legacy tasks and archived imports are hidden unless set, or
+// origin=legacy), limit, offset.
 func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 	stageFilter := strings.TrimSpace(r.URL.Query().Get("stage"))
@@ -57,7 +58,10 @@ func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid origin: must be native, paperclip_import, or legacy")
 		return
 	}
-	includeLegacy := parseBoolParam(r.URL.Query().Get("include_legacy")) || originFilter == context.OriginLegacy
+	// include_legacy and include_archive are one switch: legacy tasks and
+	// archived (done/cancelled) Paperclip imports.
+	includeLegacy := parseBoolParam(r.URL.Query().Get("include_legacy")) ||
+		parseBoolParam(r.URL.Query().Get("include_archive")) || originFilter == context.OriginLegacy
 	limitStr := r.URL.Query().Get("limit")
 	offsetStr := r.URL.Query().Get("offset")
 

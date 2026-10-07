@@ -79,13 +79,14 @@ done, rejected: terminal
 | `paperclip_import` | created by `staypoint import paperclip` |
 | `legacy` | existed before origins were tracked (migration 33) |
 
-Every list surface hides `legacy` tasks by default and has one switch to show
-them:
+Every list surface hides `legacy` tasks and **archived imports** (origin
+`paperclip_import` in stage `done` or `cancelled`: the "Paperclip archive"
+parents and their children) by default. One switch shows both:
 
-- web board: **Show legacy** toggle (with **Group by company**);
-- `GET /api/tasks?include_legacy=1` (or `origin=legacy`);
-- `staypoint task list --legacy`;
-- MCP `staypoint_task_list` with `include_legacy: true`;
+- web board: **Show archive & legacy** toggle (with **Group by company**);
+- `GET /api/tasks?include_legacy=1` or `include_archive=1` (or `origin=legacy`);
+- `staypoint task list --legacy` / `--archive` (add `--all` for done tasks);
+- MCP `staypoint_task_list` with `include_legacy` / `include_archive`;
 - the TUI board (`staypoint board`) always hides them.
 
 A legacy task is still reachable by id everywhere (task page, `task_get`,
@@ -114,12 +115,21 @@ A Board command that runs on the Board's terminal. It is refused when
 `STAYPOINT_TASK_ID` is set, and the real import asks for confirmation (type
 `import`) on a TTY.
 
-- It reads every company, and for each one every issue whose status is
-  `backlog`, `todo`, `in_progress`, `in_review` or `blocked`. The issue list
+- It reads every company, and for each one every issue, whatever its status. The issue list
   endpoint returns 500 rows when no `limit` is given, so the import pages with
   `limit=200&offset=N` until it gets a short page. Long descriptions come back
-  truncated in the list (`descriptionTruncated`), so for those issues it
-  fetches the full text from `GET /api/issues/{id}`.
+  truncated in the list (`descriptionTruncated`), so for open issues it
+  fetches the full text from `GET /api/issues/{id}`. Archived issues keep the
+  truncated text plus a note naming the Paperclip identifier, unless
+  `--full-archive-descriptions` is passed (one slow request each).
+- **Open issues** (`backlog`, `todo`, `in_progress`, `in_review`, `blocked`)
+  are imported as described below.
+- **Finished issues** (`done`, `cancelled`) go flat under a second per-company
+  parent, `Paperclip archive — <Company>`, which is itself `done`. Each one is
+  a `done` task (status `done`) or a `cancelled` task (status `soft_deleted`).
+  Its Paperclip `completedAt` / `cancelledAt` becomes `updated_at` (and
+  `deleted_at` for cancelled). They are never claimed or woken, and lists hide
+  them by default (see Origins).
 - It creates one parent per company, `Paperclip backlog — <Company>`, in
   organization `StayPoint` (STA), `Managed Solution` (MAN), `Research` (RES),
   `Maintenance` (PER) or `RuneLite` (RUN). An unknown company uses its own
@@ -141,8 +151,10 @@ A Board command that runs on the Board's terminal. It is refused when
   move to a runnable stage (409 / `ErrNoRepo`) until
   `staypoint task set-repo <id> <path>` or `PUT /api/tasks/{id}/repo` gives it
   one.
-- Running it again is safe: `source_id` has a unique index, and issues already
-  imported are skipped. A later issue is added under the existing parents.
+- Running it again is safe: `source_id` has a unique index (the archive
+  parent uses `archive:<company id>`), and issues already imported are
+  skipped. An issue imported while open stays where it is if it is finished
+  later. A later issue is added under the existing parents.
 - `--dry-run` opens the task database read-only and runs no migrations, then
   prints per-company counts and sample titles. `--company STA,MAN` limits the
   import to those companies.

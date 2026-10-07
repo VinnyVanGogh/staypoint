@@ -1,10 +1,14 @@
-// Package paperclipimport brings open Paperclip issues into StayPoint as
-// parked backlog tasks (`staypoint import paperclip`, a Board command).
+// Package paperclipimport brings every Paperclip issue into StayPoint
+// (`staypoint import paperclip`, a Board command).
 //
-// Each Paperclip company gets one parent task, "Paperclip backlog —
-// <Company>", in the matching StayPoint organization; its open issues become
-// children of it (or of their imported Paperclip parent), all in backlog,
-// unassigned, origin paperclip_import. Only the title (prefixed with the
+// Each Paperclip company gets two parent tasks in the matching StayPoint
+// organization. "Paperclip backlog — <Company>" (stage backlog) holds the open
+// issues (backlog, todo, in_progress, in_review, blocked) as parked backlog
+// tasks, nested under their imported Paperclip parent where possible.
+// "Paperclip archive — <Company>" (stage done) holds the finished ones, flat,
+// as done or cancelled tasks closed at their Paperclip completion time.
+// Archived imports are hidden by default like legacy tasks and are never
+// claimed or woken. All are unassigned, origin paperclip_import. Only the title (prefixed with the
 // identifier), description, priority, company and a source reference
 // (identifier + uuid) are kept. Re-running skips issues already imported.
 package paperclipimport
@@ -58,11 +62,24 @@ func ParentTitle(c paperclip.CompanyResponse) string {
 	return "Paperclip backlog — " + strings.TrimSpace(c.Name)
 }
 
+// ArchiveTitle is the name of a company's archive parent task.
+func ArchiveTitle(c paperclip.CompanyResponse) string {
+	return "Paperclip archive — " + strings.TrimSpace(c.Name)
+}
+
+// archiveSourceID is the source_id of a company's archive parent (the
+// backlog parent uses the bare company id).
+func archiveSourceID(companyID string) string { return "archive:" + companyID }
+
 // Options configures BuildPlan.
 type Options struct {
 	// Companies limits the import to these issue prefixes or company ids
 	// (case-insensitive). Empty means every company.
 	Companies []string
+	// FullArchiveDescriptions also fetches the full text of archived issues
+	// whose list description was truncated (one slow request each). Off by
+	// default: those keep the truncated text and a note.
+	FullArchiveDescriptions bool
 }
 
 // PlannedIssue is one issue the import will create.
@@ -91,15 +108,23 @@ type CompanyPlan struct {
 	ToImport        []PlannedIssue
 	Flattened       int
 	WithRepo        int
+
+	// Archive: finished (done/cancelled) issues.
+	ArchiveTaskID    string
+	Closed           int
+	ClosedByStatus   map[string]int
+	ArchivedImported int
+	ToArchive        []PlannedIssue
 }
 
 // Plan is the whole import.
 type Plan struct {
 	Companies []CompanyPlan
 	MaxDepth  int
+	Options   Options
 }
 
-// ToImport is the number of issues the plan creates across companies.
+// ToImport is the number of open issues the plan creates across companies.
 func (p *Plan) ToImport() int {
 	n := 0
 	for _, c := range p.Companies {
@@ -107,6 +132,18 @@ func (p *Plan) ToImport() int {
 	}
 	return n
 }
+
+// ToArchive is the number of finished issues the plan archives.
+func (p *Plan) ToArchive() int {
+	n := 0
+	for _, c := range p.Companies {
+		n += len(c.ToArchive)
+	}
+	return n
+}
+
+// Total is every task the plan creates (parents not counted).
+func (p *Plan) Total() int { return p.ToImport() + p.ToArchive() }
 
 // importedTasks maps source_id -> task id for tasks a previous import made.
 // A database without the source_id column (a read-only dry run against a
@@ -161,7 +198,7 @@ func BuildPlan(ctx context.Context, src Source, conn *sql.DB, opts Options) (*Pl
 	}
 	sort.Slice(companies, func(i, j int) bool { return companies[i].Name < companies[j].Name })
 
-	plan := &Plan{MaxDepth: maxDepth}
+	plan := &Plan{MaxDepth: maxDepth, Options: opts}
 	for _, c := range companies {
 		if !wantCompany(c, opts.Companies) {
 			continue
@@ -176,7 +213,7 @@ func BuildPlan(ctx context.Context, src Source, conn *sql.DB, opts Options) (*Pl
 }
 
 func planCompany(ctx context.Context, src Source, c paperclip.CompanyResponse, imported map[string]string, maxDepth int) (*CompanyPlan, error) {
-	issues, err := src.ListIssues(ctx, c.ID, paperclip.OpenIssueStatuses)
+	issues, err := src.ListIssues(ctx, c.ID, paperclip.AllIssueStatuses)
 	if err != nil {
 		return nil, fmt.Errorf("list issues: %w", err)
 	}
@@ -190,19 +227,32 @@ func planCompany(ctx context.Context, src Source, c paperclip.CompanyResponse, i
 	}
 
 	cp := &CompanyPlan{
-		Company:      c,
-		Organization: OrganizationFor(c),
-		ParentTaskID: imported[c.ID],
-		ByStatus:     map[string]int{},
+		Company:        c,
+		Organization:   OrganizationFor(c),
+		ParentTaskID:   imported[c.ID],
+		ArchiveTaskID:  imported[archiveSourceID(c.ID)],
+		ByStatus:       map[string]int{},
+		ClosedByStatus: map[string]int{},
 	}
 	open := map[string]paperclip.ImportIssue{}
 	for _, iss := range issues {
 		if iss.Status == "done" || iss.Status == "cancelled" {
-			continue // the server filters these; never trust that blindly
+			cp.Closed++
+			cp.ClosedByStatus[iss.Status]++
+			if _, done := imported[iss.ID]; done {
+				cp.ArchivedImported++
+				continue
+			}
+			pi := PlannedIssue{Issue: iss, RepoPath: repoByProject[iss.ProjectID], depth: 1}
+			cp.ToArchive = append(cp.ToArchive, pi)
+			continue
 		}
 		open[iss.ID] = iss
 	}
 	cp.Open = len(open)
+	sort.Slice(cp.ToArchive, func(i, j int) bool {
+		return cp.ToArchive[i].Issue.IssueNumber < cp.ToArchive[j].Issue.IssueNumber
+	})
 
 	for _, iss := range open {
 		cp.ByStatus[iss.Status]++
@@ -271,6 +321,10 @@ func TaskTitle(iss paperclip.ImportIssue) string {
 // a note naming the parent it was lifted out from.
 func TaskDescription(pi PlannedIssue, maxDepth int) string {
 	desc := strings.TrimSpace(pi.Issue.Description)
+	if pi.Issue.DescriptionTruncated {
+		desc += fmt.Sprintf("\n\n---\nNote (import): description truncated at import; the full text is on %s in Paperclip.", pi.Issue.Identifier)
+		desc = strings.TrimSpace(desc)
+	}
 	if pi.FlattenedFrom != "" {
 		note := fmt.Sprintf("Note (import): in Paperclip this is a child of %s. That nesting is deeper than tasks.max_child_depth (%d), so it was flattened to a higher level here.", pi.FlattenedFrom, maxDepth)
 		if desc == "" {
@@ -284,7 +338,8 @@ func TaskDescription(pi PlannedIssue, maxDepth int) string {
 // Result reports what Apply created.
 type Result struct {
 	ParentsCreated int
-	TasksCreated   map[string]int // by organization
+	TasksCreated   map[string]int // open issues, by organization
+	Archived       map[string]int // done/cancelled issues, by organization
 	Skipped        int            // imported concurrently / already present
 }
 
@@ -304,15 +359,18 @@ func Apply(ctx context.Context, src Source, conn *sql.DB, plan *Plan, now time.T
 	if err != nil {
 		return nil, err
 	}
-	res := &Result{TasksCreated: map[string]int{}}
+	res := &Result{TasksCreated: map[string]int{}, Archived: map[string]int{}}
 	for ci := range plan.Companies {
 		cp := &plan.Companies[ci]
-		if len(cp.ToImport) == 0 {
-			continue
-		}
 		role := "personal"
 		if workPrefixes[strings.ToUpper(cp.Company.IssuePrefix)] {
 			role = "work"
+		}
+		if err := applyArchive(conn, cp, role, imported, res, now); err != nil {
+			return res, err
+		}
+		if len(cp.ToImport) == 0 {
+			continue
 		}
 		parentID := imported[cp.Company.ID]
 		if parentID == "" {
@@ -385,15 +443,111 @@ func Apply(ctx context.Context, src Source, conn *sql.DB, plan *Plan, now time.T
 	return res, nil
 }
 
+// applyArchive creates (or reuses) the company's archive parent, stage
+// done, and its finished issues flat beneath it as done or cancelled tasks
+// closed at their Paperclip completion time.
+func applyArchive(conn *sql.DB, cp *CompanyPlan, role string, imported map[string]string, res *Result, now time.Time) error {
+	if len(cp.ToArchive) == 0 {
+		return nil
+	}
+	archiveID := imported[archiveSourceID(cp.Company.ID)]
+	if archiveID == "" {
+		parent, err := meshContext.CreateTaskWithOptions(conn, meshContext.TaskCreateOptions{
+			Name:           ArchiveTitle(cp.Company),
+			AccountRole:    role,
+			Organization:   cp.Organization,
+			ExecutionStage: governance.StageDone,
+			Origin:         meshContext.OriginPaperclipImport,
+			SourceRef:      cp.Company.IssuePrefix,
+			SourceID:       archiveSourceID(cp.Company.ID),
+			NoRepo:         true,
+			Description: fmt.Sprintf("Finished (done and cancelled) issues imported from the Paperclip company %s (%s) on %s, kept as history. Hidden by default; nothing here is ever run.",
+				cp.Company.Name, cp.Company.IssuePrefix, now.UTC().Format("2006-01-02")),
+		})
+		if err != nil {
+			return fmt.Errorf("%s: create archive task: %w", cp.Company.Name, err)
+		}
+		archiveID = parent.ID
+		imported[archiveSourceID(cp.Company.ID)] = archiveID
+		res.ParentsCreated++
+	}
+	cp.ArchiveTaskID = archiveID
+	for _, pi := range cp.ToArchive {
+		if _, done := imported[pi.Issue.ID]; done {
+			res.Skipped++
+			continue
+		}
+		stage := governance.StageDone
+		if pi.Issue.Status == "cancelled" {
+			stage = governance.StageCancelled
+		}
+		opts := meshContext.TaskCreateOptions{
+			Name:           TaskTitle(pi.Issue),
+			AccountRole:    role,
+			Organization:   cp.Organization,
+			ParentID:       archiveID,
+			ExecutionStage: stage,
+			Origin:         meshContext.OriginPaperclipImport,
+			Priority:       pi.Issue.Priority,
+			SourceRef:      pi.Issue.Identifier,
+			SourceID:       pi.Issue.ID,
+			Description:    TaskDescription(pi, 0),
+			ClosedAt:       NormalizeTime(pi.Issue.ClosedAt()),
+		}
+		if pi.RepoPath == "" {
+			opts.NoRepo = true
+		} else {
+			opts.RepoPath, opts.GitBranch = pi.RepoPath, "main"
+		}
+		task, err := meshContext.CreateTaskWithOptions(conn, opts)
+		if err != nil {
+			if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+				res.Skipped++
+				continue
+			}
+			return fmt.Errorf("%s: archive %s: %w", cp.Company.Name, pi.Issue.Identifier, err)
+		}
+		imported[pi.Issue.ID] = task.ID
+		res.Archived[cp.Organization]++
+	}
+	return nil
+}
+
+// NormalizeTime returns an RFC 3339 timestamp in the tasks table's format
+// (UTC, milliseconds, Z), or "" when ts is empty or unparsable.
+func NormalizeTime(ts string) string {
+	ts = strings.TrimSpace(ts)
+	if ts == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return ""
+	}
+	return t.UTC().Format("2006-01-02T15:04:05.000Z")
+}
+
 // fillDescriptions replaces truncated list descriptions with the full text,
-// four requests at a time (the Paperclip API is slow).
+// four requests at a time (the Paperclip API is slow). Archived issues are
+// included only with Options.FullArchiveDescriptions.
 func fillDescriptions(ctx context.Context, src Source, plan *Plan) error {
-	type ref struct{ c, i int }
+	type ref struct {
+		c, i    int
+		archive bool
+	}
 	var todo []ref
 	for c := range plan.Companies {
 		for i, pi := range plan.Companies[c].ToImport {
 			if pi.Issue.DescriptionTruncated {
-				todo = append(todo, ref{c, i})
+				todo = append(todo, ref{c, i, false})
+			}
+		}
+		if !plan.Options.FullArchiveDescriptions {
+			continue
+		}
+		for i, pi := range plan.Companies[c].ToArchive {
+			if pi.Issue.DescriptionTruncated {
+				todo = append(todo, ref{c, i, true})
 			}
 		}
 	}
@@ -411,6 +565,9 @@ func fillDescriptions(ctx context.Context, src Source, plan *Plan) error {
 			defer wg.Done()
 			defer func() { <-sem }()
 			pi := &plan.Companies[r.c].ToImport[r.i]
+			if r.archive {
+				pi = &plan.Companies[r.c].ToArchive[r.i]
+			}
 			full, err := src.GetIssue(ctx, pi.Issue.ID)
 			mu.Lock()
 			defer mu.Unlock()
