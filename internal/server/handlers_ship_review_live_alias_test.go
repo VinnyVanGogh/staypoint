@@ -3,6 +3,7 @@
 package server_test
 
 import (
+	gocontext "context"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
+	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 )
 
 // STA-767: the live_credentials gate looked up project_dev_configs by the
@@ -142,9 +144,28 @@ func createAliasShipTask(t *testing.T, e *liveShipEnv, alias string) string {
 	if err := json.Unmarshal(rb, &task); err != nil || task.ID == "" {
 		t.Fatalf("create alias task: no id in %s", rb)
 	}
-	if out, err := exec.Command("git", "-C", e.repoDir, "branch", "staypoint/"+task.ID, "main").CombinedOutput(); err != nil {
-		t.Fatalf("git branch: %v\n%s", err, out)
+	// The task branch carries one commit on top of main, its recorded base
+	// (STA-774: a card needs a verified base and something to review).
+	gitE := func(args ...string) string {
+		t.Helper()
+		out, err := exec.Command("git", append([]string{"-C", e.repoDir}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
 	}
+	mainTip := gitE("rev-parse", "main")
+	if err := workspace.RecordTaskBase(gocontext.Background(), e.db, e.repoDir, task.ID, mainTip); err != nil {
+		t.Fatalf("RecordTaskBase: %v", err)
+	}
+	wt := filepath.Join(t.TempDir(), "alias-wt")
+	gitE("worktree", "add", "-q", "-b", "staypoint/"+task.ID, wt, mainTip)
+	if err := os.WriteFile(filepath.Join(wt, "alias-task.txt"), []byte("task\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitE("-C", wt, "add", "alias-task.txt")
+	gitE("-C", wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "alias task work")
+	gitE("worktree", "remove", "--force", wt)
 	upsert, _ := json.Marshal(map[string]any{"test_steps": []string{"1. Open /"}})
 	resp, rb = shipDoReq(t, e.client, e.token, "PUT", e.baseURL+"/api/tasks/"+task.ID+"/ship-review", upsert)
 	if resp.StatusCode != http.StatusCreated {

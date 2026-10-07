@@ -111,6 +111,10 @@ var ErrHeadMoved = errors.New("branch HEAD moved since card was rendered; re-ren
 // ErrNoCard is returned when no card exists for a task.
 var ErrNoCard = errors.New("no ship review card found")
 
+// ErrNoChanges is returned when the task branch has no changes against its
+// base: an answer-only run gets no card and no Approve (STA-774).
+var ErrNoChanges = errors.New("No changes: answer-only run")
+
 // ErrTestStepsRequired is returned when test_steps is empty.
 var ErrTestStepsRequired = errors.New("test_steps are required to create a ship review card")
 
@@ -376,8 +380,13 @@ func CreateCard(db *sql.DB, taskID, branch, headSHA string, testSteps []string, 
 		return nil, fmt.Errorf("marshal test_steps: %w", err)
 	}
 
-	// Derive files changed from git diff against the merge-base.
-	filesChanged := diffFilesChanged(repoDir, headSHA)
+	// Files changed come from the task's recorded base, the same resolver
+	// the Diff tab and Approve use (STA-774). A tampered base or an
+	// answer-only run gets no card.
+	filesChanged, err := diffFilesChanged(db, repoDir, taskID, headSHA)
+	if err != nil {
+		return nil, err
+	}
 	filesJSON, err := json.Marshal(filesChanged)
 	if err != nil {
 		return nil, fmt.Errorf("marshal files_changed: %w", err)
@@ -415,40 +424,48 @@ func CreateCard(db *sql.DB, taskID, branch, headSHA string, testSteps []string, 
 	return GetCard(db, taskID)
 }
 
-// diffFilesChanged returns the list of files changed between the merge-base of
-// "main" (or "master") and headSHA. Returns an empty slice on any error.
-func diffFilesChanged(repoDir, headSHA string) []string {
-	if repoDir == "" || headSHA == "" {
-		return []string{}
+// diffFilesChanged returns the files headSHA changes against the task's
+// recorded base (workspace.TaskBase). It fails closed: a base that is missing,
+// tampered with or unreadable is an error (no card), and ErrNoChanges is
+// returned when nothing differs. repoDir "" skips the diff for DB-only
+// callers; such a card still cannot be approved, since Approve re-verifies
+// the base (VerifyCardChanges).
+func diffFilesChanged(db *sql.DB, repoDir, taskID, headSHA string) ([]string, error) {
+	if repoDir == "" {
+		return []string{}, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	return taskChanges(ctx, db, repoDir, taskID, headSHA)
+}
 
-	// Find merge-base against main (or master as fallback).
-	var base string
-	for _, target := range []string{"main", "master"} {
-		out, err := gitOutput(ctx, repoDir, "merge-base", target, headSHA)
-		if err == nil && out != "" {
-			base = out
-			break
-		}
+// taskChanges lists the files head changes against the task's verified base:
+// ErrNoChanges when there are none, the workspace error when the base cannot
+// be verified.
+func taskChanges(ctx context.Context, db *sql.DB, repoDir, taskID, head string) ([]string, error) {
+	if head == "" {
+		return nil, fmt.Errorf("task %s: no head to diff", taskID)
 	}
-	if base == "" {
-		return []string{}
+	files, _, err := workspace.TaskFilesChanged(ctx, db, repoDir, taskID, head)
+	if err != nil {
+		return nil, fmt.Errorf("verify task base: %w", err)
 	}
+	if len(files) == 0 {
+		return nil, ErrNoChanges
+	}
+	return files, nil
+}
 
-	out, err := gitOutput(ctx, repoDir, "diff", "--name-only", base, headSHA)
-	if err != nil || out == "" {
-		return []string{}
+// VerifyCardChanges re-checks, at Approve time, that card's pinned head still
+// has changes against the task's recorded base. Any failure to verify the
+// base (missing record, moved pin, git or DB error) is returned, and Approve
+// must refuse: the Board is never asked to merge something measured against
+// a base the agent could have chosen.
+func VerifyCardChanges(ctx context.Context, db *sql.DB, card *Card, repoDir string) ([]string, error) {
+	if card == nil {
+		return nil, ErrNoCard
 	}
-	files := strings.Split(out, "\n")
-	result := make([]string, 0, len(files))
-	for _, f := range files {
-		if f != "" {
-			result = append(result, f)
-		}
-	}
-	return result
+	return taskChanges(ctx, db, repoDir, card.TaskID, card.HeadSHA)
 }
 
 // GetCard returns the most recent ship review card for a task.
@@ -895,6 +912,10 @@ func StopDevServer(db *sql.DB, card *Card) {
 // server from the project config (if any) and persists dev_url.
 func BuildAndStartCard(ctx context.Context, db *sql.DB, taskID, repoPath string, testSteps []string, devURL string, checkRuns []CheckRun) (*Card, error) {
 	branch := "staypoint/" + taskID
+	if repoPath == "" {
+		// Files changed cannot be measured against a verified base.
+		return nil, fmt.Errorf("task %s has no repo path: %w", taskID, workspace.ErrNoTaskBase)
+	}
 
 	headSHA, err := CurrentBranchHEAD(ctx, repoPath, branch)
 	if err != nil {
