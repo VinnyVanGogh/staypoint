@@ -298,7 +298,7 @@ func defaultChecklistSTA236(sprint string) []Item {
 			title:    "Claude Work and Personal quota cards both render and stay put across refreshes",
 			desc:     "The overview shows Claude (Work) and Claude (Personal) side by side. Neither drops out or swaps numbers with the other between refreshes.",
 			howTo:    "Open the dashboard overview. Note both Claude cards and their 5h/weekly %. Reload 4-5 times, a few seconds apart. Both cards stay present, in the same order, with the same numbers unless real usage changed.",
-			contract: `{"type":"file_pattern","file_path":"internal/router/pacer_live.go","must_contain":["claudeAccountEmail","{\"claude_personal\", PoolPersonalClaude}"]}`,
+			contract: `{"type":"file_pattern","file_path":"internal/router/pacer_live.go","must_contain":["{quota.ProviderClaudePersonal, PoolPersonalClaude}","{quota.ProviderClaudeWork, PoolWorkClaude}"]}`,
 		},
 		{
 			section:  "09. Quota Seat Stability & Project Card Click-Through (STA-283)",

@@ -29,7 +29,7 @@ func TestLoadPacerState_UsesCachedLiveQuota(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	now := time.Now()
 	seedQuota(t, &quota.Snapshot{
-		Provider:  "claude",
+		Provider:  "claude_personal",
 		FetchedAt: now.Add(-time.Minute),
 		FiveHour:  &quota.Window{Utilization: 15, ResetsAt: now.Add(2 * time.Hour)},
 		Weekly:    &quota.Window{Utilization: 20, ResetsAt: now.Add(72 * time.Hour)},
@@ -61,7 +61,7 @@ func TestLoadPacerState_StaleOrMissingCacheFailsOpen(t *testing.T) {
 	}
 
 	stale := time.Now().Add(-2 * quota.StaleAfter)
-	seedQuota(t, &quota.Snapshot{Provider: "claude", FetchedAt: stale, FiveHour: &quota.Window{Utilization: 99, ResetsAt: time.Now().Add(time.Hour)}})
+	seedQuota(t, &quota.Snapshot{Provider: "claude_personal", FetchedAt: stale, FiveHour: &quota.Window{Utilization: 99, ResetsAt: time.Now().Add(time.Hour)}})
 	st, err = LoadPacerState()
 	if err != nil {
 		t.Fatal(err)
