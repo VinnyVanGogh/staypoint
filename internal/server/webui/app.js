@@ -6527,7 +6527,8 @@ async function sendComment(taskId, body) {
 
 // ── Detail panel (Right sidebar / Properties) ─────────────
 const WORK_KIND_LABELS = {
-  coding:       'Coding & review — Claude Opus, backup Gemini 3.1 Pro',
+  coding:       'Coding — Claude Opus, backup Gemini 3.1 Pro',
+  review:       'Code review — Claude Opus, backup Gemini 3.1 Pro',
   architecture: 'Architecture — Gemini 3.1 Pro, backup Claude Opus',
   planning:     'Planning & docs — Gemini Flash, backup Claude Sonnet',
   qa:           'QA & testing — Gemini Flash, backup Claude Sonnet',
