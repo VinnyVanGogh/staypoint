@@ -9032,6 +9032,72 @@ function renderTestCoverageSection(taskId, onState, opts = {}) {
   return { el: sec, state, apply, bypassBtn, reload: load };
 }
 
+async function fetchTargetCI(taskId, fresh) {
+  const q = fresh ? '?fresh=1' : '';
+  const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/ship-review/target-ci${q}`, { headers: authHeader() });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.message || body.error || `${r.status} ${r.statusText}`);
+  return body;
+}
+
+// renderTargetCISection shows the CI of the branch the card merges into
+// (task-2114d4aa). onState fires with { loaded, blocking, ci } whenever it
+// changes; apply(ci) lets a 409 "target_ci_red" update it in place.
+// overrideBtn is shown while the target is red and opts.enforced is set (an
+// Approve that lands on the target); a pr_merge card gets the override offer
+// from Merge PR's refusal instead.
+function renderTargetCISection(taskId, onState, opts = {}) {
+  const sec = el('div', 'ship-review-target-ci');
+  sec.dataset.state = 'loading';
+  const title = el('div', 'ship-review-section-title', 'Target CI');
+  const status = el('span', 'ship-review-target-ci-status', 'checking…');
+  title.appendChild(status);
+  const refresh = el('button', 'ship-review-repin-btn ship-review-target-ci-refresh', 'Refresh');
+  refresh.title = 'Read the target branch\'s CI from GitHub again';
+  title.appendChild(refresh);
+  sec.appendChild(title);
+  const body = el('div', 'ship-review-target-ci-body', 'Checking the target branch\'s CI…');
+  sec.appendChild(body);
+  const actions = el('div', 'ship-review-form-row ship-review-target-ci-actions');
+  const overrideBtn = el('button', 'ship-review-merge-on-red-btn', 'Merge onto red target');
+  actions.appendChild(overrideBtn);
+  actions.style.display = 'none';
+  sec.appendChild(actions);
+  const state = { loaded: false, blocking: false, ci: null };
+
+  const apply = (ci) => {
+    const v = targetCIView(ci);
+    state.loaded = true;
+    state.blocking = v.blocking;
+    state.ci = ci || null;
+    overrideBtn.textContent = `Merge onto red ${(ci && ci.branch) || 'target'}`;
+    const nodes = [el('div', `ship-review-target-ci-text ship-review-target-ci-text--${v.state}`, v.text)];
+    for (const l of v.links) {
+      const a = el('a', 'ship-review-target-ci-link', `${l.label} run ↗`);
+      a.href = l.url;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      nodes.push(a);
+    }
+    body.replaceChildren(...nodes);
+    status.textContent = v.status;
+    sec.dataset.state = v.state;
+    actions.style.display = v.blocking && opts.enforced ? '' : 'none';
+    if (onState) onState(state);
+  };
+  const load = (fresh) => {
+    status.textContent = 'checking…';
+    fetchTargetCI(taskId, fresh).then((res) => apply(res.target_ci)).catch((e) => {
+      // The server re-reads at Approve, so a failed read here never unblocks
+      // anything; it only leaves the row unknown.
+      apply({ state: 'unknown', note: e.message || String(e) });
+    });
+  };
+  refresh.addEventListener('click', () => load(true));
+  load(false);
+  return { el: sec, state, apply, overrideBtn, reload: load };
+}
+
 // renderAnswerOnlyPanel replaces the ship review card for a run with no
 // changes against its base (STA-774): the agent's final message, and the
 // files it read instead of "files changed".
@@ -9302,6 +9368,14 @@ function renderShipReviewCardFromData(container, taskId, card) {
     section.appendChild(testGate.el);
   }
 
+  // Target CI (task-2114d4aa): Approve / Merge PR refuse a red target.
+  let targetCI = null;
+  if (card.status === 'pending') {
+    targetCI = renderTargetCISection(taskId, () => section.dispatchEvent(new CustomEvent('target-ci')),
+      { enforced: approveMode !== 'pr_merge' });
+    section.appendChild(targetCI.el);
+  }
+
   // What to test
   if (card.test_steps && card.test_steps.length > 0) {
     const testSection = el('div', 'ship-review-test-section');
@@ -9547,6 +9621,12 @@ function renderShipReviewCardFromData(container, taskId, card) {
             showBypassConfirm(body.missing || []);
             return;
           }
+          if (body.error === 'target_ci_red') {
+            if (targetCI) targetCI.apply(body.target_ci);
+            acMerge.disabled = false;
+            showRedTargetConfirm(body.target_ci, (b, more) => doApprove(b, { ...(extra || {}), ...more }));
+            return;
+          }
           if (body.error === 'head_moved') {
             const newSHA = body.new_head_sha || '?';
             headMovedBanner.querySelector('.ship-review-head-moved-text').textContent =
@@ -9598,7 +9678,12 @@ function renderShipReviewCardFromData(container, taskId, card) {
   bypassConfirmForm.style.display = 'none';
   const bypassLabel = el('div', 'ship-review-form-label', '');
   const bypassMissing = el('ul', 'ship-review-merge-without-tests-missing');
-  const allForms = [sendBackForm, rejectForm, approveConfirmForm, mergeConfirmForm, anywayConfirmForm, bypassConfirmForm];
+  // "Merge onto red target" confirm (task-2114d4aa): names what is failing.
+  const redTargetForm = el('div', 'ship-review-inline-form ship-review-merge-on-red-confirm');
+  redTargetForm.style.display = 'none';
+  const redTargetLabel = el('div', 'ship-review-form-label', '');
+  let redTargetRetry = null;
+  const allForms = [sendBackForm, rejectForm, approveConfirmForm, mergeConfirmForm, anywayConfirmForm, bypassConfirmForm, redTargetForm];
   const showOnly = (form) => {
     for (const f of allForms) f.style.display = (f === form && f.style.display === 'none') ? '' : 'none';
     headMovedBanner.style.display = 'none';
@@ -9642,6 +9727,11 @@ function renderShipReviewCardFromData(container, taskId, card) {
       if (body.error === 'untested') {
         if (testGate) testGate.apply(body.test_coverage);
         showBypassConfirm(body.missing || []);
+        return;
+      }
+      if (body.error === 'target_ci_red') {
+        if (targetCI) targetCI.apply(body.target_ci);
+        showRedTargetConfirm(body.target_ci, (b, more) => doMerge(b, override, reason, { ...(extra || {}), ...more }));
         return;
       }
       if (body.error === 'head_moved') {
@@ -9742,6 +9832,43 @@ function renderShipReviewCardFromData(container, taskId, card) {
   actionsWrap.insertBefore(bypassConfirmForm, rejectForm);
   if (testGate) testGate.bypassBtn.addEventListener('click', () => showBypassConfirm());
 
+  // retry(btn, extra) re-sends the refused Approve / Merge PR with the
+  // override added to whatever it already carried.
+  function showRedTargetConfirm(ci, retry) {
+    const branch = (ci && ci.branch) || cardTarget(card);
+    const failing = targetCIFailing(ci);
+    const what = prActive ? `PR #${card.pr_number} ${shortHead}` : shortHead;
+    redTargetLabel.textContent = `Merge ${what} onto ${branch} while ${branch} is red${failing.length ? ` (${failing.join(', ')})` : ''}? This is logged.`;
+    redTargetGo.textContent = `Merge onto red ${branch}`;
+    redTargetRetry = retry;
+    for (const f of allForms) f.style.display = f === redTargetForm ? '' : 'none';
+    headMovedBanner.style.display = 'none';
+    clearErr();
+  }
+  const redTargetGo = el('button', 'ship-review-reject-submit-btn ship-review-merge-on-red-submit', 'Merge onto red target');
+  {
+    redTargetForm.appendChild(redTargetLabel);
+    const reason = document.createElement('input');
+    reason.type = 'text';
+    reason.className = 'ship-review-form-input ship-review-merge-on-red-reason';
+    reason.placeholder = 'Why merge onto a red target? (logged)';
+    redTargetForm.appendChild(reason);
+    const row = el('div', 'ship-review-form-row');
+    const cancel = el('button', 'ship-review-form-cancel', 'Cancel');
+    row.appendChild(redTargetGo);
+    row.appendChild(cancel);
+    redTargetForm.appendChild(row);
+    cancel.addEventListener('click', () => { redTargetForm.style.display = 'none'; clearErr(); });
+    redTargetGo.addEventListener('click', () => {
+      if (!redTargetRetry) return;
+      redTargetRetry(redTargetGo, { merge_on_red_target: true, merge_on_red_target_reason: reason.value.trim() });
+    });
+  }
+  actionsWrap.insertBefore(redTargetForm, rejectForm);
+  if (targetCI) {
+    targetCI.overrideBtn.addEventListener('click', () => showRedTargetConfirm(targetCI.state.ci, (b, more) => doApprove(b, more)));
+  }
+
   // Warning buttons: Merge anyway / Send failures to agent.
   if (prActive) {
     const warnRow = el('div', 'ship-review-form-row ship-review-pr-warning-actions');
@@ -9811,17 +9938,22 @@ function renderShipReviewCardFromData(container, taskId, card) {
     approveBtn.addEventListener('click', () => showOnly(approveConfirmForm));
     actions.appendChild(approveBtn);
     // direct and open_pr Approve land on main, so they wait for the test
-    // gate (STA-734); pr_merge Approve only opens the PR.
-    if (testGate && approveMode !== 'pr_merge') {
+    // gate (STA-734) and a non-red target (task-2114d4aa); pr_merge Approve
+    // only opens the PR.
+    if ((testGate || targetCI) && approveMode !== 'pr_merge') {
       const updateApproveBtn = () => {
-        const g = testGate.state;
-        approveBtn.disabled = !g.loaded || g.blocking;
+        const g = testGate ? testGate.state : { loaded: true, blocking: false };
+        const red = !!(targetCI && targetCI.state.blocking);
+        const branch = (targetCI && targetCI.state.ci && targetCI.state.ci.branch) || cardTarget(card);
+        approveBtn.disabled = !g.loaded || g.blocking || red;
         approveBtn.title = !g.loaded ? 'Checking test coverage…'
-          : g.blocking ? 'Not tested: see Test coverage. Use Merge without tests to bypass.' : '';
+          : g.blocking ? 'Not tested: see Test coverage. Use Merge without tests to bypass.'
+          : red ? `${branch} is red: see Target CI. Use Merge onto red ${branch} to override.` : '';
         if (approveBtn.disabled) approveConfirmForm.style.display = 'none';
       };
       updateApproveBtn();
       section.addEventListener('test-gate', updateApproveBtn);
+      section.addEventListener('target-ci', updateApproveBtn);
     }
   }
 

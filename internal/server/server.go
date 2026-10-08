@@ -283,6 +283,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("GET /api/tasks/{id}/ship-review/checks", shipH.Checks)
 		mux.HandleFunc("GET /api/tasks/{id}/ship-review/check-failures", shipH.CheckFailures)
 		mux.HandleFunc("GET /api/tasks/{id}/ship-review/test-coverage", shipH.TestCoverage)
+		mux.HandleFunc("GET /api/tasks/{id}/ship-review/target-ci", shipH.TargetCIState)
 		mux.Handle("POST /api/tasks/{id}/ship-review/merge", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.MergePR)))
 		mux.HandleFunc("GET /api/settings/ship-review", shipH.GetSettings)
 		// Board-only: disabling ship review is a Board action.
