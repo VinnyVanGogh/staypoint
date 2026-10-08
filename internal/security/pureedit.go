@@ -87,8 +87,10 @@ var (
 	pyAsRe     = regexp.MustCompile(`\bas[ \t]+([A-Za-z_]\w*)`)
 	// open() as the checker accepts it; literals are "N" placeholders.
 	pyOpenRe = regexp.MustCompile(`^open\([ \t]*(?:"(\d+)"|([A-Za-z_]\w*))[ \t]*(?:,[ \t]*"(\d+)"[ \t]*)?(?:,[ \t]*encoding[ \t]*=[ \t]*"\d+"[ \t]*)?\)`)
-	// Protected state a pure edit never touches, even inside the worktree.
-	pyPathBadRe = regexp.MustCompile(`^(/|~|\.\.)|/\.\.(/|$)|\.staypoint|\.claude|\.gemini|\.ssh|LaunchAgents|\.local/bin|\.git/|\.zshrc|\.bashrc|\.profile`)
+	// Protected state a pure edit never touches, even inside the worktree:
+	// agent and guard state, git internals and hooks, shell profiles, and files
+	// tools auto-load or run from a repo. Case-insensitive: APFS is.
+	pyPathBadRe = regexp.MustCompile(`(?i)^(/|~|\.\.)|/\.\.(/|$)|\.staypoint|\.claude|\.gemini|\.ssh|LaunchAgents|\.local/bin|\.git/|\.githooks|\.husky|\.agents|\.cursor|\.vscode|(^|/)\.mcp\.json$|(^|/)\.envrc$|\.zshrc|\.zprofile|\.zshenv|\.bashrc|\.bash_profile|\.profile`)
 )
 
 func wordSet(s string) map[string]bool {
@@ -246,7 +248,7 @@ func safeRelPath(p, cwd string) bool {
 		}
 	}
 	clean := filepath.Clean(p)
-	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || pyPathBadRe.MatchString(clean) {
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || pyPathBadRe.MatchString(strings.ToLower(clean)) { // APFS folds case
 		return false
 	}
 	if cwd == "" {

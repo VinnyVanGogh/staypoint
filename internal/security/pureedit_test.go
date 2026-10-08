@@ -125,6 +125,17 @@ func TestPureEdit_UnprovableScriptsHeld(t *testing.T) {
 		"lambda":               body("g = lambda p: open(p, 'w')"),
 		"str.format":           body("'{0}'.format(1)"),
 	}
+	// APFS is case-insensitive: protected names match in any case. Files
+	// that tools auto-load or run from a repo are protected too.
+	for _, p := range []string{
+		".Claude/settings.json", ".CLAUDE/settings.json", ".Gemini/settings.json", ".SSH/config",
+		".Staypoint/x", ".Git/hooks/pre-commit", "sub/.GIT/config", ".ZSHRC",
+		".mcp.json", ".MCP.json", ".envrc", ".EnvRC", ".agents/x.md", ".Agents/x.md",
+		".cursor/rules", ".Cursor/rules", ".vscode/tasks.json", ".VSCode/settings.json",
+		".husky/pre-commit", ".Husky/pre-push", ".githooks/pre-commit", ".GitHooks/pre-commit",
+	} {
+		cases["protected "+p] = body("open('" + p + "', 'w').write('x')")
+	}
 	for name, line := range cases {
 		if relaxedPureEdit(line, "") {
 			t.Errorf("%s: relaxed as a pure edit:\n%s", name, line)
