@@ -502,6 +502,9 @@ function updateShowHiddenCounts() {
 }
 
 // ── Initial data load ─────────────────────────────────────
+// Fields only the task view fetches (run steps, run errors, diff, checkpoints).
+const TASK_VIEW_FIELDS = ['runSteps', 'runErrors', '_diffData', '_checkpoints', 'governance'];
+
 async function loadAll() {
   try {
     const [fleetResp, tasksResp, sessionsResp] = await Promise.all([
@@ -516,6 +519,14 @@ async function loadAll() {
 
     if (fleetResp) state.fleet = fleetResp;
     for (const t of (tasksResp.tasks || [])) {
+      // A task page opened from a direct link usually loads before this list;
+      // keep what it fetched that the list does not carry (STA-775).
+      const prev = state.tasks[t.id];
+      if (prev) {
+        for (const k of TASK_VIEW_FIELDS) {
+          if (k in prev && !(k in t)) t[k] = prev[k];
+        }
+      }
       state.tasks[t.id] = t;
       if (t.description) state.taskDescriptions[t.id] = t.description;
       if (t.comments && t.comments.length) state.taskComments[t.id] = t.comments;
@@ -571,6 +582,7 @@ async function loadAll() {
     populateRecentTasksFilters();
     renderAll();
     renderSidebarOrgTree();
+    canonicalizeTaskPageURL(state.openDetailTaskId);
     prefetchTaskComments();
   } catch (err) {
     console.error('load failed', err);
@@ -7422,18 +7434,29 @@ let detailOpenEvent = null;
 let taskViewSeq = 0;
 
 // Fetches everything the task layout renders, for the full page and the drawer.
+// The page renders as soon as the cheap DB-backed calls return. The diff and
+// checkpoint list each run several git processes (seconds on a loaded
+// machine), so they arrive later through `diff`, which resolves to
+// { diffData, checkpoints } (STA-775). The ship review card stays in the first
+// batch: it decides whether Run Now and Mark done are offered at all.
 async function fetchTaskViewData(resolvedId) {
   const isFleet = isFleetTaskId(resolvedId);
   const apiBase = isFleet ? '/api/fleet/tasks' : '/api/tasks';
-  const [taskResp, commentsResp, stepsResp, interactionsResp, diffResp, checkpointsResp, runErrorsResp, shipCardResp] = await Promise.all([
+  const diff = isFleet
+    ? Promise.resolve({ diffData: { diff: '', files: [], checkpoint_id: '' }, checkpoints: [] })
+    : Promise.all([fetchTaskDiff(resolvedId, ''), fetchTaskCheckpoints(resolvedId)])
+      .then(([diffData, checkpoints]) => ({ diffData, checkpoints }));
+  // Ordered with fetchWholeRunDiff: a newer whole-run fetch wins the stats strip.
+  const diffSeq = wholeRunDiffSeq[resolvedId] = (wholeRunDiffSeq[resolvedId] || 0) + 1;
+  const [taskResp, commentsResp, stepsResp, interactionsResp, runErrorsResp, shipCardResp, govResp] = await Promise.all([
     apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}`),
     apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}/comments`).catch(() => ({ comments: [] })),
     (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/run-steps`).catch(() => ({ steps: [] })) : Promise.resolve({ steps: [] })),
     (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/interactions`).catch(() => ({ interactions: [] })) : Promise.resolve({ interactions: [] })),
-    (!isFleet ? fetchTaskDiff(resolvedId, '') : Promise.resolve({ diff: '', files: [], checkpoint_id: '' })),
-    (!isFleet ? fetchTaskCheckpoints(resolvedId) : Promise.resolve([])),
     (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/run-errors?limit=20`).catch(() => ({ errors: [] })) : Promise.resolve({ errors: [] })),
     (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/ship-review`).catch(() => null) : Promise.resolve(null)),
+    // Governance is optional, so it no longer waits for the rest to finish.
+    apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/governance`).catch(() => null),
   ]);
   const task = taskResp.task || taskResp;
   if (taskResp.dependencies) task.dependencies = taskResp.dependencies;
@@ -7446,17 +7469,30 @@ async function fetchTaskViewData(resolvedId) {
   task.comments = comments;
   task.runSteps = stepsResp?.steps || [];
   task.runErrors = runErrorsResp?.errors || [];
-  task._diffData = diffResp;
-  task._checkpoints = checkpointsResp;
   const interactions = interactionsResp?.interactions || [];
   const shipCard = (shipCardResp && !shipCardResp.error) ? shipCardResp : null;
+  if (govResp && !govResp.error) task.governance = govResp;
 
-  try {
-    const govResp = await apiFetch(`/api/tasks/${encodeURIComponent(task.id || resolvedId)}/governance`);
-    if (govResp && !govResp.error) task.governance = govResp;
-  } catch { /* governance optional */ }
+  return { task, comments, interactions, shipCard, diff, diffSeq };
+}
 
-  return { task, comments, interactions, shipCard };
+// Fills in the diff and checkpoints once fetchTaskViewData's `diff` resolves,
+// if the same task view (seq) is still showing.
+function fillTaskViewDiff(view, data, key, seq) {
+  data.diff.then(({ diffData, checkpoints }) => {
+    if (seq !== taskViewSeq) return;
+    const cached = state.tasks[key];
+    if (cached) {
+      cached._checkpoints = checkpoints;
+      // fetchWholeRunDiff keeps the last good numbers on an error, and a
+      // run-step refresh started after this fetch is newer: keep both.
+      if (wholeRunDiffSeq[key] === data.diffSeq && diffData && ('file_stats' in diffData || !cached._diffData)) {
+        cached._diffData = diffData;
+      }
+    }
+    view.setDiff(diffData, checkpoints);
+    refreshTaskStatsBar(key);
+  });
 }
 
 function cacheTaskView(task, comments, fallbackId) {
@@ -7545,7 +7581,8 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
   }
 
   try {
-    const { task, comments, interactions, shipCard } = await fetchTaskViewData(resolvedId);
+    const data = await fetchTaskViewData(resolvedId);
+    const { task, comments, interactions, shipCard } = data;
     if (seq !== taskViewSeq) return;
 
     // Use robust UUID for internal state
@@ -7560,7 +7597,8 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
     }
 
     const detailKey = cacheTaskView(task, comments, resolvedId);
-    renderTaskPage(content, task, comments, interactions, task._diffData, task._checkpoints, task.runErrors, shipCard, { drawer: true });
+    const view = renderTaskPage(content, task, comments, interactions, undefined, undefined, task.runErrors, shipCard, { drawer: true });
+    fillTaskViewDiff(view, data, detailKey, seq);
     startChatPoll(detailKey);
   } catch (err) {
     if (seq !== taskViewSeq) return;
@@ -8228,16 +8266,22 @@ function buildTimelineStats(task, steps, elapsedMs, isStuck) {
   add(stat('Files read', filesRead));
   add(stat('Files edited', filesEdited));
 
-  // Lines +/- over the whole run, from the diff the page already loaded.
+  // Lines +/- over the whole run, from the diff the page loads after first
+  // render; "…" until it arrives.
   const fileStats = (task._diffData && task._diffData.file_stats) || [];
   const added = fileStats.reduce((n, f) => n + (f.added || 0), 0);
   const removed = fileStats.reduce((n, f) => n + (f.removed || 0), 0);
   const linesTile = el('span', 'timeline-stat');
   linesTile.appendChild(el('span', 'timeline-stat-label', 'Lines'));
   const linesVal = el('span', 'timeline-stat-val');
-  linesVal.appendChild(el('span', 'lines-added', `+${added}`));
-  linesVal.appendChild(document.createTextNode(' '));
-  linesVal.appendChild(el('span', 'lines-removed', `−${removed}`));
+  if (task._diffData === undefined) {
+    linesVal.textContent = '…';
+    linesVal.title = 'Loading diff';
+  } else {
+    linesVal.appendChild(el('span', 'lines-added', `+${added}`));
+    linesVal.appendChild(document.createTextNode(' '));
+    linesVal.appendChild(el('span', 'lines-removed', `−${removed}`));
+  }
   linesTile.appendChild(linesVal);
   add(linesTile);
 
@@ -8487,6 +8531,23 @@ function appendRunStepToTimeline(taskId, step) {
 
 // ── Full-page task view ────────────────────────────────────
 
+// Puts the open task page's canonical /tasks/<org>/<project>/<id> path in the
+// address bar. Runs when the task loads and again after loadAll: the org
+// prefix comes from the fleet overview, which a direct link can beat.
+// Set once the full page has rendered a task; a miss ("Task not found") keeps
+// the URL it was given.
+let taskPageRenderedId = null;
+
+function canonicalizeTaskPageURL(taskId) {
+  if (!taskId || taskId !== taskPageRenderedId || state.openDetailTaskId !== taskId || !isTaskPageShowing()) return;
+  const path = window.location.pathname;
+  if (!path.startsWith('/tasks/') && !path.startsWith('/issues/')) return;
+  const finalPath = taskToPath(state.tasks[taskId] || { id: taskId });
+  if (path !== finalPath) {
+    history.replaceState({ taskId, canonicalPath: finalPath, taskPage: true }, '', finalPath);
+  }
+}
+
 // fromRouteMiss: this call re-opens a task found by resolveTaskRouteMiss, so
 // the URL that missed is replaced with the canonical one.
 async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
@@ -8502,6 +8563,7 @@ async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
   stopChatPoll();
   stopElapsedTicker();
   const seq = ++taskViewSeq;
+  taskPageRenderedId = null;
 
   let targetId = target;
   let orgHint = null;
@@ -8530,18 +8592,19 @@ async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
   if (pageContent) pageContent.innerHTML = '<p style="color:var(--muted);padding:2rem">Loading…</p>';
 
   try {
-    const { task, comments, interactions, shipCard } = await fetchTaskViewData(resolvedId);
+    const data = await fetchTaskViewData(resolvedId);
+    const { task, comments, interactions, shipCard } = data;
     if (seq !== taskViewSeq) return;
 
     if (task.id) state.openDetailTaskId = task.id;
 
-    const finalPath = taskToPath(task);
-    if ((pushHistory || fromRouteMiss) && window.location.pathname !== finalPath) {
-      history.replaceState({ taskId: task.id, canonicalPath: finalPath, taskPage: true }, '', finalPath);
-    }
-
     const activeId = cacheTaskView(task, comments, resolvedId);
-    renderTaskPage(pageContent, task, comments, interactions, task._diffData, task._checkpoints, task.runErrors, shipCard);
+    // Every way onto the page ends on its canonical /tasks/<org>/<project>/<id>
+    // URL, including a pasted or bookmarked /tasks/<id> (STA-775).
+    taskPageRenderedId = activeId;
+    canonicalizeTaskPageURL(activeId);
+    const view = renderTaskPage(pageContent, task, comments, interactions, undefined, undefined, task.runErrors, shipCard);
+    fillTaskViewDiff(view, data, activeId, seq);
     startChatPoll(activeId);
   } catch (err) {
     if (seq !== taskViewSeq) return;
@@ -10824,13 +10887,22 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   chatSection.appendChild(compose);
 
   // ── Diff ──
+  // diffData undefined means it is still loading: the page renders first and
+  // the caller fills the pane through the returned setDiff (STA-775).
   const diffPane = el('div', 'task-page-diff');
-  if (!isFleetTaskId(task.id || '')) {
-    renderDiffPane(diffPane, task, checkpoints || [], diffData || { diff: '', files: [], checkpoint_id: '' });
-    const d = diffData || {};
+  const isFleetTask = isFleetTaskId(task.id || '');
+  const setDiff = (data, cps) => {
+    if (isFleetTask) return;
+    renderDiffPane(diffPane, task, cps || [], data || { diff: '', files: [], checkpoint_id: '' });
+    const d = data || {};
     setTabCount('diff', (d.file_stats && d.file_stats.length) || (d.files && d.files.length) || 0);
-  } else {
+  };
+  if (isFleetTask) {
     diffPane.appendChild(el('p', 'panel-field-muted task-page-tab-empty', 'Fleet tasks have no diff.'));
+  } else if (diffData === undefined) {
+    diffPane.appendChild(el('p', 'panel-field-muted task-page-diff-loading', 'Loading diff…'));
+  } else {
+    setDiff(diffData, checkpoints);
   }
   tabPanels.diff.appendChild(diffPane);
 
@@ -11079,6 +11151,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   layout.appendChild(side);
   container.appendChild(layout);
   container.appendChild(chatSection);
+  return { setDiff };
 }
 
 document.addEventListener('click', (e) => {
