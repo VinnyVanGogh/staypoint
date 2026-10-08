@@ -5004,3 +5004,22 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .trust-request-row { display: flex; gap: 8px; align-items: baseline; }
 .trust-request-time { font-size: 11px; color: var(--muted); min-width: 72px; }
 .gates-trust-panel { margin: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+
+/* Pull Requests page (task-9fb380ef) */
+.prs-container { display: flex; flex-direction: column; gap: 24px; }
+.prs-repo-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
+.prs-repo-name { font-size: 1.05rem; margin: 0; }
+.prs-repo-path { font-size: 0.8rem; }
+.prs-bulk-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+.prs-table td { vertical-align: middle; }
+.prs-branch { font-family: var(--mono, monospace); font-size: 0.8rem; }
+.pr-checks { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+.pr-check { font-size: 0.8rem; white-space: nowrap; }
+.pr-check-pass { color: var(--green, #16a34a); }
+.pr-check-fail { color: var(--red, #dc2626); }
+.pr-check-pending { color: var(--muted, #888); }
+.pr-check-playwright { border: 1px dashed var(--border, #555); border-radius: 4px; padding: 0 4px; }
+.prs-mergeable-conflicting { color: var(--red, #dc2626); }
+.prs-draft { color: var(--muted, #888); font-size: 0.8rem; }
+.prs-status { white-space: pre-wrap; padding: 8px 12px; border-radius: 6px; background: var(--surface-2, rgba(127,127,127,0.12)); margin: 0 0 12px; }
+.prs-status-error, .prs-error { color: var(--red, #dc2626); }
