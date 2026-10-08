@@ -20,10 +20,11 @@ const (
 )
 
 var (
-	ErrInvalidOrigin = errors.New("invalid origin")
-	ErrInvalidStage  = errors.New("invalid execution stage")
-	ErrNoRepo        = errors.New("task has no repo")
-	ErrInvalidRepo   = errors.New("invalid repo path")
+	ErrInvalidOrigin  = errors.New("invalid origin")
+	ErrInvalidStage   = errors.New("invalid execution stage")
+	ErrNoRepo         = errors.New("task has no repo")
+	ErrInvalidRepo    = errors.New("invalid repo path")
+	ErrInvalidProject = errors.New("invalid project")
 )
 
 // ErrBoardRequired is returned when a stage change needs the Board.

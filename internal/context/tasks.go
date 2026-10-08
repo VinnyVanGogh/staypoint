@@ -1668,6 +1668,32 @@ func SetTaskRepo(db *sql.DB, taskID, repoPath, gitBranch string) (*Task, error) 
 	return GetTask(db, task.ID)
 }
 
+// SetTaskProject moves a task into project (trimmed; "" clears it). It does
+// not touch updated_at: grouping tasks is not work on them, and bumping it
+// would reorder Recent Tasks for every regrouped task.
+func SetTaskProject(db *sql.DB, taskID, project string) (*Task, error) {
+	task, err := GetTask(db, taskID)
+	if err != nil {
+		return nil, err
+	}
+	project = strings.TrimSpace(project)
+	if len(project) > 120 {
+		return nil, fmt.Errorf("%w: project name longer than 120 characters", ErrInvalidProject)
+	}
+	if _, err := db.Exec(`UPDATE tasks SET project = ? WHERE id = ?`, project, task.ID); err != nil {
+		return nil, fmt.Errorf("set task project: %w", err)
+	}
+	from, to := task.Project, project
+	if from == "" {
+		from = "(none)"
+	}
+	if to == "" {
+		to = "(none)"
+	}
+	_ = LogActivity(db, task.ID, "project_set", fmt.Sprintf("project %s -> %s", from, to))
+	return GetTask(db, task.ID)
+}
+
 func writeStage(db *sql.DB, taskID, stage string) error {
 	var query string
 	switch stage {
