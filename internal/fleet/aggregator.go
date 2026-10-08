@@ -74,7 +74,7 @@ func (a *Aggregator) GatherWith(ctx context.Context, opts GatherOptions) (*Fleet
 	}
 
 	overview := &FleetOverview{
-		Timestamp: now,
+		Timestamp:     now,
 		Organizations: []OrgFleetSummary{},
 		GlobalAgents: GlobalAgentMetrics{
 			ByProvider:     make(map[string]int),
@@ -599,6 +599,10 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 						Priority:        iss.Priority,
 						ParentID:        iss.ParentID,
 						UpdatedAt:       now,
+						// Paperclip is frozen (read-only record), so its live
+						// issues are legacy: lists hide them behind "Show
+						// archive & legacy" like imported legacy tasks.
+						Origin: "legacy",
 					}
 					switch iss.Status {
 					case "in_progress", "running":

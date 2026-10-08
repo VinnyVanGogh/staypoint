@@ -599,6 +599,13 @@ func TestAggregatorGather_PaperclipProjectsAndAssignees(t *testing.T) {
 	if t1.AssigneeAgentID != "agent-cto-1" {
 		t.Errorf("expected t1 AssigneeAgentID 'agent-cto-1', got %q", t1.AssigneeAgentID)
 	}
+	// Paperclip is frozen: live issues are legacy, hidden behind "Show
+	// archive & legacy" with the imported legacy tasks.
+	for _, ti := range org.Tasks {
+		if ti.Origin != "legacy" {
+			t.Errorf("live Paperclip issue %s origin = %q, want legacy", ti.Identifier, ti.Origin)
+		}
+	}
 
 	t2 := org.Tasks[1]
 	if t2.Project != "Native Orchestrator" {

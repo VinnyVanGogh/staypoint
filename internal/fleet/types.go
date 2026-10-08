@@ -36,7 +36,7 @@ type TaskItem struct {
 	AssigneeAgentID string    `json:"assignee_agent_id,omitempty"`
 	CheckoutAgentID string    `json:"checkout_agent_id,omitempty"`
 	// Origin is the local task origin (native, paperclip_import, legacy, agent);
-	// empty for live Paperclip issues.
+	// live Paperclip issues are "legacy" (Paperclip is frozen).
 	Origin string `json:"origin,omitempty"`
 }
 
