@@ -819,6 +819,20 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 	if !h.requireBoardToLeave(w, r, task, req.Stage) {
 		return
 	}
+	// Done through the stage endpoint keeps the done gate of POST /done:
+	// without the Board override (which needs the Board gate) it needs a work
+	// product and no watchdog block. It let an agent token close any task
+	// (task-70e08aca).
+	if req.Stage == governance.StageDone && !req.Override {
+		if err := context.CheckDoneGate(h.db, task.ID); err != nil {
+			if errors.Is(err, context.ErrNoWorkProduct) || errors.Is(err, context.ErrWatchdogBlocked) {
+				writeError(w, http.StatusConflict, err.Error())
+			} else {
+				writeError(w, http.StatusInternalServerError, err.Error())
+			}
+			return
+		}
+	}
 	if req.Stage == governance.StageInProgress {
 		if held, org := governance.TaskOrgHeld(h.db, task.ID); held {
 			orchestrator.WakeHeld(h.db, task.ID, "run_now")

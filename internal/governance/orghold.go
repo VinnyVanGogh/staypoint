@@ -169,7 +169,7 @@ func SetOrgHold(db *sql.DB, org string, held bool) error {
 	if err != nil {
 		return fmt.Errorf("set org hold: %w", err)
 	}
-	keys[OrgHoldPrefix+n] = v
+	keys[OrgHoldKey(org)] = v
 	for k := range keys {
 		if _, err := tx.Exec(
 			`INSERT INTO settings_kv (key, value, updated_at) VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
