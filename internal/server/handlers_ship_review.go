@@ -394,6 +394,7 @@ func (h *ShipReviewHandler) StartDev(w http.ResponseWriter, r *http.Request) {
 		proposed.MergeMode = cfg.MergeMode
 		proposed.GHConfigDir = cfg.GHConfigDir
 		proposed.TargetBranch = cfg.TargetBranch
+		proposed.PushPolicy = cfg.PushPolicy
 		if uErr := shipreview.UpsertProjectDevConfig(h.db, proposed); uErr == nil {
 			cfg = proposed
 			h.hub.Publish("ship_review_dev_config_proposed", map[string]any{
@@ -1157,6 +1158,8 @@ type devConfigUpdateReq struct {
 	TargetBranch    *string   `json:"target_branch"`
 	GHConfigDir     *string   `json:"gh_config_dir"`
 	LiveCredentials *bool     `json:"live_credentials"`
+	// PushPolicy is whether agents may push task branches (STA-562).
+	PushPolicy *string `json:"push_policy"`
 	// TestExemptGlobs are the project's own test-gate exempt paths (STA-734).
 	TestExemptGlobs *[]string `json:"test_exempt_globs"`
 }
@@ -1200,6 +1203,10 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusBadRequest, "gh_config_dir must be an absolute path")
 		return
 	}
+	if req.PushPolicy != nil && !shipreview.ValidPushPolicy(*req.PushPolicy) {
+		writeError(w, http.StatusBadRequest, "push_policy must be one of never, branch_only, pr")
+		return
+	}
 
 	old, err := shipreview.GetProjectDevConfig(h.db, req.RepoPath)
 	if err != nil {
@@ -1240,6 +1247,9 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 	}
 	if req.LiveCredentials != nil {
 		cfg.LiveCredentials = *req.LiveCredentials
+	}
+	if req.PushPolicy != nil {
+		cfg.PushPolicy = shipreview.PushPolicy(*req.PushPolicy)
 	}
 
 	// Read before the transaction: SQLite may have only the one connection.
@@ -1287,6 +1297,8 @@ func (h *ShipReviewHandler) UpsertProjectDevConfig(w http.ResponseWriter, r *htt
 		// its full history.
 		"old_live_credentials":  old.LiveCredentials,
 		"new_live_credentials":  cfg.LiveCredentials,
+		"old_push_policy":       string(old.PushPolicy),
+		"new_push_policy":       string(cfg.PushPolicy),
 		"old_test_exempt_globs": oldExempt,
 		"new_test_exempt_globs": newExempt,
 	}); err != nil {

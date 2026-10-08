@@ -1935,6 +1935,15 @@ type devExecer interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }
 
+// ValidPushPolicy reports whether p is a push_policy the Board may store.
+func ValidPushPolicy(p string) bool {
+	switch PushPolicy(p) {
+	case PushPolicyNever, PushPolicyBranchOnly, PushPolicyPR:
+		return true
+	}
+	return false
+}
+
 // normalizePushPolicy maps anything but a known permissive policy to
 // PushPolicyNever, so an empty, misspelled or future value fails closed.
 func normalizePushPolicy(p PushPolicy) PushPolicy {

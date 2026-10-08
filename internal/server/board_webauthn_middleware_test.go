@@ -42,6 +42,7 @@ var boardActionEndpoints = []struct {
 	{"POST", "/api/tasks/webauthn-task/ship-review/send-back", `{"comment":"test"}`},
 	{"POST", "/api/tasks/webauthn-task/ship-review/reject", `{"comment":"test"}`},
 	{"POST", "/api/tasks/webauthn-task/ship-review/delete-branch", ""},
+	{"POST", "/api/tasks/webauthn-task/ship-review/push-branch", ""},
 	{"POST", "/api/security/gate-requests/nonexistent-id/decide", `{"decision":"approved"}`},
 	{"POST", "/api/security/gate-requests/decide-batch", `{"ids":["x"],"decision":"approved"}`},
 	{"POST", "/api/security/gate-rules", `{"gate_id":"x","scope":"task"}`},
