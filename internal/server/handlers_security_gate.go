@@ -194,10 +194,13 @@ type gateCreateOutcome struct {
 }
 
 // createOrAutoApprove stores the request: approved by the first matching
-// Board allow rule or by the task's trust (with its audit row and hit count,
-// in one transaction), or pending. Under trust, merges/pushes to protected
+// Board allow rule or by the task's trust or, failing that, its
+// organization's trust (with its audit row and hit count, in one
+// transaction), or pending. Under trust, merges/pushes to protected
 // branches stay pending, deletes outside the worktree stay pending with a
-// deferral deadline, and tev1 mode leaves the request to runTev1.
+// deferral deadline, and tev1 mode leaves the request to runTev1. Under an
+// org trust the Board's unattended-run rules (AnalyzeBoardRules) also stay
+// pending. A trust lookup error fails the request (fail closed).
 func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) (*gateCreateOutcome, error) {
 	now := h.clock()
 	// Trust lookup and the exclusion analysis run git and read the
@@ -206,11 +209,20 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 		trust     *gates.Rule
 		facts     security.TrustFacts
 		deferMins int
+		boardRule string
 	)
 	if !gates.SpecialRunIDs[in.RunID] && in.TaskID != "" {
 		var err error
 		if trust, err = gates.ActiveTrust(h.db, in.TaskID, now); err != nil {
 			return nil, err
+		}
+		if trust == nil {
+			if trust, err = gates.ActiveOrgTrust(h.db, in.TaskID, now); err != nil {
+				return nil, err
+			}
+			if trust != nil {
+				boardRule = security.AnalyzeBoardRules(in.Cmdline, in.Scripts)
+			}
 		}
 		if trust != nil {
 			facts = security.AnalyzeForTrust(in.Cmdline, gates.TrustContextFor(h.db, in.TaskID, in.CWD, in.Scripts))
@@ -236,7 +248,7 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 		}
 	}
 	pending, approved := string(security.GateRequestPending), string(security.GateRequestApproved)
-	if rule == nil && trust != nil && !facts.Protected && !facts.DeleteOutside && !trust.Tev1 {
+	if rule == nil && trust != nil && !facts.Protected && boardRule == "" && !facts.DeleteOutside && !trust.Tev1 {
 		rule = trust
 	}
 	if rule == nil {
@@ -251,6 +263,9 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 			case facts.Protected:
 				event, out.held = "security_gate_trust_held", "protected: "+facts.ProtectedWhy
 				payload["message"] = "held for the Board under trust: " + facts.ProtectedWhy
+			case boardRule != "":
+				event, out.held = "security_gate_trust_held", "board rule: "+boardRule
+				payload["message"] = "held for the Board under org trust: " + boardRule
 			case facts.DeleteOutside:
 				at := now.Add(time.Duration(deferMins) * time.Minute)
 				if err := security.SetDeferAt(tx, gr.ID, at); err != nil {
@@ -277,7 +292,7 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 	}
 	msg := fmt.Sprintf("auto-approved by rule #%d", rule.ID)
 	if rule.IsTrust() {
-		msg = fmt.Sprintf("auto-approved by trust #%d (task %s)", rule.ID, rule.ScopeValue)
+		msg = fmt.Sprintf("auto-approved by trust #%d (%s)", rule.ID, gates.TrustLabel(rule))
 	}
 	if err := governance.LogGateEventTx(tx, gr.ID, by, "security_gate_auto_approved", &pending, &approved,
 		map[string]any{"message": msg, "rule_id": rule.ID, "trust": rule.IsTrust(),

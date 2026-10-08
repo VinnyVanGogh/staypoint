@@ -1,0 +1,120 @@
+package security
+
+import (
+	"net"
+	"net/url"
+	"regexp"
+	"strings"
+)
+
+// Board rules for unattended runs (task-33692ffb). Under an organization
+// trust these always wait for the Board, on top of the trust exclusions in
+// AnalyzeForTrust (protected merges and pushes, deletes outside the
+// worktree):
+//   - prod writes, deploys and renders (prod reads are fine);
+//   - external API writes (POST/PUT/PATCH/DELETE to a non-local host);
+//   - destructive deletes of real data (SQL DELETE/DROP/TRUNCATE, API and
+//     cloud deletes);
+//   - sending PII (mail, uploads to other hosts, payloads carrying an email
+//     address or SSN-like number).
+//
+// The check reads the command text and its scripts' snapshots, not the
+// parse tree: it is a deliberately broad backstop, so a false match only
+// means the Board is asked. Opening a pull request is not held; merging is
+// held by AnalyzeForTrust.
+
+var (
+	prodWordRe  = regexp.MustCompile(`(?i)(\bprod\b|\bproduction\b|--prod\b|\bprd\b|[-_.]prod\b|\bprod[-_.])`)
+	prodWriteRe = regexp.MustCompile(`(?i)\b(deploy|render|apply|publish|release|rollout|migrate|upgrade|install|restart|scale|push|sync|upload|put|post|patch|delete|drop|truncate|insert|update|create|set|write|exec|rm|cp|mv|kill|destroy|promote)\b`)
+	// deployRe holds deploys whatever their target names: a deploy that
+	// does not say prod may still be prod.
+	deployRe = regexp.MustCompile(`(?i)(\b(wrangler|vercel|netlify|fly|flyctl|firebase|heroku|railway|render|serverless|sls|cdk|sam|amplify|eb|gcloud\s+app|supabase\s+functions)\b[\s\S]*\bdeploy\b|\bterraform\s+(apply|destroy|import)\b|\bpulumi\s+(up|destroy)\b|\bkubectl\s+(apply|create|delete|replace|patch|scale|rollout|set|edit)\b|\bhelm\s+(install|upgrade|uninstall|rollback)\b|\bsupabase\s+db\s+push\b|\bansible-playbook\b|\bdeploy[\w.-]*\.sh\b|\bdocker\s+push\b)`)
+
+	httpClientRe = regexp.MustCompile(`(?i)(^|[\s;&|(` + "`" + `])(curl|wget|http|https|xh|httpie)\b`)
+	httpWriteRe  = regexp.MustCompile(`(?i)(-X\s*['"]?(POST|PUT|PATCH|DELETE)\b|--request\s*[= ]\s*['"]?(POST|PUT|PATCH|DELETE)\b|--method\s*[= ]\s*['"]?(POST|PUT|PATCH|DELETE)\b|(^|\s)(-d|--data[\w-]*|-F|--form[\w-]*|--json|-T|--upload-file|--post-data|--post-file|--body-data|--body-file)(\s|=|$)|(^|\s)(POST|PUT|PATCH|DELETE)\s+\S|\s[\w.-]+:?=\S)`)
+	codeWriteRe  = regexp.MustCompile(`(?i)(requests\.(post|put|patch|delete)\(|httpx\.(post|put|patch|delete)\(|urllib\.request\.urlopen\([^)]*data|method\s*[:=]\s*['"](POST|PUT|PATCH|DELETE)['"]|axios\.(post|put|patch|delete)\(|http\.(Post|PostForm|NewRequest)\(|Net::HTTP::(Post|Put|Patch|Delete)|\.(post|put|patch|delete)\(\s*['"]https?://)`)
+	urlRe        = regexp.MustCompile(`(?i)\bhttps?://[^\s'"<>` + "`" + `]+`)
+
+	ghAPIWriteRe = regexp.MustCompile(`(?i)\bgh\s+api\b[\s\S]*(-X\s*['"]?(POST|PUT|PATCH|DELETE)\b|--method\s*[= ]?\s*['"]?(POST|PUT|PATCH|DELETE)\b|\s(-f|-F|--field|--raw-field|--input)(\s|=))`)
+	ghWriteRe    = regexp.MustCompile(`(?i)\bgh\s+(repo\s+(delete|archive|rename|edit|create)|release\s+(create|delete|upload|edit)|secret\s+(set|delete|remove)|variable\s+(set|delete)|issue\s+(create|delete|close|comment|edit|transfer)|gist\s+(create|delete|edit)|workflow\s+(run|enable|disable)|run\s+(rerun|cancel|delete)|ruleset|label\s+(create|delete|edit)|pr\s+(close|comment|review))\b`)
+
+	sqlDeleteRe   = regexp.MustCompile(`(?i)(\bdelete\s+from\b|\bdrop\s+(table|database|schema|index|view|collection)\b|\btruncate\s+(table\s+)?\w|\bdeleteMany\b|\bdropDatabase\b|\bflushall\b|\bflushdb\b)`)
+	cloudDeleteRe = regexp.MustCompile(`(?i)(\baws\s+\S+\s+(rm|delete[\w-]*|terminate[\w-]*)\b|\bgsutil\s+(rm|rb)\b|\bgcloud\b[\s\S]*\bdelete\b|\baz\b[\s\S]*\bdelete\b|\bdocker\s+(volume\s+rm|system\s+prune|volume\s+prune)\b|\bdropdb\b|\bwrangler\b[\s\S]*\bdelete\b|\bsupabase\s+db\s+reset\b|\bgit\s+push\b[\s\S]*(--delete|\s:\S))`)
+
+	mailRe   = regexp.MustCompile(`(?i)(^|[\s;&|(/])(sendmail|mail|mailx|mutt|msmtp|swaks|agentmail)\b|\bsmtplib\b|\bnodemailer\b|\bsmtp://|\bsmtps://`)
+	uploadRe = regexp.MustCompile(`(?i)(^|[\s;&|(])(scp|sftp|nc|ncat|netcat|socat|ftp|rclone\s+(copy|sync|move))\b|\brsync\b[^|;&]*\s[\w.@-]+:`)
+	emailRe  = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
+	ssnRe    = regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`)
+)
+
+// AnalyzeBoardRules returns why line (or a script it runs) breaks a Board
+// rule for unattended runs, or "" when it does not.
+func AnalyzeBoardRules(line string, scripts []ScriptHash) string {
+	if why := boardRuleText(line, "command"); why != "" {
+		return why
+	}
+	for _, s := range scripts {
+		if why := boardRuleText(s.Content, "script "+s.Path); why != "" {
+			return why
+		}
+	}
+	return ""
+}
+
+func boardRuleText(code, what string) string {
+	if strings.TrimSpace(code) == "" {
+		return ""
+	}
+	switch {
+	case deployRe.MatchString(code):
+		return what + " deploys (Board rule: no prod writes or deploys)"
+	case prodWordRe.MatchString(code) && prodWriteRe.MatchString(code):
+		return what + " may write to prod (Board rule: prod reads only)"
+	case sqlDeleteRe.MatchString(code) || cloudDeleteRe.MatchString(code):
+		return what + " may delete real data (Board rule: no destructive deletes)"
+	case ghAPIWriteRe.MatchString(code) || ghWriteRe.MatchString(code):
+		return what + " writes to the GitHub API (Board rule: no external API writes)"
+	case externalHTTPWrite(code):
+		return what + " writes to an external API (Board rule: external reads only)"
+	case mailRe.MatchString(code):
+		return what + " sends mail (Board rule: no sending PII)"
+	case uploadRe.MatchString(code):
+		return what + " sends data to another host (Board rule: no sending PII)"
+	case (httpClientRe.MatchString(code) || urlRe.MatchString(code)) && (emailRe.MatchString(code) || ssnRe.MatchString(code)):
+		return what + " sends what looks like PII (Board rule: no sending PII)"
+	}
+	return ""
+}
+
+// externalHTTPWrite reports an HTTP write (curl -d, -X POST, requests.post,
+// ...) to a non-local host. A write with no URL it can read counts as
+// external (fail closed).
+func externalHTTPWrite(code string) bool {
+	write := (httpClientRe.MatchString(code) && httpWriteRe.MatchString(code)) || codeWriteRe.MatchString(code)
+	if !write {
+		return false
+	}
+	urls := urlRe.FindAllString(code, -1)
+	if len(urls) == 0 {
+		return true
+	}
+	for _, u := range urls {
+		if !isLocalURL(u) {
+			return true
+		}
+	}
+	return false
+}
+
+func isLocalURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
+}

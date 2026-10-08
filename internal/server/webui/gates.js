@@ -842,3 +842,122 @@ async function renderTrustedTasksPanel() {
   }
   return panel;
 }
+
+// ── Org trust: "Trust this organization until…" (task-33692ffb) ─────────────
+
+// orgTrustCreate asks for a fresh Touch ID and trusts every running task of
+// org. The body names a preset only; the server sets the expiry (max 16 h).
+async function orgTrustCreate(org, spec) {
+  const r = await withBoardWebAuthn((sessionToken, assertion) => fetch('/api/settings/org-trust', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeader(), 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+    body: JSON.stringify({ org, ...spec }),
+  }), `trusting ${org}`);
+  if (r === null) return false;
+  if (!r.ok) { await gateActionFailed(r); return false; }
+  return true;
+}
+
+// orgTrustRevoke ends an org trust at once (Board session, no Touch ID).
+async function orgTrustRevoke(org) {
+  try {
+    const r = await fetch('/api/settings/org-trust/revoke', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeader() },
+      body: JSON.stringify({ org }),
+    });
+    if (!r.ok) { await gateActionFailed(r); return false; }
+    showToast(`Trust revoked: ${org}'s Red requests wait for you again.`, 'success');
+    return true;
+  } catch (e) {
+    alert(`Revoke failed: ${e.message}`);
+    return false;
+  }
+}
+
+// renderOrgTrustSection fills sec (a Settings section) with the active org
+// trusts and a "Trust this organization until…" form for orgNames.
+async function renderOrgTrustSection(sec, orgNames) {
+  let info;
+  try { info = await apiFetch('/api/settings/org-trust'); } catch (_) { return; }
+  const body = sec.querySelector('.org-trust-body') || sec.appendChild(el('div', 'org-trust-body'));
+  body.innerHTML = '';
+  const rerender = () => renderOrgTrustSection(sec, orgNames);
+  const now = Date.now();
+  const trusts = info.trusts || [];
+  const trusted = new Set(trusts.map(t => t.scope_value));
+  if (trusts.some(t => t.tev1)) body.appendChild(trustTev1Banner('a trusted organization'));
+  for (const t of trusts) {
+    const banner = el('div', 'trust-banner org-trust-banner');
+    banner.dataset.org = t.scope_value;
+    banner.appendChild(el('span', 'trust-banner-text', `${t.scope_value}: ${trustBannerText(t, now)}`));
+    const revoke = el('button', 'gate-btn gate-deny-btn trust-revoke-btn', 'Revoke');
+    revoke.addEventListener('click', async () => { if (await orgTrustRevoke(t.scope_value)) rerender(); });
+    banner.appendChild(revoke);
+    body.appendChild(banner);
+  }
+
+  const form = el('div', 'trust-create org-trust-create');
+  form.appendChild(el('div', 'task-page-section-title', 'Trust this organization until…'));
+  const row = el('div', 'trust-create-row');
+  // A free-text field with the known organizations as suggestions: the
+  // server checks the name against the tasks table.
+  const org = el('input', 'select-filter org-trust-org');
+  org.placeholder = 'organization';
+  const list = el('datalist', '');
+  list.id = 'org-trust-orgs';
+  org.setAttribute('list', list.id);
+  const seen = new Set();
+  for (const name of orgNames) {
+    const key = String(name).trim().toLowerCase();
+    if (!key || seen.has(key) || trusted.has(key)) continue;
+    seen.add(key);
+    const o = el('option', '');
+    o.value = name;
+    list.appendChild(o);
+  }
+  const preset = el('select', 'select-filter trust-preset');
+  for (const [v, label] of TRUST_PRESETS) {
+    const o = el('option', '', label);
+    o.value = v;
+    preset.appendChild(o);
+  }
+  preset.value = 'overnight';
+  const maxMins = info.max_minutes || 960;
+  const mins = el('input', 'trust-custom-minutes');
+  mins.type = 'number';
+  mins.min = String(info.min_minutes || 15);
+  mins.max = String(maxMins);
+  mins.placeholder = 'minutes';
+  mins.hidden = true;
+  preset.addEventListener('change', () => { mins.hidden = preset.value !== 'custom'; });
+  const tev1Label = el('label', 'trust-tev1-toggle');
+  const tev1 = el('input', '');
+  tev1.type = 'checkbox';
+  tev1Label.append(tev1, document.createTextNode(' tev1 decides overnight (off by default)'));
+  if (!info.tev1_configured) { tev1.disabled = true; tev1Label.title = 'No local tev1 advisor configured'; }
+  const go = el('button', 'gate-btn gate-approve-btn trust-create-btn', 'Trust (Touch ID)');
+  go.addEventListener('click', async () => {
+    if (!org.value.trim()) { alert('Pick an organization'); return; }
+    let ack = false;
+    if (tev1.checked) {
+      ack = confirm(`Enable tev1 overnight mode for ${org.value}?\n\n${info.tev1_warning || ''}\n\nOn a deny, low confidence or error the request is not run and that task is parked until you review it.`);
+      if (!ack) return;
+    }
+    const { spec, error } = trustSpec(preset.value, mins.value, tev1.checked, ack);
+    if (error) { alert(error); return; }
+    if (spec.minutes && spec.minutes > maxMins) { alert(`An organization trust is at most ${maxMins} minutes`); return; }
+    if (!confirm(`Trust every running task in ${org.value}? Their Red requests run without asking you until the trust ends.`)) return;
+    go.disabled = true;
+    const ok = await orgTrustCreate(org.value, spec);
+    go.disabled = false;
+    if (ok) rerender();
+  });
+  row.append(org, list, preset, mins, tev1Label, go);
+  form.appendChild(row);
+  form.appendChild(el('div', 'muted-text trust-create-note',
+    `While trusted, Red requests of every running task in the organization run without asking you, and each is logged. `
+    + `Always excluded: merges, and pushes to protected branches; prod writes and deploys; external API writes; `
+    + `destructive deletes of real data; sending PII. Deletes outside a task worktree wait, then are skipped and queued for you. `
+    + `At most ${Math.round(maxMins / 60)} h. Opening pull requests is allowed.`));
+  body.appendChild(form);
+}

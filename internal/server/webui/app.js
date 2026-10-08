@@ -4817,6 +4817,16 @@ function renderSettings() {
   }
   container.appendChild(holdSec);
 
+  // Organization trust (Board-only, Touch ID): "Trust this organization until…"
+  const trustSec = el('div', 'settings-section org-trust-section');
+  const trustHdr = el('div', 'settings-section-header');
+  trustHdr.appendChild(el('div', 'settings-section-title', 'Organization trust'));
+  trustHdr.appendChild(el('div', 'settings-section-desc',
+    'Auto-approve Red requests from every running task in one organization until a time you pick (at most 16 h). The Board rules still wait for you. Created with Touch ID; revoke any time.'));
+  trustSec.appendChild(trustHdr);
+  container.appendChild(trustSec);
+  if (typeof renderOrgTrustSection === 'function') renderOrgTrustSection(trustSec, holdOrgs);
+
   // Provider accounts
   const provSec = el('div', 'settings-section');
   const provHdr = el('div', 'settings-section-header');
