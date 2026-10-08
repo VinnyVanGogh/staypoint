@@ -66,6 +66,24 @@ test.describe('Gates page', () => {
     await expect(matchRow.locator('.gate-deny-btn')).toBeVisible();
   });
 
+  test('a gate row links its task to the task page', async ({ api, page }) => {
+    const task = await api.createTask('gate-task-link');
+    const cmd = `git push origin main ${uniq()}`;
+    await api.createGateRequest(cmd, ['Red-tier: push to main'], 'run-gate-task-link', task.id);
+
+    await page.goto('/gates');
+    await expect(page.locator('#conn-badge')).toHaveText('live');
+
+    const row = page.locator('#gates-container .gates-table tbody tr').filter({ hasText: cmd });
+    const link = row.locator('a.gate-task-link');
+    await expect(link).toHaveText(`task ${task.id}`);
+    // A real href, so "Open in New Tab" and cmd-click work.
+    await expect(link).toHaveAttribute('href', `/tasks/${task.id}`);
+
+    await link.click();
+    await expect(page).toHaveURL(new RegExp(`/${task.id}$`));
+  });
+
   test('Deny button records decision and actor in security_gate_audit_log', async ({ api, boardPage }) => {
     const cmd = `git push origin main ${uniq()}`;
     const gr = await api.createGateRequest(cmd, ['Red-tier: push to main'], 'run-sta-587-deny');
