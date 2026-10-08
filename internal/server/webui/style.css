@@ -4794,6 +4794,8 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .gate-reasons { font-size: 11px; color: var(--muted); margin-top: 3px; }
 .gate-run-link { font-size: 11px; color: var(--accent-light, #a78bfa); text-decoration: none; }
 .gate-run-link:hover { text-decoration: underline; }
+.gate-task-link { color: var(--accent-light, #a78bfa); text-decoration: underline; text-underline-offset: 2px; }
+.gate-task-link:focus-visible { outline: 2px solid var(--accent-light, #a78bfa); outline-offset: 2px; border-radius: 2px; }
 .gate-status-pending  { color: var(--amber, #f59e0b); font-weight: 600; }
 .gate-status-approved { color: var(--green, #3fb950); font-weight: 600; }
 .gate-status-denied   { color: var(--red, #f85149); font-weight: 600; }

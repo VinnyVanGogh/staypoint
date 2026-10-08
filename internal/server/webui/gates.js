@@ -287,8 +287,24 @@ async function renderGateRequestsTab() {
     } else {
       runTd.appendChild(el('span', 'muted-text', '—'));
     }
-    const ctx = [gr.task_id && `task ${gr.task_id}`, gr.repo, gr.org].filter(Boolean).join(' · ');
-    if (ctx) runTd.appendChild(el('div', 'gate-context', ctx));
+    const rest = [gr.repo, gr.org].filter(Boolean).join(' · ');
+    if (gr.task_id || rest) {
+      const ctxDiv = el('div', 'gate-context');
+      if (gr.task_id) {
+        // A real href so cmd/ctrl-click and "Open in New Tab" work; a plain
+        // click stays in the app.
+        const taskA = el('a', 'gate-task-link', `task ${gr.task_id}`);
+        taskA.href = `/tasks/${encodeURIComponent(gr.task_id)}`;
+        taskA.addEventListener('click', e => {
+          if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+          e.preventDefault();
+          openTaskPage(gr.task_id);
+        });
+        ctxDiv.appendChild(taskA);
+      }
+      if (rest) ctxDiv.appendChild(document.createTextNode(`${gr.task_id ? ' · ' : ''}${rest}`));
+      runTd.appendChild(ctxDiv);
+    }
     tr.appendChild(runTd);
 
     const timeTd = document.createElement('td');
