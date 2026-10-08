@@ -1109,6 +1109,7 @@ function navigateTo(viewName, orgName = null, pushHistory = true) {
     if (viewName === 'logs')         renderLogsPage();
     if (viewName === 'artifacts')    renderArtifactsPage();
     if (viewName === 'gates')        renderGatesPage();
+    if (viewName === 'pull-requests') renderPullRequestsPage();
     if (viewName === 'boss') {
       renderBoss();
       preloadBossReports(true);
@@ -10952,6 +10953,37 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     meta.appendChild(reviewLink);
   }
 
+  // ── Run all children (task-f6777004) ──
+  // One passkey moves every backlog/todo child to todo, in priority order, and
+  // wakes it; tasks.max_running_children caps how many run at once.
+  const childList = task.dependencies?.subtasks || task.subtasks || [];
+  if (task.id && !isFleetTaskId(task.id) && childList.length) {
+    const runKidsBtn = el('button', 'run-children-btn', '▶ Run all children');
+    runKidsBtn.type = 'button';
+    runKidsBtn.title = 'Queue every backlog/todo child (Board, passkey)';
+    runKidsBtn.addEventListener('click', async () => {
+      runKidsBtn.disabled = true;
+      try {
+        const res = await withBoardWebAuthn((sessionToken, assertion) =>
+          fetch(`/api/tasks/${encodeURIComponent(task.id)}/run-children`, {
+            method: 'POST',
+            headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+            body: '{}',
+          }), 'running all children of this task');
+        if (res === null) { runKidsBtn.disabled = false; return; }
+        if (!res.ok) throw await boardActionError(res);
+        const out = await res.json();
+        const lines = (out.children || []).map(c => `${c.result}: ${c.name || c.task_id}${c.reason ? ` (${c.reason})` : ''}`);
+        alert(`Queued ${out.queued} child task(s).\n\n${lines.join('\n')}`);
+        setTimeout(reopen, 300);
+      } catch (err) {
+        runKidsBtn.disabled = false;
+        alert(`Run all children failed: ${err.message || err}`);
+      }
+    });
+    headerActions.appendChild(runKidsBtn);
+  }
+
   // ── Mark done / Cancel task (any non-terminal stage, STA-861) ──
   // The Board can close any open task from here. Mark done goes through the
   // Board gate (passkey) with {board: true}, so no work product is needed; an
@@ -12949,4 +12981,246 @@ async function renderArtifactsPage() {
   fillArtifactSelect(selects.kind, 'All Kinds', opts.kinds.map(k => ({ value: k, label: k })), f.kind);
   for (const [key, sel] of Object.entries(selects)) if (sel) f[key] = sel.value;
   renderArtifactsTable();
+}
+
+// ── Pull Requests page (task-9fb380ef) ─────────────────────────────────────
+// Lists open PRs per repo with checks and the linked StayPoint task. Merge,
+// Merge selected and Combine into one PR are Board actions: each goes through
+// withBoardWebAuthn (one passkey per action), pinned to the head SHAs shown.
+
+const prsState = { repos: [], selected: {} }; // selected: repo_path -> Set of PR numbers
+
+function prAgeText(sec) {
+  if (!sec || sec < 0) return '';
+  if (sec < 3600) return `${Math.max(1, Math.round(sec / 60))}m`;
+  if (sec < 86400) return `${Math.round(sec / 3600)}h`;
+  return `${Math.round(sec / 86400)}d`;
+}
+
+function prChecksCell(c) {
+  const wrap = el('span', 'pr-checks');
+  c = c || {};
+  wrap.appendChild(el('span', 'pr-check pr-check-pass', `✓ ${c.pass || 0}`));
+  wrap.appendChild(el('span', 'pr-check pr-check-fail', `✗ ${c.fail || 0}`));
+  wrap.appendChild(el('span', 'pr-check pr-check-pending', `… ${c.pending || 0}`));
+  if (c.playwright) {
+    const pw = el('span', `pr-check pr-check-playwright pr-check-${c.playwright}`, `Playwright: ${c.playwright}`);
+    pw.title = 'Playwright UI Specs is counted separately: main has known failures';
+    wrap.appendChild(pw);
+  }
+  return wrap;
+}
+
+function prMergeableText(pr) {
+  if (pr.mergeable === 'CONFLICTING') return 'conflicts';
+  if (pr.mergeable === 'MERGEABLE') return (pr.merge_state_status || 'mergeable').toLowerCase();
+  return (pr.mergeable || 'unknown').toLowerCase();
+}
+
+async function prBoardPost(path, body, label) {
+  return withBoardWebAuthn((sessionToken, assertion) =>
+    fetch(path, {
+      method: 'POST',
+      headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
+      body: JSON.stringify(body),
+    }), label);
+}
+
+function prMergeReport(out) {
+  const parts = [];
+  if (out.merged && out.merged.length) parts.push(`Merged: ${out.merged.map(n => '#' + n).join(', ')}`);
+  if (out.failed) parts.push(`Failed: #${out.failed.number} (${out.failed.error}: ${out.failed.message})`);
+  if (out.not_attempted && out.not_attempted.length) parts.push(`Not attempted: ${out.not_attempted.map(n => '#' + n).join(', ')}`);
+  return parts.join('\n') || 'Nothing merged.';
+}
+
+function renderPullRequestsRepo(repo, status) {
+  const box = el('div', 'prs-repo');
+  box.dataset.repo = repo.repo_path;
+  const head = el('div', 'prs-repo-head');
+  head.appendChild(el('h2', 'prs-repo-name', repo.name));
+  head.appendChild(el('span', 'muted-text prs-repo-path', repo.repo_path));
+  box.appendChild(head);
+  if (repo.error) {
+    box.appendChild(el('p', 'prs-error', `Could not list PRs: ${repo.error}`));
+    return box;
+  }
+  const prs = repo.prs || [];
+  if (!prs.length) {
+    box.appendChild(el('p', 'muted-text prs-empty', 'No open pull requests.'));
+    return box;
+  }
+  const sel = prsState.selected[repo.repo_path] || (prsState.selected[repo.repo_path] = new Set());
+  const ordered = () => prs.filter(p => sel.has(p.number));
+
+  const bar = el('div', 'prs-bulk-bar');
+  const mergeSel = el('button', 'prs-merge-selected-btn', 'Merge selected');
+  const combineSel = el('button', 'prs-combine-btn', 'Combine into one PR');
+  mergeSel.type = 'button';
+  combineSel.type = 'button';
+  const syncBar = () => {
+    mergeSel.disabled = sel.size < 1;
+    combineSel.disabled = sel.size < 2;
+  };
+  bar.appendChild(mergeSel);
+  bar.appendChild(combineSel);
+  bar.appendChild(el('span', 'muted-text', 'Selected PRs run in the order listed.'));
+  box.appendChild(bar);
+
+  const table = el('table', 'data-table prs-table');
+  const thead = el('thead');
+  const hr = el('tr');
+  for (const h of ['', '#', 'Title', 'Task', 'Branch → base', 'Author', 'Age', 'Mergeable', 'Checks', 'Files', '']) hr.appendChild(el('th', null, h));
+  thead.appendChild(hr);
+  table.appendChild(thead);
+  const tbody = el('tbody');
+  for (const pr of prs) {
+    const tr = el('tr', 'prs-row');
+    tr.dataset.number = String(pr.number);
+    const cbTd = el('td');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'prs-select';
+    cb.checked = sel.has(pr.number);
+    cb.addEventListener('change', () => { if (cb.checked) sel.add(pr.number); else sel.delete(pr.number); syncBar(); });
+    cbTd.appendChild(cb);
+    tr.appendChild(cbTd);
+    const numTd = el('td');
+    const a = el('a', 'prs-number', `#${pr.number}`);
+    a.href = pr.url; a.target = '_blank'; a.rel = 'noopener';
+    numTd.appendChild(a);
+    tr.appendChild(numTd);
+    const titleTd = el('td', 'prs-title', pr.title);
+    if (pr.is_draft) titleTd.appendChild(el('span', 'prs-draft', ' draft'));
+    tr.appendChild(titleTd);
+    const taskTd = el('td', 'prs-task');
+    if (pr.task) {
+      const ta = el('a', null, pr.task.name || pr.task.id);
+      ta.href = `/tasks/${encodeURIComponent(pr.task.id)}`;
+      ta.title = pr.task.id;
+      ta.addEventListener('click', (e) => { e.preventDefault(); if (typeof openTaskPage === 'function') openTaskPage(pr.task.id); });
+      taskTd.appendChild(ta);
+    } else {
+      taskTd.appendChild(el('span', 'muted-text', '—'));
+    }
+    tr.appendChild(taskTd);
+    tr.appendChild(el('td', 'prs-branch', `${pr.head_ref} → ${pr.base_ref}`));
+    tr.appendChild(el('td', null, pr.author || ''));
+    tr.appendChild(el('td', null, prAgeText(pr.age_sec)));
+    tr.appendChild(el('td', `prs-mergeable prs-mergeable-${(pr.mergeable || 'unknown').toLowerCase()}`, prMergeableText(pr)));
+    const ckTd = el('td');
+    ckTd.appendChild(prChecksCell(pr.checks));
+    tr.appendChild(ckTd);
+    tr.appendChild(el('td', null, String(pr.changed_files || 0)));
+    const actTd = el('td');
+    const mb = el('button', 'prs-merge-btn', 'Merge');
+    mb.type = 'button';
+    mb.title = `Merge commit, pinned to ${String(pr.head_sha).slice(0, 12)}`;
+    mb.addEventListener('click', async () => {
+      if (!confirm(`Merge #${pr.number} "${pr.title}" into ${pr.base_ref} (merge commit, head ${String(pr.head_sha).slice(0, 12)})?`)) return;
+      mb.disabled = true;
+      await runPRMerge(repo, [pr], status);
+      mb.disabled = false;
+    });
+    actTd.appendChild(mb);
+    tr.appendChild(actTd);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  box.appendChild(table);
+
+  mergeSel.addEventListener('click', async () => {
+    const list = ordered();
+    if (!list.length) return;
+    if (!confirm(`Merge ${list.length} PR(s) in this order, stopping at the first failure?\n\n${list.map(p => `#${p.number} ${p.title}`).join('\n')}`)) return;
+    mergeSel.disabled = true;
+    await runPRMerge(repo, list, status);
+    syncBar();
+  });
+  combineSel.addEventListener('click', async () => {
+    const list = ordered();
+    if (list.length < 2) return;
+    const base = list[0].base_ref || 'main';
+    if (list.some(p => p.base_ref !== base)) { status('Combine needs PRs with the same base branch.', true); return; }
+    const title = prompt(`Title for the combined PR into ${base}:`, `Combine ${list.map(p => '#' + p.number).join(', ')}`);
+    if (title === null) return;
+    combineSel.disabled = true;
+    try {
+      const res = await prBoardPost('/api/pull-requests/combine', {
+        repo_path: repo.repo_path, base, title,
+        prs: list.map(p => ({ number: p.number, head_sha: p.head_sha, title: p.title })),
+      }, 'combining pull requests');
+      if (res === null) return;
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        status(`Combine failed${out.failed_pr ? ` at #${out.failed_pr}` : ''}: ${out.error || res.status} ${out.message || ''}. Nothing was left on GitHub.`, true);
+        return;
+      }
+      status(`Opened combined PR: ${out.pr && out.pr.url}`, false);
+      sel.clear();
+      renderPullRequestsPage();
+    } catch (e) {
+      status(`Combine failed: ${e.message || e}`, true);
+    } finally {
+      syncBar();
+    }
+  });
+  syncBar();
+  return box;
+}
+
+async function runPRMerge(repo, list, status) {
+  try {
+    const res = await prBoardPost('/api/pull-requests/merge', {
+      repo_path: repo.repo_path,
+      prs: list.map(p => ({ number: p.number, head_sha: p.head_sha })),
+    }, list.length > 1 ? 'merging the selected pull requests' : `merging #${list[0].number}`);
+    if (res === null) return;
+    const out = await res.json().catch(() => ({}));
+    if (!out.merged && !res.ok) { status(boardActionErrorText(res, out), true); return; }
+    status(prMergeReport(out), !!out.failed);
+    const sel = prsState.selected[repo.repo_path];
+    if (sel) for (const n of out.merged || []) sel.delete(n);
+    renderPullRequestsPage();
+  } catch (e) {
+    status(`Merge failed: ${e.message || e}`, true);
+  }
+}
+
+async function renderPullRequestsPage() {
+  const container = document.getElementById('prs-container');
+  if (!container) return;
+  const refresh = document.getElementById('prs-refresh-btn');
+  if (refresh && !refresh.dataset.wired) {
+    refresh.dataset.wired = '1';
+    refresh.addEventListener('click', () => renderPullRequestsPage());
+  }
+  let statusEl = document.getElementById('prs-status');
+  if (!statusEl) {
+    statusEl = el('pre', 'prs-status');
+    statusEl.id = 'prs-status';
+    statusEl.style.display = 'none';
+    container.before(statusEl);
+  }
+  const status = (msg, isErr) => {
+    statusEl.textContent = msg;
+    statusEl.classList.toggle('prs-status-error', !!isErr);
+    statusEl.style.display = msg ? '' : 'none';
+  };
+  if (!container.childElementCount) container.appendChild(el('p', 'muted-text', 'Loading pull requests…'));
+  let data;
+  try {
+    data = await apiFetch('/api/pull-requests');
+  } catch (e) {
+    container.innerHTML = '';
+    container.appendChild(el('p', 'prs-error', `Failed to load pull requests: ${e.message}`));
+    return;
+  }
+  prsState.repos = data.repos || [];
+  container.innerHTML = '';
+  if (!prsState.repos.length) {
+    container.appendChild(el('p', 'muted-text prs-empty', 'No repos yet: the page lists StayPoint\'s own repo and any repo with a task that registered a PR.'));
+    return;
+  }
+  for (const repo of prsState.repos) container.appendChild(renderPullRequestsRepo(repo, status));
 }

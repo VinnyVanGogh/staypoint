@@ -25,6 +25,7 @@ type Server struct {
 	hub        *EventHub
 	secMid     *SecurityMiddleware
 	webAuthnH  *WebAuthnHandler
+	prH        *PullRequestsHandler
 	addr       string
 	port       int
 	mu         sync.Mutex
@@ -154,6 +155,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("POST /api/tasks/{id}/blockers", tasksH.AddBlocker)
 		mux.HandleFunc("DELETE /api/tasks/{id}/blockers/{bid}", tasksH.RemoveBlocker)
 		mux.HandleFunc("POST /api/tasks/{id}/stage", tasksH.SetStage)
+		// task-f6777004: Run all children is one Board action (session + passkey).
+		mux.Handle("POST /api/tasks/{id}/run-children", s.secMid.WrapBoardAction(http.HandlerFunc(tasksH.RunChildren)))
 		mux.HandleFunc("PUT /api/tasks/{id}/repo", tasksH.SetRepo)
 		mux.HandleFunc("PUT /api/tasks/{id}/project", tasksH.SetProject)
 		mux.HandleFunc("PUT /api/tasks/{id}/provider", tasksH.SetProvider)
@@ -282,6 +285,15 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		// Board-only: disabling ship review is a Board action.
 		mux.Handle("POST /api/settings/ship-review", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.SetSettings)))
 		mux.HandleFunc("GET /api/project-dev-configs", shipH.ListProjectDevConfigs)
+
+		// task-9fb380ef: Pull Requests page. Listing is read-only; merging and
+		// combining PRs are Board actions behind the same gate as Approve.
+		if s.prH == nil {
+			s.prH = NewPullRequestsHandler(s.opts.DB)
+		}
+		mux.HandleFunc("GET /api/pull-requests", s.prH.List)
+		mux.Handle("POST /api/pull-requests/merge", s.secMid.WrapBoardAction(http.HandlerFunc(s.prH.Merge)))
+		mux.Handle("POST /api/pull-requests/combine", s.secMid.WrapBoardAction(http.HandlerFunc(s.prH.Combine)))
 		// Board-only: setting dev_command/setup_steps is a Board action (STA-520).
 		mux.Handle("PUT /api/project-dev-configs", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.UpsertProjectDevConfig)))
 		if s.opts.TestMode {
@@ -409,6 +421,14 @@ func (s *Server) BoardNonce() string {
 // Hub returns the server's EventHub for publishing events.
 func (s *Server) Hub() *EventHub {
 	return s.hub
+}
+
+// SetPRClientFactory replaces the gh-backed client behind the Pull Requests
+// page. Tests use it so they never reach GitHub; nil restores the default.
+func (s *Server) SetPRClientFactory(f PRClientFactory) {
+	if s.prH != nil {
+		s.prH.setFactory(f)
+	}
 }
 
 // SetWebAuthnVerifier replaces the WebAuthn assertion verifier on the security middleware.
