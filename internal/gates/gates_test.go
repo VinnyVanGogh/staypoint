@@ -388,3 +388,77 @@ func TestTogetherAdvisorParsesReason(t *testing.T) {
 		t.Fatalf("advice %+v %v", a, err)
 	}
 }
+
+// STA-433.1: gate advice logged before migration 42 still reads through
+// LatestAdvice and Stats after the shadow-decision columns are added.
+func TestLatestAdviceSurvivesMigration42(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "staypoint.db")
+	s, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := s.DB()
+	gr := pendingRequest(t, d, "./audit.sh", "task-1", "/r", "o")
+	for _, stmt := range []string{
+		`DROP TABLE decision_log`,
+		`CREATE TABLE decision_log (
+			id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			subject_kind   TEXT NOT NULL,
+			subject_id     TEXT NOT NULL,
+			advisor        TEXT NOT NULL,
+			model          TEXT NOT NULL DEFAULT '',
+			recommendation TEXT NOT NULL DEFAULT '',
+			reason         TEXT NOT NULL DEFAULT '',
+			latency_ms     INTEGER NOT NULL DEFAULT 0,
+			error          TEXT NOT NULL DEFAULT '',
+			final_decision TEXT NOT NULL DEFAULT '',
+			decided_by     TEXT NOT NULL DEFAULT '',
+			decided_at     TEXT,
+			created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+		)`,
+		`CREATE INDEX idx_decision_log_subject ON decision_log (subject_kind, subject_id, advisor, id)`,
+		`DELETE FROM schema_versions WHERE version = 42`,
+		`DELETE FROM schema_migrations WHERE version = 42`,
+	} {
+		if _, err := d.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	if err := LogAdvice(d, gr.ID, Advice{Advisor: AdvisorTogether, Model: "m", Recommendation: RecApprove, Reason: "safe", LatencyMS: 12}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordFinalDecision(d, gr.ID, RecApprove, "board", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s, err = db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	d = s.DB()
+	var cols int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('decision_log') WHERE name IN ('decision_key','task_id','question','options_json','pick')`).Scan(&cols); err != nil || cols != 5 {
+		t.Fatalf("migration 42 columns = %d, %v", cols, err)
+	}
+	m, err := LatestAdvice(d, []string{gr.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := m[gr.ID][AdvisorTogether]
+	if a.Recommendation != RecApprove || a.Reason != "safe" || a.Model != "m" || a.LatencyMS != 12 || a.FinalDecision != RecApprove {
+		t.Fatalf("advice after 42 = %+v", a)
+	}
+	st, err := Stats(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st) != 1 || st[0].Decided != 1 || st[0].Agreed != 1 {
+		t.Fatalf("stats after 42 = %+v", st)
+	}
+	// New gate advice still logs after 42.
+	if err := LogAdvice(d, gr.ID, Advice{Advisor: AdvisorGemini, Recommendation: RecDeny}); err != nil {
+		t.Fatalf("log after 42: %v", err)
+	}
+}
