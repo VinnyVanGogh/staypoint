@@ -64,6 +64,7 @@ func TestPureEdit_AdversarialNotRelaxed(t *testing.T) {
 		"wrapper prefix":                 "env python3 - <<'EOF'\nprint(1)\nEOF",
 		"extra redirect":                 "python3 - <<'EOF' > /tmp/out\nprint(1)\nEOF",
 		"git internals":                  body("open('.git/hooks/pre-commit','w').write('x')"),
+		"fullwidth identifier is exec":   body("ｅｘｅｃ('import os')"),
 	}
 	for name, line := range cases {
 		segs, _, err := parseShell(line)
