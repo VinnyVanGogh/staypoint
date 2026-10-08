@@ -3,8 +3,10 @@ package context
 import (
 	"errors"
 	"testing"
+	"unicode"
 
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
+	"github.com/VinnyVanGogh/staypoint/internal/names/namestest"
 )
 
 // Surprise starts (2026-10-07).
@@ -167,14 +169,49 @@ func TestOrgHold_KeyMatchesSQL(t *testing.T) {
 
 func TestNameTargetsProd(t *testing.T) {
 	for name, want := range map[string]bool{
-		"port the fix to prod":     true,
-		"Production deploy":        true,
-		"PROD hotfix":              true,
-		"product page copy":        false,
-		"reproduce the flaky test": false,
+		"port the fix to prod":                    true,
+		"Production deploy":                       true,
+		"PROD hotfix":                             true,
+		"product page copy":                       false,
+		"reproduce the flaky test":                false,
+		"deploy_prod":                             true,
+		"PROD_release":                            true,
+		"deployToProd":                            true,
+		"ProductionDB migration":                  true,
+		"pRoD hotfix":                             true,
+		"push to prod.":                           true,
+		"push to pr" + string(rune(0x043E)) + "d": true, // Cyrillic о
+		string([]rune{0xFF50, 0xFF52, 0xFF4F, 0xFF44}) + " deploy": true, // fullwidth
+		"pr" + string(rune(0x200B)) + "od deploy":                  true, // zero-width space
+		"products list":        false,
+		"productivity metrics": false,
+		"prod2 cluster":        false,
+		"reprod":               false,
 	} {
 		if got := NameTargetsProd(name); got != want {
 			t.Errorf("NameTargetsProd(%q) = %v, want %v", name, got, want)
 		}
 	}
+}
+
+// FuzzNameTargetsProd: "prod" or "production", in any case or lookalike
+// spelling, set off by any non-alphanumeric separator, is always found, and
+// NameTargetsProd never panics on arbitrary input.
+func FuzzNameTargetsProd(f *testing.F) {
+	f.Add("deploy", "now", []byte{1, 2, 3}, byte('_'), false)
+	f.Add("", "", []byte{0x82, 5}, byte(' '), true)
+	f.Fuzz(func(t *testing.T, before, after string, seed []byte, sep byte, long bool) {
+		_ = NameTargetsProd(before + after)
+		if r := rune(sep); r >= 0x80 || !(unicode.IsPunct(r) || unicode.IsSymbol(r) || r == ' ') {
+			sep = '-'
+		}
+		word := "prod"
+		if long {
+			word = "production"
+		}
+		name := before + string(sep) + namestest.Variant(word, seed) + string(sep) + after
+		if !NameTargetsProd(name) {
+			t.Fatalf("NameTargetsProd(%q) = false", name)
+		}
+	})
 }

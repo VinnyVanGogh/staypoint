@@ -9,6 +9,9 @@ import (
 	"testing"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/VinnyVanGogh/staypoint/internal/names"
+	"github.com/VinnyVanGogh/staypoint/internal/names/namestest"
 )
 
 // Filesystem-independent checks of the #245 name logic: these hold on a
@@ -27,6 +30,50 @@ func TestProtectedName_EqualFold(t *testing.T) {
 			t.Errorf("protectedName(%q) = true", b)
 		}
 	}
+}
+
+func TestProtectedName_Lookalikes(t *testing.T) {
+	cyrA := string(rune(0x0430))
+	zwsp := string(rune(0x200B))
+	fullM := string(rune(0xFF4D))
+	for _, b := range []string{"m" + cyrA + "in", "ma" + zwsp + "in", fullM + "ain", " main", "Dev-Serv" + string(rune(0x0435)) + "r", "M" + cyrA + "STER"} {
+		if !protectedName(b) {
+			t.Errorf("protectedName(%q) = false", b)
+		}
+	}
+	if !protectedName("r"+string(rune(0x0435))+"lease", "release") {
+		t.Error("extra names must compare through names.Normalize")
+	}
+}
+
+// FuzzProtectedName: every case, lookalike, accent, zero-width or whitespace
+// spelling of a protected name or an extra name is protected, and a name
+// that normalises to something else is not.
+func FuzzProtectedName(f *testing.F) {
+	for _, s := range []string{"main", "master", "dev-server", "head", "release", "feature/x"} {
+		f.Add(s, []byte{1, 2, 3, 4, 0x85}, "release")
+	}
+	f.Fuzz(func(t *testing.T, branch string, seed []byte, extra string) {
+		ex := namestest.ASCIIName(extra)
+		for _, p := range []string{"main", "master", "dev-server", "head", ex} {
+			if p == "" {
+				continue
+			}
+			if v := namestest.Variant(p, seed); !protectedName(v, ex) {
+				t.Fatalf("protectedName(%q, %q) = false, a spelling of %q", v, ex, p)
+			}
+		}
+		got := protectedName(branch, extra)
+		want := false
+		for _, p := range append([]string{"main", "master", WorkTargetBranch, "HEAD"}, extra) {
+			if p != "" && names.Normalize(branch) == names.Normalize(p) {
+				want = true
+			}
+		}
+		if got != want {
+			t.Fatalf("protectedName(%q, %q) = %v, want %v", branch, extra, got, want)
+		}
+	})
 }
 
 func TestMatchExactRefs_CaseSensitiveAndNoChildren(t *testing.T) {

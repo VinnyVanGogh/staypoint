@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
+	"github.com/VinnyVanGogh/staypoint/internal/names"
 )
 
 // Task origins (tasks.origin). See Task.Origin.
@@ -50,14 +51,22 @@ func blockedStageSQL() string {
 		governance.NonRunnableStagesSQL() + `) THEN execution_stage ELSE 'blocked' END`
 }
 
-// prodWord matches "prod" / "production" as a word.
-var prodWord = regexp.MustCompile(`(?i)\bprod(uction)?\b`)
+// prodWord matches "prod" / "production" as a word of a normalised name.
+// Only letters and digits continue a word: "_" and other punctuation
+// separate one ("deploy_prod"), where \b would not.
+var prodWord = regexp.MustCompile(`(?:^|[^\p{L}\p{N}])prod(?:uction)?(?:$|[^\p{L}\p{N}])`)
 
 // NameTargetsProd reports whether a task's name says it targets production
-// (e.g. "port X to prod"). Board surfaces add the repo's live_credentials
-// flag; either one makes leaving backlog a Touch ID action.
+// (e.g. "port X to prod", "deployToProd", "PROD_release", or "prod" spelled
+// with lookalike or fullwidth letters). The name is normalised with
+// names.Normalize and matched both as written and split at camel-case
+// boundaries: the split finds "deployToProd", and the unsplit form still
+// finds odd casings such as "pRoD" that the split would cut apart. Board
+// surfaces add the repo's live_credentials flag; either one makes leaving
+// backlog a Touch ID action.
 func NameTargetsProd(name string) bool {
-	return prodWord.MatchString(name)
+	return prodWord.MatchString(names.Normalize(name)) ||
+		prodWord.MatchString(names.Normalize(names.SplitCamel(name)))
 }
 
 // IsValidOrigin reports whether origin is one of the task origins.

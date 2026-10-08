@@ -126,6 +126,13 @@ jobs:
       - name: Run Tests (with race detector)
         run: scripts/check-test-home.sh -v -race -timeout 25m ./...
 
+      # Short fuzz runs of the shared name normaliser and the safety checks
+      # built on it (branch delete, org hold, prod detection). A failure
+      # writes the input under testdata/fuzz; commit it as a regression seed.
+      - name: Fuzz name matching
+        if: matrix.os == 'ubuntu-latest'
+        run: FUZZTIME=20s scripts/fuzz-names.sh
+
       # repoaccess builds for Windows, tests included (STA-697). The rest of the
       # module does not cross-build yet, so this is scoped to the package.
       - name: Vet repoaccess for Windows

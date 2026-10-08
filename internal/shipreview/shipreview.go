@@ -23,6 +23,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
+	"github.com/VinnyVanGogh/staypoint/internal/names"
 	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 )
 
@@ -1171,7 +1172,7 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 	if err := guardDeletableBranch(ctx, repoDir, branch); err != nil {
 		return err
 	}
-	if card.TargetBranch != "" && strings.EqualFold(branch, card.TargetBranch) {
+	if card.TargetBranch != "" && protectedName(branch, card.TargetBranch) {
 		return fmt.Errorf("%w: %q is the merge target", ErrProtectedBranch, branch)
 	}
 	if mainSHA == "" {
@@ -1184,7 +1185,7 @@ func CleanupMergedBranch(ctx context.Context, repoDir string, card *Card, mainSH
 	}
 	// git refuses to delete a branch that is checked out, so never touch the
 	// branch repoDir itself is on (the merge leaves it on main).
-	if cur, err := gitOutput(ctx, repoDir, "symbolic-ref", "--short", "-q", "HEAD"); err == nil && strings.EqualFold(cur, branch) {
+	if cur, err := gitOutput(ctx, repoDir, "symbolic-ref", "--short", "-q", "HEAD"); err == nil && names.Equal(cur, branch) {
 		return fmt.Errorf("%w: %q is checked out in %s", ErrProtectedBranch, branch, repoDir)
 	}
 
