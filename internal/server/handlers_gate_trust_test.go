@@ -261,7 +261,8 @@ func TestTrust_DeleteOutsideWorktreeDefersAndNeverReplays(t *testing.T) {
 		t.Fatalf("delete outside the worktree not held: %v", got)
 	}
 	gr, _ := security.GetGateRequest(e.db, id)
-	if gr.DeferAt == nil || gr.DeferAt.Sub(gr.CreatedAt) < 9*time.Minute || gr.DeferAt.Sub(gr.CreatedAt) > 11*time.Minute {
+	wantDefer := time.Duration(gates.DefaultTrustDeferMinutes) * time.Minute
+	if gr.DeferAt == nil || gr.DeferAt.Sub(gr.CreatedAt) < wantDefer-time.Minute || gr.DeferAt.Sub(gr.CreatedAt) > wantDefer+time.Minute {
 		t.Fatalf("defer_at: %v (created %v)", gr.DeferAt, gr.CreatedAt)
 	}
 	// Not yet due: still pending for the hook.
