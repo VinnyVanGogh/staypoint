@@ -50,6 +50,28 @@ jobs:
       - name: Run JS unit tests
         run: node --test tests/unit/*.mjs
 
+  # A PR's migration must not take a version main already ships under another
+  # name (#247 used 40 while main had 40). Compares against main as fetched
+  # now, not the base SHA the PR was opened against.
+  migration-versions:
+    name: Migration Versions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Fetch main
+        run: git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+
+      - name: Check migration versions against main
+        run: go run ./cmd/migrationcheck -base origin/main
+
   playwright:
     name: Playwright UI Specs
     runs-on: ubuntu-latest
