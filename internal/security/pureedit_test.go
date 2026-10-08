@@ -1,6 +1,8 @@
 package security
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -22,6 +24,9 @@ func seed() { http.Post("https://x.example/api", "", nil); exec.Command("gh", "p
 EOF`
 
 func TestPureEdit_RealOvernightEditsPass(t *testing.T) {
+	if !relaxedPureEdit(pyEdit, t.TempDir()) {
+		t.Fatal("the overnight str.replace edit is not recognised as a pure edit")
+	}
 	for _, line := range []string{pyEdit, catAppend, "sed -n 1,5p a.go; " + pyEdit} {
 		c := &Classifier{CWD: "/repo/wt", CWDTrusted: true}
 		if v := c.Classify(line); v.Tier >= Red {
@@ -72,10 +77,103 @@ func TestPureEdit_AdversarialNotRelaxed(t *testing.T) {
 			continue // unparseable stays Red anyway
 		}
 		for _, s := range segs {
-			if pureEditHeredoc(s) {
+			if pureEditHeredoc(s, "") {
 				t.Errorf("%s: relaxed as a pure edit:\n%s", name, line)
 			}
 		}
+	}
+}
+
+// relaxedPureEdit reports whether any segment of line is treated as a pure
+// edit when run from cwd.
+func relaxedPureEdit(line, cwd string) bool {
+	segs, _, err := parseShell(line)
+	if err != nil {
+		return false
+	}
+	for _, s := range segs {
+		if pureEditHeredoc(s, cwd) {
+			return true
+		}
+	}
+	return false
+}
+
+// A pure edit is proven, not assumed: every open() target must be a
+// whitespace-free relative literal inside the worktree, and every name must
+// be one the checker knows. Anything it cannot prove is held.
+func TestPureEdit_UnprovableScriptsHeld(t *testing.T) {
+	body := func(code string) string { return "python3 - <<'EOF'\n" + code + "\nEOF" }
+	cases := map[string]string{
+		"os.path.join target":  body("import os\nopen(os.path.join('a', 'b'), 'w').write('x')"),
+		"concatenated target":  body("p = 'sub' + 'dir/f'\nopen(p, 'w').write('x')"),
+		"rebound target":       body("p = 'a.txt'\np = q\nopen(p, 'w').write('x')"),
+		"pathlib slash":        body("from pathlib import Path\n(Path('a') / 'b').write_text('x')"),
+		"pathlib write_text":   body("from pathlib import Path\nPath('a').write_text('x')"),
+		"target with a space":  body("open('a b.txt', 'w').write('x')"),
+		"dotdot after clean":   body("open('sub/../../f', 'w').write('x')"),
+		"open passed as value": body("w = open\nw('f', 'w').write('x')"),
+		"open keyword args":    body("open(file='f', mode='w').write('x')"),
+		"mode not a literal":   body("m = 'w'\nopen('f', m).write('x')"),
+		"unlisted import":      body("import zipfile"),
+		"import mid-line":      body("x = 1; import zipfile"),
+		"unlisted builtin":     body("type('a', (), {})"),
+		"unlisted attribute":   body("import json\njson.JSONDecoder"),
+		"unbound name":         body("print(undefined_thing)"),
+		"shadowed builtin":     body("open = print\nopen('f')"),
+		"def":                  body("def f(p):\n    return open(p, 'w')"),
+		"lambda":               body("g = lambda p: open(p, 'w')"),
+		"str.format":           body("'{0}'.format(1)"),
+	}
+	for name, line := range cases {
+		if relaxedPureEdit(line, "") {
+			t.Errorf("%s: relaxed as a pure edit:\n%s", name, line)
+		}
+	}
+}
+
+// A literal relative path can still leave the worktree through a symlink or
+// a hard link already there; the checker looks before relaxing.
+func TestPureEdit_LinksOutOfWorktreeHeld(t *testing.T) {
+	root := t.TempDir()
+	wt, outside := filepath.Join(root, "wt"), filepath.Join(root, "outside")
+	for _, d := range []string{wt, outside} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(outside, filepath.Join(wt, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(outside, "f"), filepath.Join(wt, "hard")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "real.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body := func(p string) string { return "python3 - <<'EOF'\nopen('" + p + "', 'w').write('y')\nEOF" }
+	if relaxedPureEdit(body("link/f"), wt) {
+		t.Error("write through a symlink out of the worktree relaxed")
+	}
+	if relaxedPureEdit(body("hard"), wt) {
+		t.Error("write to a hard link of a file outside the worktree relaxed")
+	}
+	if !relaxedPureEdit(body("real.txt"), wt) || !relaxedPureEdit(body("new/file.txt"), wt) {
+		t.Error("plain relative write inside the worktree not relaxed")
+	}
+}
+
+// Only the pure heredoc's own body is stripped, never an earlier copy of the
+// same text elsewhere on the line.
+func TestPureEdit_StripRemovesOnlyTheHeredocSpan(t *testing.T) {
+	head := "echo 'x = 1\n' && "
+	line := head + "python3 - <<'EOF'\nx = 1\nEOF"
+	got := stripPureEditBodies(line)
+	if !strings.HasPrefix(got, head) || strings.Count(got, "x = 1") != 1 {
+		t.Errorf("strip removed the wrong text: %q", got)
 	}
 }
 
