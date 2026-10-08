@@ -54,7 +54,9 @@ case "$1 $2" in
   m=$(git commit-tree "$cur^{tree}" -p origin/main -p "$cur" -m "Merge pull request #$n") || exit 1
   git push -q origin "$m:refs/heads/main" || exit 1
   echo "$m" > "$D/merge_sha"; echo MERGED > "$D/state" ;;
-"run view") cat "$D/runlog" 2>/dev/null ;;
+"run list") if [ -f "$D/runs.json" ]; then cat "$D/runs.json"; else echo "[]"; fi ;;
+"run view")
+  case "$*" in *"--json jobs"*) cat "$D/jobs.json" 2>/dev/null || echo '{"jobs":[]}' ;; *) cat "$D/runlog" 2>/dev/null ;; esac ;;
 *) echo "fake gh: unexpected $*" >&2; exit 2 ;;
 esac
 `

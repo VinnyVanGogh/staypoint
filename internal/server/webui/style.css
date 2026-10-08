@@ -4917,6 +4917,26 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .ship-review-test-task-link { overflow-wrap: anywhere; }
 .ship-review-test-task-note { margin-left: 8px; font-size: 12px; color: var(--muted); }
 
+/* ── Target CI (task-2114d4aa) ─────────────────────────────────────────── */
+.ship-review-target-ci { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.ship-review-target-ci-status { margin-left: 8px; font-weight: 400; font-size: 12px; color: var(--muted); }
+.ship-review-target-ci[data-state="red"] .ship-review-target-ci-status { color: var(--red, #f85149); }
+.ship-review-target-ci[data-state="green"] .ship-review-target-ci-status { color: var(--green, #3fb950); }
+.ship-review-target-ci-refresh { margin-left: 8px; }
+.ship-review-target-ci-body { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; }
+.ship-review-target-ci-text { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.ship-review-target-ci-text--green { color: var(--green, #3fb950); }
+.ship-review-target-ci-text--red {
+  flex-basis: 100%;
+  padding: 7px 12px;
+  border-radius: 6px;
+  background: rgba(248,81,73,.1);
+  border: 1px solid rgba(248,81,73,.35);
+  color: var(--red, #f85149);
+  font-weight: 600;
+}
+.ship-review-target-ci-link { font-size: 12px; }
+
 /* Non-git task (STA-864): runs in place, nothing checkpointed or reviewable. */
 .task-page-nongit-banner {
   margin: 0 0 10px;

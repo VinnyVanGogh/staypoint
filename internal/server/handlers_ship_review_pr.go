@@ -238,6 +238,7 @@ func (h *ShipReviewHandler) MergePR(w http.ResponseWriter, r *http.Request) {
 		OverrideReason          string `json:"override_reason"`
 		MigrationOverrideReason string `json:"migration_override_reason"`
 		testGateBypass
+		targetCIOverride
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.HeadSHA == "" {
@@ -289,6 +290,10 @@ func (h *ShipReviewHandler) MergePR(w http.ResponseWriter, r *http.Request) {
 	// STA-734: the test gate, after the head and CI facts above are settled.
 	gate, ok := h.enforceTestGate(w, r, card, task, "merge_pr", req.HeadSHA, req.testGateBypass)
 	if !ok {
+		return
+	}
+	// task-2114d4aa: never onto a red target without the Board's override.
+	if !h.enforceTargetCI(w, r, card, task, "merge_pr", req.HeadSHA, req.targetCIOverride) {
 		return
 	}
 

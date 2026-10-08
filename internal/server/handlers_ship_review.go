@@ -703,6 +703,7 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 		// HeadSHA, when sent, is the head the Board was shown (STA-717).
 		HeadSHA string `json:"head_sha"`
 		testGateBypass
+		targetCIOverride
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.HeadSHA != "" && req.HeadSHA != card.HeadSHA {
@@ -765,6 +766,12 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 	var gate *gateOutcome
 	if mode != shipreview.MergeModePRMerge {
 		if gate, ok = h.enforceTestGate(w, r, card, task, "approve", req.HeadSHA, req.testGateBypass); !ok {
+			return
+		}
+		// task-2114d4aa: and not onto a red target. After the test gate, so a
+		// "Merge without tests" retry meets this refusal and the UI's red
+		// override retry carries both.
+		if !h.enforceTargetCI(w, r, card, task, "approve", req.HeadSHA, req.targetCIOverride) {
 			return
 		}
 	}
