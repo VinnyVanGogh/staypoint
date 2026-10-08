@@ -99,7 +99,10 @@ jobs:
       - name: Run Playwright UI specs
         run: scripts/ui-e2e.sh
         env:
-          E2E_ARTIFACTS: tests/ui/artifacts
+          # Absolute: ui-e2e.sh runs Playwright from tests/ui, so a relative
+          # path landed in tests/ui/tests/ui/artifacts and the upload below
+          # found nothing.
+          E2E_ARTIFACTS: ${{ github.workspace }}/tests/ui/artifacts
 
       - name: Upload artifacts on failure
         if: failure()

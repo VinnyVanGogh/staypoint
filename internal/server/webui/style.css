@@ -3150,6 +3150,9 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   padding: 0 6px;
 }
 .task-page-tab-count:empty { display: none; }
+/* Decisions waiting on the Board (task-e3fe2c0b). */
+.task-page-tab.has-pending .task-page-tab-label { color: var(--yellow, #e3b341); }
+.task-page-tab.has-pending .task-page-tab-count { background: var(--yellow, #e3b341); color: #1a1a1a; font-weight: 700; }
 .task-page-tabpanels {
   flex: 1;
   min-height: 0;
@@ -4132,6 +4135,13 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 }
 .interaction-accept-btn:hover { background: rgba(63,185,80,.28); }
 .interaction-accept-btn:disabled { opacity: .5; cursor: default; }
+/* The default answer for the task's state is solid; the alternative is outlined. */
+.interaction-accept-btn.is-default { background: var(--green); color: #0d1117; border-color: var(--green); }
+.interaction-accept-btn.is-default:hover { filter: brightness(1.08); }
+.interaction-accept-only-btn:not(.is-default) { background: transparent; }
+.decision-stage-hint { margin: 2px 0 10px; font-size: 12px; }
+.interaction-resolve-error { margin-left: 8px; font-size: 12px; color: var(--red); }
+.artifacts-view-cell { text-align: right; white-space: nowrap; }
 .interaction-reject-btn {
   background: rgba(248,81,73,.1);
   color: var(--red);

@@ -28,15 +28,23 @@ settable from the API, CLI or board:
 | `paused` | run paused at a step boundary, still checked out | In Progress |
 | `capped` | turn or budget cap hit; the daemon resets it to `todo` on restart | Todo |
 | `stopped` | the Board stopped the run; not runnable: only Run Now (or a Board stage change) resumes it, a comment or other wake does not | Todo |
+| `error` | the run ended in error (the harness writes its disposition as the stage); not runnable, like `stopped`: only Run Now resumes it | Todo |
 
 `rejected` is the governance review outcome (`in_review -> rejected`). It is
 closed and not runnable.
 
 ### Not runnable
 
-`backlog`, `stopped`, `done`, `cancelled` and `rejected` are never claimed:
-`Harness.Claim` refuses them with `ErrNotRunnable`, so no wake (assignment,
-comment, queue re-dispatch, MCP `staypoint_wake`) can start a run. Creating a
+`backlog`, `stopped`, `error`, `done`, `cancelled` and `rejected` are never
+claimed: `Harness.Claim` refuses them with `ErrNotRunnable`, so no wake
+(assignment, comment, decision-card answer, queue re-dispatch, MCP
+`staypoint_wake`) can start a run.
+
+Decision cards (task-e3fe2c0b): answering a card wakes the task unless the
+answer is sent with `"resume": false` ("Accept only"). On a task that is not
+waiting mid-run (anything but `todo`, `in_progress`, `blocked`, `paused`) the
+web UI defaults to Accept only; "Accept & resume" there records the answer and
+then presses Run Now, so Run Now's Board, hold and backlog gates apply. Creating a
 task in `backlog` does not notify the daemon, and `staypoint_wake` refuses a
 non-runnable task outright. A comment does not notify the daemon for a
 non-runnable task, or while a Board stop is pending for the run still holding
