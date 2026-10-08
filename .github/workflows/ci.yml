@@ -147,6 +147,14 @@ jobs:
           version: latest
         continue-on-error: true
 
+      # Blocking, unlike golangci-lint above: a function no cmd/ binary can
+      # reach, beyond the baseline, fails the build. Catches an exported gate
+      # with no production caller, which `unused` cannot see (task-70e08aca).
+      # macOS only: the baseline holds darwin-only files.
+      - name: Dead code (deadcode vs baseline)
+        if: matrix.os == 'macos-latest' && matrix.go-version == '1.25'
+        run: scripts/check-deadcode.sh
+
       - name: Build Binaries (staypoint & staypointd)
         run: |
           go build -v -o bin/staypoint ./cmd/staypoint

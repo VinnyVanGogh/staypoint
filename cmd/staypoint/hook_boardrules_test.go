@@ -105,9 +105,9 @@ func TestGateFileEdit_CreatesGateRequest(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"g1","status":"deferred"}`))
 	}))
 	defer srv.Close()
-	prev := fileEditDaemonConn
-	fileEditDaemonConn = func() (string, string) { return srv.URL, "tok" }
-	defer func() { fileEditDaemonConn = prev }()
+	prev := gateDaemonConn
+	gateDaemonConn = func() (string, string) { return srv.URL, "tok" }
+	defer func() { gateDaemonConn = prev }()
 
 	wt := t.TempDir()
 	home, _ := os.UserHomeDir()
