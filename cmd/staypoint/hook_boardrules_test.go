@@ -26,6 +26,11 @@ func TestRaiseForBoardRules(t *testing.T) {
 		"scripts/reinstall-daemon.sh",
 		"GIT=git; $GIT push origin main",
 		"vercel --prod",
+		"env -u STAYPOINT_TASK_ID claude -p x",
+		"unset STAYPOINT_TASK_ID; claude",
+		"/opt/homebrew/bin/gemini -p x",
+		"npx @anthropic-ai/claude-code -p x",
+		"\\ssh host cmd",
 	} {
 		snap := security.NewSnapshotter()
 		v := (&security.Classifier{CWD: cwd, CWDTrusted: true, Snap: snap}).Classify(cmd)

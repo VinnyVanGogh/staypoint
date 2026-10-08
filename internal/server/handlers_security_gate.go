@@ -229,6 +229,11 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 		if trust != nil {
 			// The Board's unattended-run rules hold under any trust.
 			boardRule = security.AnalyzeBoardRules(in.Cmdline, in.Scripts)
+			if boardRule == "" && isFileEditRequest(in.Cmdline) {
+				// The hook sends an edit only when it is outside the worktree
+				// or to a protected path: never approved by a trust.
+				boardRule = "file edit outside the task worktree (Board rule: edits stay in the worktree)"
+			}
 			facts = security.AnalyzeForTrust(in.Cmdline, gates.TrustContextFor(h.db, in.TaskID, in.CWD, in.Scripts))
 			deferMins = gates.TrustDeferMinutes(h.db)
 		}
@@ -322,6 +327,16 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 		return nil, err
 	}
 	return &gateCreateOutcome{gr: gr, rule: rule}, nil
+}
+
+// isFileEditRequest reports a hook file-edit request ("Write <path>").
+func isFileEditRequest(cmdline string) bool {
+	for _, t := range []string{"Write ", "Edit ", "MultiEdit ", "NotebookEdit "} {
+		if strings.HasPrefix(cmdline, t) {
+			return true
+		}
+	}
+	return false
 }
 
 // orgTrustCoversRepo reports whether an org trust may cover taskID: only a
@@ -483,6 +498,21 @@ func (h *SecurityGateHandler) decideOne(r *http.Request, id, decisionStr string,
 			msg := fmt.Sprintf("Board rejected held action %s: %s; do not perform it.", gr.ID, gr.Cmdline)
 			if approved {
 				msg = fmt.Sprintf("Board approved held action %s: %s; perform it now.", gr.ID, gr.Cmdline)
+				if ruleDraft == nil {
+					// Let the identical re-run through: a task-scoped exact
+					// rule for 24h (MatchRule runs before any trust).
+					draft, derr := gates.RuleFromRequest(cur, gates.RuleSpec{Scope: gates.ScopeTask, MatchKind: gates.MatchExact,
+						ExpiresInMinutes: 24 * 60, Note: "approved deferred request " + gr.ID}, time.Now())
+					if derr == nil {
+						if newRule, err = gates.InsertRule(tx, draft); err != nil {
+							return nil, nil, nil, &decideError{http.StatusInternalServerError, "rule write failed"}
+						}
+						payload["rule_id"] = newRule.ID
+						msg += fmt.Sprintf(" Allow rule #%d lets exactly this command through for this task for 24h.", newRule.ID)
+					} else {
+						msg += " (No allow rule: " + derr.Error() + "; the re-run waits for the Board again.)"
+					}
+				}
 			}
 			if _, err := tx.Exec(`INSERT INTO task_comments (task_id, author, message) VALUES (?, 'board', ?)`, cur.TaskID, msg); err != nil {
 				return nil, nil, nil, &decideError{http.StatusInternalServerError, "task comment write failed"}

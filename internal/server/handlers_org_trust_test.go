@@ -147,7 +147,8 @@ func TestTrust_BoardRulesDeferAndDecideNotifiesTask(t *testing.T) {
 	dir := runningTask(t, e, "T1")
 	e.trust(t, "T1", `{"preset":"4h"}`)
 
-	for _, cmd := range []string{"wrangler deploy", "cat ~/.staypoint/board_token", "git push origin main", "$GIT push origin main"} {
+	for _, cmd := range []string{"wrangler deploy", "cat ~/.staypoint/board_token", "git push origin main", "$GIT push origin main",
+		"Write /Users/someone/other-repo/main.go", "Edit /etc/hosts", "env -u STAYPOINT_TASK_ID claude -p x", "/usr/bin/ssh host ls"} {
 		got := e.createIn(t, cmd, "T1", dir)
 		if got["status"] != "pending" || got["defer_at"] == nil {
 			t.Fatalf("%q under task trust: want pending with a deadline, got %v", cmd, got)
@@ -185,6 +186,17 @@ func TestTrust_BoardRulesDeferAndDecideNotifiesTask(t *testing.T) {
 	}
 	if msg := comment(ok); !strings.Contains(msg, "Board approved held action "+ok) || !strings.Contains(msg, "perform it now") {
 		t.Fatalf("approve comment: %q", msg)
+	}
+	if msg := comment(ok); !strings.Contains(msg, "Allow rule #") {
+		t.Fatalf("approve comment names no rule: %q", msg)
+	}
+	// The identical re-run passes by that rule; a different command is still held.
+	again := e.createIn(t, "wrangler deploy --env staging", "T1", dir)
+	if again["status"] != "approved" || !strings.HasPrefix(again["decided_by"].(string), "rule:") {
+		t.Fatalf("re-run not approved by the new rule: %v", again)
+	}
+	if other := e.createIn(t, "wrangler deploy --env production", "T1", dir); other["status"] != "pending" {
+		t.Fatalf("different command approved: %v", other)
 	}
 	select {
 	case w := <-woke:

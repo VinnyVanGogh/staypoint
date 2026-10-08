@@ -58,10 +58,23 @@ var (
 	selfPathRe = regexp.MustCompile(`(?i)((~|\$HOME|\$\{HOME\}|/Users/[^/\s'"]+|/home/[^/\s'"]+|/var/root)/\.staypoint\b|\.claude/settings[\w.-]*\.json|\.claude/hooks\b|\.gemini/settings|\.gemini/hooks\b|Library/LaunchAgents\b)`)
 )
 
+// progAt is a regexp prefix for "at a program position": a line or segment
+// start, then any env assignments and wrappers (env, command, exec, nohup,
+// sudo, npx, ...), then an optional backslash and directory, so `\ssh`,
+// `/usr/bin/ssh` and `command ssh` read as ssh.
+const progAt = `(^|[;&|(\n{` + "`" + `]|\$\(|\bthen\b|\bdo\b|\belse\b)\s*` +
+	`(([A-Za-z_]\w*=\S*|env|command|builtin|exec|nohup|sudo|doas|time|nice|ionice|caffeinate|timeout\s+\S+|xargs|npx|bunx|pnpm\s+dlx|yarn\s+dlx|npm\s+exec|uvx|pipx\s+run)(\s+-\S+)*\s+)*` +
+	`\\?([^\s;&|]*/)?`
+
 var (
+	// nestedAgentRe: a daemon-run agent starting another agent CLI escapes
+	// its own hook and task (task-9d94997c).
+	nestedAgentRe = regexp.MustCompile(`(?i)` + progAt + `(claude|claude-code|gemini|codex|agy|cursor-agent|aider|@anthropic-ai/claude-code|@google/gemini-cli|@openai/codex)(@\S*)?(\s|$|[;&|)` + "`" + `])`)
+	// stayEnvRe: unsetting or overriding the StayPoint env the hook relies on.
+	stayEnvRe = regexp.MustCompile(`(?i)(\bunset\b[^;&|\n]*STAYPOINT_|\benv\b[^;&|\n]*(-u\s*STAYPOINT_|--unset[= ]STAYPOINT_|\s-i\b|\s--ignore-environment\b|\s-(\s|$))|(^|[\s;&|(])(export\s+)?STAYPOINT_\w*=|\bexport\s+-n\s+STAYPOINT_)`)
 	// remoteShellRe: a shell on another machine may write prod or delete
 	// data, and a tunnel exposes local services. Held whatever it runs.
-	remoteShellRe = regexp.MustCompile(`(?i)((^|[\s;&|(` + "`" + `])(ssh|mosh|autossh)\s|\bgcloud\s+compute\s+(ssh|scp)\b|\baws\s+ssm\s+(start-session|send-command)\b|\bkubectl\s+(exec|attach|port-forward)\b|\bdocker\s+(-H|--host|context)\b)`)
+	remoteShellRe = regexp.MustCompile(`(?i)(` + progAt + `(ssh|mosh|autossh)(\s|$)|\bgcloud\s+compute\s+(ssh|scp)\b|\baws\s+ssm\s+(start-session|send-command)\b|\bkubectl\s+(exec|attach|port-forward)\b|\bdocker\s+(-H|--host|context)\b)`)
 	// indirectRe: a program word that is a variable, a substitution or eval
 	// cannot be checked (` + "`" + `GIT=git; $GIT push origin main` + "`" + `).
 	indirectRe = regexp.MustCompile(`(^|[;&|(\n{]|\$\(|\bthen\b|\bdo\b|\belse\b)\s*([A-Za-z_]\w*=\S*\s+)*(\$|` + "`" + `|eval\b|exec\s+\$)`)
@@ -110,6 +123,8 @@ func boardRuleText(code, what string) string {
 		return ""
 	}
 	switch {
+	case nestedAgentRe.MatchString(code) || stayEnvRe.MatchString(code):
+		return what + " starts a nested agent or changes the StayPoint env (Board rule: self-protection: nested agent or StayPoint env change)"
 	case indirectRe.MatchString(code):
 		return what + " runs an indirect command ($VAR, $(...), eval) that cannot be checked"
 	case remoteShellRe.MatchString(code):
