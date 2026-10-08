@@ -216,6 +216,18 @@ func (h *Harness) SlotKeyForTask(ctx context.Context, taskID string) SlotKey {
 // newWorktreeManager makes a WorktreeManager that cuts new task branches
 // from the project's target branch (dev-server for work repos), the branch
 // Approve merges into.
+// preflightBranch is the branch a task's git pre-flight fast-forwards
+// against: the branch the task was cut from (its recorded target, then the
+// project's target, then the repo default), not a hardcoded main. A task cut
+// from dev-server can never fast-forward to main, so every run of it ended at
+// pre-flight with zero turns.
+func preflightBranch(ctx context.Context, db *sql.DB, repo, taskID string) string {
+	if b, err := shipreview.TaskTargetBranch(ctx, db, repo, taskID); err == nil && b != "" {
+		return b
+	}
+	return "main"
+}
+
 func newWorktreeManager(repoRoot string, db *sql.DB) *workspace.WorktreeManager {
 	wm := workspace.NewWorktreeManager(repoRoot, db)
 	wm.TargetBranch = func(ctx context.Context, repo string) (string, error) {
@@ -492,7 +504,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// Skipped when cfg.SkipGitPreflight is true (tests running in a non-git dir).
 	if !cfg.SkipGitPreflight && !nonGit {
 		gfCtx, gfCancel := context.WithTimeout(ctx, 60*time.Second)
-		gfResult, gfErr := gitgate.PreFlight(gfCtx, wtPath, "main")
+		gfResult, gfErr := gitgate.PreFlight(gfCtx, wtPath, preflightBranch(gfCtx, h.DB, repoPath, taskID))
 		gfCancel()
 		gfSummary := "git-preflight: "
 		if gfErr != nil {
