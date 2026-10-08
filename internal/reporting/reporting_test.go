@@ -955,3 +955,192 @@ func TestBatchGeneration_NoFileCollision(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// 6. T18: Boss Card Dual-Mode Usage, Labels, Ratecard Citation & Work Products
+// ---------------------------------------------------------------------------
+
+func TestBossCardDualModeLedgerAndWorkProducts(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "staypoint.db")
+
+	// Set up SQLite database with tasks and task_work_products
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test db: %v", err)
+	}
+	defer rawDB.Close()
+
+	schema := `
+	CREATE TABLE tasks (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		repo_path TEXT NOT NULL,
+		git_branch TEXT,
+		status TEXT NOT NULL DEFAULT 'active',
+		account_role TEXT NOT NULL DEFAULT 'work',
+		max_budget_usd REAL NOT NULL DEFAULT 0.0,
+		max_turns INTEGER NOT NULL DEFAULT 0,
+		spent_tokens INTEGER NOT NULL DEFAULT 0,
+		spent_usd REAL NOT NULL DEFAULT 0.0,
+		spent_turns INTEGER NOT NULL DEFAULT 0,
+		organization TEXT,
+		project TEXT,
+		parent_id TEXT,
+		execution_stage TEXT NOT NULL DEFAULT 'todo',
+		checkout_run_id TEXT,
+		checkout_agent_id TEXT,
+		is_blocked INTEGER NOT NULL DEFAULT 0,
+		block_reason TEXT,
+		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+		updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+		deleted_at TEXT
+	);
+
+	CREATE TABLE task_work_products (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+		product_type TEXT NOT NULL,
+		reference TEXT NOT NULL,
+		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+	);
+	`
+	if _, err := rawDB.Exec(schema); err != nil {
+		t.Fatalf("failed to create tables: %v", err)
+	}
+
+	// Insert test tasks with spend and work products
+	_, err = rawDB.Exec(`
+		INSERT INTO tasks (id, name, repo_path, project, spent_usd, spent_turns, spent_tokens)
+		VALUES ('task-001', 'Authentication Microservice', '/dev/auth', 'Auth Project', 450.50, 120, 1500000);
+
+		INSERT INTO task_work_products (task_id, product_type, reference)
+		VALUES ('task-001', 'pull_request', '#42');
+
+		INSERT INTO tasks (id, name, repo_path, project, spent_usd, spent_turns, spent_tokens)
+		VALUES ('task-002', 'Data Ingestion Pipeline', '/dev/data', 'ETL Project', 320.00, 80, 950000);
+
+		INSERT INTO task_work_products (task_id, product_type, reference)
+		VALUES ('task-002', 'commit', 'git:a1b2c3d');
+	`)
+	if err != nil {
+		t.Fatalf("failed to insert test data: %v", err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.DBPath = dbPath
+	cfg.TelemetryDBPath = filepath.Join(tempDir, "nonexistent-telemetry.db")
+
+	work, _, _, _, err := FetchTelemetryWithRange(cfg, DateRangeOptions{})
+	if err != nil {
+		t.Fatalf("FetchTelemetryWithRange failed: %v", err)
+	}
+
+	// Verify exact label and ratecard source
+	if work.RatecardSource == "" {
+		t.Errorf("expected non-empty RatecardSource")
+	}
+	if !strings.Contains(work.RatecardSource, "models.dev") {
+		t.Errorf("expected RatecardSource to cite models.dev, got %q", work.RatecardSource)
+	}
+
+	// Verify dual ledgers
+	if work.ActualSpend != "$0.00" {
+		t.Errorf("expected ActualSpend to be '$0.00', got %q", work.ActualSpend)
+	}
+	if !strings.Contains(work.ActualSpendSub, "$0 marginal for flat subscriptions") {
+		t.Errorf("expected ActualSpendSub to mention flat subscriptions, got %q", work.ActualSpendSub)
+	}
+
+	// Verify deliverables wired to tasks and work products
+	if len(work.Deliverables) < 2 {
+		t.Fatalf("expected at least 2 deliverables from tasks, got %d", len(work.Deliverables))
+	}
+	foundAuth := false
+	foundETL := false
+	for _, d := range work.Deliverables {
+		if strings.Contains(d.Name, "Authentication Microservice") {
+			foundAuth = true
+			if !strings.Contains(d.WorkProduct, "pull_request: #42") {
+				t.Errorf("expected work product 'pull_request: #42', got %q", d.WorkProduct)
+			}
+			if !strings.Contains(d.Value, "$450.50") {
+				t.Errorf("expected value '$450.50', got %q", d.Value)
+			}
+			if !strings.Contains(d.ActualSpend, "$0.00 ($0 marginal)") {
+				t.Errorf("expected deliverable ActualSpend '$0.00 ($0 marginal)', got %q", d.ActualSpend)
+			}
+		}
+		if strings.Contains(d.Name, "Data Ingestion Pipeline") {
+			foundETL = true
+			if !strings.Contains(d.WorkProduct, "commit: git:a1b2c3d") {
+				t.Errorf("expected work product 'commit: git:a1b2c3d', got %q", d.WorkProduct)
+			}
+		}
+	}
+	if !foundAuth || !foundETL {
+		t.Errorf("expected both tasks found in deliverables: foundAuth=%v, foundETL=%v", foundAuth, foundETL)
+	}
+
+	// Generate Work HTML and test exact labels
+	html, err := generateWorkHTML(work)
+	if err != nil {
+		t.Fatalf("generateWorkHTML failed: %v", err)
+	}
+
+	// Check acceptance criteria:
+	// 1. Metric labeled exactly "API list-price equivalent value"
+	if !strings.Contains(html, "API list-price equivalent value") {
+		t.Errorf("HTML must contain exact metric label 'API list-price equivalent value'")
+	}
+
+	// 2. Cite the ratecard source
+	if !strings.Contains(html, work.RatecardSource) {
+		t.Errorf("HTML must cite ratecard source %q", work.RatecardSource)
+	}
+
+	// 3. Two ledgers: Actual Spend ($0 marginal) and API list-price equivalent value
+	if !strings.Contains(html, "Actual Spend") {
+		t.Errorf("HTML must contain 'Actual Spend'")
+	}
+	if !strings.Contains(html, "$0 marginal for flat subscriptions") {
+		t.Errorf("HTML must contain '$0 marginal for flat subscriptions'")
+	}
+	if !strings.Contains(html, "Dual-Ledger Accounting") {
+		t.Errorf("HTML must explain Dual-Ledger Accounting")
+	}
+
+	// 4. Verify deliverables rendered in HTML
+	if !strings.Contains(html, "Authentication Microservice") || !strings.Contains(html, "pull_request: #42") {
+		t.Errorf("HTML should render Authentication Microservice with work product")
+	}
+}
+
+// With no audited tasks the Boss Card lists no deliverables: it must never
+// fall back to placeholder projects or PR numbers.
+func TestBossCardNoTasksShowsNoDeliverables(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.DBPath = filepath.Join(tempDir, "missing-staypoint.db")
+	cfg.TelemetryDBPath = filepath.Join(tempDir, "missing-telemetry.db")
+
+	work, _, _, _, err := FetchTelemetryWithRange(cfg, DateRangeOptions{})
+	if err != nil {
+		t.Fatalf("FetchTelemetryWithRange failed: %v", err)
+	}
+	if len(work.Deliverables) != 0 {
+		t.Fatalf("expected no deliverables without tasks, got %+v", work.Deliverables)
+	}
+	html, err := generateWorkHTML(work)
+	if err != nil {
+		t.Fatalf("generateWorkHTML failed: %v", err)
+	}
+	if !strings.Contains(html, "No audited deliverables recorded") {
+		t.Errorf("HTML should say no deliverables were recorded")
+	}
+	for _, fake := range []string{"PR #12", "Partner Center Analytics API"} {
+		if strings.Contains(html, fake) {
+			t.Errorf("HTML contains placeholder deliverable %q", fake)
+		}
+	}
+}
