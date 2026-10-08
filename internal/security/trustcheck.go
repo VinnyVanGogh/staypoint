@@ -151,6 +151,11 @@ func (a *trustAnalyzer) nextDir(s segment, dir string) string {
 }
 
 func (a *trustAnalyzer) segment(s segment, dir, baseDir string, depth int) {
+	// A pure-edit Python heredoc run in the command's own cwd only edits
+	// files there (task-31dea40b): nothing to hold.
+	if a.tc.CWD != "" && dir == baseDir && pureEditHeredoc(s) {
+		return
+	}
 	argv := stripPrefixes(s.argv)
 	off := len(s.argv) - len(argv)
 	dynAt := func(i int) bool { return segDyn(s, off+i) }

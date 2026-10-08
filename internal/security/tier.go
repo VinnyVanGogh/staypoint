@@ -264,6 +264,13 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 	if len(argv) == 0 {
 		return
 	}
+	// A pure-edit Python heredoc only reads and writes files relative to its
+	// working directory (task-31dea40b); when that is the trusted cwd, it is
+	// an ordinary edit, not a script to hold.
+	if c.CWDTrusted && !c.cwdFromCd && pureEditHeredoc(s) {
+		v.raise(Yellow, "")
+		return
+	}
 	name := baseCmd(argv)
 	args := argv[1:]
 	shellFedByHeredoc := c.classifyHeredocs(s, name, args, v, depth)
