@@ -91,7 +91,7 @@ test('Artifacts page lists documents across tasks, filters, and opens one', asyn
 // task-e3fe2c0b: a document opens in full (the Brief's dialog) from the task
 // page viewer and straight from the Artifacts page, not only Download.
 test('artifacts open in the full view from the task page and the Artifacts page', async ({ page, api }) => {
-  const task = await api.createTask('artifacts-full-view', { organization: 'FullViewArt' });
+  const task = await api.createTask('artifacts-full-view');
   addDoc(task.id, 'plan', 1, '# Full plan\n\n- everything\n\n<script>window.__pwned = 1</script>');
 
   await gotoTaskPage(page, task);
