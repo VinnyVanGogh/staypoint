@@ -160,6 +160,40 @@ func TestRun_AnsweredRunIsNotSilent(t *testing.T) {
 	}
 }
 
+// A run that only called tools (no text, no final answer, no diff) is not
+// silent either: the tool call is output the timeline shows.
+func TestRun_ToolOnlyRunIsNotSilent(t *testing.T) {
+	const taskID = "tool-only-task"
+	h := silentHarness(t, taskID)
+	sr := NewStepRecorder(h.DB, func(string, any) {}, "tool-only-run", taskID)
+	result, err := h.Run(context.Background(), taskID, RunConfig{
+		MaxTurns:         1,
+		AgentID:          "tester",
+		MaxWallclock:     10 * time.Second,
+		SkipGitPreflight: true,
+		StepRecorder:     sr,
+		ParseDelta: func(line []byte) ([]StepDelta, error) {
+			if !strings.Contains(string(line), "tool_use") {
+				return nil, nil
+			}
+			return []StepDelta{{Kind: StepDeltaToolUse, ToolName: "Read", ToolID: "t1", ToolInput: `{"file_path":"README.md"}`}}, nil
+		},
+		RunAdapter: func(_ context.Context, _, _ string, _, _ []string, stdout, _ io.Writer) error {
+			fmt.Fprintln(stdout, `{"type":"tool_use","name":"Read"}`)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition == "error" {
+		t.Fatalf("tool-only run marked error")
+	}
+	if msg := lastHarnessComment(t, h, taskID); strings.Contains(msg, "no output") {
+		t.Fatalf("tool-only run got a no-output diagnostic: %q", msg)
+	}
+}
+
 // A run stopped by the Board keeps "stopped" even when it was silent.
 func TestRun_SilentStoppedRunStaysStopped(t *testing.T) {
 	const taskID = "silent-stop-task"
