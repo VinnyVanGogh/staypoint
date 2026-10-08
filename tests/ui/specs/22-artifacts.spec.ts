@@ -87,3 +87,28 @@ test('Artifacts page lists documents across tasks, filters, and opens one', asyn
   await expect(page.locator('#task-page-tab-artifacts')).toHaveAttribute('aria-selected', 'true');
   await expect(page.locator('#task-page-tabpanel-artifacts .artifact-viewer-body h1')).toHaveText('Other plan');
 });
+
+// task-e3fe2c0b: a document opens in full (the Brief's dialog) from the task
+// page viewer and straight from the Artifacts page, not only Download.
+test('artifacts open in the full view from the task page and the Artifacts page', async ({ page, api }) => {
+  const task = await api.createTask('artifacts-full-view', { organization: 'FullViewArt' });
+  addDoc(task.id, 'plan', 1, '# Full plan\n\n- everything\n\n<script>window.__pwned = 1</script>');
+
+  await gotoTaskPage(page, task);
+  await openTaskPanelTab(page, 'Artifacts');
+  await page.locator('#task-page-tabpanel-artifacts .artifact-viewer-head .long-content-open').click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.locator('h1')).toHaveText('Full plan');
+  await expect(dialog.locator('li')).toHaveText('everything');
+  await page.keyboard.press('Escape');
+  await expect(dialog).toHaveCount(0);
+
+  await page.goto('/artifacts');
+  const row = page.locator('#artifacts-container .artifacts-row', { hasText: 'artifacts-full-view' });
+  await expect(row).toHaveCount(1, { timeout: 20_000 });
+  await row.getByRole('button', { name: 'View', exact: true }).click();
+  await expect(page.getByRole('dialog').locator('h1')).toHaveText('Full plan');
+  // View stays on the Artifacts page instead of opening the task.
+  await expect(page).toHaveURL(/\/artifacts/);
+  expect(await page.evaluate(() => (window as any).__pwned)).toBeUndefined();
+});

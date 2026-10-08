@@ -30,7 +30,7 @@ var (
 	ErrTaskNotFound   = errors.New("task not found")
 	// ErrNotRunnable: the task is parked (backlog) or closed (done,
 	// cancelled, rejected). Run Now moves a backlog task to todo first.
-	ErrNotRunnable    = errors.New("Can't start run: this task is not runnable in its current stage (backlog, stopped, done or cancelled). Move it to todo or press Run Now first.")
+	ErrNotRunnable    = errors.New("Can't start run: this task is not runnable in its current stage (backlog, stopped, error, done or cancelled). Move it to todo or press Run Now first.")
 	ErrConcurrencyCap = errors.New("Can't start run: the maximum number of parallel runs (max_concurrent_runs) is already active.")
 	// ErrOrgHeld: the task's organization is on a Board hold; nothing in it
 	// is claimed until the Board lifts the hold.

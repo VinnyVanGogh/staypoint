@@ -742,6 +742,12 @@ func (h *TasksHandler) ResolveInteraction(w http.ResponseWriter, r *http.Request
 	var req struct {
 		Status   string `json:"status"`
 		Response any    `json:"response"`
+		// Resume false is "Answer only": record the answer without waking
+		// the task. Omitted keeps the old behaviour, a wake that the claim
+		// still refuses for non-runnable stages (backlog, stopped, error…).
+		// "Answer & resume" on a parked task is answer-only plus Run Now, so
+		// Run Now's Board, hold and backlog gates apply (task-e3fe2c0b).
+		Resume *bool `json:"resume"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -774,8 +780,10 @@ func (h *TasksHandler) ResolveInteraction(w http.ResponseWriter, r *http.Request
 		})
 	}
 
-	orchestrator.GlobalDispatcher.Wake(id, "interaction_resolved",
-		fmt.Sprintf("interaction_resolved:%s:%d", id, iid))
+	if req.Resume == nil || *req.Resume {
+		orchestrator.GlobalDispatcher.Wake(id, "interaction_resolved",
+			fmt.Sprintf("interaction_resolved:%s:%d", id, iid))
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(updated)

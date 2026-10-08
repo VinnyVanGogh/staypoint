@@ -26,6 +26,9 @@ const (
 	StagePaused  = "paused"
 	StageCapped  = "capped"
 	StageStopped = "stopped"
+	// StageError is the stage a run that ended in error leaves behind (the
+	// harness persists its disposition as the stage).
+	StageError = "error"
 )
 
 // validTransitions defines which transitions are structurally allowed.
@@ -61,7 +64,9 @@ func IsBoardSettableStage(stage string) bool {
 // stopped is here (STA-861): a run the Board stopped stays stopped until the
 // Board resumes it with Run Now (which writes in_progress first) or moves it
 // to another stage; a comment, unblock or other wake must not restart it.
-var nonRunnableStages = []string{StageBacklog, StageDone, StageCancelled, StageRejected, StageStopped}
+// error is here for the same reason (task-e3fe2c0b): answering a decision card
+// on an errored task records the answer; only Run Now restarts it.
+var nonRunnableStages = []string{StageBacklog, StageDone, StageCancelled, StageRejected, StageStopped, StageError}
 
 // IsRunnableStage reports whether a task in stage may be claimed by a run.
 func IsRunnableStage(stage string) bool {
