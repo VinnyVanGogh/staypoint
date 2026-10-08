@@ -351,39 +351,29 @@ func handleHookPrompt() {
 		}
 	}
 
+	fmt.Println(promptHookOutput(isAntigravity, notices))
+}
+
+// promptHookOutput renders the prompt hook's notices for the calling client:
+// agy PreInvocation takes injectSteps (camelCase, protojson); Claude Code
+// UserPromptSubmit takes additionalContext inside hookSpecificOutput. A
+// top-level additionalContext is not in Claude's schema, so notices sent that
+// way never reached the model.
+func promptHookOutput(isAntigravity bool, notices []string) string {
+	if len(notices) == 0 {
+		return "{}"
+	}
+	text := strings.Join(notices, "\n\n")
+	var resp any
 	if isAntigravity {
-		if len(notices) > 0 {
-			type InjectedStep struct {
-				EphemeralMessage string `json:"ephemeralMessage,omitempty"`
-			}
-			type HookResp struct {
-				InjectSteps []InjectedStep `json:"injectSteps"`
-			}
-			resp := HookResp{
-				InjectSteps: []InjectedStep{
-					{
-						EphemeralMessage: strings.Join(notices, "\n\n"),
-					},
-				},
-			}
-			out, _ := json.Marshal(resp)
-			fmt.Println(string(out))
-			return
-		}
-		fmt.Println("{}")
-		return
+		resp = map[string]any{"injectSteps": []map[string]string{{"ephemeralMessage": text}}}
+	} else {
+		resp = map[string]any{"hookSpecificOutput": map[string]string{
+			"hookEventName": "UserPromptSubmit", "additionalContext": text,
+		}}
 	}
-
-	if len(notices) > 0 {
-		resp := map[string]string{
-			"additionalContext": strings.Join(notices, "\n\n"),
-		}
-		out, _ := json.Marshal(resp)
-		fmt.Println(string(out))
-		return
-	}
-
-	fmt.Println("{}")
+	out, _ := json.Marshal(resp)
+	return string(out)
 }
 
 var hookInstallCmd = &cobra.Command{
@@ -407,7 +397,7 @@ var hookPreToolCmd = &cobra.Command{
 }
 
 // preToolAllow is the response that lets the tool call proceed.
-func preToolAllow() { fmt.Println("{}") }
+func preToolAllow() { fmt.Println(preToolAllowJSON(trackgate.ClientClaude)) }
 
 // preToolAllowPinned lets the tool call proceed with its command replaced by
 // pinned (STA-868): scripts judged or approved by content run from the exact

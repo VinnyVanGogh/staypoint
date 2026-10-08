@@ -1,0 +1,1 @@
+{"decision":"block","hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Board gate unreachable; command blocked (x)"},"reason":"Board gate unreachable; command blocked (x)"}
