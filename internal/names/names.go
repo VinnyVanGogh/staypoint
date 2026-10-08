@@ -43,8 +43,7 @@ var upperConfusables = map[rune]rune{
 	'Μ': 'm', 'Η': 'h', 'Ν': 'n', 'Υ': 'y',
 }
 
-// Normalize folds s for comparison: s cut at its first NUL, compatibility
-// decomposition (NFKD),
+// Normalize folds s for comparison: compatibility decomposition (NFKD),
 // combining marks, format characters (zero-width space and joiners, BOM, bidi
 // controls, soft hyphen) and other control characters dropped, lookalike
 // letters mapped to Latin, lower case, every run of whitespace collapsed to
@@ -53,12 +52,6 @@ func Normalize(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	space := false
-	// A name ends at its first NUL, as it does for SQLite functions (text
-	// reaches them as a C string) and for git, so the SQL and Go forms of a
-	// hold check agree. Found by FuzzOrgHold.
-	if i := strings.IndexByte(s, 0); i >= 0 {
-		s = s[:i]
-	}
 	// Invalid bytes become U+FFFD first: NFKD leaves the rune after an
 	// invalid byte undecomposed, which made Normalize not idempotent.
 	for _, r := range norm.NFKD.String(strings.ToValidUTF8(s, string(utf8.RuneError))) {

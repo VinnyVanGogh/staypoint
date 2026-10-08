@@ -3,6 +3,7 @@ package governance_test
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/VinnyVanGogh/staypoint/internal/db"
@@ -48,6 +49,10 @@ func TestOrgHold_Lookalikes(t *testing.T) {
 		if governance.OrgHeld(conn, org) || sqlHeld(t, conn, "u"+string(rune('a'+i)), org) {
 			t.Errorf("%q held, want not held", org)
 		}
+	}
+	// A NUL ends the name for the Claim SQL; Go agrees, and the hold widens.
+	if !governance.OrgHeld(conn, "Managed Solution\x00x") || !sqlHeld(t, conn, "nul", "Managed Solution\x00x") {
+		t.Error("name with a held prefix before NUL must be held")
 	}
 	if err := governance.SetOrgHold(conn, zwsp+" ", true); err == nil {
 		t.Error("SetOrgHold on an invisible-only name must fail")
@@ -108,7 +113,9 @@ func FuzzOrgHold(f *testing.F) {
 		if !governance.OrgHeld(conn, v) || !sqlHeld(t, conn, "v", v) {
 			t.Fatalf("hold on %q does not hold %q", namestest.Variant(a, seed), v)
 		}
-		want := names.Normalize(other) == a
+		// Holds compare names up to the first NUL (holdName).
+		cut, _, _ := strings.Cut(other, "\x00")
+		want := names.Normalize(cut) == a
 		if got, gotSQL := governance.OrgHeld(conn, other), sqlHeld(t, conn, "o", other); got != want || gotSQL != want {
 			t.Fatalf("org %q under hold %q: OrgHeld %v, SQL %v, want %v", other, a, got, gotSQL, want)
 		}

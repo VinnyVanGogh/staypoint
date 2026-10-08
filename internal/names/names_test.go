@@ -51,7 +51,7 @@ func TestNormalize(t *testing.T) {
 		"":                              "",
 		" " + zwsp + " ":                "",
 		"feature/x":                     "feature/x",
-		"ACme\x000":                     "acme", // ends at NUL, like SQLite
+		"ACme\x000":                     "acme0", // NUL dropped, never a cut
 		"main" + ideoSp + "line" + zwsp: "main line",
 	}
 	for in, want := range cases {

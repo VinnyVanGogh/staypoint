@@ -183,6 +183,7 @@ func TestNameTargetsProd(t *testing.T) {
 		"push to pr" + string(rune(0x043E)) + "d": true, // Cyrillic о
 		string([]rune{0xFF50, 0xFF52, 0xFF4F, 0xFF44}) + " deploy": true, // fullwidth
 		"pr" + string(rune(0x200B)) + "od deploy":                  true, // zero-width space
+		"x\x00 to prod":        true, // a NUL must not hide the rest
 		"products list":        false,
 		"productivity metrics": false,
 		"prod2 cluster":        false,

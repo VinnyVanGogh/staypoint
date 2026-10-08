@@ -32,8 +32,8 @@ import (
 // OrgHoldPrefix prefixes the settings_kv key of an organization's hold.
 const OrgHoldPrefix = "org_hold."
 
-// NormNameSQLFunc is the SQLite function names.Normalize is registered as,
-// for every connection the "sqlite" driver opens in a binary that links this
+// NormNameSQLFunc is the SQLite function holdName is registered as, for
+// every connection the "sqlite" driver opens in a binary that links this
 // package (which every binary building OrgNotHeldSQL does).
 const NormNameSQLFunc = "staypoint_norm_name"
 
@@ -44,15 +44,27 @@ func init() {
 			case nil:
 				return "", nil
 			case string:
-				return names.Normalize(v), nil
+				return holdName(v), nil
 			case []byte:
-				return names.Normalize(string(v)), nil
+				return holdName(string(v)), nil
 			default:
-				return names.Normalize(fmt.Sprint(v)), nil
+				return holdName(fmt.Sprint(v)), nil
 			}
 		}); err != nil {
 		panic(fmt.Sprintf("register %s: %v", NormNameSQLFunc, err))
 	}
+}
+
+// holdName is org as holds compare it: names.Normalize of org up to its
+// first NUL. Text reaches a SQLite function as a C string, so the Claim SQL
+// only ever sees that much; cutting here too keeps OrgHeld and the SQL in
+// agreement (found by FuzzOrgHold). The cut can only widen a hold: a name
+// whose prefix is held is held.
+func holdName(org string) string {
+	if i := strings.IndexByte(org, 0); i >= 0 {
+		org = org[:i]
+	}
+	return names.Normalize(org)
 }
 
 // ErrOrgHeld is returned when a task's organization is on hold.
@@ -60,7 +72,7 @@ var ErrOrgHeld = errors.New("organization is on hold")
 
 // OrgHoldKey is the settings_kv key for org's hold.
 func OrgHoldKey(org string) string {
-	return OrgHoldPrefix + names.Normalize(org)
+	return OrgHoldPrefix + holdName(org)
 }
 
 // NormalizeOrg is an organization name as org trusts key it: SQLite's
@@ -86,7 +98,7 @@ func sqliteLower(s string) string {
 // error reports held (fail closed): a broken settings table must not let
 // runs through a hold.
 func OrgHeld(db *sql.DB, org string) bool {
-	n := names.Normalize(org)
+	n := holdName(org)
 	if n == "" {
 		return false
 	}
@@ -119,7 +131,7 @@ func orgHoldKeys(q interface {
 		if err := rows.Scan(&k, &v); err != nil {
 			return nil, err
 		}
-		if names.Normalize(strings.TrimPrefix(k, OrgHoldPrefix)) == n {
+		if holdName(strings.TrimPrefix(k, OrgHoldPrefix)) == n {
 			out[k] = v
 		}
 	}
@@ -140,7 +152,7 @@ func TaskOrgHeld(db *sql.DB, taskID string) (bool, string) {
 // the Board gate. Lifting clears every key that matches org (see
 // orgHoldKeys), so a hold written under an older key cannot outlive it.
 func SetOrgHold(db *sql.DB, org string, held bool) error {
-	n := names.Normalize(org)
+	n := holdName(org)
 	if n == "" {
 		return fmt.Errorf("organization is required")
 	}
