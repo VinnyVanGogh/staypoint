@@ -52,7 +52,9 @@ const (
 
 // Defaults and bounds for the trust settings.
 const (
-	DefaultTrustDeferMinutes = 10
+	// 2 (was 10): under overnight trust a held request stalls its agent for
+	// this long before it is skipped to the Board's list (2026-10-07).
+	DefaultTrustDeferMinutes = 2
 	MaxTrustDeferMinutes     = 120
 	DefaultTev1Threshold     = 0.7
 	MinTev1Threshold         = 0.5
