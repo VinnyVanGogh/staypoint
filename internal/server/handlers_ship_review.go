@@ -1319,3 +1319,33 @@ func (h *ShipReviewHandler) SeedCard(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, card)
 }
 
+// SeedTaskBase handles PUT /api/tasks/{id}/test/base (test-only). It records
+// sha as the task's base the way worktree creation does (STA-774), for specs
+// that build the task branch by hand instead of through a daemon run. Only
+// registered when server.Options.TestMode is true.
+func (h *ShipReviewHandler) SeedTaskBase(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SHA          string `json:"sha"`
+		TargetBranch string `json:"target_branch"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	task, err := context.GetTask(h.db, r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "task not found: "+err.Error())
+		return
+	}
+	if err := workspace.RecordTaskBase(r.Context(), h.db, task.RepoPath, task.ID, req.SHA); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.TargetBranch != "" {
+		if err := workspace.RecordTaskTarget(r.Context(), h.db, task.ID, req.TargetBranch); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	writeJSON(w, map[string]string{"task_id": task.ID, "base_sha": req.SHA})
+}

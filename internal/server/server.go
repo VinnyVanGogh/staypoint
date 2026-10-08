@@ -301,6 +301,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.Handle("PUT /api/project-dev-configs", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.UpsertProjectDevConfig)))
 		if s.opts.TestMode {
 			mux.HandleFunc("PUT /api/tasks/{id}/ship-review/seed", shipH.SeedCard)
+			mux.HandleFunc("PUT /api/tasks/{id}/test/base", shipH.SeedTaskBase)
 		}
 
 		// WebAuthn / passkey endpoints (Board session required; assertion enforced on delete)

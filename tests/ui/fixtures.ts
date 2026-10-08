@@ -164,6 +164,21 @@ export class StayPointAPI {
   }
 }
 
+/**
+ * Records the tip of main in repoDir as the task's base, the way the daemon
+ * does when it creates a task worktree (STA-774). Specs that build the
+ * staypoint/<id> branch by hand call this before the card upsert, which
+ * refuses a task with no recorded base. TestMode-only endpoint.
+ */
+export async function recordTaskBase(request: APIRequestContext, taskId: string, repoDir: string) {
+  const sha = execFileSync('git', ['-C', repoDir, 'rev-parse', 'main'], { encoding: 'utf8' }).trim();
+  const res = await request.put(`/api/tasks/${encodeURIComponent(taskId)}/test/base`, {
+    headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+    data: { sha, target_branch: 'main' },
+  });
+  expect(res.ok(), `record task base failed: ${await res.text()}`).toBeTruthy();
+}
+
 /** URL of the full task page, matching taskToPath() in app.js for local tasks. */
 export function taskPagePath(task: Task): string {
   return `/tasks/${encodeURIComponent(task.organization || 'STA')}/${encodeURIComponent(
