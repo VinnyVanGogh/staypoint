@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     git_branch        TEXT,
     organization      TEXT,
     project           TEXT,
+    parent_id         TEXT,
     status            TEXT NOT NULL DEFAULT 'active',
     execution_stage   TEXT NOT NULL DEFAULT 'todo',
     checkout_run_id   TEXT,

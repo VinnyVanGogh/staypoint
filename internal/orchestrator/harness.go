@@ -250,7 +250,9 @@ const closedStageGuard = " AND execution_stage NOT IN ('done', 'cancelled')"
 // the DB guard (checkout_run_id IS NULL) unblocks on the next wake.
 // Parked (backlog) and closed (done, cancelled, rejected) tasks are never
 // claimed; see governance.IsRunnableStage. Neither is a task whose
-// organization is on a Board hold (ErrOrgHeld).
+// organization is on a Board hold (ErrOrgHeld). A child whose parent already
+// has tasks.max_running_children children running is refused with
+// ErrParentBusy, a capacity refusal: it queues and starts when a sibling ends.
 func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) error {
 	slots := h.slots()
 	if err := slots.Acquire(taskID, h.SlotKeyForTask(ctx, taskID)); err != nil {
@@ -258,11 +260,13 @@ func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) erro
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	childLimit := governance.RunningChildLimit(h.DB)
 	res, err := h.DB.ExecContext(ctx,
 		`UPDATE tasks
 		    SET execution_stage='in_progress', checkout_run_id=?, checkout_agent_id=?, updated_at=?
 		  WHERE id=? AND checkout_run_id IS NULL AND execution_stage NOT IN (`+governance.NonRunnableStagesSQL()+`)
-		    AND `+governance.OrgNotHeldSQL("tasks"),
+		    AND `+governance.OrgNotHeldSQL("tasks")+`
+		    AND `+governance.SiblingsUnderRunLimitSQL("tasks", childLimit),
 		runID, agentID, now, taskID,
 	)
 	if err != nil {
@@ -282,6 +286,9 @@ func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) erro
 		}
 		if held, _ := governance.TaskOrgHeld(h.DB, taskID); held {
 			return ErrOrgHeld
+		}
+		if governance.ParentAtRunLimit(h.DB, taskID, childLimit) {
+			return ErrParentBusy
 		}
 		return ErrAlreadyClaimed
 	}
@@ -1091,13 +1098,13 @@ const briefMaxBytes = 8 * 1024 // 8 KB
 
 // taskBrief holds the immutable task metadata fetched once before the run loop.
 type taskBrief struct {
-	Name            string
-	Org             string
-	Project         string
-	RepoPath        string
-	GitBranch       string
-	Description     string
-	ShipReviewGate  bool // true when gates.ship_review is enabled
+	Name           string
+	Org            string
+	Project        string
+	RepoPath       string
+	GitBranch      string
+	Description    string
+	ShipReviewGate bool // true when gates.ship_review is enabled
 	// PlainDir is set when the task runs in a non-git directory (STA-864).
 	PlainDir bool
 	// Handoff is the daemon-stored handoff from the parent task (STA-820).

@@ -116,18 +116,52 @@ func TestCreateChildTask_RejectsMissingParentAndEmptyName(t *testing.T) {
 	}
 }
 
+// tasks.max_children caps agent-created children only.
 func TestCreateChildTask_ChildCountCap(t *testing.T) {
 	database, parent := createPlanningParent(t)
 	if err := SetChildTaskLimits(database, 2, 2); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		if _, err := CreateChildTask(database, ChildTaskOptions{ParentID: parent.ID, Name: "c", WorkKind: "coding"}); err != nil {
+		if _, err := CreateChildTask(database, ChildTaskOptions{ParentID: parent.ID, Name: "c", WorkKind: "coding", Origin: OriginAgent}); err != nil {
 			t.Fatalf("child %d: %v", i, err)
 		}
 	}
-	if _, err := CreateChildTask(database, ChildTaskOptions{ParentID: parent.ID, Name: "c3", WorkKind: "coding"}); !errors.Is(err, ErrChildLimit) {
-		t.Errorf("third child: want ErrChildLimit, got %v", err)
+	if _, err := CreateChildTask(database, ChildTaskOptions{ParentID: parent.ID, Name: "c3", WorkKind: "coding", Origin: OriginAgent}); !errors.Is(err, ErrChildLimit) {
+		t.Errorf("third agent child: want ErrChildLimit, got %v", err)
+	}
+}
+
+// Board (native) children ignore tasks.max_children and stop only at the
+// tasks.max_board_children soft limit; a Board override lifts that too.
+func TestCreateChildTask_BoardChildrenUseBoardLimit(t *testing.T) {
+	database, parent := createPlanningParent(t)
+	if err := SetChildTaskLimits(database, 1, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO settings_kv (key, value) VALUES (?, '3')`, SettingMaxBoardChildren); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := CreateChildTask(database, ChildTaskOptions{ParentID: parent.ID, Name: "b", WorkKind: "coding", ExecutionStage: "backlog"}); err != nil {
+			t.Fatalf("board child %d: %v", i+1, err)
+		}
+	}
+	if _, err := CreateChildTask(database, ChildTaskOptions{ParentID: parent.ID, Name: "b4", WorkKind: "coding", ExecutionStage: "backlog"}); !errors.Is(err, ErrChildLimit) {
+		t.Errorf("fourth board child: want ErrChildLimit at the board limit, got %v", err)
+	}
+	if _, err := CreateChildTask(database, ChildTaskOptions{ParentID: parent.ID, Name: "agent", WorkKind: "coding", Origin: OriginAgent}); !errors.Is(err, ErrChildLimit) {
+		t.Errorf("agent child past max_children: want ErrChildLimit, got %v", err)
+	}
+	if _, err := CreateChildTask(database, ChildTaskOptions{ParentID: parent.ID, Name: "b5", WorkKind: "coding", ExecutionStage: "backlog", BoardOverride: true}); err != nil {
+		t.Errorf("board override past the board limit: %v", err)
+	}
+}
+
+func TestBoardChildLimit_Default(t *testing.T) {
+	database, _ := createPlanningParent(t)
+	if n := BoardChildLimit(database); n != 200 {
+		t.Errorf("board child limit default = %d, want 200", n)
 	}
 }
 

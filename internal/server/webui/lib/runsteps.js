@@ -91,6 +91,7 @@
     org: 'org limit: this organization is at max_runs_per_org',
     slots: 'global limit: max_concurrent_runs reached',
     quota: 'quota: provider quota is locked',
+    parent: 'parent limit: its parent already has max_running_children running',
   };
   function queueLabel(pos) {
     if (!pos || !pos.queued) return '';

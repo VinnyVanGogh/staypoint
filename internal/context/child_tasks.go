@@ -27,12 +27,21 @@ const HandoffDocKey = "handoff"
 
 // Settings keys (settings_kv) for the child-task guardrails. The Board raises
 // them; the defaults apply when unset or unparsable.
+//
+// tasks.max_children caps how many children an agent can create under one
+// parent (clutter protection; agent children land in backlog and cannot run
+// without the Board). Board and native children use the much higher
+// tasks.max_board_children soft limit, so the Board can keep organising a
+// standing parent. How many children run at once is a separate cap,
+// governance.SettingMaxRunningChildren, enforced at claim time.
 const (
-	SettingMaxChildren   = "tasks.max_children"
-	SettingMaxChildDepth = "tasks.max_child_depth"
+	SettingMaxChildren      = "tasks.max_children"
+	SettingMaxBoardChildren = "tasks.max_board_children"
+	SettingMaxChildDepth    = "tasks.max_child_depth"
 
-	DefaultMaxChildren   = 10
-	DefaultMaxChildDepth = 2
+	DefaultMaxChildren      = 10
+	DefaultMaxBoardChildren = 200
+	DefaultMaxChildDepth    = 2
 )
 
 // validWorkKinds mirrors router.ValidWorkKinds (internal/router/kinds.go).
@@ -66,7 +75,8 @@ type ChildTaskOptions struct {
 	Description  string
 	MaxBudgetUSD float64
 	MaxTurns     int
-	// BoardOverride lifts the depth cap. Only Board-facing surfaces set it.
+	// BoardOverride lifts the depth and count caps. Only Board-facing
+	// surfaces set it.
 	BoardOverride bool
 	// ExecutionStage is the requested initial stage ("" = todo). It is
 	// honoured: a backlog child is created parked and never woken.
@@ -81,6 +91,12 @@ type ChildTaskOptions struct {
 func ChildTaskLimits(db *sql.DB) (int, int) {
 	return intSetting(db, SettingMaxChildren, DefaultMaxChildren),
 		intSetting(db, SettingMaxChildDepth, DefaultMaxChildDepth)
+}
+
+// BoardChildLimit returns the soft cap on children the Board (or any
+// non-agent origin) can create under one parent.
+func BoardChildLimit(db *sql.DB) int {
+	return intSetting(db, SettingMaxBoardChildren, DefaultMaxBoardChildren)
 }
 
 // SetChildTaskLimits persists the child-task guardrails.
@@ -161,12 +177,17 @@ func CreateChildTask(db *sql.DB, opts ChildTaskOptions) (*Task, error) {
 	}
 
 	maxChildren, maxDepth := ChildTaskLimits(db)
-	var existing int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE parent_id = ? AND status != 'soft_deleted'`, parent.ID).Scan(&existing); err != nil {
-		return nil, fmt.Errorf("count children: %w", err)
+	if opts.Origin != OriginAgent {
+		maxChildren = BoardChildLimit(db)
 	}
-	if existing >= maxChildren {
-		return nil, fmt.Errorf("%w (%d)", ErrChildLimit, maxChildren)
+	if !opts.BoardOverride {
+		var existing int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE parent_id = ? AND status != 'soft_deleted'`, parent.ID).Scan(&existing); err != nil {
+			return nil, fmt.Errorf("count children: %w", err)
+		}
+		if existing >= maxChildren {
+			return nil, fmt.Errorf("%w (%d)", ErrChildLimit, maxChildren)
+		}
 	}
 	parentDepth, err := taskDepth(db, parent.ID)
 	if err != nil {
