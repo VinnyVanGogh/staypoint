@@ -263,6 +263,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		// Org hold: Board-only (session + passkey); agents can read it, never set it.
 		mux.HandleFunc("GET /api/settings/org-hold", gateH.GetOrgHolds)
 		mux.Handle("POST /api/settings/org-hold", s.secMid.WrapBoardAction(http.HandlerFunc(gateH.UpdateOrgHold)))
+		mux.HandleFunc("GET /api/settings/org-trust", gateH.ListOrgTrusts)
+		mux.Handle("POST /api/settings/org-trust", s.secMid.WrapBoardAction(http.HandlerFunc(gateH.CreateOrgTrust)))
+		mux.Handle("POST /api/settings/org-trust/revoke", s.secMid.WrapBoardSession(http.HandlerFunc(gateH.RevokeOrgTrust)))
 
 		// Ship Review REST API (Board-approval gate for agent branch merges)
 		shipH := NewShipReviewHandler(s.opts.DB, s.hub)

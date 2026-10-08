@@ -224,9 +224,9 @@ func TrustsForTask(db Execer, taskID string) ([]*Rule, error) {
 	return collectRules(rows)
 }
 
-// RecentTrusts returns trusts that are live or ended after since, newest first.
+// RecentTrusts returns task trusts that are live or ended after since, newest first.
 func RecentTrusts(db Execer, since time.Time) ([]*Rule, error) {
-	rows, err := db.Query(`SELECT ` + ruleCols + ` FROM security_gate_rules WHERE match_kind = 'any' ORDER BY id DESC LIMIT 200`)
+	rows, err := db.Query(`SELECT ` + ruleCols + ` FROM security_gate_rules WHERE match_kind = 'any' AND scope = 'task' ORDER BY id DESC LIMIT 200`)
 	if err != nil {
 		return nil, err
 	}
@@ -285,7 +285,7 @@ func ActiveTrust(db Execer, taskID string, now time.Time) (*Rule, error) {
 // SweepTrusts ends every live trust whose task has left in_progress.
 func SweepTrusts(db Execer, now time.Time) error {
 	rows, err := db.Query(`SELECT DISTINCT scope_value FROM security_gate_rules
-		WHERE match_kind = 'any' AND deleted_at IS NULL AND expires_at IS NOT NULL`)
+		WHERE match_kind = 'any' AND scope = 'task' AND deleted_at IS NULL AND expires_at IS NOT NULL`)
 	if err != nil {
 		return err
 	}

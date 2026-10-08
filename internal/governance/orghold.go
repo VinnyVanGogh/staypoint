@@ -27,7 +27,13 @@ var ErrOrgHeld = errors.New("organization is on hold")
 // OrgNotHeldSQL does (SQLite trim: spaces only; lower: ASCII only), so the
 // key written here is the key Claim looks up for any organization name.
 func OrgHoldKey(org string) string {
-	return OrgHoldPrefix + sqliteLower(strings.Trim(org, " "))
+	return OrgHoldPrefix + NormalizeOrg(org)
+}
+
+// NormalizeOrg is an organization name as holds and org trusts key it:
+// SQLite's lower(trim(org)) (spaces only, ASCII only).
+func NormalizeOrg(org string) string {
+	return sqliteLower(strings.Trim(org, " "))
 }
 
 // sqliteLower folds ASCII A-Z only, like SQLite's built-in lower().

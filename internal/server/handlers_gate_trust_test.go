@@ -100,9 +100,9 @@ func TestTrust_ProtectedMergesAndPushesStillWait(t *testing.T) {
 		}
 	}
 
-	// A non-excluded Red command (ssh is allowed under trust) is approved
+	// A non-excluded Red command (sudo; ssh is now a Board rule) is approved
 	// by the trust, audited, and still rated by the advisor.
-	got := e.createIn(t, "ssh build-host 'make test'", "T1", dir)
+	got := e.createIn(t, "sudo ls /var/log", "T1", dir)
 	if got["status"] != "approved" || got["decided_by"] != "rule:"+itoa(ruleID) {
 		t.Fatalf("want trust approval, got %v", got)
 	}
@@ -347,7 +347,7 @@ func TestTrust_Tev1DecidesAndParksOnlyThatTask(t *testing.T) {
 			if rule["tev1_threshold"].(float64) != 0.7 {
 				t.Fatalf("threshold %v", rule["tev1_threshold"])
 			}
-			got := e.createIn(t, "sudo launchctl list", "T1", dir)
+			got := e.createIn(t, "sudo ls /var/log", "T1", dir)
 			gr := waitDecided(t, e, got["id"].(string))
 			want := security.GateRequestDenied
 			if c.approve {
@@ -360,7 +360,7 @@ func TestTrust_Tev1DecidesAndParksOnlyThatTask(t *testing.T) {
 			if c.approve == blocked {
 				t.Fatalf("T1 blocked=%v (%s) after %s", blocked, reason, gr.Status)
 			}
-			if !c.approve && !strings.HasPrefix(reason, "tev1 denied: sudo launchctl list") {
+			if !c.approve && !strings.HasPrefix(reason, "tev1 denied: sudo ls /var/log") {
 				t.Fatalf("block reason: %q", reason)
 			}
 			if b, _ := blockedReason(t, e, "T2"); b {

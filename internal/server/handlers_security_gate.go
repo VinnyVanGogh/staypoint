@@ -194,10 +194,15 @@ type gateCreateOutcome struct {
 }
 
 // createOrAutoApprove stores the request: approved by the first matching
-// Board allow rule or by the task's trust (with its audit row and hit count,
-// in one transaction), or pending. Under trust, merges/pushes to protected
+// Board allow rule or by the task's trust or, failing that, its
+// organization's trust (with its audit row and hit count, in one
+// transaction), or pending. Under trust, merges/pushes to protected
 // branches stay pending, deletes outside the worktree stay pending with a
-// deferral deadline, and tev1 mode leaves the request to runTev1.
+// deferral deadline, and tev1 mode leaves the request to runTev1. Under any
+// trust the Board's unattended-run rules (AnalyzeBoardRules) also stay
+// pending. Every held request gets the deferral deadline, so the run moves on
+// and the Board decides it in the morning (task-9d94997c). A trust lookup
+// error fails the request (fail closed).
 func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) (*gateCreateOutcome, error) {
 	now := h.clock()
 	// Trust lookup and the exclusion analysis run git and read the
@@ -206,13 +211,29 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 		trust     *gates.Rule
 		facts     security.TrustFacts
 		deferMins int
+		boardRule string
 	)
 	if !gates.SpecialRunIDs[in.RunID] && in.TaskID != "" {
 		var err error
 		if trust, err = gates.ActiveTrust(h.db, in.TaskID, now); err != nil {
 			return nil, err
 		}
+		if trust == nil {
+			if trust, err = gates.ActiveOrgTrust(h.db, in.TaskID, now); err != nil {
+				return nil, err
+			}
+			if trust != nil && !orgTrustCoversRepo(h.db, in.TaskID) {
+				trust = nil
+			}
+		}
 		if trust != nil {
+			// The Board's unattended-run rules hold under any trust.
+			boardRule = security.AnalyzeBoardRules(in.Cmdline, in.Scripts)
+			if boardRule == "" && isFileEditRequest(in.Cmdline) {
+				// The hook sends an edit only when it is outside the worktree
+				// or to a protected path: never approved by a trust.
+				boardRule = "file edit outside the task worktree (Board rule: edits stay in the worktree)"
+			}
 			facts = security.AnalyzeForTrust(in.Cmdline, gates.TrustContextFor(h.db, in.TaskID, in.CWD, in.Scripts))
 			deferMins = gates.TrustDeferMinutes(h.db)
 		}
@@ -236,7 +257,7 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 		}
 	}
 	pending, approved := string(security.GateRequestPending), string(security.GateRequestApproved)
-	if rule == nil && trust != nil && !facts.Protected && !facts.DeleteOutside && !trust.Tev1 {
+	if rule == nil && trust != nil && !facts.Protected && boardRule == "" && !facts.DeleteOutside && !trust.Tev1 {
 		rule = trust
 	}
 	if rule == nil {
@@ -247,19 +268,34 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 		out := &gateCreateOutcome{gr: gr}
 		if trust != nil {
 			event, payload := "", map[string]any{"rule_id": trust.ID, "cmdline": gr.Cmdline, "task_id": gr.TaskID}
-			switch {
-			case facts.Protected:
-				event, out.held = "security_gate_trust_held", "protected: "+facts.ProtectedWhy
-				payload["message"] = "held for the Board under trust: " + facts.ProtectedWhy
-			case facts.DeleteOutside:
+			deferHeld := func() error {
 				at := now.Add(time.Duration(deferMins) * time.Minute)
 				if err := security.SetDeferAt(tx, gr.ID, at); err != nil {
-					return nil, err
+					return err
 				}
 				gr.DeferAt = &at
+				payload["defer_at"] = at.UTC().Format(time.RFC3339)
+				return nil
+			}
+			switch {
+			case facts.Protected:
+				if err := deferHeld(); err != nil {
+					return nil, err
+				}
+				event, out.held = "security_gate_trust_held", "protected: "+facts.ProtectedWhy
+				payload["message"] = fmt.Sprintf("held for the Board under trust (waits %d min, then is skipped): %s", deferMins, facts.ProtectedWhy)
+			case boardRule != "":
+				if err := deferHeld(); err != nil {
+					return nil, err
+				}
+				event, out.held = "security_gate_trust_held", "board rule: "+boardRule
+				payload["message"] = fmt.Sprintf("held for the Board under trust (waits %d min, then is skipped): %s", deferMins, boardRule)
+			case facts.DeleteOutside:
+				if err := deferHeld(); err != nil {
+					return nil, err
+				}
 				event, out.held = "security_gate_trust_deferring", "delete outside worktree: "+facts.DeleteWhy
 				payload["message"] = fmt.Sprintf("delete outside the worktree waits %d min, then is skipped: %s", deferMins, facts.DeleteWhy)
-				payload["defer_at"] = at.UTC().Format(time.RFC3339)
 			default:
 				event, out.tev1 = "security_gate_tev1_asked", trust
 				payload["message"] = fmt.Sprintf("tev1 decides (threshold %.2f)", trust.Tev1Threshold)
@@ -277,7 +313,7 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 	}
 	msg := fmt.Sprintf("auto-approved by rule #%d", rule.ID)
 	if rule.IsTrust() {
-		msg = fmt.Sprintf("auto-approved by trust #%d (task %s)", rule.ID, rule.ScopeValue)
+		msg = fmt.Sprintf("auto-approved by trust #%d (%s)", rule.ID, gates.TrustLabel(rule))
 	}
 	if err := governance.LogGateEventTx(tx, gr.ID, by, "security_gate_auto_approved", &pending, &approved,
 		map[string]any{"message": msg, "rule_id": rule.ID, "trust": rule.IsTrust(),
@@ -291,6 +327,31 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 		return nil, err
 	}
 	return &gateCreateOutcome{gr: gr, rule: rule}, nil
+}
+
+// isFileEditRequest reports a hook file-edit request ("Write <path>").
+func isFileEditRequest(cmdline string) bool {
+	for _, t := range []string{"Write ", "Edit ", "MultiEdit ", "NotebookEdit "} {
+		if strings.HasPrefix(cmdline, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// orgTrustCoversRepo reports whether an org trust may cover taskID: only a
+// task with a repo that is not a work repo. Anyone can create a task in an
+// organization pointing at any repo, so a work repo (or an unreadable or
+// missing repo) is never covered (fail closed).
+func orgTrustCoversRepo(db *sql.DB, taskID string) bool {
+	var repo string
+	if err := db.QueryRow(`SELECT COALESCE(repo_path,'') FROM tasks WHERE id = ?`, taskID).Scan(&repo); err != nil {
+		return false
+	}
+	if strings.TrimSpace(repo) == "" {
+		return false
+	}
+	return !repoIsWork(repo)
 }
 
 // startAdvisory asks the Together advisor about a new pending request in the
@@ -428,9 +489,35 @@ func (h *SecurityGateHandler) decideOne(r *http.Request, id, decisionStr string,
 	decidedStatus := string(gr.Status)
 	payload := map[string]any{"cmdline": gr.Cmdline, "decision": string(gr.Status), "run_id": gr.RunID}
 	if cur.DeferredAt != nil {
-		// The hook gave up at the deadline: this records the decision only.
+		// The hook gave up at the deadline: the command is not replayed. The
+		// task is told on its thread; an approval also wakes it (afterDecide)
+		// so the agent performs the action itself (task-9d94997c).
 		payload["deferred"] = true
-		payload["message"] = "deferred request decided; the command is not replayed (a follow-up run can redo it)"
+		payload["message"] = "deferred request decided; the command is not replayed, the task is told to perform it"
+		if cur.TaskID != "" {
+			msg := fmt.Sprintf("Board rejected held action %s: %s; do not perform it.", gr.ID, gr.Cmdline)
+			if approved {
+				msg = fmt.Sprintf("Board approved held action %s: %s; perform it now.", gr.ID, gr.Cmdline)
+				if ruleDraft == nil {
+					// Let the identical re-run through: a task-scoped exact
+					// rule for 24h (MatchRule runs before any trust).
+					draft, derr := gates.RuleFromRequest(cur, gates.RuleSpec{Scope: gates.ScopeTask, MatchKind: gates.MatchExact,
+						ExpiresInMinutes: 24 * 60, Note: "approved deferred request " + gr.ID}, time.Now())
+					if derr == nil {
+						if newRule, err = gates.InsertRule(tx, draft); err != nil {
+							return nil, nil, nil, &decideError{http.StatusInternalServerError, "rule write failed"}
+						}
+						payload["rule_id"] = newRule.ID
+						msg += fmt.Sprintf(" Allow rule #%d lets exactly this command through for this task for 24h.", newRule.ID)
+					} else {
+						msg += " (No allow rule: " + derr.Error() + "; the re-run waits for the Board again.)"
+					}
+				}
+			}
+			if _, err := tx.Exec(`INSERT INTO task_comments (task_id, author, message) VALUES (?, 'board', ?)`, cur.TaskID, msg); err != nil {
+				return nil, nil, nil, &decideError{http.StatusInternalServerError, "task comment write failed"}
+			}
+		}
 	}
 	if ruleDraft != nil {
 		if newRule, err = gates.InsertRule(tx, *ruleDraft); err != nil {
@@ -466,6 +553,9 @@ func (h *SecurityGateHandler) afterDecide(gr *security.GateRequest, rule *gates.
 	})
 	if rule != nil {
 		h.hub.Publish("security_gate_rules", map[string]any{"id": rule.ID, "action": "created"})
+	}
+	if gr.DeferredAt != nil && gr.TaskID != "" && gr.Status == security.GateRequestApproved {
+		orchestrator.GlobalDispatcher.Wake(gr.TaskID, "gate_approved_deferred", "gate_approved:"+gr.ID)
 	}
 	if geminiScope != nil && geminiScope.TaskID != "" {
 		// Wake the held task: an approval starts its run (consumed there),

@@ -482,6 +482,19 @@ var (
 func handleHookPreTool() {
 	raw, _ := io.ReadAll(os.Stdin)
 
+	// Nested agent under a daemon run with the task ID dropped: refuse every
+	// tool call before any other gate can let it through (task-859a5234).
+	if orphanedNestedAgent() {
+		client := trackgate.ClientClaude
+		if req, ok := parsePreToolRequest(raw, hookPreToolFormat, os.Getenv); ok {
+			client = req.Client
+		} else if hookPreToolFormat == "gemini" {
+			client = trackgate.ClientGemini
+		}
+		fmt.Println(preToolDeny(client, nestedAgentReason))
+		return
+	}
+
 	// Pause gate: block before ANY tool call when the run is paused.
 	// This implements step-boundary pause (STA-505): at most the step in
 	// flight when Pause was clicked finishes; subsequent steps are held here
@@ -518,8 +531,14 @@ func handleHookPreTool() {
 		return
 	}
 
-	// Only intercept Bash tool calls for security classification.
+	// Only intercept Bash tool calls for security classification, and, for
+	// a daemon-run agent, file edits (task-9d94997c).
+	taskID := os.Getenv("STAYPOINT_TASK_ID")
 	if !strings.EqualFold(payload.ToolName, "bash") {
+		if taskID != "" && fileEditTools[strings.ToLower(payload.ToolName)] {
+			gateFileEdit(payload.ToolName, payload.ToolInput, payload.SessionID, payload.CWD, taskID)
+			return
+		}
 		preToolAllow()
 		return
 	}
@@ -557,6 +576,12 @@ func handleHookPreTool() {
 	c := &security.Classifier{CWD: cwd, CWDTrusted: cwdTrusted, Snap: snap,
 		ScratchDirs: hookScratchDirs(os.Getenv("STAYPOINT_TASK_ID"))}
 	verdict := c.Classify(bashInput.Command)
+	// A daemon-run agent (STAYPOINT_TASK_ID is in the hook's own env, which
+	// the command cannot change) asks the Board for anything that breaks an
+	// unattended-run Board rule, whatever its tier (task-9d94997c).
+	if taskID != "" {
+		raiseForBoardRules(bashInput.Command, cwd, snap, &verdict)
+	}
 
 	if pinned := pinJudged(bashInput.Command, &verdict); pinned != "" {
 		preToolAllowPinned(payload.ToolInput, pinned)
@@ -627,7 +652,7 @@ func handleHookPreTool() {
 			preToolBlock(fmt.Sprintf("Board denied: %s", strings.Join(verdict.Reasons, "; ")))
 			return
 		case "deferred":
-			preToolBlock(fmt.Sprintf("deferred: Board will review later. This delete outside the task worktree was not approved in time, so it was skipped and NOT run (gate %s). Continue with other work; do not retry it. A follow-up run can redo it once the Board approves.", gr.ID))
+			preToolBlock(deferredMessage(gr.ID))
 			return
 		case "":
 			// daemon unreachable mid-poll — fail-closed
@@ -635,6 +660,146 @@ func handleHookPreTool() {
 			return
 		default:
 			// still pending — loop
+		}
+	}
+}
+
+// deferredMessage is what the agent is told when a held request's deadline
+// passes: it was skipped, and the Board decides it later.
+func deferredMessage(id string) string {
+	return fmt.Sprintf("deferred: held for the Board's morning review, skipped and NOT run (gate %s). Continue with other work; do not retry it or work around it. If the Board approves, you will be told on the task thread to perform it.", id)
+}
+
+// raiseForBoardRules raises v to Red when cmd, or a script it runs, breaks a
+// Board rule. Scripts are read through snap, as on the Red path.
+func raiseForBoardRules(cmd, cwd string, snap *security.Snapshotter, v *security.Verdict) {
+	var hashes []security.ScriptHash
+	for _, r := range security.ScriptRefs(cmd, cwd, snap, 0) {
+		hashes = append(hashes, security.ScriptHash{Path: r.Path, Content: string(r.Full)})
+	}
+	if why := security.AnalyzeBoardRules(cmd, hashes); why != "" {
+		v.Tier = security.Red
+		v.Reasons = append(v.Reasons, "board rule: "+why)
+	}
+}
+
+// fileEditDaemonConn is resolveDaemonConn; tests point it at a fake daemon.
+var fileEditDaemonConn = resolveDaemonConn
+
+// fileEditTools are the Claude Code tools that write files.
+var fileEditTools = map[string]bool{"write": true, "edit": true, "multiedit": true, "notebookedit": true}
+
+// fileEditHold reports why a daemon-run agent's edit of path must wait for
+// the Board: a self-protected path, or a file outside the task's worktree
+// (cwd) and scratch dirs. "" means it may proceed.
+func fileEditHold(path, cwd, home string, scratch []string) string {
+	if path == "" {
+		return "file edit without a path"
+	}
+	if !filepath.IsAbs(path) && !strings.HasPrefix(path, "~/") && cwd == "" {
+		return "relative file path with no working directory"
+	}
+	path = resolveEditPath(path, cwd, home)
+	if why := security.SelfProtectedPath(path); why != "" {
+		return why
+	}
+	inside := func(dir string) bool {
+		if dir == "" {
+			return false
+		}
+		dir = resolveBestEffort(filepath.Clean(dir))
+		return path == dir || strings.HasPrefix(path, dir+string(filepath.Separator))
+	}
+	if inside(cwd) {
+		return ""
+	}
+	for _, d := range scratch {
+		if inside(d) {
+			return ""
+		}
+	}
+	return "edits a file outside the task worktree: " + path
+}
+
+// resolveEditPath makes an edit target absolute (~ and cwd), clean and
+// symlink-resolved where it exists.
+func resolveEditPath(path, cwd, home string) string {
+	if strings.HasPrefix(path, "~/") && home != "" {
+		path = filepath.Join(home, path[2:])
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(cwd, path)
+	}
+	return resolveBestEffort(filepath.Clean(path))
+}
+
+// resolveBestEffort follows symlinks in the longest existing prefix of p.
+func resolveBestEffort(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	dir, base := filepath.Split(p)
+	dir = filepath.Clean(dir)
+	if dir == p || dir == "." || dir == "/" {
+		return p
+	}
+	return filepath.Join(resolveBestEffort(dir), base)
+}
+
+// gateFileEdit holds a daemon-run agent's file edit for the Board exactly
+// like a held Bash command when fileEditHold says so.
+func gateFileEdit(tool string, toolInput json.RawMessage, sessionID, cwd, taskID string) {
+	var in struct {
+		FilePath     string `json:"file_path"`
+		NotebookPath string `json:"notebook_path"`
+	}
+	_ = json.Unmarshal(toolInput, &in)
+	path := in.FilePath
+	if path == "" {
+		path = in.NotebookPath
+	}
+	home, _ := os.UserHomeDir()
+	why := fileEditHold(path, cwd, home, hookScratchDirs(taskID))
+	if why == "" {
+		preToolAllow()
+		return
+	}
+	if cfg != nil && !cfg.Gates.MainMergeApprovalEnabled() {
+		preToolAllow()
+		return
+	}
+	reasons := []string{why}
+	daemonURL, token := fileEditDaemonConn()
+	if daemonURL == "" {
+		preToolBlock(fmt.Sprintf("Board gate unreachable; edit blocked (%s)", why))
+		return
+	}
+	gr := createGateRequest(daemonURL, token, gateRequestBody{
+		Cmdline: fmt.Sprintf("%s %s", tool, resolveEditPath(path, cwd, home)), Reasons: reasons, RunID: sessionID, TaskID: taskID, CWD: cwd,
+	})
+	if gr == nil {
+		preToolBlock(fmt.Sprintf("could not register gate request; edit blocked (%s)", why))
+		return
+	}
+	if gr.Status == "approved" {
+		preToolAllow()
+		return
+	}
+	for {
+		status, _ := pollGateRequest(daemonURL, token, gr.ID)
+		switch status {
+		case "approved":
+			preToolAllow()
+			return
+		case "denied":
+			preToolBlock(fmt.Sprintf("Board denied: %s", why))
+			return
+		case "deferred":
+			preToolBlock(deferredMessage(gr.ID))
+			return
+		case "":
+			preToolBlock(fmt.Sprintf("Board gate unreachable during poll; edit blocked (%s)", why))
+			return
 		}
 	}
 }
