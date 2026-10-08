@@ -1550,48 +1550,6 @@ func AddWorkProduct(db *sql.DB, taskID, productType, reference string) error {
 	return err
 }
 
-// GetWorkProducts returns all work products associated with a specific task ID.
-func GetWorkProducts(db *sql.DB, taskID string) ([]TaskWorkProduct, error) {
-	task, err := GetTask(db, taskID)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := db.Query(`SELECT id, task_id, product_type, reference, created_at FROM task_work_products WHERE task_id = ? ORDER BY created_at ASC`, task.ID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var products []TaskWorkProduct
-	for rows.Next() {
-		var p TaskWorkProduct
-		if err := rows.Scan(&p.ID, &p.TaskID, &p.ProductType, &p.Reference, &p.CreatedAt); err != nil {
-			return nil, err
-		}
-		products = append(products, p)
-	}
-	return products, rows.Err()
-}
-
-// GetAllWorkProducts returns all work products across all tasks, ordered by created_at DESC.
-func GetAllWorkProducts(db *sql.DB) ([]TaskWorkProduct, error) {
-	rows, err := db.Query(`SELECT id, task_id, product_type, reference, created_at FROM task_work_products ORDER BY created_at DESC`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var products []TaskWorkProduct
-	for rows.Next() {
-		var p TaskWorkProduct
-		if err := rows.Scan(&p.ID, &p.TaskID, &p.ProductType, &p.Reference, &p.CreatedAt); err != nil {
-			return nil, err
-		}
-		products = append(products, p)
-	}
-	return products, rows.Err()
-}
-
 func LogActivity(db *sql.DB, taskID, eventType, details string) error {
 	_, err := db.Exec(`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, ?, ?)`, taskID, eventType, details)
 	return err

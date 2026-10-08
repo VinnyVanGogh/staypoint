@@ -216,6 +216,8 @@ func generateWorkHTML(data WorkReportData) (string, error) {
             <div style="font-size: 9.5px; color: #64748b;">{{.ActualSpend}}</div>
           </div>
         </li>
+        {{else}}
+        <li class="project-item"><div class="project-impact">No audited deliverables recorded for this period.</div></li>
         {{end}}
       </ul>
       <div style="margin-top: 10px; font-size: 10.5px; color: #64748b;">

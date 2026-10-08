@@ -185,36 +185,8 @@ func FetchTelemetryWithRange(cfg *config.Config, rangeOpts DateRangeOptions) (
 		HasEngineerName:             strings.TrimSpace(cfg.EngineerName) != "",
 		DirectCostMultiplier:        "14.4x net return on upgrade",
 		DBPath:                      cfg.DBPath,
-		Deliverables: []DeliverableItem{
-			{
-				Name:        "Partner Center Analytics API",
-				Impact:      "FastAPI microservices, OAuth PKCE flow, sync daemon",
-				Value:       "$1,140 value",
-				ActualSpend: "$0.00 ($0 marginal)",
-				WorkProduct: "PR #12 (merged)",
-			},
-			{
-				Name:        "VPS HR Automation Architecture",
-				Impact:      "Onboarding automation, systems config validation",
-				Value:       "$985 value",
-				ActualSpend: "$0.00 ($0 marginal)",
-				WorkProduct: "PR #14 (merged)",
-			},
-			{
-				Name:        "GitHub Repo Server & CI/CD Tooling",
-				Impact:      "Production pipeline fixes, automated test harnesses",
-				Value:       "$460 value",
-				ActualSpend: "$0.00 ($0 marginal)",
-				WorkProduct: "PR #16 (merged)",
-			},
-			{
-				Name:        "Exchange & Enterprise Mail Router",
-				Impact:      "Routing logic, security filters, payload parsing",
-				Value:       "$296 value",
-				ActualSpend: "$0.00 ($0 marginal)",
-				WorkProduct: "PR #18 (merged)",
-			},
-		},
+		// Deliverables come only from audited tasks and their recorded work
+		// products (queryStaypointTasks); with none, the report shows none.
 	}
 
 	if cfg.HourlyRate > 0 {

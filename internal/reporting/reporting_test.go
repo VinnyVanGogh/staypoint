@@ -1116,3 +1116,31 @@ func TestBossCardDualModeLedgerAndWorkProducts(t *testing.T) {
 	}
 }
 
+// With no audited tasks the Boss Card lists no deliverables: it must never
+// fall back to placeholder projects or PR numbers.
+func TestBossCardNoTasksShowsNoDeliverables(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.DBPath = filepath.Join(tempDir, "missing-staypoint.db")
+	cfg.TelemetryDBPath = filepath.Join(tempDir, "missing-telemetry.db")
+
+	work, _, _, _, err := FetchTelemetryWithRange(cfg, DateRangeOptions{})
+	if err != nil {
+		t.Fatalf("FetchTelemetryWithRange failed: %v", err)
+	}
+	if len(work.Deliverables) != 0 {
+		t.Fatalf("expected no deliverables without tasks, got %+v", work.Deliverables)
+	}
+	html, err := generateWorkHTML(work)
+	if err != nil {
+		t.Fatalf("generateWorkHTML failed: %v", err)
+	}
+	if !strings.Contains(html, "No audited deliverables recorded") {
+		t.Errorf("HTML should say no deliverables were recorded")
+	}
+	for _, fake := range []string{"PR #12", "Partner Center Analytics API"} {
+		if strings.Contains(html, fake) {
+			t.Errorf("HTML contains placeholder deliverable %q", fake)
+		}
+	}
+}
