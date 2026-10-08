@@ -490,7 +490,7 @@ func handleHookPreTool() {
 	// flight when Pause was clicked finishes; subsequent steps are held here
 	// until Resume is clicked (or Stop cancels the turn).
 	if taskID := os.Getenv("STAYPOINT_TASK_ID"); taskID != "" {
-		daemonURL, token := resolveDaemonConn()
+		daemonURL, token := gateDaemonConn()
 		if daemonURL != "" {
 			waitForStepResume(daemonURL, token, taskID)
 		}
@@ -591,7 +591,7 @@ func handleHookPreTool() {
 	}
 
 	// Red-tier command: post to daemon for Board approval.
-	daemonURL, token := resolveDaemonConn()
+	daemonURL, token := gateDaemonConn()
 	if daemonURL == "" {
 		// Fail-closed: daemon unreachable, cannot get Board decision.
 		preToolBlock(fmt.Sprintf("Board gate unreachable; command blocked (%s)", strings.Join(verdict.Reasons, "; ")))
@@ -673,8 +673,9 @@ func raiseForBoardRules(cmd, cwd string, snap *security.Snapshotter, v *security
 	}
 }
 
-// fileEditDaemonConn is resolveDaemonConn; tests point it at a fake daemon.
-var fileEditDaemonConn = resolveDaemonConn
+// gateDaemonConn is resolveDaemonConn for the PreToolUse gates (pause, Red
+// Bash, file edit); tests point it at a fake or test daemon.
+var gateDaemonConn = resolveDaemonConn
 
 // fileEditTools are the Claude Code tools that write files.
 var fileEditTools = map[string]bool{"write": true, "edit": true, "multiedit": true, "notebookedit": true}
@@ -759,7 +760,7 @@ func gateFileEdit(tool string, toolInput json.RawMessage, sessionID, cwd, taskID
 		return
 	}
 	reasons := []string{why}
-	daemonURL, token := fileEditDaemonConn()
+	daemonURL, token := gateDaemonConn()
 	if daemonURL == "" {
 		preToolBlock(fmt.Sprintf("Board gate unreachable; edit blocked (%s)", why))
 		return
