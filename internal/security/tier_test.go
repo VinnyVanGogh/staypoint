@@ -225,18 +225,22 @@ func TestPushPolicy(t *testing.T) {
 		want   Tier
 		desc   string
 	}{
-		// policy "never" (default) — all git push is Red regardless of refspec
+		// policy "never" (explicit Board choice) — all git push is Red regardless of refspec
 		{"never", "git push origin feature-branch", Red, "never: task branch push is Red"},
 		{"never", "git push -u origin staypoint/task-abc", Red, "never: -u push is Red"},
 		{"never", "git push", Red, "never: bare push is Red"},
-		// empty policy defaults to "never"
-		{"", "git push origin feature-branch", Red, "empty defaults to never: task branch push is Red"},
-		{"", "git push", Red, "empty defaults to never: bare push is Red"},
+		{"never", "git push origin dev-server", Red, "never: dev-server push is Red"},
+		// empty Classifier.PushPolicy means no policy was resolved (not "no
+		// row": the resolver maps no row to branch_only), so it fails closed
+		{"", "git push origin feature-branch", Red, "unresolved is never: task branch push is Red"},
+		{"", "git push", Red, "unresolved is never: bare push is Red"},
+		{"bogus", "git push origin feature-branch", Red, "unknown value is never"},
 		// policy "branch_only" — non-main push is Yellow; main push stays Red
 		{"branch_only", "git push origin feature-branch", Yellow, "branch_only: task branch push is Yellow"},
 		{"branch_only", "git push -u origin staypoint/task-xyz", Yellow, "branch_only: -u push is Yellow"},
 		{"branch_only", "git push origin main", Red, "branch_only: main push is still Red"},
 		{"branch_only", "git push --force", Red, "branch_only: force push is still Red"},
+		{"branch_only", "git push origin dev-server", Yellow, "branch_only: dev-server push is Yellow"},
 		// policy "pr" — same as branch_only for push tier
 		{"pr", "git push origin feature-branch", Yellow, "pr: task branch push is Yellow"},
 		{"pr", "git push origin main", Red, "pr: main push is still Red"},
@@ -283,7 +287,7 @@ func TestPushPolicyFor(t *testing.T) {
 		{allowed, "git push origin HEAD:refs/heads/main", Red, "refspec to main stays Red"},
 		{allowed, "git push --force origin feature", Red, "force stays Red under branch_only"},
 		{denied, "git push origin feature", Red, "never repo"},
-		{t.TempDir(), "git push origin feature", Red, "unconfigured repo"},
+		{t.TempDir(), "git push origin feature", Red, "resolver returns no policy"},
 		// Allowed: the configured repo pushing a task branch.
 		{allowed, "git push origin feature", Yellow, "branch_only repo, task branch"},
 		{denied, "git -C " + allowed + " push origin feature", Yellow, "-C into a branch_only repo"},

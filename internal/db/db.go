@@ -1541,10 +1541,12 @@ var Migrations = []Migration{
 		Version: 45,
 		Name:    "project_push_policy",
 		Up: func(conn *sql.DB) error {
-			// STA-562: per-project push policy. Default 'never': agents must
-			// not push task branches without Board approval.
+			// STA-562: per-project push policy. Default 'branch_only': agents
+			// may push feature branches (and dev-server); main/master stays
+			// Red under every policy. 'never' applies only when the Board
+			// stores it (Board decision 2026-10-08).
 			_, err := conn.Exec(
-				`ALTER TABLE project_dev_configs ADD COLUMN push_policy TEXT NOT NULL DEFAULT 'never'
+				`ALTER TABLE project_dev_configs ADD COLUMN push_policy TEXT NOT NULL DEFAULT 'branch_only'
 				 CHECK (push_policy IN ('never','branch_only','pr'));`,
 			)
 			if err != nil && !strings.Contains(err.Error(), "duplicate column name") {

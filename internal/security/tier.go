@@ -110,9 +110,12 @@ type Classifier struct {
 	// ScratchDirs are where an agent's throwaway files live: the run's scratch
 	// dir and the system temp dirs. Nil means DefaultScratchDirs().
 	ScratchDirs []string
-	// PushPolicy is the per-project push restriction. When "never", all
-	// git push operations are classified Red regardless of refspec. Default ""
-	// is treated as "never" so new projects are safe by default.
+	// PushPolicy is the per-project push restriction, used when PushPolicyFor
+	// is nil. When "never", all git push operations are classified Red
+	// regardless of refspec. "" means no policy was resolved for this
+	// Classifier (not "no row": the resolver maps no row to "branch_only"), so
+	// it is treated as "never". Pushes to main/master are Red under every
+	// policy.
 	PushPolicy string
 	// PushPolicyFor, when set, resolves the push policy of the repo a push
 	// runs in (after -C and cd), replacing PushPolicy. A push whose repo
@@ -500,8 +503,9 @@ func (c *Classifier) classifyGit(args []string, v *Verdict) {
 		}
 		v.raise(Yellow, "")
 	case "push":
-		// Per-project push policy (STA-562): "never" (default) means agents
-		// must not push. Anything but a known permissive policy is "never".
+		// Per-project push policy (STA-562): "never" means agents must not
+		// push. Anything but a known permissive policy is "never". The
+		// main/master and force/delete checks below apply under every policy.
 		if c.pushPolicyAt(effectiveDir) == "never" {
 			v.raise(Red, "git push denied: project push_policy is 'never'; the Board pushes after Ship Review")
 			return

@@ -841,8 +841,10 @@ type hookScript struct {
 // in. A task worktree resolves to its main checkout through the git common
 // dir, which is where project_dev_configs rows are keyed. The database is
 // opened read-only, so a hook built from another version never migrates the
-// daemon's schema. It fails closed: a relative dir, no repo, no database, a
-// missing column or no row all return "never".
+// daemon's schema. A repo with no row (or no explicit choice) is
+// "branch_only", per the Board decision of 2026-10-08. It fails closed: a
+// relative dir, no repo, no configured or openable database, a lookup error
+// (including a missing column) or an unknown value all return "never".
 func hookPushPolicy(dir string) string {
 	never := string(shipreview.PushPolicyNever)
 	if dir == "" || !filepath.IsAbs(dir) || cfg == nil || cfg.DBPath == "" {

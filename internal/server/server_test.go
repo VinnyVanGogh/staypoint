@@ -1676,8 +1676,16 @@ func TestUpsertDevConfig_PushPolicy(t *testing.T) {
 			t.Errorf("push_policy %s: want 400, got %d", bad, code)
 		}
 	}
-	if code, got := put(`{"repo_path":"/tmp/pp-repo","dev_command":"make dev"}`); code != http.StatusOK || got["push_policy"] != "never" {
-		t.Errorf("new row default: code %d push_policy %v, want 200 never", code, got["push_policy"])
+	// No explicit choice is branch_only (Board decision 2026-10-08).
+	if code, got := put(`{"repo_path":"/tmp/pp-repo","dev_command":"make dev"}`); code != http.StatusOK || got["push_policy"] != "branch_only" {
+		t.Errorf("new row default: code %d push_policy %v, want 200 branch_only", code, got["push_policy"])
+	}
+	// An explicit never survives a PUT that omits push_policy.
+	if code, got := put(`{"repo_path":"/tmp/pp-repo","push_policy":"never"}`); code != http.StatusOK || got["push_policy"] != "never" {
+		t.Errorf("set never: code %d push_policy %v", code, got["push_policy"])
+	}
+	if code, got := put(`{"repo_path":"/tmp/pp-repo","dev_command":"make dev2"}`); code != http.StatusOK || got["push_policy"] != "never" {
+		t.Errorf("partial PUT kept never: code %d push_policy %v, want never", code, got["push_policy"])
 	}
 	if code, got := put(`{"repo_path":"/tmp/pp-repo","push_policy":"branch_only"}`); code != http.StatusOK || got["push_policy"] != "branch_only" {
 		t.Errorf("set branch_only: code %d push_policy %v", code, got["push_policy"])

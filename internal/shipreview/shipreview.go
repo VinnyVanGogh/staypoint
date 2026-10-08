@@ -1505,9 +1505,14 @@ func runShellStep(ctx context.Context, step, workDir string) error {
 }
 
 // PushPolicy controls whether agents may push task branches to the remote.
-// never      – git push is a Red-tier action requiring Board approval (default for new projects).
-// branch_only – agents may push the task branch but not open PRs.
+// Pushes to main/master are Red under every policy.
+// branch_only – agents may push feature branches (and dev-server) but not open
+//               PRs. The default: a repo with no row, or a row with no stored
+//               choice, is branch_only (Board decision 2026-10-08).
 // pr          – agents may push and open a pull request.
+// never       – every git push is a Red-tier action requiring Board approval.
+//               Applies only when the Board stores it explicitly, or when the
+//               policy cannot be resolved (fail closed).
 type PushPolicy string
 
 const (
@@ -1550,7 +1555,7 @@ type ProjectDevConfig struct {
 	// BuildAndStartCard never auto-starts it.
 	LiveCredentials bool `json:"live_credentials"`
 	// PushPolicy controls whether agents may push task branches (STA-562).
-	// Defaults to "never".
+	// Defaults to "branch_only"; "never" only when the Board stores it.
 	PushPolicy PushPolicy `json:"push_policy"`
 }
 
@@ -1633,7 +1638,7 @@ const devConfigColumns = `repo_path, dev_command, dev_url, setup_steps_json,
 	COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
 	COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0),
 	COALESCE(merge_mode,''), COALESCE(gh_config_dir,''), COALESCE(live_credentials,0),
-	COALESCE(target_branch,''), COALESCE(push_policy,'never')`
+	COALESCE(target_branch,''), COALESCE(push_policy,'')`
 
 func scanDevConfig(rows *sql.Rows) (*ProjectDevConfig, error) {
 	var c ProjectDevConfig
@@ -1908,7 +1913,7 @@ func lookupDevConfig(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, unveri
 			return c, unverified, nil
 		}
 	}
-	return &ProjectDevConfig{RepoPath: repoPath, PushPolicy: PushPolicyNever}, unverified, nil
+	return &ProjectDevConfig{RepoPath: repoPath, PushPolicy: PushPolicyBranchOnly}, unverified, nil
 }
 
 // loadDevConfigs reads every dev config row. It returns before any stat runs,
@@ -1944,23 +1949,27 @@ func ValidPushPolicy(p string) bool {
 	return false
 }
 
-// normalizePushPolicy maps anything but a known permissive policy to
-// PushPolicyNever, so an empty, misspelled or future value fails closed.
+// normalizePushPolicy maps an empty value (no explicit choice) to
+// PushPolicyBranchOnly and passes the known policies through. A misspelled or
+// future value fails closed to PushPolicyNever.
 func normalizePushPolicy(p PushPolicy) PushPolicy {
 	switch p {
-	case PushPolicyBranchOnly, PushPolicyPR:
+	case "":
+		return PushPolicyBranchOnly
+	case PushPolicyNever, PushPolicyBranchOnly, PushPolicyPR:
 		return p
 	}
 	return PushPolicyNever
 }
 
 // GetProjectPushPolicy returns the push policy for a repo path, matching rows
-// by directory like GetProjectDevConfig (STA-767). It fails closed: no row, a
-// lookup error, or a path that cannot be verified against a live project all
-// return PushPolicyNever.
+// by directory like GetProjectDevConfig (STA-767). No explicit policy (no row,
+// no database, an empty path, an empty stored value) is PushPolicyBranchOnly.
+// It fails closed to PushPolicyNever on a lookup error, a path that cannot be
+// verified against a live project, or an unknown stored value.
 func GetProjectPushPolicy(db *sql.DB, repoPath string) PushPolicy {
 	if db == nil || repoPath == "" {
-		return PushPolicyNever
+		return PushPolicyBranchOnly
 	}
 	cfg, unverified, err := lookupDevConfig(db, repoPath)
 	if err != nil || unverified || cfg == nil {

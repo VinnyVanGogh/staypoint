@@ -1130,7 +1130,9 @@ type taskBrief struct {
 	PlainDir bool
 	// Handoff is the daemon-stored handoff from the parent task (STA-820).
 	Handoff string
-	// PushPolicy is the project's push_policy (STA-562); "" means never.
+	// PushPolicy is the project's push_policy (STA-562), resolved by
+	// GetProjectPushPolicy (no row is branch_only). "" means it was never
+	// resolved (a zero-value brief) and is shown as never.
 	PushPolicy shipreview.PushPolicy
 }
 
