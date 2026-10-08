@@ -973,6 +973,31 @@ func (h *TasksHandler) SetRepo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, task)
 }
 
+// SetProject handles PUT /api/tasks/{id}/project {"project": "Web UI"}.
+// "" clears it. Grouping only: it does not change updated_at.
+func (h *TasksHandler) SetProject(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Project string `json:"project"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	task, err := context.SetTaskProject(h.db, r.PathValue("id"), req.Project)
+	if err != nil {
+		switch {
+		case isNotFound(err):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, context.ErrInvalidProject):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, task)
+}
+
 // repoIsWork classifies a task repo for the Gemini rules. An empty path is
 // the daemon's working directory, as task creation defaults it. Unreadable
 // classification counts as work (fail closed).
