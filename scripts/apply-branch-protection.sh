@@ -45,7 +45,19 @@ REQUIRED_CHECKS=(
 
 want_json=$(printf '%s\n' "${REQUIRED_CHECKS[@]}" | jq -R . | jq -s -c 'sort')
 
-current=$(gh api "repos/$REPO/branches/$BRANCH/protection" 2>/dev/null || echo '{}')
+# Only "not protected" reads as no settings. Any other failed read aborts: a
+# PUT built from '{}' would silently drop the settings the read missed.
+errf=$(mktemp)
+trap 'rm -f "$errf"' EXIT
+if ! current=$(gh api "repos/$REPO/branches/$BRANCH/protection" 2>"$errf"); then
+	if grep -q 'Branch not protected' "$errf"; then
+		current='{}'
+	else
+		echo "could not read $REPO $BRANCH protection:" >&2
+		cat "$errf" >&2
+		exit 2
+	fi
+fi
 have_json=$(jq -c '[.required_status_checks.checks[]?.context] | sort' <<<"$current")
 
 if [ "$mode" = "--check" ]; then
@@ -89,4 +101,4 @@ if jq -e '.restrictions' <<<"$current" >/dev/null 2>&1; then
 	exit 1
 fi
 gh api -X PUT "repos/$REPO/branches/$BRANCH/protection" --input - <<<"$body" >/dev/null
-exec "$0" --check
+"$0" --check
