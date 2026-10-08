@@ -71,4 +71,20 @@ test.describe('interaction cards', () => {
     await expect(card.getByRole('button', { name: 'Accept only', exact: true })).toBeVisible();
     await expect(card.getByRole('button', { name: 'Reject', exact: true })).toBeVisible();
   });
+
+  // A card on a task the page offers no Run Now for (here cancelled) gets no
+  // Accept & resume: answering it must not start a run Run Now would not.
+  test('a closed task offers Accept only, not Accept & resume', async ({ page, api }) => {
+    const task = await api.createTask('Interaction closed task');
+    await api.createInteraction(task.id, 'request_confirmation', { prompt: 'Decide on a closed task?' });
+    await api.setStage(task.id, 'cancelled');
+
+    await gotoTaskPage(page, task);
+    await expect(page.locator('#task-page-content .run-now-btn')).toHaveCount(0);
+    const card = page.locator('#task-page-tabpanel-decisions .interaction-card', { hasText: 'Decide on a closed task?' });
+    await expect(card).toBeVisible();
+    await expect(card.getByRole('button', { name: 'Accept only', exact: true })).toBeVisible();
+    await expect(card.getByRole('button', { name: 'Reject', exact: true })).toBeVisible();
+    await expect(card.getByRole('button', { name: 'Accept & resume', exact: true })).toHaveCount(0);
+  });
 });

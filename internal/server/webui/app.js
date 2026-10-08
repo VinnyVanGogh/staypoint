@@ -414,6 +414,31 @@ async function boardActionError(r) {
   return new Error(boardActionErrorText(r, body));
 }
 
+// postRunNow is the Run Now request: POST stage in_progress, retried with
+// Touch ID when the server asks for it (a prod-targeting agent task leaving
+// backlog). Returns null when the Board cancelled the passkey prompt, else
+// the Response; throws the server's error when it refused.
+async function postRunNow(taskId) {
+  const send = (sessionToken, assertion) => {
+    const headers = { 'Content-Type': 'application/json', ...authHeader() };
+    if (sessionToken) headers['X-WebAuthn-Session'] = sessionToken;
+    if (assertion) headers['X-WebAuthn-Assertion'] = assertion;
+    return fetch(`/api/tasks/${encodeURIComponent(taskId)}/stage`, {
+      method: 'POST', headers, body: JSON.stringify({ stage: 'in_progress' }),
+    });
+  };
+  let res = await send('', '');
+  if (res.status === 403) {
+    const err = await res.clone().json().catch(() => ({}));
+    if (err.error === 'board_passkey_assertion_required') {
+      res = await withBoardWebAuthn(send, 'running this prod-targeting task');
+      if (res === null) return null;
+    }
+  }
+  if (!res.ok) throw await boardActionError(res);
+  return res;
+}
+
 // Close any open .report-dl-menu when clicking outside its wrapper.
 document.addEventListener('click', () => {
   document.querySelectorAll('.report-dl-menu').forEach(m => { m.hidden = true; });
@@ -10463,6 +10488,21 @@ async function renderMigrationsPanel(container, taskId) {
 // in_review, done…) answering defaults to recording the answer only.
 const DECISION_RESUME_STAGES = ['todo', 'in_progress', 'blocked', 'paused'];
 
+// A ship review card in pending/sent_back/approved/rejected state blocks Run
+// Now and Mark done: starting a new run on finished work or closing without
+// merging both confuse the review flow.
+const SHIP_CARD_ACTIVE_STATUSES = new Set(['pending', 'sent_back', 'approved', 'rejected']);
+const RUN_NOW_STATUSES = new Set(['active', 'todo', 'backlog', 'blocked', 'in_review']);
+
+function shipCardBlocksRun(shipCard) {
+  return !!(shipCard && SHIP_CARD_ACTIVE_STATUSES.has(shipCard.status));
+}
+
+// runNowOffered reports whether the task page shows Run Now for task.
+function runNowOffered(task, shipCard) {
+  return !!(task && task.id && RUN_NOW_STATUSES.has(task.status) && !shipCardBlocksRun(shipCard));
+}
+
 function decisionResumesByDefault(task) {
   return DECISION_RESUME_STAGES.includes(String((task && task.execution_stage) || '').toLowerCase());
 }
@@ -10472,7 +10512,10 @@ function decisionResumesByDefault(task) {
 // only sends resume:false, so the task stays where it is. Accept & resume on
 // a task that is not waiting mid-run records the answer, then presses Run Now
 // so Run Now's Board, hold and backlog gates apply (task-e3fe2c0b).
-function renderInteractionCards(container, task, interactions) {
+// opts.canRunNow says whether the page offers Run Now (no active ship review
+// card, a runnable status); a parked task where it does not gets no Accept &
+// resume, so a card answer never starts a run the Run Now button would not.
+function renderInteractionCards(container, task, interactions, opts = {}) {
   const taskId = (task && task.id) || '';
   const pending = (interactions || []).filter(i => i.status === 'pending');
   if (!pending.length) {
@@ -10480,13 +10523,17 @@ function renderInteractionCards(container, task, interactions) {
     return 0;
   }
   const resumeDefault = decisionResumesByDefault(task);
+  const offerResume = resumeDefault || !!opts.canRunNow;
 
   const section = el('div', 'task-page-section');
   section.id = 'interaction-cards-section';
   section.appendChild(el('div', 'task-page-section-title', `Waiting on you (${pending.length})`));
+  const stageName = task.execution_stage || 'not running';
   section.appendChild(el('p', 'panel-field-muted decision-stage-hint', resumeDefault
     ? 'The agent is waiting on this. Accept & resume lets it continue.'
-    : `This task is ${task.execution_stage || 'not running'}. Accept only records your answer and leaves it there; Accept & resume also starts a run.`));
+    : offerResume
+      ? `This task is ${stageName}. Accept only records your answer and leaves it there; Accept & resume also starts a run.`
+      : `This task is ${stageName}. Accept only records your answer and leaves it there.`));
 
   for (const interaction of pending) {
     const kind = interaction.interaction_kind || '';
@@ -10549,6 +10596,11 @@ function renderInteractionCards(container, task, interactions) {
     const actions = el('div', 'interaction-card-actions');
 
     const allBtns = () => [resumeBtn, acceptOnlyBtn, rejectBtn];
+    const showError = (text) => {
+      const prev = header.querySelector('.interaction-resolve-error');
+      if (prev) prev.remove();
+      header.appendChild(el('span', 'interaction-resolve-error', text));
+    };
     const resolveInteraction = async (status, resume) => {
       allBtns().forEach(b => { b.disabled = true; });
       try {
@@ -10565,20 +10617,27 @@ function renderInteractionCards(container, task, interactions) {
           // is answered quietly and, when asked, started by Run Now below.
           body: JSON.stringify({ status, resume: resume && resumeDefault, ...(response !== undefined ? { response } : {}) })
         });
-        if (resume && !resumeDefault) {
-          await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/stage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ stage: 'in_progress' })
-          });
-        }
-        card.classList.add('resolved');
-        const label = status !== 'accepted' ? '✗ Rejected' : (resume ? '✓ Accepted · resumed' : '✓ Accepted · answer only');
-        header.appendChild(el('span', `interaction-resolved-badge status-${status}`, label));
       } catch (err) {
         allBtns().forEach(b => { b.disabled = false; });
-        header.appendChild(el('span', 'interaction-resolve-error', `Failed: ${(err && err.message) || err}`));
+        showError(`Failed: ${(err && err.message) || err}`);
+        return;
       }
+      // The answer is recorded from here on: the card is resolved whatever
+      // Run Now does, and its buttons stay off (a second resolve would fail).
+      card.classList.add('resolved');
+      let resumed = resume;
+      if (resume && !resumeDefault) {
+        try {
+          // Run Now itself, with its Touch ID retry for prod-targeting tasks.
+          resumed = (await postRunNow(taskId)) !== null;
+          if (!resumed) showError('Answer recorded; Run Now was cancelled.');
+        } catch (err) {
+          resumed = false;
+          showError(`Answer recorded; Run Now failed: ${(err && err.message) || err}`);
+        }
+      }
+      const label = status !== 'accepted' ? '✗ Rejected' : (resumed ? '✓ Accepted · resumed' : '✓ Accepted · answer only');
+      header.appendChild(el('span', `interaction-resolved-badge status-${status}`, label));
     };
 
     const resumeBtn = el('button', 'interaction-accept-btn', 'Accept & resume');
@@ -10600,7 +10659,8 @@ function renderInteractionCards(container, task, interactions) {
     rejectBtn.addEventListener('click', () => resolveInteraction('rejected', resumeDefault));
 
     actions.appendChild(resumeDefault ? resumeBtn : acceptOnlyBtn);
-    actions.appendChild(resumeDefault ? acceptOnlyBtn : resumeBtn);
+    if (resumeDefault) actions.appendChild(acceptOnlyBtn);
+    else if (offerResume) actions.appendChild(resumeBtn);
     actions.appendChild(rejectBtn);
     card.appendChild(actions);
     section.appendChild(card);
@@ -10992,7 +11052,8 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
 
   // Decision cards (pending ask_user_questions / request_confirmation /
   // suggest_tasks) live on the Decisions tab (task-e3fe2c0b).
-  setTabCount('decisions', renderInteractionCards(tabPanels.decisions, task, interactions || []));
+  setTabCount('decisions', renderInteractionCards(tabPanels.decisions, task, interactions || [],
+    { canRunNow: runNowOffered(task, shipCard) }));
 
   layout.appendChild(main);
 
@@ -11187,39 +11248,19 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   }
   appendTaskRelations(meta, task, openTask);
 
-  // A ship review card in pending/sent_back/approved/rejected state blocks
-  // Run Now and Mark done — starting a new run on finished work or closing
-  // without merging both confuse the review flow.
-  const activeCardStatuses = new Set(['pending', 'sent_back', 'approved', 'rejected']);
-  const hasActiveCard = !!(shipCard && activeCardStatuses.has(shipCard.status));
+  // An active ship review card blocks Run Now and Mark done (shipCardBlocksRun).
+  const hasActiveCard = shipCardBlocksRun(shipCard);
 
   // ── Run Now button ──
-  const runableStatuses = new Set(['active', 'todo', 'backlog', 'blocked', 'in_review']);
-  if (task.id && runableStatuses.has(task.status) && !hasActiveCard) {
+  if (runNowOffered(task, shipCard)) {
     const runBtn = el('button', 'run-now-btn', '▶ Run Now');
     runBtn.type = 'button';
     runBtn.addEventListener('click', async () => {
       runBtn.disabled = true;
       runBtn.textContent = 'Starting…';
       try {
-        const send = (sessionToken, assertion) => {
-          const headers = { 'Content-Type': 'application/json', ...authHeader() };
-          if (sessionToken) headers['X-WebAuthn-Session'] = sessionToken;
-          if (assertion) headers['X-WebAuthn-Assertion'] = assertion;
-          return fetch(`/api/tasks/${encodeURIComponent(task.id)}/stage`, {
-            method: 'POST', headers, body: JSON.stringify({ stage: 'in_progress' }),
-          });
-        };
-        let res = await send('', '');
-        // A prod-targeting agent task needs Touch ID to leave backlog.
-        if (res.status === 403) {
-          const err = await res.clone().json().catch(() => ({}));
-          if (err.error === 'board_passkey_assertion_required') {
-            res = await withBoardWebAuthn(send, 'running this prod-targeting task');
-            if (res === null) { runBtn.disabled = false; runBtn.textContent = '▶ Run Now'; return; }
-          }
-        }
-        if (!res.ok) throw await boardActionError(res);
+        const res = await postRunNow(task.id);
+        if (res === null) { runBtn.disabled = false; runBtn.textContent = '▶ Run Now'; return; }
         runBtn.textContent = '✓ Started';
         setTimeout(reopen, 800);
       } catch (err) {
@@ -11230,7 +11271,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
       }
     });
     headerActions.prepend(runBtn);
-  } else if (task.id && runableStatuses.has(task.status) && shipCard && ['pending', 'sent_back'].includes(shipCard.status)) {
+  } else if (task.id && RUN_NOW_STATUSES.has(task.status) && shipCard && ['pending', 'sent_back'].includes(shipCard.status)) {
     const reviewLink = el('a', 'ship-review-see-card-link', '↓ See review card');
     reviewLink.href = '#';
     reviewLink.style.cssText = 'display:block;margin-top:8px;font-size:0.85rem;';
