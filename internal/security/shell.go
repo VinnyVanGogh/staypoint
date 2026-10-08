@@ -15,8 +15,6 @@ type redirect struct {
 	heredoc bool
 	quoted  bool
 	body    string
-	// bodyStart, bodyEnd: rune offsets of body within the parsed line.
-	bodyStart, bodyEnd int
 	// fd is the explicit file descriptor before the operator ("2" in 2>), "".
 	fd string
 	// dyn is true when target contains an unquoted (or double-quoted)
@@ -367,14 +365,12 @@ func readHeredocs(rs []rune, start int, docs []*redirect) (int, error) {
 	for _, r := range docs {
 		var body strings.Builder
 		found := false
-		r.bodyStart = j
 		for j <= len(rs) {
 			k := j
 			for k < len(rs) && rs[k] != '\n' {
 				k++
 			}
 			line := string(rs[j:k])
-			lineStart := j
 			j = k + 1
 			cmp := line
 			if r.op == "<<-" {
@@ -382,7 +378,6 @@ func readHeredocs(rs []rune, start int, docs []*redirect) (int, error) {
 			}
 			if cmp == r.target {
 				found = true
-				r.bodyEnd = lineStart
 				break
 			}
 			body.WriteString(line)

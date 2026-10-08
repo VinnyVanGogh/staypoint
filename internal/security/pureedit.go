@@ -39,9 +39,21 @@ import (
 
 var pythonInterpRe = regexp.MustCompile(`^python(3(\.\d+)?)?$`)
 
-// pureEditHeredoc reports whether s is a pure-edit Python heredoc run from
-// cwd. With cwd "" the on-disk link checks are skipped.
+// pureEditAutoAllow is the one switch for relaxing pure-edit heredocs.
+// Auto-allow disabled by the Board 2026-10-08 until the typed-tools MCP
+// replaces it (task-3b4575f7); every inline script is held.
+const pureEditAutoAllow = false
+
+// pureEditHeredoc reports whether the classifier and trust check may relax s
+// as a pure edit. It is always false while pureEditAutoAllow is off.
 func pureEditHeredoc(s segment, cwd string) bool {
+	return pureEditAutoAllow && pureEditHeredocShape(s, cwd)
+}
+
+// pureEditHeredocShape reports whether s is a pure-edit Python heredoc run
+// from cwd. With cwd "" the on-disk link checks are skipped. It only
+// analyses; whether anything is relaxed is pureEditHeredoc's call.
+func pureEditHeredocShape(s segment, cwd string) bool {
 	if len(s.argv) == 0 || len(stripPrefixes(s.argv)) != len(s.argv) {
 		return false
 	}
@@ -350,80 +362,6 @@ func isIdentRune(r rune) bool {
 	return r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
 }
 
-// dataHeredocToRelative reports whether s is `cat`/`tee` writing one quoted
-// heredoc into relative, non-protected files (`cat > f <<'EOF'`,
-// `cat >> f <<'EOF'`, `tee f <<'EOF'`): the body is file content, not code.
-func dataHeredocToRelative(s segment) bool {
-	if len(s.argv) == 0 || (s.argv[0] != "cat" && s.argv[0] != "tee") || s.piped {
-		return false
-	}
-	var targets []string
-	docs := 0
-	for _, r := range s.redirects {
-		switch {
-		case r.heredoc:
-			if !r.quoted {
-				return false
-			}
-			docs++
-		case r.op == ">" || r.op == ">>":
-			if r.dyn || r.meta {
-				return false
-			}
-			targets = append(targets, r.target)
-		default:
-			return false
-		}
-	}
-	for i, a := range s.argv[1:] {
-		if s.argv[0] == "cat" || strings.HasPrefix(a, "-") || (i+1 < len(s.dyn) && s.dyn[i+1]) {
-			if s.argv[0] == "cat" || a != "-a" {
-				return false
-			}
-			continue
-		}
-		targets = append(targets, a)
-	}
-	if docs != 1 || len(targets) == 0 {
-		return false
-	}
-	for _, t := range targets {
-		if !safeRelPath(t, "") {
-			return false
-		}
-	}
-	return true
-}
-
-// stripPureEditBodies returns line with the bodies of pure-edit Python and
-// data heredocs removed, for the text-based Board-rule backstop. Only each
-// heredoc's own span is cut; a line that does not parse, or whose spans do
-// not match their bodies, is returned unchanged.
-func stripPureEditBodies(line string) string {
-	segs, _, err := parseShell(line)
-	if err != nil {
-		return line
-	}
-	rs := []rune(line)
-	var spans [][2]int
-	for _, s := range segs {
-		if !pureEditHeredoc(s, "") && !dataHeredocToRelative(s) {
-			continue
-		}
-		for _, r := range s.redirects {
-			if !r.heredoc {
-				continue
-			}
-			if r.bodyStart < 0 || r.bodyEnd > len(rs) || r.bodyStart > r.bodyEnd || string(rs[r.bodyStart:r.bodyEnd]) != r.body {
-				return line
-			}
-			spans = append(spans, [2]int{r.bodyStart, r.bodyEnd})
-		}
-	}
-	// Spans come in line order; cut from the end so earlier offsets hold.
-	for i := len(spans) - 1; i >= 0; i-- {
-		a, b := spans[i][0], spans[i][1]
-		rs = append(append([]rune{}, rs[:a]...), rs[b:]...)
-	}
-	return string(rs)
-}
+// No heredoc body (Python or cat/tee data) is stripped before the Board-rule
+// text check: with auto-allow off nothing is relaxed, so stripping could only
+// hide text from the Board rules. AnalyzeBoardRules sees the full command.

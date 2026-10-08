@@ -107,9 +107,7 @@ func SelfProtectedPath(path string) string {
 // AnalyzeBoardRules returns why line (or a script it runs) breaks a Board
 // rule for unattended runs, or "" when it does not.
 func AnalyzeBoardRules(line string, scripts []ScriptHash) string {
-	// Source text inside a pure-edit Python heredoc is data being written,
-	// not commands being run (task-31dea40b).
-	if why := boardRuleText(stripPureEditBodies(line), "command"); why != "" {
+	if why := boardRuleText(line, "command"); why != "" {
 		return why
 	}
 	for _, s := range scripts {

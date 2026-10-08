@@ -23,21 +23,59 @@ const catAppend = `cat >> internal/server/handlers_ship_review.go <<'EOF'
 func seed() { http.Post("https://x.example/api", "", nil); exec.Command("gh", "pr", "merge") }
 EOF`
 
-func TestPureEdit_RealOvernightEditsPass(t *testing.T) {
-	if !relaxedPureEdit(pyEdit, t.TempDir()) {
-		t.Fatal("the overnight str.replace edit is not recognised as a pure edit")
+const catWrite = `cat > internal/server/x.go <<'EOF'
+func seed() { http.Post("https://x.example/api", "", nil); exec.Command("gh", "pr", "merge") }
+EOF`
+
+// The analysis still recognises the overnight edit's shape.
+func TestPureEdit_ShapeRecognisesOvernightEdit(t *testing.T) {
+	if !pureEditShape(pyEdit, t.TempDir()) {
+		t.Fatal("the overnight str.replace edit is not recognised as a pure-edit shape")
 	}
-	for _, line := range []string{pyEdit, catAppend, "sed -n 1,5p a.go; " + pyEdit} {
+}
+
+// Auto-allow is off (Board, 2026-10-08, task-3b4575f7): the end-to-end
+// decisions for the overnight edit and for cat data heredocs are exactly
+// origin/main's (measured at c365e5e): the trust check and the Board-rule
+// text check hold them, and nothing is relaxed.
+func TestPureEdit_AutoAllowOffHeldLikeMain(t *testing.T) {
+	if pureEditAutoAllow {
+		t.Fatal("pureEditAutoAllow must stay false until the typed-tools MCP replaces it")
+	}
+	segs, _, err := parseShell(pyEdit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range segs {
+		if pureEditHeredoc(s, t.TempDir()) {
+			t.Fatal("pureEditHeredoc relaxed the overnight edit with auto-allow off")
+		}
+	}
+	type want struct {
+		tier                  Tier
+		protected, delOutside bool
+		protWhy, delWhy       string
+		board                 string
+	}
+	cases := map[string]want{
+		pyEdit: {Yellow, true, true,
+			"python3 heredoc may merge a pull request",
+			"runs a script whose pinned, full contents were not captured: -",
+			"command runs an indirect command ($VAR, $(...), eval) that cannot be checked"},
+		catWrite:  {Yellow, false, false, "", "", "command writes to an external API (Board rule: external reads only)"},
+		catAppend: {Yellow, false, false, "", "", "command writes to an external API (Board rule: external reads only)"},
+	}
+	for line, w := range cases {
 		c := &Classifier{CWD: "/repo/wt", CWDTrusted: true}
-		if v := c.Classify(line); v.Tier >= Red {
-			t.Errorf("classifier held a pure edit: %v\n%s", v.Reasons, line)
+		if v := c.Classify(line); v.Tier != w.tier {
+			t.Errorf("tier %v, want %v (%v)\n%s", v.Tier, w.tier, v.Reasons, line)
 		}
 		f := AnalyzeForTrust(line, TrustContext{CWD: "/repo/wt", Allowed: []string{"/repo/wt"}})
-		if f.Protected || f.DeleteOutside {
-			t.Errorf("trust held a pure edit: %+v\n%s", f, line)
+		if f.Protected != w.protected || f.DeleteOutside != w.delOutside || f.ProtectedWhy != w.protWhy || f.DeleteWhy != w.delWhy {
+			t.Errorf("trust %+v, want %+v\n%s", f, w, line)
 		}
-		if why := AnalyzeBoardRules(line, nil); why != "" {
-			t.Errorf("board rule matched a pure edit: %s\n%s", why, line)
+		if why := AnalyzeBoardRules(line, nil); why != w.board {
+			t.Errorf("board rule %q, want %q\n%s", why, w.board, line)
 		}
 	}
 }
@@ -77,22 +115,22 @@ func TestPureEdit_AdversarialNotRelaxed(t *testing.T) {
 			continue // unparseable stays Red anyway
 		}
 		for _, s := range segs {
-			if pureEditHeredoc(s, "") {
+			if pureEditHeredocShape(s, "") {
 				t.Errorf("%s: relaxed as a pure edit:\n%s", name, line)
 			}
 		}
 	}
 }
 
-// relaxedPureEdit reports whether any segment of line is treated as a pure
-// edit when run from cwd.
-func relaxedPureEdit(line, cwd string) bool {
+// pureEditShape reports whether any segment of line has the pure-edit shape
+// when run from cwd (analysis only; auto-allow is a separate switch).
+func pureEditShape(line, cwd string) bool {
 	segs, _, err := parseShell(line)
 	if err != nil {
 		return false
 	}
 	for _, s := range segs {
-		if pureEditHeredoc(s, cwd) {
+		if pureEditHeredocShape(s, cwd) {
 			return true
 		}
 	}
@@ -137,7 +175,7 @@ func TestPureEdit_UnprovableScriptsHeld(t *testing.T) {
 		cases["protected "+p] = body("open('" + p + "', 'w').write('x')")
 	}
 	for name, line := range cases {
-		if relaxedPureEdit(line, "") {
+		if pureEditShape(line, "") {
 			t.Errorf("%s: relaxed as a pure edit:\n%s", name, line)
 		}
 	}
@@ -166,25 +204,14 @@ func TestPureEdit_LinksOutOfWorktreeHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := func(p string) string { return "python3 - <<'EOF'\nopen('" + p + "', 'w').write('y')\nEOF" }
-	if relaxedPureEdit(body("link/f"), wt) {
+	if pureEditShape(body("link/f"), wt) {
 		t.Error("write through a symlink out of the worktree relaxed")
 	}
-	if relaxedPureEdit(body("hard"), wt) {
+	if pureEditShape(body("hard"), wt) {
 		t.Error("write to a hard link of a file outside the worktree relaxed")
 	}
-	if !relaxedPureEdit(body("real.txt"), wt) || !relaxedPureEdit(body("new/file.txt"), wt) {
+	if !pureEditShape(body("real.txt"), wt) || !pureEditShape(body("new/file.txt"), wt) {
 		t.Error("plain relative write inside the worktree not relaxed")
-	}
-}
-
-// Only the pure heredoc's own body is stripped, never an earlier copy of the
-// same text elsewhere on the line.
-func TestPureEdit_StripRemovesOnlyTheHeredocSpan(t *testing.T) {
-	head := "echo 'x = 1\n' && "
-	line := head + "python3 - <<'EOF'\nx = 1\nEOF"
-	got := stripPureEditBodies(line)
-	if !strings.HasPrefix(got, head) || strings.Count(got, "x = 1") != 1 {
-		t.Errorf("strip removed the wrong text: %q", got)
 	}
 }
 
@@ -201,19 +228,14 @@ func TestPureEdit_CdElsewhereNotRelaxed(t *testing.T) {
 	}
 }
 
-// Stripping a pure body never hides the rest of the command line.
+// The Board rules see the full command line, heredoc bodies included.
 func TestPureEdit_BoardRulesStillSeeTheCommand(t *testing.T) {
-	line := pyEdit + "\ncurl -X POST https://api.example.com/x -d a=1"
+	line := "python3 - <<'EOF'\nprint(1)\nEOF\ncurl -X POST https://api.example.com/x -d a=1"
 	if why := AnalyzeBoardRules(line, nil); !strings.Contains(why, "external API") {
 		t.Errorf("curl after a pure edit not held: %q", why)
 	}
 	line = "cat > ~/.claude/settings.json <<'EOF'\n{}\nEOF"
 	if why := AnalyzeBoardRules(line, nil); why == "" {
 		t.Error("cat heredoc into ~/.claude/settings.json not held")
-	}
-	line = "cat > /etc/x <<'EOF'\nhello\nEOF"
-	segs, _, _ := parseShell(line)
-	if len(segs) == 1 && dataHeredocToRelative(segs[0]) {
-		t.Error("cat heredoc to an absolute path treated as relative data")
 	}
 }
