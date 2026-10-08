@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	gctx "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
@@ -349,6 +350,12 @@ func (h *GovernanceHandler) Transition(w http.ResponseWriter, r *http.Request) {
 	}
 
 	from := task.ExecutionStage
+	// Agent-created tasks leave a parked stage only through the Board's
+	// stage endpoint (POST /api/tasks/{id}/stage), which runs the Board gate.
+	if gctx.RequiresBoardToLeave(task, strings.ToLower(strings.TrimSpace(req.To))) {
+		writeBoardError(w, "board_session_required", "forbidden: "+task.ID+" was created by an agent; only the Board can move it out of "+from)
+		return
+	}
 	if err := governance.ExecuteTransition(h.db, task.ID, from, req.To, req.ActorID); err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return

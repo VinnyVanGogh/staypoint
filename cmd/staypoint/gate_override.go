@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
 	"github.com/VinnyVanGogh/staypoint/internal/trackgate"
 	"github.com/mattn/go-isatty"
@@ -117,6 +118,26 @@ var agentContextEnv = []string{
 	"GEMINI_CLI",             // Gemini CLI
 	"ANTIGRAVITY_LS_ADDRESS", // agy
 	"ANTIGRAVITY_CSRF_TOKEN", // agy
+}
+
+// inAgentContext reports whether any agentContextEnv variable is set.
+func inAgentContext(getenv func(string) string) bool {
+	for _, k := range agentContextEnv {
+		if strings.TrimSpace(getenv(k)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// cliTaskOrigin is the origin of a task the CLI creates: agent inside an
+// agent session (the task starts in backlog and only the Board starts it),
+// native otherwise.
+func cliTaskOrigin(getenv func(string) string) string {
+	if inAgentContext(getenv) {
+		return meshContext.OriginAgent
+	}
+	return meshContext.OriginNative
 }
 
 // refuseOverrideInAgentContext is the first, soft layer: an agent cannot

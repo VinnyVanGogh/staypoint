@@ -413,8 +413,10 @@ func runTaskCreate(cmd *cobra.Command, args []string) error {
 			// STA-861: --session means an interactive session tracks this
 			// task: park it in backlog (never claimed) and attach.
 			sessionFlag, _ := cmd.Flags().GetString("session")
+			// --backlog parks the local task too; without it the create-time
+			// assignment wake started a run the Board never asked for.
 			stage := ""
-			if strings.TrimSpace(sessionFlag) != "" {
+			if strings.TrimSpace(sessionFlag) != "" || genResult.Task.Status == "backlog" {
 				stage = governance.StageBacklog
 			}
 			created, createErr := meshContext.CreateTaskWithOptions(store.DB(), meshContext.TaskCreateOptions{
@@ -430,6 +432,7 @@ func runTaskCreate(cmd *cobra.Command, args []string) error {
 				Provider:       choice.Provider,
 				ModelOverride:  choice.Model,
 				ExecutionStage: stage,
+				Origin:         cliTaskOrigin(os.Getenv),
 			})
 			if createErr == nil && stage != "" {
 				if session, client, _, err := attachFlags(cmd); err == nil {

@@ -288,6 +288,10 @@ body.has-passkey-banner { --passkey-banner-h: 40px; }
 .org-card-title { display: flex; justify-content: space-between; align-items: center; }
 .org-name { font-size: 14px; font-weight: 600; }
 .org-prefix { font-size: 11px; color: var(--muted); font-family: monospace; }
+.org-held-badge { margin-left: 8px; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; letter-spacing: 0.05em; color: #fca5a5; background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.45); }
+.org-hold-row { display: flex; justify-content: flex-end; margin-top: 6px; }
+.org-hold-btn { font-size: 11px; padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border, #444); background: transparent; color: var(--muted); cursor: pointer; }
+.org-hold-btn-lift { color: #fca5a5; border-color: rgba(239,68,68,0.45); }
 .org-stats-grid {
   display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
   background: var(--surface); padding: 8px 10px; border-radius: 6px; text-align: center;

@@ -32,6 +32,9 @@ var (
 	// cancelled, rejected). Run Now moves a backlog task to todo first.
 	ErrNotRunnable    = errors.New("Can't start run: this task is not runnable in its current stage (backlog, stopped, done or cancelled). Move it to todo or press Run Now first.")
 	ErrConcurrencyCap = errors.New("Can't start run: the maximum number of parallel runs (max_concurrent_runs) is already active.")
+	// ErrOrgHeld: the task's organization is on a Board hold; nothing in it
+	// is claimed until the Board lifts the hold.
+	ErrOrgHeld = errors.New("Can't start run: this task's organization is on hold. The Board lifts the hold in Settings (Touch ID).")
 )
 
 // taskCompleteMarker is the canonical signal an adapter emits on completion.
@@ -246,7 +249,8 @@ const closedStageGuard = " AND execution_stage NOT IN ('done', 'cancelled')"
 // RunSlots re-dispatches it when a slot frees. Across restarts, RecoveryScan clears stale checkout_run_id values so
 // the DB guard (checkout_run_id IS NULL) unblocks on the next wake.
 // Parked (backlog) and closed (done, cancelled, rejected) tasks are never
-// claimed; see governance.IsRunnableStage.
+// claimed; see governance.IsRunnableStage. Neither is a task whose
+// organization is on a Board hold (ErrOrgHeld).
 func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) error {
 	slots := h.slots()
 	if err := slots.Acquire(taskID, h.SlotKeyForTask(ctx, taskID)); err != nil {
@@ -257,7 +261,8 @@ func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) erro
 	res, err := h.DB.ExecContext(ctx,
 		`UPDATE tasks
 		    SET execution_stage='in_progress', checkout_run_id=?, checkout_agent_id=?, updated_at=?
-		  WHERE id=? AND checkout_run_id IS NULL AND execution_stage NOT IN (`+governance.NonRunnableStagesSQL()+`)`,
+		  WHERE id=? AND checkout_run_id IS NULL AND execution_stage NOT IN (`+governance.NonRunnableStagesSQL()+`)
+		    AND `+governance.OrgNotHeldSQL("tasks"),
 		runID, agentID, now, taskID,
 	)
 	if err != nil {
@@ -274,6 +279,9 @@ func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) erro
 		}
 		if !governance.IsRunnableStage(stage) {
 			return ErrNotRunnable
+		}
+		if held, _ := governance.TaskOrgHeld(h.DB, taskID); held {
+			return ErrOrgHeld
 		}
 		return ErrAlreadyClaimed
 	}

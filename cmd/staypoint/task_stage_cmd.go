@@ -1,12 +1,16 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
+	"os"
 	"strings"
 
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
+	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
@@ -31,12 +35,43 @@ blocked is set with 'staypoint task block' because it needs a reason.`,
 			return fmt.Errorf("open db: %w", err)
 		}
 		defer store.Close()
-		if err := meshContext.SetTaskExecutionStageWithOptions(store.DB(), args[0], stage, meshContext.DoneOptions{BoardOverride: override}); err != nil {
+		tty := isatty.IsTerminal(os.Stdin.Fd()) && isatty.IsTerminal(os.Stdout.Fd())
+		boardStage, err := cliBoardStage(store.DB(), args[0], stage, os.Getenv, tty)
+		if err != nil {
+			return err
+		}
+		if err := meshContext.SetTaskExecutionStageWithOptions(store.DB(), args[0], stage, meshContext.DoneOptions{BoardOverride: override, BoardStage: boardStage}); err != nil {
 			return err
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "Task %s moved to %s\n", args[0], stage)
 		return nil
 	},
+}
+
+// cliBoardStage decides whether this CLI stage change counts as the Board's.
+// Only moving an agent-created task out of a parked stage needs it: that is
+// refused inside an agent session or without a terminal, and refused outright
+// for a prod-targeting task, which needs Touch ID in the Board UI.
+func cliBoardStage(conn *sql.DB, taskID, stage string, getenv func(string) string, tty bool) (bool, error) {
+	task, err := meshContext.GetTask(conn, taskID)
+	if err != nil {
+		return false, err
+	}
+	if !meshContext.RequiresBoardToLeave(task, stage) {
+		return false, nil
+	}
+	if err := refuseBoardOnlyInAgentContext("moving an agent-created task out of "+task.ExecutionStage, getenv, tty); err != nil {
+		return false, err
+	}
+	if meshContext.NameTargetsProd(task.Name) {
+		return false, fmt.Errorf("%s targets prod: moving it out of %s needs Touch ID; use Run Now or the stage menu in the Board UI", task.ID, task.ExecutionStage)
+	}
+	if task.RepoPath != "" {
+		if _, gated, err := shipreview.LiveGateConfig(conn, task.RepoPath); err != nil || gated {
+			return false, fmt.Errorf("%s targets a live_credentials (prod) repo: moving it out of %s needs Touch ID; use the Board UI", task.ID, task.ExecutionStage)
+		}
+	}
+	return true, nil
 }
 
 // filterTaskList applies the task list flags: legacy tasks and archived

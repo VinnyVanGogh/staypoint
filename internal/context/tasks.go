@@ -51,8 +51,9 @@ type Task struct {
 	// Valid values: "coding" (default), "review", "architecture", "planning", "qa", "docs".
 	WorkKind        string            `json:"work_kind"`
 	// Origin is where the task came from: native (created in StayPoint),
-	// paperclip_import (staypoint import paperclip) or legacy (existed before
-	// origins were tracked). Boards and lists hide legacy by default.
+	// paperclip_import (staypoint import paperclip), legacy (existed before
+	// origins were tracked) or agent (created by an agent; starts in backlog
+	// and only the Board moves it out). Boards and lists hide legacy by default.
 	Origin string `json:"origin"`
 	// Priority is low, medium (default), high or critical.
 	Priority string `json:"priority,omitempty"`
@@ -229,6 +230,12 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 	}
 	if !IsValidOrigin(origin) {
 		return nil, fmt.Errorf("%w %q", ErrInvalidOrigin, origin)
+	}
+	// An agent-created task always starts parked in backlog, whatever stage
+	// the agent asked for; only the Board moves it out (see
+	// RequiresBoardToLeave). A runnable stage here would wake it at once.
+	if origin == OriginAgent {
+		stage = governance.StageBacklog
 	}
 	priority := NormalizeTaskPriority(opts.Priority)
 	if !IsValidTaskProvider(opts.Provider) {
@@ -1115,6 +1122,10 @@ func commentWakes(db *sql.DB, taskID string) bool {
 	if !governance.IsRunnableStage(stage) {
 		return false
 	}
+	// A held organization's tasks never wake; the refusal is logged as held.
+	if orchestrator.WakeHeld(db, taskID, "comment") {
+		return false
+	}
 	// A stop is pending while the stopped run still holds the checkout; once
 	// it exits the stage is stopped (not runnable).
 	var stop int
@@ -1196,7 +1207,7 @@ func BlockTaskWithBlockers(db *sql.DB, taskID, reason string, blockers []Blocker
 		return err
 	}
 
-	query := `UPDATE tasks SET is_blocked = 1, block_reason = ?, execution_stage = 'blocked', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`
+	query := `UPDATE tasks SET is_blocked = 1, block_reason = ?, execution_stage = `+blockedStageSQL()+`, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`
 	if _, err := tx.Exec(query, cleanReason, task.ID); err != nil {
 		tx.Rollback()
 		return err
@@ -1307,7 +1318,7 @@ func AddTaskBlocker(db *sql.DB, taskID, blockerID, rationale string) error {
 	}
 	if _, err := tx.Exec(`
 		UPDATE tasks
-		SET is_blocked = 1, block_reason = ?, execution_stage = 'blocked', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		SET is_blocked = 1, block_reason = ?, execution_stage = `+blockedStageSQL()+`, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 		WHERE id = ?
 	`, reason, task.ID); err != nil {
 		tx.Rollback()
@@ -1613,6 +1624,9 @@ func SetTaskExecutionStageWithOptions(db *sql.DB, taskID, stage string, opts Don
 		if err := checkOpenChildren(db, task.ID); err != nil {
 			return err
 		}
+	}
+	if RequiresBoardToLeave(task, stage) && !opts.BoardStage {
+		return fmt.Errorf("%w: %s was created by an agent and is %s; only the Board can move it to %s", ErrBoardRequired, task.ID, task.ExecutionStage, stage)
 	}
 	if strings.TrimSpace(task.RepoPath) == "" && governance.IsRunnableStage(stage) {
 		return fmt.Errorf("%w: set one with 'staypoint task set-repo %s <path>' first", ErrNoRepo, task.ID)

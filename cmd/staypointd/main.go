@@ -356,6 +356,12 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 		h.WM = wmOverride[0]
 	}
 	orchestrator.GlobalDispatcher.OnWake = func(taskID, reason string) {
+		// Org hold: refuse (and log as held) before any run work. Claim
+		// refuses it too, so a wake that slips past here still cannot run.
+		if orchestrator.WakeHeld(dbStore.DB(), taskID, reason) {
+			orchestrator.GlobalRunSlots.Dequeue(taskID)
+			return
+		}
 		var agentID string
 		if err := dbStore.DB().QueryRowContext(context.Background(),
 			"SELECT COALESCE(assignee_agent_id,'') FROM tasks WHERE id=?", taskID,
@@ -506,6 +512,11 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 				// parallel slots this no longer hits the global cap first; it must
 				// stay quiet and not post an error state over the live run.
 				slog.Info("run refused: task already running", slog.String("task", taskID))
+				return
+			}
+			if errors.Is(runErr, orchestrator.ErrOrgHeld) {
+				slog.Info("run refused: organization on hold", slog.String("task", taskID))
+				orchestrator.GlobalRunSlots.Dequeue(taskID)
 				return
 			}
 			if errors.Is(runErr, orchestrator.ErrNotRunnable) {

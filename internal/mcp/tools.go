@@ -150,7 +150,7 @@ func (s *Server) getToolsList() []Tool {
 					},
 					"origin": {
 						Type:        "string",
-						Description: "Only tasks with this origin: native, paperclip_import, legacy",
+						Description: "Only tasks with this origin: native, paperclip_import, legacy, agent",
 					},
 				},
 			},
@@ -474,7 +474,7 @@ func (s *Server) handleTaskList(ctx context.Context, rawArgs json.RawMessage) *T
 	}
 	args.Origin = strings.TrimSpace(args.Origin)
 	if args.Origin != "" && !meshContext.IsValidOrigin(args.Origin) {
-		return toolError("origin must be one of native, paperclip_import, legacy")
+		return toolError("origin must be one of native, paperclip_import, legacy, agent")
 	}
 
 	dbConn, err := s.getDB()
@@ -594,6 +594,9 @@ func (s *Server) handleWake(ctx context.Context, rawArgs json.RawMessage) *ToolC
 	if dbConn, err := s.getDB(); err == nil {
 		if task, err := meshContext.GetTask(dbConn, args.TaskID); err == nil && !governance.IsRunnableStage(task.ExecutionStage) {
 			return toolError(fmt.Sprintf("task %s is %s and cannot be woken; move it to todo first", task.ID, task.ExecutionStage))
+		}
+		if orchestrator.WakeHeld(dbConn, args.TaskID, args.Reason) {
+			return toolError(fmt.Sprintf("task %s is held: its organization is on hold; only the Board can lift it", args.TaskID))
 		}
 	}
 

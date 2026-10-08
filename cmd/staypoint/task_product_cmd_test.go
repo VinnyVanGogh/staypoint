@@ -47,7 +47,7 @@ func TestCreateOrgTask_IsNeverClaimedByDaemon(t *testing.T) {
 	}
 
 	// Board Run Now: backlog -> todo -> in_progress, then the claim succeeds.
-	if err := meshContext.SetTaskExecutionStageWithOptions(conn, taskID, "in_progress", meshContext.DoneOptions{}); err != nil {
+	if err := meshContext.SetTaskExecutionStageWithOptions(conn, taskID, "in_progress", meshContext.DoneOptions{BoardStage: true}); err != nil {
 		t.Fatalf("run now: %v", err)
 	}
 	if err := h.Claim(context.Background(), taskID, "run-2", "agent"); err != nil {

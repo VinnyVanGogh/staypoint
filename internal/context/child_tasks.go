@@ -68,6 +68,12 @@ type ChildTaskOptions struct {
 	MaxTurns     int
 	// BoardOverride lifts the depth cap. Only Board-facing surfaces set it.
 	BoardOverride bool
+	// ExecutionStage is the requested initial stage ("" = todo). It is
+	// honoured: a backlog child is created parked and never woken.
+	ExecutionStage string
+	// Origin defaults to OriginNative. Agent surfaces set OriginAgent, which
+	// always creates the child in backlog.
+	Origin string
 }
 
 // ChildTaskLimits returns (maxChildren, maxDepth) from settings_kv, falling
@@ -134,7 +140,8 @@ func CountOpenChildren(db *sql.DB, taskID string) (int, error) {
 	return n, err
 }
 
-// CreateChildTask creates a todo child of opts.ParentID that inherits the
+// CreateChildTask creates a child of opts.ParentID (todo unless
+// opts.ExecutionStage or an agent origin parks it in backlog) that inherits the
 // parent's repo, branch, role, org and project, and stores the handoff
 // (parent link, plan, parent's latest final message) as the child's
 // "handoff" document.
@@ -183,6 +190,10 @@ func CreateChildTask(db *sql.DB, opts ChildTaskOptions) (*Task, error) {
 		ParentID:     parent.ID,
 		WorkKind:     opts.WorkKind,
 		Description:  opts.Description,
+		// The child is created with its final stage, so a backlog (or agent)
+		// child never fires the create-time assignment wake.
+		ExecutionStage: opts.ExecutionStage,
+		Origin:         opts.Origin,
 	})
 	if err != nil {
 		return nil, err
@@ -245,6 +256,10 @@ type DoneOptions struct {
 	// BoardNote is recorded on the timeline with a BoardDone close as
 	// "Marked done by Board: <note>".
 	BoardNote string
+	// BoardStage is the Board (past its gate) changing the stage. Moving an
+	// agent-created task out of a parked stage into a runnable one requires
+	// it (RequiresBoardToLeave); without it ErrBoardRequired is returned.
+	BoardStage bool
 }
 
 func checkOpenChildren(db *sql.DB, taskID string) error {
