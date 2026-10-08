@@ -1,0 +1,1 @@
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":{"command":"bash /dev/fd/3 3\u003c\u003c'EOF'\necho fixed\nEOF","description":"run fix"}}}

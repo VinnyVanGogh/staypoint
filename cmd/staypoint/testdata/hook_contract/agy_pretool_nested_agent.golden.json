@@ -1,0 +1,1 @@
+{"decision":"deny","reason":"StayPoint: this agent was started inside a StayPoint run without the run's task ID (a nested agent, or STAYPOINT_TASK_ID was dropped). Its tool calls are refused; do the work in the parent run instead."}
