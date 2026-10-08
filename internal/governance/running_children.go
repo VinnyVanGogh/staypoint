@@ -31,13 +31,16 @@ func RunningChildLimit(db *sql.DB) int {
 
 // SiblingsUnderRunLimitSQL is a WHERE fragment true when the tasks row
 // referenced as table (e.g. "tasks") has no parent, or fewer than limit of its
-// siblings are checked out by a run. limit <= 0 disables the check.
+// siblings are running (checked out and in_progress). Requiring in_progress
+// keeps a stale checkout (a run that crashed after its task left
+// in_progress, which RecoveryScan does not clear) from holding the parent
+// busy forever. limit <= 0 disables the check.
 func SiblingsUnderRunLimitSQL(table string, limit int) string {
 	if limit <= 0 {
 		return "1=1"
 	}
 	return `(COALESCE(` + table + `.parent_id, '') = '' OR (SELECT COUNT(*) FROM tasks rs WHERE rs.parent_id = ` + table +
-		`.parent_id AND rs.id != ` + table + `.id AND rs.checkout_run_id IS NOT NULL) < ` + strconv.Itoa(limit) + `)`
+		`.parent_id AND rs.id != ` + table + `.id AND rs.checkout_run_id IS NOT NULL AND rs.execution_stage = 'in_progress') < ` + strconv.Itoa(limit) + `)`
 }
 
 // ParentAtRunLimit reports whether taskID has a parent whose running children
@@ -48,6 +51,7 @@ func ParentAtRunLimit(db *sql.DB, taskID string, limit int) bool {
 	}
 	var n int
 	err := db.QueryRow(`SELECT COUNT(*) FROM tasks t JOIN tasks rs ON rs.parent_id = t.parent_id
-		WHERE t.id = ? AND COALESCE(t.parent_id, '') != '' AND rs.id != t.id AND rs.checkout_run_id IS NOT NULL`, taskID).Scan(&n)
+		WHERE t.id = ? AND COALESCE(t.parent_id, '') != '' AND rs.id != t.id AND rs.checkout_run_id IS NOT NULL
+		  AND rs.execution_stage = 'in_progress'`, taskID).Scan(&n)
 	return err == nil && n >= limit
 }
