@@ -482,6 +482,19 @@ var (
 func handleHookPreTool() {
 	raw, _ := io.ReadAll(os.Stdin)
 
+	// Nested agent under a daemon run with the task ID dropped: refuse every
+	// tool call before any other gate can let it through (task-859a5234).
+	if orphanedNestedAgent() {
+		client := trackgate.ClientClaude
+		if req, ok := parsePreToolRequest(raw, hookPreToolFormat, os.Getenv); ok {
+			client = req.Client
+		} else if hookPreToolFormat == "gemini" {
+			client = trackgate.ClientGemini
+		}
+		fmt.Println(preToolDeny(client, nestedAgentReason))
+		return
+	}
+
 	// Pause gate: block before ANY tool call when the run is paused.
 	// This implements step-boundary pause (STA-505): at most the step in
 	// flight when Pause was clicked finishes; subsequent steps are held here
