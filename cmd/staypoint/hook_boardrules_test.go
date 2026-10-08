@@ -114,7 +114,17 @@ func TestGateFileEdit_CreatesGateRequest(t *testing.T) {
 	out := captureStdout(t, func() {
 		gateFileEdit("Write", json.RawMessage(`{"file_path":"~/.claude/settings.json","content":"x"}`), "sess", wt, "T1")
 	})
-	if got.TaskID != "T1" || !strings.HasPrefix(got.Cmdline, "Write "+filepath.Join(home, ".claude")) || len(got.Reasons) != 1 {
+	// gateFileEdit resolves symlinks (macOS: /var -> /private/var), so
+	// compare against the resolved home as well.
+	resolvedHome := home
+	if r, err := filepath.EvalSymlinks(home); err == nil {
+		resolvedHome = r
+	}
+	wantPrefix := func(c string) bool {
+		return strings.HasPrefix(c, "Write "+filepath.Join(home, ".claude")) ||
+			strings.HasPrefix(c, "Write "+filepath.Join(resolvedHome, ".claude"))
+	}
+	if got.TaskID != "T1" || !wantPrefix(got.Cmdline) || len(got.Reasons) != 1 {
 		t.Fatalf("gate request: %+v", got)
 	}
 	if !strings.Contains(out, "deferred: held for the Board") || !strings.Contains(out, "g1") {
