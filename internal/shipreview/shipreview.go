@@ -1386,6 +1386,37 @@ func deleteRemoteBranchLeased(ctx context.Context, repoDir, branch, tip string) 
 	return err
 }
 
+// PushBranch pushes the task branch to origin. This is a Board-only action:
+// it is called from the Ship Review card after the Board decides to share the
+// branch without merging (e.g. to open a PR externally or trigger a preview).
+//
+// It refuses every name branch cleanup refuses (main, master, dev-server, the
+// remote default branch in any spelling, names reached through another ref)
+// and the card's merge target. It pushes exactly headSHA, the commit the
+// Board reviewed, to refs/heads/<branch>, never force, so a branch that moved
+// since the card was rendered is refused and a remote that diverged rejects
+// the push instead of being overwritten.
+func PushBranch(ctx context.Context, repoDir, branch, targetBranch, headSHA string) error {
+	if err := guardDeletableBranch(ctx, repoDir, branch); err != nil {
+		return err
+	}
+	if targetBranch != "" && protectedName(branch, targetBranch) {
+		return fmt.Errorf("%w: %q is the merge target", ErrProtectedBranch, branch)
+	}
+	if headSHA == "" {
+		return ErrHeadMoved
+	}
+	currentHEAD, err := gitOutput(ctx, repoDir, "rev-parse", "--verify", "refs/heads/"+branch+"^{commit}")
+	if err != nil {
+		return fmt.Errorf("resolve branch HEAD: %w", err)
+	}
+	if currentHEAD != headSHA {
+		return ErrHeadMoved
+	}
+	_, err = gitOutput(ctx, repoDir, "push", "origin", headSHA+":refs/heads/"+branch)
+	return err
+}
+
 // SetBranchCleanup records the outcome of CleanupMergedBranch on the card.
 func SetBranchCleanup(db *sql.DB, cardID string, deleted bool, errMsg string) error {
 	_, err := db.Exec(`
@@ -1473,15 +1504,32 @@ func runShellStep(ctx context.Context, step, workDir string) error {
 	return cmd.Run()
 }
 
+// PushPolicy controls whether agents may push task branches to the remote.
+// Pushes to main/master are Red under every policy.
+// branch_only – agents may push feature branches (and dev-server) but not open
+//               PRs. The default: a repo with no row, or a row with no stored
+//               choice, is branch_only (Board decision 2026-10-08).
+// pr          – agents may push and open a pull request.
+// never       – every git push is a Red-tier action requiring Board approval.
+//               Applies only when the Board stores it explicitly, or when the
+//               policy cannot be resolved (fail closed).
+type PushPolicy string
+
+const (
+	PushPolicyNever      PushPolicy = "never"
+	PushPolicyBranchOnly PushPolicy = "branch_only"
+	PushPolicyPR         PushPolicy = "pr"
+)
+
 // ProjectDevConfig holds per-project dev-server and migration settings.
 type ProjectDevConfig struct {
-	RepoPath        string   `json:"repo_path"`
-	DevCommand      string   `json:"dev_command"`
-	DevURL          string   `json:"dev_url"`
-	SetupSteps      []string `json:"setup_steps"`
+	RepoPath        string     `json:"repo_path"`
+	DevCommand      string     `json:"dev_command"`
+	DevURL          string     `json:"dev_url"`
+	SetupSteps      []string   `json:"setup_steps"`
 	// MigrationGlobs is the list of glob patterns used to detect migration files
 	// in the task's diff. When empty the package-level defaults are used.
-	MigrationGlobs  []string `json:"migration_globs"`
+	MigrationGlobs  []string   `json:"migration_globs"`
 	// SQLEditorURL is the project's SQL editor deep-link (e.g. Supabase dashboard).
 	SQLEditorURL    string   `json:"sql_editor_url"`
 	// SupabaseEnabled enables the built-in Supabase dev env (Docker + local DB).
@@ -1506,6 +1554,31 @@ type ProjectDevConfig struct {
 	// its dev server needs the Board passkey plus an explicit confirm, and
 	// BuildAndStartCard never auto-starts it.
 	LiveCredentials bool `json:"live_credentials"`
+	// PushPolicy controls whether agents may push task branches (STA-562).
+	// Defaults to "branch_only"; "never" only when the Board stores it.
+	PushPolicy PushPolicy `json:"push_policy"`
+}
+
+// BranchRemoteInfo holds the remote-tracking state of a task branch.
+type BranchRemoteInfo struct {
+	// Pushed is true when the branch exists on origin.
+	Pushed bool `json:"pushed"`
+	// RemoteSHA is the SHA at origin/<branch>, empty if not pushed.
+	RemoteSHA string `json:"remote_sha,omitempty"`
+}
+
+// GetBranchRemoteInfo resolves whether the task branch exists on origin.
+func GetBranchRemoteInfo(ctx context.Context, repoDir, branch string) BranchRemoteInfo {
+	out, err := gitOutput(ctx, repoDir, "ls-remote", "--heads", "origin", branch)
+	if err != nil || out == "" {
+		return BranchRemoteInfo{}
+	}
+	// ls-remote output: "<sha>\trefs/heads/<branch>"
+	parts := strings.Fields(out)
+	if len(parts) == 0 {
+		return BranchRemoteInfo{}
+	}
+	return BranchRemoteInfo{Pushed: true, RemoteSHA: parts[0]}
 }
 
 // GetProjectDevConfig loads the dev config for a repo path, or returns defaults.
@@ -1565,18 +1638,19 @@ const devConfigColumns = `repo_path, dev_command, dev_url, setup_steps_json,
 	COALESCE(migration_globs_json,'[]'), COALESCE(sql_editor_url,''),
 	COALESCE(supabase_enabled,0), COALESCE(supabase_keep_up,0),
 	COALESCE(merge_mode,''), COALESCE(gh_config_dir,''), COALESCE(live_credentials,0),
-	COALESCE(target_branch,'')`
+	COALESCE(target_branch,''), COALESCE(push_policy,'')`
 
 func scanDevConfig(rows *sql.Rows) (*ProjectDevConfig, error) {
 	var c ProjectDevConfig
-	var stepsJSON, migGlobsJSON string
+	var stepsJSON, migGlobsJSON, pushPolicy string
 	var supEnabled, supKeepUp, live int
-	if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL, &supEnabled, &supKeepUp, &c.MergeMode, &c.GHConfigDir, &live, &c.TargetBranch); err != nil {
+	if err := rows.Scan(&c.RepoPath, &c.DevCommand, &c.DevURL, &stepsJSON, &migGlobsJSON, &c.SQLEditorURL, &supEnabled, &supKeepUp, &c.MergeMode, &c.GHConfigDir, &live, &c.TargetBranch, &pushPolicy); err != nil {
 		return nil, err
 	}
 	c.SupabaseEnabled = supEnabled != 0
 	c.SupabaseKeepUp = supKeepUp != 0
 	c.LiveCredentials = live != 0
+	c.PushPolicy = normalizePushPolicy(PushPolicy(pushPolicy))
 	if err := json.Unmarshal([]byte(stepsJSON), &c.SetupSteps); err != nil {
 		c.SetupSteps = []string{}
 	}
@@ -1839,7 +1913,7 @@ func lookupDevConfig(db *sql.DB, repoPath string) (cfg *ProjectDevConfig, unveri
 			return c, unverified, nil
 		}
 	}
-	return &ProjectDevConfig{RepoPath: repoPath}, unverified, nil
+	return &ProjectDevConfig{RepoPath: repoPath, PushPolicy: PushPolicyBranchOnly}, unverified, nil
 }
 
 // loadDevConfigs reads every dev config row. It returns before any stat runs,
@@ -1864,6 +1938,44 @@ func loadDevConfigs(db *sql.DB) ([]*ProjectDevConfig, error) {
 // devExecer is satisfied by both *sql.DB and *sql.Tx.
 type devExecer interface {
 	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// ValidPushPolicy reports whether p is a push_policy the Board may store.
+func ValidPushPolicy(p string) bool {
+	switch PushPolicy(p) {
+	case PushPolicyNever, PushPolicyBranchOnly, PushPolicyPR:
+		return true
+	}
+	return false
+}
+
+// normalizePushPolicy maps an empty value (no explicit choice) to
+// PushPolicyBranchOnly and passes the known policies through. A misspelled or
+// future value fails closed to PushPolicyNever.
+func normalizePushPolicy(p PushPolicy) PushPolicy {
+	switch p {
+	case "":
+		return PushPolicyBranchOnly
+	case PushPolicyNever, PushPolicyBranchOnly, PushPolicyPR:
+		return p
+	}
+	return PushPolicyNever
+}
+
+// GetProjectPushPolicy returns the push policy for a repo path, matching rows
+// by directory like GetProjectDevConfig (STA-767). No explicit policy (no row,
+// no database, an empty path, an empty stored value) is PushPolicyBranchOnly.
+// It fails closed to PushPolicyNever on a lookup error, a path that cannot be
+// verified against a live project, or an unknown stored value.
+func GetProjectPushPolicy(db *sql.DB, repoPath string) PushPolicy {
+	if db == nil || repoPath == "" {
+		return PushPolicyBranchOnly
+	}
+	cfg, unverified, err := lookupDevConfig(db, repoPath)
+	if err != nil || unverified || cfg == nil {
+		return PushPolicyNever
+	}
+	return normalizePushPolicy(cfg.PushPolicy)
 }
 
 // UpsertProjectDevConfig saves a project dev config.
@@ -1901,8 +2013,8 @@ func upsertDevConfig(exec devExecer, cfg *ProjectDevConfig) error {
 		INSERT INTO project_dev_configs
 			(repo_path, dev_command, dev_url, setup_steps_json, migration_globs_json,
 			 sql_editor_url, supabase_enabled, supabase_keep_up, merge_mode, gh_config_dir, live_credentials,
-			 target_branch, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			 target_branch, push_policy, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 		ON CONFLICT(repo_path) DO UPDATE SET
 			dev_command          = excluded.dev_command,
 			dev_url              = excluded.dev_url,
@@ -1915,11 +2027,12 @@ func upsertDevConfig(exec devExecer, cfg *ProjectDevConfig) error {
 			gh_config_dir        = excluded.gh_config_dir,
 			live_credentials     = excluded.live_credentials,
 			target_branch        = excluded.target_branch,
+			push_policy          = excluded.push_policy,
 			updated_at           = excluded.updated_at`,
 		cfg.RepoPath, cfg.DevCommand, cfg.DevURL,
 		string(stepsJSON), string(migGlobsJSON), cfg.SQLEditorURL,
 		supabaseEnabled, supabaseKeepUp, cfg.MergeMode, cfg.GHConfigDir, liveCredentials,
-		cfg.TargetBranch,
+		cfg.TargetBranch, string(normalizePushPolicy(cfg.PushPolicy)),
 	)
 	return err
 }

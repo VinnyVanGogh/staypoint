@@ -1130,6 +1130,10 @@ type taskBrief struct {
 	PlainDir bool
 	// Handoff is the daemon-stored handoff from the parent task (STA-820).
 	Handoff string
+	// PushPolicy is the project's push_policy (STA-562), resolved by
+	// GetProjectPushPolicy (no row is branch_only). "" means it was never
+	// resolved (a zero-value brief) and is shown as never.
+	PushPolicy shipreview.PushPolicy
 }
 
 // harnessComment is a non-harness comment visible to the agent.
@@ -1155,6 +1159,7 @@ func fetchTaskBrief(ctx context.Context, db *sql.DB, taskID string) taskBrief {
 	var gateVal string
 	_ = db.QueryRowContext(ctx, `SELECT value FROM settings_kv WHERE key='gates.ship_review'`).Scan(&gateVal)
 	b.ShipReviewGate = gateVal != "false"
+	b.PushPolicy = shipreview.GetProjectPushPolicy(db, b.RepoPath)
 	return b
 }
 
@@ -1243,6 +1248,15 @@ func buildBriefBlock(brief taskBrief, comments []harnessComment, isFirstTurn boo
 		}
 		if brief.GitBranch != "" {
 			b.WriteString("Branch: " + safeField(brief.GitBranch) + "\n")
+		}
+		// Inject push policy so agents know their git push permissions up front.
+		policy := brief.PushPolicy
+		if policy == "" {
+			policy = shipreview.PushPolicyNever
+		}
+		b.WriteString("Push-Policy: " + string(policy) + "\n")
+		if policy == shipreview.PushPolicyNever {
+			b.WriteString("Push-Note: DO NOT run git push. The Board pushes the branch after Ship Review. git push is a Red-tier action and will be blocked by the pre-tool gate.\n")
 		}
 		if brief.Description != "" {
 			b.WriteString("---\nDescription:\n" + safeField(brief.Description) + "\n")

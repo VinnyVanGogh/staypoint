@@ -12,7 +12,7 @@ import (
 
 // boardEndpointRe matches board-only API endpoint path segments that agents must not call.
 var boardEndpointRe = regexp.MustCompile(
-	`/(?:ship-review/(?:approve|send-back|reject|delete-branch)|gate-requests/[^/\s'"]+/decide|settings/(?:security-gate|ship-review))`)
+	`/(?:ship-review/(?:approve|send-back|reject|delete-branch|push-branch)|gate-requests/[^/\s'"]+/decide|settings/(?:security-gate|ship-review))`)
 
 // boardBootstrapRe matches the board-session bootstrap URL pattern (board_nonce or board_token
 // query parameter). An agent fetching this URL (even via GET) would obtain the board cookie.
@@ -110,6 +110,17 @@ type Classifier struct {
 	// ScratchDirs are where an agent's throwaway files live: the run's scratch
 	// dir and the system temp dirs. Nil means DefaultScratchDirs().
 	ScratchDirs []string
+	// PushPolicy is the per-project push restriction, used when PushPolicyFor
+	// is nil. When "never", all git push operations are classified Red
+	// regardless of refspec. "" means no policy was resolved for this
+	// Classifier (not "no row": the resolver maps no row to "branch_only"), so
+	// it is treated as "never". Pushes to main/master are Red under every
+	// policy.
+	PushPolicy string
+	// PushPolicyFor, when set, resolves the push policy of the repo a push
+	// runs in (after -C and cd), replacing PushPolicy. A push whose repo
+	// cannot be modelled (--git-dir, --work-tree, -c) is treated as "never".
+	PushPolicyFor func(dir string) string
 
 	line      *lineCtx // facts about the whole command line being classified
 	baseCWD   string   // CWD before any `cd` in the line
@@ -492,6 +503,13 @@ func (c *Classifier) classifyGit(args []string, v *Verdict) {
 		}
 		v.raise(Yellow, "")
 	case "push":
+		// Per-project push policy (STA-562): "never" means agents must not
+		// push. Anything but a known permissive policy is "never". The
+		// main/master and force/delete checks below apply under every policy.
+		if c.pushPolicyAt(effectiveDir) == "never" {
+			v.raise(Red, "git push denied: project push_policy is 'never'; the Board pushes after Ship Review")
+			return
+		}
 		if has("--force", "--force-with-lease", "--mirror", "--delete", "--prune", "--all", "--tags") || shortFlag('f') || shortFlag('d') {
 			v.raise(Red, "git push rewrites or deletes remote history")
 		}
@@ -562,6 +580,34 @@ func resolveGitWorkDir(base, rel string) string {
 var pushValueFlags = map[string]bool{
 	"-o": true, "--push-option": true,
 	"--receive-pack": true, "--exec": true, "--repo": true,
+}
+
+// pushPolicyAt returns the push policy for a push run in dir: "branch_only"
+// or "pr" when the project allows agent pushes, else "never". With
+// PushPolicyFor set, a dir that cannot be modelled ("") is "never", and when a
+// `cd` earlier in the line may sit in a subshell the original directory's
+// policy must allow the push too.
+func (c *Classifier) pushPolicyAt(dir string) string {
+	norm := func(p string) string {
+		if p == "branch_only" || p == "pr" {
+			return p
+		}
+		return "never"
+	}
+	if c.PushPolicyFor == nil {
+		return norm(c.PushPolicy)
+	}
+	if dir == "" {
+		return "never"
+	}
+	p := norm(c.PushPolicyFor(dir))
+	if p != "never" && c.baseCWD != "" && c.baseCWD != c.CWD {
+		alt := rebaseGitDir(dir, c.CWD, c.baseCWD)
+		if alt == "" || norm(c.PushPolicyFor(alt)) == "never" {
+			return "never"
+		}
+	}
+	return p
 }
 
 // barePushTargetsMain reports whether a bare `git push` (no explicit refspec)
