@@ -505,16 +505,11 @@ func RestoreFile(ctx context.Context, workDir, checkpointID, filePath string) er
 	return err
 }
 
-// FindPreRunCheckpoint returns the ID of the checkpoint created as the pre-run
-// baseline for taskID (message prefix "pre-run <taskID>"). Returns "" when none
-// is found; the caller falls back to "latest" in that case.
-func FindPreRunCheckpoint(ctx context.Context, repoPath, taskID string) (string, error) {
-	id, _, err := FindPreRunCheckpointRef(ctx, repoPath, taskID)
-	return id, err
-}
-
-// FindPreRunCheckpointRef is FindPreRunCheckpoint plus the checkpoint's full
-// ref. Diffing against the ref skips the for-each-ref lookup a bare ID costs.
+// FindPreRunCheckpointRef returns the ID and full ref of the checkpoint
+// created as the pre-run baseline for taskID (message prefix
+// "pre-run <taskID>"). Returns "" when none is found; the caller falls back
+// to "latest" in that case. Diffing against the ref skips the for-each-ref
+// lookup a bare ID costs (STA-775).
 func FindPreRunCheckpointRef(ctx context.Context, repoPath, taskID string) (id, ref string, err error) {
 	cps, err := ListCheckpoints(ctx, repoPath, 0)
 	if err != nil {

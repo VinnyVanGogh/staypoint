@@ -379,16 +379,19 @@ func TestFindPreRunCheckpoint(t *testing.T) {
 		t.Fatalf("CreateCheckpoint turn failed: %v", err)
 	}
 
-	found, err := FindPreRunCheckpoint(ctx, dir, taskID)
+	found, foundRef, err := FindPreRunCheckpointRef(ctx, dir, taskID)
 	if err != nil {
-		t.Fatalf("FindPreRunCheckpoint failed: %v", err)
+		t.Fatalf("FindPreRunCheckpointRef failed: %v", err)
 	}
 	if found != preCP.ID {
-		t.Errorf("FindPreRunCheckpoint returned %q, want %q", found, preCP.ID)
+		t.Errorf("FindPreRunCheckpointRef returned %q, want %q", found, preCP.ID)
+	}
+	if foundRef != preCP.Ref {
+		t.Errorf("FindPreRunCheckpointRef ref = %q, want %q", foundRef, preCP.Ref)
 	}
 
 	// Should not match a different task.
-	notFound, err := FindPreRunCheckpoint(ctx, dir, "task-other")
+	notFound, _, err := FindPreRunCheckpointRef(ctx, dir, "task-other")
 	if err != nil {
 		t.Fatalf("FindPreRunCheckpoint (other task) failed: %v", err)
 	}
