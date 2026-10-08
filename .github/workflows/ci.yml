@@ -90,6 +90,7 @@ jobs:
   test:
     name: Build & Test
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       # PRs run Go 1.25 only, on both OSes: macOS stays because the daemon is
@@ -118,8 +119,12 @@ jobs:
 
       # Runs under a throwaway HOME and fails if a test leaves
       # ~/.staypoint/handoff* or ~/Desktop behind (STA-741).
+      # -timeout 25m: internal/server takes ~2 min locally but, under -race,
+      # brushed go test's 10m default on macos-latest and timed out mid-test
+      # on #252, #254 and #255 (task-e53e4137). The job's own timeout still
+      # bounds a real hang.
       - name: Run Tests (with race detector)
-        run: scripts/check-test-home.sh -v -race ./...
+        run: scripts/check-test-home.sh -v -race -timeout 25m ./...
 
       # repoaccess builds for Windows, tests included (STA-697). The rest of the
       # module does not cross-build yet, so this is scoped to the package.
