@@ -35,7 +35,7 @@ func TestSec243_Tev1MalformedAnswerNeverApproves(t *testing.T) {
 			e := startGateServer(t, c.adv, nil)
 			dir := runningTask(t, e, "T1")
 			e.trust(t, "T1", `{"preset":"overnight","tev1":true,"tev1_ack":true}`)
-			got := e.createIn(t, "sudo launchctl list", "T1", dir)
+			got := e.createIn(t, "sudo ls /var/log", "T1", dir)
 			gr := waitDecided(t, e, got["id"].(string))
 			if gr.Status != security.GateRequestDenied {
 				t.Fatalf("tev1 decision %s, want denied (fail closed)", gr.Status)

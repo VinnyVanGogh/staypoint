@@ -957,7 +957,9 @@ async function renderOrgTrustSection(sec, orgNames) {
   form.appendChild(el('div', 'muted-text trust-create-note',
     `While trusted, Red requests of every running task in the organization run without asking you, and each is logged. `
     + `Always excluded: merges, and pushes to protected branches; prod writes and deploys; external API writes; `
-    + `destructive deletes of real data; sending PII. Deletes outside a task worktree wait, then are skipped and queued for you. `
+    + `destructive deletes of real data; sending PII; remote shells; changes to StayPoint or agent guards. `
+    + `Held requests wait, then are skipped and queued for your morning review; approving one tells the task to do it. `
+    + `Work-repo tasks are never covered. `
     + `At most ${Math.round(maxMins / 60)} h. Opening pull requests is allowed.`));
   body.appendChild(form);
 }

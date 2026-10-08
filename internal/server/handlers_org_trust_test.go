@@ -1,9 +1,14 @@
 package server_test
 
 import (
+	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 )
 
 // task-33692ffb: "Trust this organization until…", end to end over HTTP.
@@ -89,7 +94,7 @@ func TestOrgTrust_ApprovesOrgTasksAndBoardRulesStillWait(t *testing.T) {
 	}
 
 	// Ordinary Red commands and opening a PR are approved by the org trust.
-	for _, cmd := range []string{"ssh build-host 'make test'", "gh pr create --title x --body y"} {
+	for _, cmd := range []string{"sudo ls /var/log", "gh pr create --title x --body y"} {
 		got := e.createIn(t, cmd, "T1", dir)
 		if got["status"] != "approved" || got["decided_by"] != "rule:"+itoa(ruleID) {
 			t.Fatalf("%q: want org trust approval, got %v", cmd, got)
@@ -101,11 +106,11 @@ func TestOrgTrust_ApprovesOrgTasksAndBoardRulesStillWait(t *testing.T) {
 		}
 	}
 	// Another organization's task is not covered.
-	if got := e.createIn(t, "ssh build-host 'make test'", "O1", t.TempDir()); got["status"] != "pending" {
+	if got := e.createIn(t, "sudo ls /var/log", "O1", t.TempDir()); got["status"] != "pending" {
 		t.Fatalf("other org approved: %v", got)
 	}
 	// Board policy requests are never approved by a rule.
-	if got := e.createIn(t, "ssh build-host 'make test'", "T1", dir, "tracking-gate-override"); got["status"] == "approved" && got["decided_by"] == "rule:"+itoa(ruleID) {
+	if got := e.createIn(t, "sudo ls /var/log", "T1", dir, "tracking-gate-override"); got["status"] == "approved" && got["decided_by"] == "rule:"+itoa(ruleID) {
 		t.Fatalf("policy request approved by org trust: %v", got)
 	}
 
@@ -126,10 +131,106 @@ func TestOrgTrust_ApprovesOrgTasksAndBoardRulesStillWait(t *testing.T) {
 	if !boardAuditHas(t, e, "revoke_org_trust") {
 		t.Fatal("revoke not in the Board audit log")
 	}
-	if got := e.createIn(t, "ssh build-host 'make test'", "T1", dir); got["status"] != "pending" {
+	if got := e.createIn(t, "sudo ls /var/log", "T1", dir); got["status"] != "pending" {
 		t.Fatalf("revoked org trust approved: %v", got)
 	}
 	if st, _, _ := e.do(t, "POST", "/api/settings/org-trust/revoke", `{"org":"StayPoint"}`, true, ""); st != http.StatusNotFound {
 		t.Fatalf("second revoke: %d", st)
+	}
+}
+
+// task-9d94997c: the Board rules hold under a task trust too, every held
+// request gets a deferral deadline, and deciding a deferred one tells the
+// task (approval also wakes it).
+func TestTrust_BoardRulesDeferAndDecideNotifiesTask(t *testing.T) {
+	e := startGateServer(t, nil, nil)
+	dir := runningTask(t, e, "T1")
+	e.trust(t, "T1", `{"preset":"4h"}`)
+
+	for _, cmd := range []string{"wrangler deploy", "cat ~/.staypoint/board_token", "git push origin main", "$GIT push origin main"} {
+		got := e.createIn(t, cmd, "T1", dir)
+		if got["status"] != "pending" || got["defer_at"] == nil {
+			t.Fatalf("%q under task trust: want pending with a deadline, got %v", cmd, got)
+		}
+	}
+	if got := e.createIn(t, "gh pr create --title x --body y", "T1", dir); got["status"] != "approved" {
+		t.Fatalf("gh pr create under task trust: %v", got)
+	}
+
+	woke := make(chan string, 4)
+	prev := orchestrator.GlobalDispatcher.OnWake
+	orchestrator.GlobalDispatcher.OnWake = func(taskID, reason string) { woke <- taskID + " " + reason }
+	t.Cleanup(func() { orchestrator.GlobalDispatcher.OnWake = prev })
+
+	held := func(cmd string) string {
+		t.Helper()
+		id := e.createIn(t, cmd, "T1", dir)["id"].(string)
+		if _, err := e.db.Exec(`UPDATE security_gate_requests SET defer_at = ? WHERE id = ?`, "2000-01-01T00:00:00Z", id); err != nil {
+			t.Fatal(err)
+		}
+		if st, out, _ := e.do(t, "GET", "/api/security/gate-requests/"+id, "", false, ""); st != http.StatusOK || out["status"] != "deferred" {
+			t.Fatalf("not deferred: %d %v", st, out)
+		}
+		return id
+	}
+	comment := func(id string) string {
+		var msg string
+		_ = e.db.QueryRow(`SELECT message FROM task_comments WHERE task_id = 'T1' AND message LIKE ? ORDER BY id DESC LIMIT 1`, "%"+id+"%").Scan(&msg)
+		return msg
+	}
+
+	ok := held("wrangler deploy --env staging")
+	if st, out, _ := e.do(t, "POST", "/api/security/gate-requests/"+ok+"/decide", `{"decision":"approved"}`, true, "good"); st != http.StatusOK {
+		t.Fatalf("approve: %d %v", st, out)
+	}
+	if msg := comment(ok); !strings.Contains(msg, "Board approved held action "+ok) || !strings.Contains(msg, "perform it now") {
+		t.Fatalf("approve comment: %q", msg)
+	}
+	select {
+	case w := <-woke:
+		if w != "T1 gate_approved_deferred" {
+			t.Fatalf("wake: %q", w)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("approved deferred request did not wake the task")
+	}
+
+	no := held("terraform apply")
+	// The Gates page's Deferred queue lists it.
+	_, list, _ := e.do(t, "GET", "/api/security/gate-requests?status=deferred", "", false, "")
+	if !strings.Contains(fmt.Sprint(list["gate_requests"]), no) {
+		t.Fatalf("deferred queue missing %s: %v", no, list)
+	}
+	if st, _, _ := e.do(t, "POST", "/api/security/gate-requests/"+no+"/decide", `{"decision":"denied"}`, true, "good"); st != http.StatusOK {
+		t.Fatalf("deny: %d", st)
+	}
+	if msg := comment(no); !strings.Contains(msg, "Board rejected held action "+no) {
+		t.Fatalf("deny comment: %q", msg)
+	}
+	select {
+	case w := <-woke:
+		t.Fatalf("denied request woke the task: %q", w)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+}
+
+// task-9d94997c item C: an org trust never covers a work-repo task or a task
+// without a repo.
+func TestOrgTrust_SkipsWorkReposAndRepoless(t *testing.T) {
+	e := startGateServer(t, nil, nil)
+	for id, repo := range map[string]string{"W1": filepath.Join(t.TempDir(), "mansol-client"), "N1": "", "P1": t.TempDir()} {
+		seedTask(t, e.db, id, repo, "StayPoint")
+		if _, err := e.db.Exec(`UPDATE tasks SET execution_stage = 'in_progress', status = 'active' WHERE id = ?`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if st, out, _ := e.do(t, "POST", "/api/settings/org-trust", `{"org":"staypoint","preset":"1h"}`, true, "good"); st != http.StatusCreated {
+		t.Fatalf("create: %d %v", st, out)
+	}
+	for id, want := range map[string]string{"W1": "pending", "N1": "pending", "P1": "approved"} {
+		if got := e.createIn(t, "sudo ls /var/log", id, t.TempDir()); got["status"] != want {
+			t.Errorf("%s: want %s, got %v", id, want, got)
+		}
 	}
 }

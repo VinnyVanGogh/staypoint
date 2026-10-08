@@ -16,7 +16,11 @@ import (
 //   - destructive deletes of real data (SQL DELETE/DROP/TRUNCATE, API and
 //     cloud deletes);
 //   - sending PII (mail, uploads to other hosts, payloads carrying an email
-//     address or SSN-like number).
+//     address or SSN-like number);
+//   - self-protection: rebuilding, reinstalling, restarting or replacing
+//     StayPoint, touching ~/.staypoint (tokens, DB, config), writing to the
+//     local StayPoint API, or editing agent guard config (hooks, settings,
+//     LaunchAgents).
 //
 // The check reads the command text and its scripts' snapshots, not the
 // parse tree: it is a deliberately broad backstop, so a false match only
@@ -45,7 +49,47 @@ var (
 	uploadRe = regexp.MustCompile(`(?i)(^|[\s;&|(])(scp|sftp|nc|ncat|netcat|socat|ftp|rclone\s+(copy|sync|move))\b|\brsync\b[^|;&]*\s[\w.@-]+:`)
 	emailRe  = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
 	ssnRe    = regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`)
+
+	// selfCmdRe: commands that rebuild, reinstall, restart or replace
+	// StayPoint or the agent's own guards.
+	selfCmdRe = regexp.MustCompile(`(?i)(reinstall-daemon|\blaunchctl\b|\bgo\s+install\b[^;&|\n]*staypoint|\bgo\s+(install|build)\b[^;&|\n]*\.local/bin|\bgo\s+build\b[^;&|\n]*-o[\s=]*\S*staypoint|\b(cp|mv|ln|install|rsync|ditto)\b[^;&|\n]*\.local/bin|\b(kill|pkill|killall)\b[^;&|\n]*staypoint|\bbrew\s+(re)?install\b[^;&|\n]*staypoint)`)
+	// selfPathRe: paths StayPoint and the agent guards depend on. Any
+	// reference holds, reads included: they hold tokens and the guards.
+	selfPathRe = regexp.MustCompile(`(?i)((~|\$HOME|\$\{HOME\}|/Users/[^/\s'"]+|/home/[^/\s'"]+|/var/root)/\.staypoint\b|\.claude/settings[\w.-]*\.json|\.claude/hooks\b|\.gemini/settings|\.gemini/hooks\b|Library/LaunchAgents\b)`)
 )
+
+var (
+	// remoteShellRe: a shell on another machine may write prod or delete
+	// data, and a tunnel exposes local services. Held whatever it runs.
+	remoteShellRe = regexp.MustCompile(`(?i)((^|[\s;&|(` + "`" + `])(ssh|mosh|autossh)\s|\bgcloud\s+compute\s+(ssh|scp)\b|\baws\s+ssm\s+(start-session|send-command)\b|\bkubectl\s+(exec|attach|port-forward)\b|\bdocker\s+(-H|--host|context)\b)`)
+	// indirectRe: a program word that is a variable, a substitution or eval
+	// cannot be checked (` + "`" + `GIT=git; $GIT push origin main` + "`" + `).
+	indirectRe = regexp.MustCompile(`(^|[;&|(\n{]|\$\(|\bthen\b|\bdo\b|\belse\b)\s*([A-Za-z_]\w*=\S*\s+)*(\$|` + "`" + `|eval\b|exec\s+\$)`)
+	// dataFileRe: SQL fed from a file may delete anything.
+	dataFileRe = regexp.MustCompile(`(?i)(\b(sqlite3|psql|mysql|mariadb|duckdb|mongosh|mongo|redis-cli|clickhouse-client)\b[^;&|\n]*(<|\s-f\s|\s--file|\.read\b|\s-e\s+source\b))`)
+	// methodRe: an HTTP method chosen at run time cannot be checked.
+	methodRe     = regexp.MustCompile(`(?i)(requests\.request\(|httpx\.request\(|urllib\.request\.Request\([^)]*data\s*=|method\s*[:=]\s*[A-Za-z_$]|fetch\([^)]*\{[^}]*method\s*:|axios\(\s*\{|axios\.request\()`)
+	vercelProdRe = regexp.MustCompile(`(?i)\b(vercel|netlify)\b[^;&|\n]*--prod\b`)
+)
+
+// StayPointPort is the local StayPoint API port; writes to it are
+// self-protection, not a local call.
+const StayPointPort = "41421"
+
+// bareStayPointRe is the StayPoint API written without a scheme.
+var bareStayPointRe = regexp.MustCompile(`(?i)(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):41421\b`)
+
+// SelfProtectedPath reports why editing path (absolute, cleaned) breaks the
+// self-protection rule, or "".
+func SelfProtectedPath(path string) string {
+	switch {
+	case selfPathRe.MatchString(path):
+		return "edits StayPoint state or agent guard config (Board rule: self-protection)"
+	case strings.Contains(path, "/.local/bin/") || strings.HasSuffix(path, "/.local/bin"):
+		return "replaces a binary in ~/.local/bin (Board rule: self-protection)"
+	}
+	return ""
+}
 
 // AnalyzeBoardRules returns why line (or a script it runs) breaks a Board
 // rule for unattended runs, or "" when it does not.
@@ -66,14 +110,26 @@ func boardRuleText(code, what string) string {
 		return ""
 	}
 	switch {
-	case deployRe.MatchString(code):
+	case indirectRe.MatchString(code):
+		return what + " runs an indirect command ($VAR, $(...), eval) that cannot be checked"
+	case remoteShellRe.MatchString(code):
+		return what + " opens a remote shell or tunnel, which may write prod or delete data (Board rule: no prod writes or deletes)"
+	case selfCmdRe.MatchString(code):
+		return what + " rebuilds, restarts or replaces StayPoint or its guards (Board rule: self-protection)"
+	case selfPathRe.MatchString(code):
+		return what + " touches StayPoint state or agent guard config (Board rule: self-protection)"
+	case localAPIWrite(code):
+		return what + " writes to the local StayPoint API (Board rule: self-protection)"
+	case deployRe.MatchString(code) || vercelProdRe.MatchString(code):
 		return what + " deploys (Board rule: no prod writes or deploys)"
 	case prodWordRe.MatchString(code) && prodWriteRe.MatchString(code):
 		return what + " may write to prod (Board rule: prod reads only)"
-	case sqlDeleteRe.MatchString(code) || cloudDeleteRe.MatchString(code):
+	case sqlDeleteRe.MatchString(code) || cloudDeleteRe.MatchString(code) || dataFileRe.MatchString(code):
 		return what + " may delete real data (Board rule: no destructive deletes)"
 	case ghAPIWriteRe.MatchString(code) || ghWriteRe.MatchString(code):
 		return what + " writes to the GitHub API (Board rule: no external API writes)"
+	case methodRe.MatchString(code):
+		return what + " makes an HTTP call whose method cannot be checked (Board rule: external reads only)"
 	case externalHTTPWrite(code):
 		return what + " writes to an external API (Board rule: external reads only)"
 	case mailRe.MatchString(code):
@@ -90,8 +146,7 @@ func boardRuleText(code, what string) string {
 // ...) to a non-local host. A write with no URL it can read counts as
 // external (fail closed).
 func externalHTTPWrite(code string) bool {
-	write := (httpClientRe.MatchString(code) && httpWriteRe.MatchString(code)) || codeWriteRe.MatchString(code)
-	if !write {
+	if !httpWrite(code) {
 		return false
 	}
 	urls := urlRe.FindAllString(code, -1)
@@ -104,6 +159,32 @@ func externalHTTPWrite(code string) bool {
 		}
 	}
 	return false
+}
+
+// httpWrite reports an HTTP write in code (curl -d, -X POST, requests.post).
+func httpWrite(code string) bool {
+	return (httpClientRe.MatchString(code) && httpWriteRe.MatchString(code)) || codeWriteRe.MatchString(code)
+}
+
+// localAPIWrite reports an HTTP write to the StayPoint API on this machine.
+func localAPIWrite(code string) bool {
+	if !httpWrite(code) {
+		return false
+	}
+	if bareStayPointRe.MatchString(code) {
+		return true
+	}
+	for _, u := range urlRe.FindAllString(code, -1) {
+		if isStayPointURL(u) {
+			return true
+		}
+	}
+	return false
+}
+
+func isStayPointURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Port() == StayPointPort && isLocalURL(raw)
 }
 
 func isLocalURL(raw string) bool {
