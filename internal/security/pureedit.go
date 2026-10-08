@@ -78,10 +78,15 @@ func pythonPureEdit(body string) bool {
 	if !ok {
 		return false
 	}
-	// Path.replace moves files; only str.replace on a value is allowed, and
-	// that cannot be told apart cheaply, so a .replace( whose receiver is a
-	// Path(...) call is rejected below via the banned "resolve"/"Path(" mix:
-	// reject any Path(...).replace( explicitly.
+	// Python NFKC-normalises identifiers, so fullwidth ｅｘｅｃ is exec: the
+	// ASCII word checks below only hold for ASCII code.
+	for _, r := range code {
+		if r > 127 {
+			return false
+		}
+	}
+	// Path.replace moves files, and a str.replace cannot be told apart from it
+	// cheaply: reject Path(...) chained into .replace(.
 	if strings.Contains(code, "Path(") && pyReplaceRe.MatchString(code) && strings.Contains(code, ").replace(") {
 		return false
 	}
