@@ -290,6 +290,15 @@ func (h *Harness) Claim(ctx context.Context, taskID, runID, agentID string) erro
 		if governance.ParentAtRunLimit(h.DB, taskID, childLimit) {
 			return ErrParentBusy
 		}
+		// The UPDATE refused an unclaimed child but its parent is no
+		// longer at the cap: a sibling released in between. Queue it as a
+		// parent wait so the next pump retries it, instead of dropping it
+		// as already claimed.
+		var checkout, parent sql.NullString
+		_ = h.DB.QueryRowContext(ctx, "SELECT checkout_run_id, parent_id FROM tasks WHERE id=?", taskID).Scan(&checkout, &parent)
+		if !checkout.Valid && parent.String != "" && childLimit > 0 {
+			return ErrParentBusy
+		}
 		return ErrAlreadyClaimed
 	}
 

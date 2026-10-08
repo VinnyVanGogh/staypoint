@@ -84,3 +84,28 @@ func TestClaim_RunningChildrenCapZeroDisables(t *testing.T) {
 		h.Release(id, "run-"+id)
 	}
 }
+
+// A sibling whose checkout survived after its task left in_progress (a run
+// that crashed after moving its task to in_review, which RecoveryScan does not
+// clear) must not hold the parent busy forever.
+func TestClaim_StaleSiblingCheckoutDoesNotCount(t *testing.T) {
+	db := openTestDB(t)
+	insertTask(t, db, "task-parent", "/repo/p")
+	for _, id := range []string{"task-stale", "task-next"} {
+		insertTask(t, db, id, "/repo/"+id)
+		if _, err := db.Exec(`UPDATE tasks SET parent_id = 'task-parent' WHERE id = ?`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE tasks SET checkout_run_id = 'run-dead', execution_stage = 'in_review' WHERE id = 'task-stale'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO settings_kv (key, value) VALUES (?, '1')`, governance.SettingMaxRunningChildren); err != nil {
+		t.Fatal(err)
+	}
+	h := &Harness{DB: db}
+	if err := h.Claim(context.Background(), "task-next", "run-next", "agent"); err != nil {
+		t.Fatalf("stale sibling checkout blocked the parent: %v", err)
+	}
+	h.Release("task-next", "run-next")
+}
