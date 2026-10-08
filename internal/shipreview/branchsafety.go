@@ -6,7 +6,7 @@ package shipreview
 // ref is a file, so refs/heads/Main opens refs/heads/main: `git rev-parse
 // refs/heads/Main` returns main's tip and `git update-ref -d refs/heads/Main`
 // deletes main. Branch names are therefore compared to protected names with
-// strings.EqualFold, and a name is only trusted when `git for-each-ref` (which
+// names.Normalize (case and lookalike folding), and a name is only trusted when `git for-each-ref` (which
 // lists refs by their real names) reports exactly that ref.
 
 import (
@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/VinnyVanGogh/staypoint/internal/names"
 	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 )
 
@@ -44,15 +45,19 @@ const (
 )
 
 // alwaysProtected are branch names that are never shipped as a registered
-// branch nor deleted, compared case-insensitively.
+// branch nor deleted, compared through names.Normalize.
 var alwaysProtected = []string{"main", "master", WorkTargetBranch, "HEAD"}
 
-// protectedName reports whether branch equals, ignoring case, any of the
-// always-protected names or extra (the default, target and project target
-// branches; "" entries are ignored).
+// protectedName reports whether branch equals, once both are normalised
+// (case, whitespace, invisible characters, accents and lookalike letters:
+// names.Normalize), any of the always-protected names or extra (the default,
+// target and project target branches; "" entries are ignored). APFS treats
+// differently normalised Unicode spellings of a ref as the same file, so the
+// folding is wider than case alone.
 func protectedName(branch string, extra ...string) bool {
+	nb := names.Normalize(branch)
 	for _, n := range append(append([]string(nil), alwaysProtected...), extra...) {
-		if n != "" && strings.EqualFold(branch, n) {
+		if n != "" && nb == names.Normalize(n) {
 			return true
 		}
 	}
