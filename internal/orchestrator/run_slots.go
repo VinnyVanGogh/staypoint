@@ -42,13 +42,18 @@ var ErrPlainDirBusy error = &capError{msg: "Can't start run: another run is alre
 // max_runs_per_org runs.
 var ErrOrgBusy error = &capError{msg: "Can't start run: this organization already has the most parallel runs allowed (max_runs_per_org)."}
 
+// ErrParentBusy is returned by Claim when the task's parent already has
+// tasks.max_running_children children running.
+var ErrParentBusy error = &capError{msg: "Can't start run: this task's parent already has the most children running at once (tasks.max_running_children)."}
+
 // Queue wait reasons, shown on the task page.
 const (
-	WaitSlots = "slots"  // the global cap (max_concurrent_runs) is reached
-	WaitRepo  = "repo"   // the task's repo is at max_runs_per_repo
-	WaitDir   = "folder" // another run holds the task's plain (non-git) folder
-	WaitOrg   = "org"    // the task's organization is at max_runs_per_org
-	WaitQuota = "quota"  // every provider for this task's pool is quota-locked
+	WaitSlots  = "slots"  // the global cap (max_concurrent_runs) is reached
+	WaitRepo   = "repo"   // the task's repo is at max_runs_per_repo
+	WaitDir    = "folder" // another run holds the task's plain (non-git) folder
+	WaitOrg    = "org"    // the task's organization is at max_runs_per_org
+	WaitQuota  = "quota"  // every provider for this task's pool is quota-locked
+	WaitParent = "parent" // the task's parent is at tasks.max_running_children
 )
 
 // WaitFor maps a capacity refusal from Claim to its queue wait reason.
@@ -60,6 +65,8 @@ func WaitFor(err error) string {
 		return WaitRepo
 	case errors.Is(err, ErrOrgBusy):
 		return WaitOrg
+	case errors.Is(err, ErrParentBusy):
+		return WaitParent
 	}
 	return WaitSlots
 }
@@ -391,7 +398,10 @@ func (s *RunSlots) planLocked(withQuotaProbes bool) (usage, []QueuedRun) {
 		k := q.key()
 		err := s.refusalLocked(k, &u)
 		if err == nil {
-			if q.Wait == WaitQuota {
+			// A run waiting on its parent's running-children cap is
+			// refused by the claim SQL, not by these slot caps, so it
+			// is probed like a quota wait instead of reserving capacity.
+			if q.Wait == WaitQuota || q.Wait == WaitParent {
 				if withQuotaProbes {
 					fit = append(fit, q)
 				}

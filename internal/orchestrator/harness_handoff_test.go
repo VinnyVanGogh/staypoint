@@ -9,9 +9,6 @@ import (
 // STA-820: a child task's first prompt carries the daemon-stored handoff.
 func TestBuildRawArgs_ChildHandoffInFirstPromptOnly(t *testing.T) {
 	db := openTestDB(t)
-	if _, err := db.Exec(`ALTER TABLE tasks ADD COLUMN parent_id TEXT`); err != nil {
-		t.Fatal(err)
-	}
 	mustExec := func(q string, args ...any) {
 		t.Helper()
 		if _, err := db.Exec(q, args...); err != nil {
