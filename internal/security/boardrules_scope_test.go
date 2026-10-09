@@ -155,6 +155,20 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"STAYPOINT_SKIP_PERMISSIONS=1 make",
 		"zsh -n +o NO_EXEC scripts/reinstall-daemon.sh",
 		"zsh -n -o exec scripts/reinstall-daemon.sh",
+		// Final Opus review: git options that run a program, brace-expanded
+		// gate variables, go test flags that run a linker or compiler.
+		"git grep -O'scripts/reinstall-daemon.sh #' -e .",
+		"git grep --open-files-in-pager='launchctl kickstart -k gui/501/com.staypoint.daemon #' -e .",
+		"git grep --open-files-in-pager='true; claude -p hi' -e .",
+		"git -C /r grep -nO'claude -p x #' -e .",
+		"git diff --ext-diff -- scripts/reinstall-daemon.sh",
+		"git show HEAD:scripts/reinstall-daemon.sh --output=/tmp/r.sh",
+		"unset STAYPOINT_{TASK,SESSION}_ID",
+		"env -u STAYPOINT_{TASK,SESSION}_ID make",
+		"env -u STAYPOINT_TASK_ID go test -ldflags='-linkmode=external -extld=/tmp/x.sh' ./x",
+		"env -u STAYPOINT_TASK_ID go test -gcflags=all=-N ./x",
+		"env -u STAYPOINT_TASK_ID go test --ldflags -extld=/tmp/x.sh ./x",
+		"env -u STAYPOINT_TASK_ID go test -compiler=gccgo -gccgoflags=-x ./x",
 		// The gate's env: unset or overridden for anything but go test/vet.
 		"env -u STAYPOINT_TASK_ID claude -p x",
 		"env -u STAYPOINT_TASK_ID staypoint task list",

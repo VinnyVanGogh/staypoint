@@ -283,6 +283,10 @@ func runsAgent(code string, depth int) bool {
 		if writesFile(s) && anyNames(nestedAgentRe, s.argv) {
 			return true
 		}
+		// git grep -O'claude -p x #': the pager value runs, glued to its flag.
+		if baseCmd(argv) == "git" && gitRunsProgram(argv[1:]) {
+			return true
+		}
 		if !viaXargs && !writesFile(s) && dataArgs(argv) {
 			continue
 		}
@@ -467,6 +471,12 @@ func stayEnvChange(code string, depth int) bool {
 	return false
 }
 
+// gateVarName reports a name that is, or may expand to, a gate variable:
+// STAYPOINT_{TASK,SESSION}_ID is two of them once the shell expands it.
+func gateVarName(n string) bool {
+	return gateVarRe.MatchString(n) || strings.HasPrefix(n, "STAYPOINT_") && strings.ContainsAny(n, "{*?[\\")
+}
+
 // envState tracks one command's env changes. other is any change besides
 // clearing a gate variable (PATH=, GOFLAGS=, STAYPOINT_TASK_ID=other): with
 // it, `go test` may not be the go test it looks like, so the exemption is
@@ -499,7 +509,7 @@ func envChange(argv []string, st *envState, depth int) bool {
 	case name == "unset" || name == "export" || name == "declare" || name == "typeset" || name == "local" || name == "readonly":
 		for _, a := range args {
 			// unset $n, export ${n}=x: a name we cannot read.
-			if gateVarRe.MatchString(assignName(a)) || strings.ContainsAny(assignName(a), "$`") {
+			if gateVarName(assignName(a)) || strings.ContainsAny(assignName(a), "$`") {
 				return true
 			}
 		}
@@ -511,14 +521,14 @@ func envChange(argv []string, st *envState, depth int) bool {
 			a := args[i]
 			switch {
 			case a == "-u" || a == "--unset":
-				if i+1 < len(args) && gateVarRe.MatchString(args[i+1]) {
+				if i+1 < len(args) && gateVarName(args[i+1]) {
 					st.changed = true
 				}
 				i++
 			case strings.HasPrefix(a, "--unset="):
-				st.changed = st.changed || gateVarRe.MatchString(a[len("--unset="):])
+				st.changed = st.changed || gateVarName(a[len("--unset="):])
 			case strings.HasPrefix(a, "-u"):
-				st.changed = st.changed || gateVarRe.MatchString(a[2:])
+				st.changed = st.changed || gateVarName(a[2:])
 			case a == "-C" || a == "--chdir":
 				i++
 			case a == "--":
@@ -563,16 +573,24 @@ func envChange(argv []string, st *envState, depth int) bool {
 // alias, PATH or GO* settings, an overlay): no go test exemption.
 var goShadowRe = regexp.MustCompile(`\balias\b|\bfunction\b|\(\s*\)\s*\{|\bPATH=|\bGO\w*=|-overlay|\bgo\s+env\s+-w\b|\bread\b|\bhash\b|\bsource\b|(^|[;&|(\n]\s*)\.\s|\bexport\b[^;&|\n]*\b(GO\w*|PATH)\b`)
 
-// goTestOrVet reports `go test` or `go vet` without a flag that runs
-// another program (-exec, -toolexec, -vettool).
+// goRunFlags: go test/vet flags that run another program (-exec, -toolexec,
+// -vettool) or pass flags to the compiler or linker (-ldflags=-extld=x).
+var goRunFlags = []string{"exec", "toolexec", "vettool", "ldflags", "gcflags", "asmflags", "gccgoflags", "compiler"}
+
+// goTestOrVet reports `go test` or `go vet` without a goRunFlags flag.
 func goTestOrVet(argv []string) bool {
 	if len(argv) < 2 || argv[0] != "go" || (argv[1] != "test" && argv[1] != "vet") {
 		return false
 	}
 	for _, a := range argv[2:] {
+		if !strings.HasPrefix(a, "-") {
+			continue
+		}
 		f := strings.TrimLeft(a, "-")
-		if strings.HasPrefix(a, "-") && (strings.HasPrefix(f, "exec") || strings.HasPrefix(f, "toolexec") || strings.HasPrefix(f, "vettool")) {
-			return false
+		for _, r := range goRunFlags {
+			if strings.HasPrefix(f, r) {
+				return false
+			}
 		}
 	}
 	return true
@@ -857,7 +875,25 @@ func gitNamesOnly(re *regexp.Regexp, args []string) bool {
 				return false
 			}
 		default:
-			return gitNameSubs[a]
+			return gitNameSubs[a] && !gitRunsProgram(args[i+1:])
+		}
+	}
+	return false
+}
+
+// gitRunsProgram reports subcommand options that run a program (grep -O
+// opens a pager through the shell, --ext-diff an external diff) or copy
+// what they show (--output).
+func gitRunsProgram(args []string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		// -O may close a short-flag cluster (-nO<pager>).
+		short := strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--")
+		if short && strings.ContainsRune(a, 'O') || strings.HasPrefix(a, "--open-files-in-pager") ||
+			strings.HasPrefix(a, "--output") || a == "--ext-diff" {
+			return true
 		}
 	}
 	return false
