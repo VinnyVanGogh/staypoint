@@ -39,6 +39,7 @@ var validSPARoutes = map[string]bool{
 	"audit":         true,
 	"gates":         true,
 	"pull-requests": true,
+	"reflect":       true,
 	"tasks":         true,
 	"issues":        true,
 	"task-page":     true,

@@ -297,6 +297,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 			s.prH = NewPullRequestsHandler(s.opts.DB)
 		}
 		mux.HandleFunc("GET /api/pull-requests", s.prH.List)
+
+		// Reflect: facts + cited summary across every org, so Board session only.
+		reflectH := NewReflectHandler(s.opts.DB)
+		mux.Handle("GET /api/reflect", s.secMid.WrapBoardSession(http.HandlerFunc(reflectH.Get)))
+		mux.Handle("POST /api/reflect/summary", s.secMid.WrapBoardSession(http.HandlerFunc(reflectH.StartSummary)))
 		mux.Handle("POST /api/pull-requests/merge", s.secMid.WrapBoardAction(http.HandlerFunc(s.prH.Merge)))
 		mux.Handle("POST /api/pull-requests/combine", s.secMid.WrapBoardAction(http.HandlerFunc(s.prH.Combine)))
 		// Board-only: setting dev_command/setup_steps is a Board action (STA-520).

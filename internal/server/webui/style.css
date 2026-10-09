@@ -5080,3 +5080,18 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .prs-draft { color: var(--muted, #888); font-size: 0.8rem; }
 .prs-status { white-space: pre-wrap; padding: 8px 12px; border-radius: 6px; background: var(--surface-2, rgba(127,127,127,0.12)); margin: 0 0 12px; }
 .prs-status-error, .prs-error { color: var(--red, #dc2626); }
+
+/* Reflect view */
+.reflect-container { display: flex; flex-direction: column; gap: 16px; }
+.reflect-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
+.reflect-box { border: 1px solid var(--border, #333); border-radius: 8px; padding: 12px 14px; background: var(--surface, transparent); min-width: 0; }
+.reflect-h { margin: 0 0 8px; font-size: 14px; }
+.reflect-sub { margin: 12px 0 4px; font-size: 13px; }
+.reflect-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.reflect-table td { padding: 3px 6px; border-top: 1px solid var(--border, #333); vertical-align: top; overflow-wrap: anywhere; }
+.reflect-n { text-align: right; width: 3em; font-variant-numeric: tabular-nums; }
+.reflect-summary-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.reflect-claims { margin: 0; padding-left: 18px; font-size: 13px; line-height: 1.5; }
+.reflect-claims li { margin-bottom: 4px; }
+.reflect-refs { display: inline; }
+.reflect-ref { font-size: 11px; color: var(--accent, #38bdf8); margin-right: 4px; white-space: nowrap; }

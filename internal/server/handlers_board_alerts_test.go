@@ -38,6 +38,28 @@ func seedBoardAlertsTable(t *testing.T, db *sql.DB) {
 	}
 }
 
+func TestReflect_TokenOnlyRefused(t *testing.T) {
+	database := setupTestDB(t)
+	srv, token := startTestServer(t, database)
+	for _, m := range []string{http.MethodGet, http.MethodPost} {
+		path := "/api/reflect?since=30d"
+		if m == http.MethodPost {
+			path = "/api/reflect/summary?since=30d"
+		}
+		req, _ := http.NewRequest(m, srv.URL()+path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s %s with agent token only: want 403, got %d %s", m, path, resp.StatusCode, body)
+		}
+	}
+}
+
 func TestGetBoardAlerts_ReturnsOnlyUnacknowledged(t *testing.T) {
 	database := setupTestDB(t)
 	seedBoardAlertsTable(t, database)

@@ -1298,6 +1298,7 @@ function navigateTo(viewName, orgName = null, pushHistory = true) {
     if (viewName === 'artifacts')    renderArtifactsPage();
     if (viewName === 'gates')        renderGatesPage();
     if (viewName === 'pull-requests') renderPullRequestsPage();
+    if (viewName === 'reflect')      renderReflectPage();
     if (viewName === 'boss') {
       renderBoss();
       preloadBossReports(true);

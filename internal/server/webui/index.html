@@ -70,6 +70,9 @@
       <button class="sidebar-item" data-view="pull-requests">
         <span class="sidebar-icon">&#8645;</span>Pull Requests
       </button>
+      <button class="sidebar-item" data-view="reflect">
+        <span class="sidebar-icon">&#8635;</span>Reflect
+      </button>
       <div class="sidebar-nav-divider"></div>
       <button class="sidebar-item" data-view="settings">
         <span class="sidebar-icon">&#9881;</span>Settings
@@ -703,6 +706,17 @@
       <div id="prs-container" class="prs-container"></div>
     </section>
 
+    <section id="view-reflect" class="view">
+      <div class="view-header">
+        <div class="view-title-group">
+          <h1 class="view-title">Reflect</h1>
+          <span class="refresh-indicator">Facts first, then a summary where every claim links to its source.</span>
+        </div>
+        <div class="table-controls" id="reflect-periods"></div>
+      </div>
+      <div id="reflect-container" class="reflect-container"></div>
+    </section>
+
     <section id="view-gates" class="view">
       <div class="view-header">
         <div class="view-title-group">
@@ -866,6 +880,7 @@
 <script src="/ui/lib/quotagauge.js"></script>
 <script src="/ui/lib/gates.js"></script>
 <script src="/ui/lib/artifacts.js"></script>
+<script src="/ui/lib/reflect.js"></script>
 <!-- gates.js before app.js: app.js boot() may open /gates straight away. -->
 <script src="/ui/gates.js"></script>
 <script src="/ui/app.js"></script>
