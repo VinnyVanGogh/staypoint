@@ -872,8 +872,43 @@ func gitNamesOnly(re *regexp.Regexp, args []string) bool {
 	return gitNameSubs[sub] && !gitRunsProgram(sub, rest)
 }
 
-// gitOrderFileSubs: builtins whose -O is a diff orderfile, not a pager.
-var gitOrderFileSubs = map[string]bool{"log": true, "show": true, "diff": true, "whatchanged": true, "format-patch": true, "diff-tree": true}
+// gitNotGrep: builtins with no pager option: -O is a diff orderfile or
+// not an option, and an O in a glued value (commit -m"OOM") is data.
+var gitNotGrep = map[string]bool{
+	"add": true, "am": true, "annotate": true, "apply": true, "archive": true, "bisect": true, "blame": true,
+	"branch": true, "cat-file": true, "check-ignore": true, "checkout": true, "cherry-pick": true, "clean": true,
+	"clone": true, "commit": true, "config": true, "describe": true, "diff": true, "diff-tree": true,
+	"fetch": true, "format-patch": true, "hash-object": true, "init": true, "log": true, "ls-files": true,
+	"ls-tree": true, "merge": true, "mv": true, "pull": true, "push": true, "rebase": true, "reflog": true,
+	"remote": true, "reset": true, "restore": true, "rev-parse": true, "revert": true, "rm": true,
+	"shortlog": true, "show": true, "stash": true, "status": true, "switch": true, "tag": true,
+	"update-index": true, "whatchanged": true, "worktree": true,
+}
+
+// gitGrepValueShort: git grep short flags whose value is the rest of the
+// word (-e'pat', -A3, -m1); an O after one is data.
+const gitGrepValueShort = "efABCm"
+
+// gitShortRunsPager reports a short-flag cluster that may open a pager:
+// grep's -O, read flag by flag. Any other builtin has no -O pager; an
+// alias or an unknown subcommand may be grep, so any O there holds.
+func gitShortRunsPager(sub, cluster string) bool {
+	if gitNotGrep[sub] {
+		return false
+	}
+	if sub != "grep" {
+		return strings.ContainsRune(cluster, 'O')
+	}
+	for _, r := range cluster {
+		switch {
+		case r == 'O':
+			return true
+		case strings.ContainsRune(gitGrepValueShort, r):
+			return false
+		}
+	}
+	return false
+}
 
 // gitGlobalValue and gitGlobalFlag: git's options before the subcommand,
 // with and without a separate value.
@@ -921,11 +956,10 @@ func gitRunsProgram(sub string, args []string) bool {
 					return true
 				}
 			}
-		case !gitOrderFileSubs[sub] && strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 'O'):
-			// -O may close a grep short-flag cluster (-nO<pager>). An
-			// alias or a misread global option may be grep too; only the
-			// diff family's -O<orderfile> (and log -S'TODO') runs nothing.
-			return true
+		case strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--"):
+			if gitShortRunsPager(sub, a[1:]) {
+				return true
+			}
 		}
 	}
 	return false

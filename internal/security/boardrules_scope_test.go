@@ -277,6 +277,12 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"git commit -m 'route x | gemini fallback'",
 		"git log -S'TODO' scripts/reinstall-daemon.sh",
 		"git log -G'FOO' -- scripts/reinstall-daemon.sh",
+		// An O in a glued value is data (review of e3f6a20).
+		`git commit -m"OOM fix by claude"`,
+		"git log -L:Object:scripts/reinstall-daemon.sh",
+		"git checkout -bOverhaul-claude",
+		"git grep -e'Overnight claude' -- scripts/",
+		"git grep -nA3 -e'Overnight' scripts/reinstall-daemon.sh",
 		"cd internal/agy && go test ./...",
 		"CLAUDE_CONFIG_DIR=~/.claude-work go test ./internal/adapter/",
 	}
@@ -327,11 +333,13 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 // table, which a task run may not read itself. The Board exports them with
 //
 //	sqlite3 -json ~/.staypoint/staypoint.db \
-//	  "select task_id, cmdline from security_gate_requests where task_id='task-800b532d'" > /tmp/replay.json
+//	  "select task_id, cmdline, scripts_json from security_gate_requests where task_id='task-800b532d'" > /tmp/replay.json
 //
 // and runs SP_BOARDRULES_REPLAY=/tmp/replay.json go test ./internal/security/ -run Replay -v.
-// Every line still held is listed; the test fails if any is held for
-// self-protection.
+// Scripts are judged from the content the hook stored, which may be
+// truncated; rows whose scripts have no stored content are counted, since
+// their verdict covers the command line only. The test fails on any row
+// still held for self-protection.
 func TestBoardRulesReplay(t *testing.T) {
 	path := os.Getenv("SP_BOARDRULES_REPLAY")
 	if path == "" {
@@ -342,24 +350,34 @@ func TestBoardRulesReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	var rows []struct {
-		TaskID  string `json:"task_id"`
-		Cmdline string `json:"cmdline"`
+		TaskID      string `json:"task_id"`
+		Cmdline     string `json:"cmdline"`
+		ScriptsJSON string `json:"scripts_json"`
 	}
 	if err := json.Unmarshal(raw, &rows); err != nil {
 		t.Fatal(err)
 	}
-	held := 0
+	other, blind := 0, 0
 	for _, r := range rows {
-		why := AnalyzeBoardRulesForTask(r.TaskID, r.Cmdline, nil)
-		if why == "" {
-			continue
+		var scripts []ScriptHash
+		if r.ScriptsJSON != "" {
+			if err := json.Unmarshal([]byte(r.ScriptsJSON), &scripts); err != nil {
+				t.Fatalf("scripts_json for %q: %v", r.Cmdline, err)
+			}
 		}
-		held++
-		if strings.Contains(why, "self-protection") {
+		for _, s := range scripts {
+			if s.Content == "" {
+				blind++
+				break
+			}
+		}
+		why := AnalyzeBoardRulesForTask(r.TaskID, r.Cmdline, scripts)
+		switch {
+		case strings.Contains(why, "self-protection"):
 			t.Errorf("held: %q: %s", r.Cmdline, why)
-		} else {
-			t.Logf("held (other rule): %q: %s", r.Cmdline, why)
+		case why != "":
+			other++
 		}
 	}
-	t.Logf("%d of %d rows still held", held, len(rows))
+	t.Logf("%d rows: %d held by other Board rules, %d with scripts judged without content", len(rows), other, blind)
 }
