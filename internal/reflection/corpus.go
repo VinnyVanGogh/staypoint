@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/archive"
+	"github.com/VinnyVanGogh/staypoint/internal/bridge"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 )
 
@@ -35,6 +36,8 @@ type CorpusOptions struct {
 	IncludeWork bool
 	// WorkOrgs are organizations whose task text is work data (default "Managed Solution").
 	WorkOrgs []string
+	// IsWorkRepo reports whether a repo path holds work data (default bridge.IsWorkRepo).
+	IsWorkRepo func(string) bool
 }
 
 func (o *CorpusOptions) defaults() {
@@ -47,7 +50,54 @@ func (o *CorpusOptions) defaults() {
 	if o.WorkOrgs == nil {
 		o.WorkOrgs = []string{"Managed Solution"}
 	}
+	if o.IsWorkRepo == nil {
+		o.IsWorkRepo = bridge.IsWorkRepo
+	}
 }
+
+// workFilter decides what is work data when IncludeWork is off. It fails
+// closed: text it cannot attribute to a non-work task is treated as work.
+type workFilter struct {
+	include bool
+	orgs    map[string]bool
+	isRepo  func(string) bool
+	// taskWork caches task id -> is work (org or repo).
+	taskWork map[string]bool
+	mesh     *sql.DB
+}
+
+func newWorkFilter(mesh *sql.DB, opts CorpusOptions) *workFilter {
+	w := &workFilter{include: opts.IncludeWork, orgs: map[string]bool{}, isRepo: opts.IsWorkRepo,
+		taskWork: map[string]bool{}, mesh: mesh}
+	for _, o := range opts.WorkOrgs {
+		w.orgs[strings.ToLower(o)] = true
+	}
+	return w
+}
+
+func (w *workFilter) org(org string) bool { return w.orgs[strings.ToLower(org)] }
+
+// task reports whether a task's text is work data; unknown tasks count as work.
+func (w *workFilter) task(id string) bool {
+	if id == "" {
+		return true
+	}
+	if v, ok := w.taskWork[id]; ok {
+		return v
+	}
+	v := true
+	if w.mesh != nil {
+		var org, repo string
+		if w.mesh.QueryRow(`SELECT COALESCE(organization,''), repo_path FROM tasks WHERE id = ?`, id).Scan(&org, &repo) == nil {
+			v = w.org(org) || (repo != "" && w.isRepo(repo))
+		}
+	}
+	w.taskWork[id] = v
+	return v
+}
+
+// skip reports whether an item must stay out of a personal-seat corpus.
+func (w *workFilter) skip(taskID string) bool { return !w.include && w.task(taskID) }
 
 // Corpus is the sampled, size-capped evidence for one period.
 type Corpus struct {
@@ -77,46 +127,49 @@ type bucket struct {
 func BuildCorpus(src Sources, archiveDir string, f *Facts, opts CorpusOptions) (*Corpus, error) {
 	opts.defaults()
 	since := sqliteTime(f.Since)
-	workOrg := map[string]bool{}
-	for _, o := range opts.WorkOrgs {
-		workOrg[strings.ToLower(o)] = true
-	}
+	wf := newWorkFilter(src.Mesh, opts)
 	var buckets []bucket
 	if src.Mesh != nil {
 		buckets = append(buckets,
-			bucket{"board comments", meshItems(src.Mesh, `SELECT c.id, c.created_at, c.message, c.task_id, t.name, COALESCE(t.organization,'')
+			bucket{"board comments", meshItems(src.Mesh, `SELECT c.id, c.created_at, c.message, c.task_id, t.name
 				FROM task_comments c JOIN tasks t ON t.id = c.task_id
-				WHERE c.author IN ('board','user') AND c.created_at >= ? ORDER BY c.created_at`, since, "comment", workOrg, opts.IncludeWork)},
-			bucket{"blocked reasons", meshItems(src.Mesh, `SELECT id, updated_at, block_reason, id, name, COALESCE(organization,'')
-				FROM tasks WHERE COALESCE(block_reason,'') != '' AND updated_at >= ? AND status != 'soft_deleted' ORDER BY updated_at`, since, "blocked", workOrg, opts.IncludeWork)},
-			bucket{"run failures", meshItems(src.Mesh, `SELECT e.id, e.created_at, e.stderr_tail, COALESCE(e.task_id,''), COALESCE(t.name,''), COALESCE(t.organization,'')
-				FROM run_errors e LEFT JOIN tasks t ON t.id = e.task_id WHERE e.created_at >= ? ORDER BY e.created_at`, since, "run_error", workOrg, opts.IncludeWork)},
+				WHERE c.author IN ('board','user') AND c.created_at >= ? ORDER BY c.created_at`, since, "comment", wf)},
+			bucket{"blocked reasons", meshItems(src.Mesh, `SELECT id, updated_at, block_reason, id, name
+				FROM tasks WHERE COALESCE(block_reason,'') != '' AND updated_at >= ? AND status != 'soft_deleted' ORDER BY updated_at`, since, "blocked", wf)},
+			bucket{"run failures", meshItems(src.Mesh, `SELECT e.id, e.created_at, e.stderr_tail, COALESCE(e.task_id,''), COALESCE(t.name,'')
+				FROM run_errors e LEFT JOIN tasks t ON t.id = e.task_id WHERE e.created_at >= ? ORDER BY e.created_at`, since, "run_error", wf)},
 			bucket{"decisions", meshItems(src.Mesh, `SELECT d.id, d.created_at,
 					d.subject_kind || ' ' || d.subject_id || ': ' || d.final_decision || ' (advisor said ' || d.recommendation || ': ' || d.reason || ')',
-					CASE WHEN d.subject_id LIKE 'task-%' THEN d.subject_id ELSE '' END, COALESCE(t.name,''), COALESCE(t.organization,'')
+					CASE WHEN d.subject_id LIKE 'task-%' THEN d.subject_id ELSE '' END, COALESCE(t.name,'')
 				FROM decision_log d LEFT JOIN tasks t ON t.id = d.subject_id
-				WHERE d.final_decision != '' AND d.created_at >= ? ORDER BY d.created_at`, since, "decision", workOrg, opts.IncludeWork)},
+				WHERE d.final_decision != '' AND d.created_at >= ? ORDER BY d.created_at`, since, "decision", wf)},
 		)
 	}
 	if src.Archive != nil {
-		buckets = append(buckets, bucket{"transcripts", transcriptItems(src.Archive, f.Since, opts)})
+		buckets = append(buckets, bucket{"transcripts", transcriptItems(src.Archive, f.Since, opts, wf)})
 	}
 	return assemble(buckets, opts), nil
 }
 
-func meshItems(db *sql.DB, q, since, kind string, workOrg map[string]bool, includeWork bool) []Item {
+func meshItems(db *sql.DB, q, since, kind string, wf *workFilter) []Item {
 	rows, err := db.Query(q, since)
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
-	var out []Item
+	type row struct{ id, at, text, taskID, name string }
+	var all []row
 	for rows.Next() {
-		var id, at, text, taskID, name, org string
-		if rows.Scan(&id, &at, &text, &taskID, &name, &org) != nil {
-			continue
+		var r row
+		if rows.Scan(&r.id, &r.at, &r.text, &r.taskID, &r.name) == nil {
+			all = append(all, r)
 		}
-		if !includeWork && workOrg[strings.ToLower(org)] {
+	}
+	rows.Close()
+	// Filter after closing rows: the filter queries the same single-connection DB.
+	var out []Item
+	for _, r := range all {
+		id, at, text, taskID, name := r.id, r.at, r.text, r.taskID, r.name
+		if wf.skip(taskID) {
 			continue
 		}
 		ref := Ref{Kind: kind, ID: id, Label: name}
@@ -132,8 +185,8 @@ func meshItems(db *sql.DB, q, since, kind string, workOrg map[string]bool, inclu
 }
 
 // transcriptItems reads up to 3 typed user messages from each sampled session.
-func transcriptItems(db *sql.DB, since time.Time, opts CorpusOptions) []Item {
-	q := `SELECT source, rel_path, archive_path, started_at, task_id FROM transcripts
+func transcriptItems(db *sql.DB, since time.Time, opts CorpusOptions, wf *workFilter) []Item {
+	q := `SELECT source, rel_path, archive_path, started_at, task_id, repo, cwd FROM transcripts
 		WHERE (started_at >= ? OR ended_at >= ?) AND user_msgs > 0`
 	if !opts.IncludeWork {
 		q += ` AND profile != 'work'`
@@ -144,13 +197,20 @@ func transcriptItems(db *sql.DB, since time.Time, opts CorpusOptions) []Item {
 	if err != nil {
 		return nil
 	}
-	type sess struct{ source, rel, path, at, task string }
+	type sess struct{ source, rel, path, at, task, repo, cwd string }
 	var all []sess
 	for rows.Next() {
 		var x sess
-		if rows.Scan(&x.source, &x.rel, &x.path, &x.at, &x.task) == nil {
-			all = append(all, x)
+		if rows.Scan(&x.source, &x.rel, &x.path, &x.at, &x.task, &x.repo, &x.cwd) != nil {
+			continue
 		}
+		// A personal-profile session can still be in a work repo or on a
+		// work task; without a repo it cannot be attributed, so it stays out.
+		if !opts.IncludeWork && (x.repo == "" || opts.IsWorkRepo(x.repo) || opts.IsWorkRepo(x.cwd) ||
+			(x.task != "" && wf.task(x.task))) {
+			continue
+		}
+		all = append(all, x)
 	}
 	rows.Close()
 	// Opening every archived file is the slow part: sample at most 120 sessions evenly.

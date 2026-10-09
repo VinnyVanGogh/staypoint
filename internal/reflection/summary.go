@@ -44,14 +44,19 @@ type Runner func(ctx context.Context, prompt string) (string, error)
 
 const sections = "themes, frustrations, breakages, decisions, suggestions"
 
-// BuildPrompt renders the facts and corpus into one instruction.
-func BuildPrompt(f *Facts, c *Corpus) string {
+// BuildPrompt renders the facts and corpus into one instruction. Without
+// IncludeWork, the free-text fact rows (failure and block reasons, which can
+// quote client data) are left out and work orgs and repos are reduced to a
+// count, so only the corpus, already filtered, carries text.
+func BuildPrompt(f *Facts, c *Corpus, opts CorpusOptions) string {
+	opts.defaults()
+	wf := newWorkFilter(nil, opts)
 	var b strings.Builder
 	fmt.Fprintf(&b, `You are writing a private reflection for the owner ("the Board") of a fleet of AI coding agents run through StayPoint, covering the last %d days (%s to %s).
 
 Computed facts (authoritative, do not contradict them):
 `, f.Days, f.Since.Format("2006-01-02"), f.Until.Format("2006-01-02"))
-	facts, _ := json.Marshal(struct {
+	pf := struct {
 		Shipped   int     `json:"tasks_shipped"`
 		ByOrg     []Count `json:"by_org"`
 		Merged    int     `json:"merged_reviews"`
@@ -59,12 +64,19 @@ Computed facts (authoritative, do not contradict them):
 		Tokens    int64   `json:"tokens"`
 		Cost      float64 `json:"cost_usd"`
 		Gates     []Count `json:"gate_requests"`
-		Failures  []Count `json:"top_failures"`
-		Blocked   []Count `json:"top_blocked_reasons"`
+		Failures  []Count `json:"top_failures,omitempty"`
+		Blocked   []Count `json:"top_blocked_reasons,omitempty"`
 		Repos     []Count `json:"repos"`
 		Decisions []Count `json:"board_decisions"`
-	}{f.TasksShippedN, stripRefs(f.TasksShipped), f.MergedReviewsN, f.RunHours, f.TotalTokens, f.TotalCostUSD,
-		stripRefs(f.GateRequests), stripRefs(f.RunFailures), stripRefs(f.BlockedReasons), stripRefs(f.Repos), stripRefs(f.BoardDecisions)})
+	}{f.TasksShippedN, promptRows(f.TasksShipped, nil), f.MergedReviewsN, f.RunHours, f.TotalTokens, f.TotalCostUSD,
+		promptRows(f.GateRequests, nil), nil, nil, promptRows(f.Repos, nil), promptRows(f.BoardDecisions, nil)}
+	if opts.IncludeWork {
+		pf.Failures, pf.Blocked = promptRows(f.RunFailures, nil), promptRows(f.BlockedReasons, nil)
+	} else {
+		pf.ByOrg = promptRows(f.TasksShipped, wf.org)
+		pf.Repos = promptRows(f.Repos, opts.IsWorkRepo)
+	}
+	facts, _ := json.Marshal(pf)
 	b.Write(facts)
 	b.WriteString(`
 
@@ -87,11 +99,22 @@ Every item must cite at least one evidence id that directly supports it; an item
 	return b.String()
 }
 
-func stripRefs(cs []Count) []Count {
-	out := make([]Count, len(cs))
-	for i, c := range cs {
+// promptRows drops refs, redacts keys, and folds rows whose key is work data
+// into one "(work)" row so only the count reaches the personal seat.
+func promptRows(cs []Count, isWork func(string) bool) []Count {
+	out := make([]Count, 0, len(cs))
+	work := Count{Key: "(work)"}
+	for _, c := range cs {
+		if isWork != nil && isWork(c.Key) {
+			work.Count += c.Count
+			continue
+		}
 		c.Refs = nil
-		out[i] = c
+		c.Key = security.Redact(c.Key)
+		out = append(out, c)
+	}
+	if work.Count > 0 {
+		out = append(out, work)
 	}
 	return out
 }
@@ -104,11 +127,12 @@ func firstN(s string, n int) string {
 }
 
 // Summarize runs the prompt and keeps only claims that cite real evidence.
-func Summarize(ctx context.Context, run Runner, f *Facts, c *Corpus, model string, includesWork bool, now time.Time) (*Summary, error) {
+func Summarize(ctx context.Context, run Runner, f *Facts, c *Corpus, model string, opts CorpusOptions, now time.Time) (*Summary, error) {
 	if len(c.Items) == 0 {
 		return nil, errors.New("reflect: no evidence in this period to summarise")
 	}
-	reply, err := run(ctx, BuildPrompt(f, c))
+	includesWork := opts.IncludeWork
+	reply, err := run(ctx, BuildPrompt(f, c, opts))
 	if err != nil {
 		return nil, err
 	}

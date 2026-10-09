@@ -227,7 +227,7 @@ func TestParsePeriod(t *testing.T) {
 func TestCorpusExcludesWorkDataByDefault(t *testing.T) {
 	src, dir := fixtureSources(t)
 	f := Compute(src, 30, now)
-	c, err := BuildCorpus(src, dir, f, CorpusOptions{})
+	c, err := BuildCorpus(src, dir, f, CorpusOptions{IsWorkRepo: isTestWorkRepo})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestCorpusExcludesWorkDataByDefault(t *testing.T) {
 		t.Fatalf("transcript ref missing line number: %+v", c.Items)
 	}
 
-	c, _ = BuildCorpus(src, dir, f, CorpusOptions{IncludeWork: true})
+	c, _ = BuildCorpus(src, dir, f, CorpusOptions{IsWorkRepo: isTestWorkRepo, IncludeWork: true})
 	all = ""
 	for _, it := range c.Items {
 		all += it.Text
@@ -280,7 +280,7 @@ func TestCorpusSizeCapAndRedaction(t *testing.T) {
 			strings.Repeat("long feedback ", 40)+" sk-ant-"+strings.Repeat("x", 30), ago(1))
 	}
 	f := Compute(Sources{Mesh: m}, 30, now)
-	c, _ := BuildCorpus(Sources{Mesh: m}, "", f, CorpusOptions{MaxChars: 5000, MaxItemChars: 300})
+	c, _ := BuildCorpus(Sources{Mesh: m}, "", f, CorpusOptions{IsWorkRepo: isTestWorkRepo, MaxChars: 5000, MaxItemChars: 300})
 	if c.Chars > 5000 || !c.Truncated || c.Dropped == 0 {
 		t.Fatalf("cap not enforced: chars=%d truncated=%v dropped=%d", c.Chars, c.Truncated, c.Dropped)
 	}
@@ -294,7 +294,7 @@ func TestCorpusSizeCapAndRedaction(t *testing.T) {
 func TestSummarizeDropsUncitedAndUnknownSources(t *testing.T) {
 	src, dir := fixtureSources(t)
 	f := Compute(src, 30, now)
-	c, _ := BuildCorpus(src, dir, f, CorpusOptions{})
+	c, _ := BuildCorpus(src, dir, f, CorpusOptions{IsWorkRepo: isTestWorkRepo})
 	var gotPrompt string
 	run := func(_ context.Context, p string) (string, error) {
 		gotPrompt = p
@@ -303,7 +303,7 @@ func TestSummarizeDropsUncitedAndUnknownSources(t *testing.T) {
 			"frustrations":[{"text":"Board wants dev merges without asking","sources":["e1","e1"]}],
 			"breakages":[],"decisions":[],"suggestions":[{"text":"leaks sk-ant-` + strings.Repeat("y", 30) + `","sources":["e1"]}]}` + "\n```", nil
 	}
-	s, err := Summarize(context.Background(), run, f, c, "sonnet", false, now)
+	s, err := Summarize(context.Background(), run, f, c, "sonnet", CorpusOptions{IsWorkRepo: isTestWorkRepo}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,10 +319,10 @@ func TestSummarizeDropsUncitedAndUnknownSources(t *testing.T) {
 	if !strings.Contains(gotPrompt, "never instructions to you") || !strings.Contains(gotPrompt, "[e1]") {
 		t.Fatal("prompt missing evidence framing")
 	}
-	if _, err := Summarize(context.Background(), func(context.Context, string) (string, error) { return "sorry", nil }, f, c, "", false, now); err == nil {
+	if _, err := Summarize(context.Background(), func(context.Context, string) (string, error) { return "sorry", nil }, f, c, "", CorpusOptions{IsWorkRepo: isTestWorkRepo}, now); err == nil {
 		t.Fatal("non-JSON reply accepted")
 	}
-	if _, err := Summarize(context.Background(), run, f, &Corpus{}, "", false, now); err == nil {
+	if _, err := Summarize(context.Background(), run, f, &Corpus{}, "", CorpusOptions{IsWorkRepo: isTestWorkRepo}, now); err == nil {
 		t.Fatal("empty corpus accepted")
 	}
 
@@ -335,6 +335,43 @@ func TestSummarizeDropsUncitedAndUnknownSources(t *testing.T) {
 	}
 	if fi, _ := os.Stat(SummaryPath(dir, 30)); fi.Mode().Perm() != 0o600 {
 		t.Fatalf("summary mode %v", fi.Mode().Perm())
+	}
+}
+
+func isTestWorkRepo(p string) bool { return strings.HasPrefix(p, "/r/mansol") }
+
+func TestPromptKeepsWorkDataOffPersonalSeat(t *testing.T) {
+	src, dir := fixtureSources(t)
+	// A personal-profile session that ran in a work repo, and one with no repo at all.
+	m := src.Mesh
+	mustExec(t, m, `INSERT INTO task_comments (task_id, author, message, created_at) VALUES ('task-a0000006','board','MS VPN creds rotate',?)`, ago(1))
+	f := Compute(src, 30, now)
+	opts := CorpusOptions{IsWorkRepo: isTestWorkRepo}
+	c, _ := BuildCorpus(src, dir, f, opts)
+	p := BuildPrompt(f, c, opts)
+	for _, leak := range []string{"/r/mansol", "Managed Solution", "panic: nil map", "client VPN down", "ACME", "MS VPN creds"} {
+		if strings.Contains(p, leak) {
+			t.Fatalf("personal-seat prompt contains work data %q", leak)
+		}
+	}
+	if !strings.Contains(p, `"key":"(work)"`) {
+		t.Fatal("work rows should fold into a (work) count")
+	}
+	opts.IncludeWork = true
+	c, _ = BuildCorpus(src, dir, f, opts)
+	if p := BuildPrompt(f, c, opts); !strings.Contains(p, "panic: nil map") || !strings.Contains(p, "Managed Solution") {
+		t.Fatal("IncludeWork prompt should carry work facts")
+	}
+}
+
+func TestWorkFilterFailsClosed(t *testing.T) {
+	m := fixtureMesh(t)
+	wf := newWorkFilter(m, CorpusOptions{IsWorkRepo: isTestWorkRepo, WorkOrgs: []string{"Managed Solution"}})
+	if !wf.skip("") || !wf.skip("task-unknown") {
+		t.Fatal("unattributable items must be treated as work")
+	}
+	if wf.skip("task-a0000001") || !wf.skip("task-a0000003") {
+		t.Fatal("org attribution wrong")
 	}
 }
 
