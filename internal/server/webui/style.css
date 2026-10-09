@@ -2104,6 +2104,22 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   transform: translateX(3px); color: var(--accent-light);
 }
 
+/* ── Settings Dev Environment Config (STA-520) ───────────── */
+.settings-dev-config-list { border-bottom: 1px solid var(--border); }
+.settings-dev-config-empty { padding: 12px 18px; font-size: 12px; color: var(--muted); }
+.settings-dev-config-row { align-items: flex-start; gap: 16px; }
+.settings-dev-config-row .settings-row-label-wrap { min-width: 0; flex: 1; }
+.settings-dev-config-repo { font-family: monospace; font-size: 12px; color: var(--cyan); overflow-wrap: anywhere; }
+.settings-dev-config-detail { display: flex; gap: 6px; margin-top: 4px; font-size: 11px; color: var(--muted); }
+.settings-dev-config-detail-label { flex-shrink: 0; min-width: 84px; }
+.settings-dev-config-detail code { font-family: monospace; color: var(--text); overflow-wrap: anywhere; }
+.settings-dev-config-row .settings-row-ctrl { flex-shrink: 0; text-align: right; }
+.settings-dev-config-form { display: flex; flex-direction: column; gap: 6px; padding: 14px 18px; }
+.settings-dev-config-field-label { font-size: 12px; font-weight: 600; color: var(--muted); margin-top: 6px; }
+.settings-dev-config-field-label:first-child { margin-top: 0; }
+.settings-dev-config-actions { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.settings-dev-config-status { font-size: 12px; color: var(--muted); }
+
 /* ── Settings Provider Accounts Quota Breakdown ──────────── */
 .settings-provider-card {
   padding: 16px 18px; border-bottom: 1px solid var(--border);
@@ -4186,17 +4202,23 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .form-field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; }
 .form-field label { font-size: 12px; font-weight: 600; color: var(--muted, #888); }
 .form-field .required { color: var(--red, #f85149); }
-.form-field input, .form-field select {
+/* Same field look for the task page's kind/provider selects and the
+   Settings dev environment config form (task-a2401862). */
+.form-field input, .form-field select, .form-field textarea,
+.task-kind-select, .task-provider-select, .settings-dev-config-input {
   background: var(--surface2, #28283e);
   border: 1px solid var(--border, #30304a);
   border-radius: 6px;
   color: var(--text, #cdd6f4);
+  font-family: inherit;
   font-size: 13px;
   padding: 7px 10px;
   outline: none;
   transition: border-color .15s;
 }
-.form-field input:focus, .form-field select:focus { border-color: var(--accent, #4f8ef7); }
+.form-field textarea, textarea.settings-dev-config-input { resize: vertical; }
+.form-field input:focus, .form-field select:focus, .form-field textarea:focus,
+.task-kind-select:focus, .task-provider-select:focus, .settings-dev-config-input:focus { border-color: var(--accent, #4f8ef7); }
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .form-error {
   background: rgba(248,81,73,.12); border: 1px solid rgba(248,81,73,.3);
@@ -4578,7 +4600,8 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 }
 .ship-review-sendback-submit-btn:hover { background: rgba(248,196,54,.22); }
 .ship-review-sendback-submit-btn:disabled { opacity: .5; cursor: default; }
-.ship-review-reject-submit-btn {
+.ship-review-reject-submit-btn,
+.ship-review-merge-without-tests-btn {
   padding: 6px 12px;
   border-radius: 5px;
   font-size: 12px;
@@ -4588,8 +4611,10 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   border: 1px solid rgba(248,81,73,.4);
   color: var(--red, #f85149);
 }
-.ship-review-reject-submit-btn:hover { background: rgba(248,81,73,.22); }
-.ship-review-reject-submit-btn:disabled { opacity: .5; cursor: default; }
+.ship-review-reject-submit-btn:hover,
+.ship-review-merge-without-tests-btn:hover { background: rgba(248,81,73,.22); }
+.ship-review-reject-submit-btn:disabled,
+.ship-review-merge-without-tests-btn:disabled { opacity: .5; cursor: default; }
 .ship-review-form-checkbox-row { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text, #cdd6f4); }
 .ship-review-del-branch-chk { accent-color: var(--red, #f85149); }
 

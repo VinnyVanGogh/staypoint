@@ -5382,14 +5382,26 @@ function renderSettings() {
       return;
     }
     for (const c of configs) {
-      const row = el('div', 'settings-dev-config-row');
-      row.appendChild(el('code', 'settings-dev-config-repo', c.repo_path));
-      row.appendChild(el('span', 'settings-dev-config-cmd', c.dev_command || '—'));
+      const row = el('div', 'settings-row settings-row-clickable settings-dev-config-row');
+      const info = el('div', 'settings-row-label-wrap');
+      info.appendChild(el('code', 'settings-dev-config-repo', c.repo_path));
+      const detail = (label, value) => {
+        const d = el('div', 'settings-dev-config-detail');
+        d.appendChild(el('span', 'settings-dev-config-detail-label', label));
+        d.appendChild(value ? el('code', '', value) : el('span', '', '—'));
+        info.appendChild(d);
+      };
+      detail('Dev command', c.dev_command);
+      detail('Setup steps', (c.setup_steps || []).join(' && '));
+      detail('Target branch', c.target_branch);
+      row.appendChild(info);
       const mode = c.effective_merge_mode || 'direct';
-      row.appendChild(el('span', 'settings-dev-config-merge-mode',
-        `${MERGE_MODE_LABELS[mode] || mode}${c.merge_mode ? '' : ' (default)'}${c.is_work_repo ? ' · work repo' : ''}${c.target_branch ? ` → ${c.target_branch}` : ''}`));
+      const ctrl = el('div', 'settings-row-ctrl');
+      ctrl.appendChild(el('div', 'settings-dev-config-merge-mode',
+        `${MERGE_MODE_LABELS[mode] || mode}${c.merge_mode ? '' : ' (default)'}`));
+      if (c.is_work_repo) ctrl.appendChild(el('div', 'settings-row-sub', 'Work repo'));
+      row.appendChild(ctrl);
       row.title = 'Click to edit';
-      row.style.cursor = 'pointer';
       // Load the saved values so a save never blanks fields it did not show.
       row.addEventListener('click', () => {
         repoInput.value = c.repo_path || '';
@@ -5442,7 +5454,8 @@ function renderSettings() {
   targetInput.type = 'text';
   targetInput.className = 'settings-dev-config-input settings-dev-config-target-branch';
   targetInput.placeholder = 'Target branch (blank: dev-server for work repos that have it, else the default branch)';
-  const saveBtn = el('button', 'settings-dev-config-save', 'Save config');
+  const saveBtn = el('button', 'btn btn-primary settings-dev-config-save', 'Save config');
+  saveBtn.type = 'button';
   const saveStatus = el('span', 'settings-dev-config-status', '');
   devForm.appendChild(el('div', 'settings-dev-config-field-label', 'Repo path'));
   devForm.appendChild(repoInput);
@@ -5456,8 +5469,10 @@ function renderSettings() {
   devForm.appendChild(targetInput);
   devForm.appendChild(el('div', 'settings-dev-config-field-label', 'gh config dir'));
   devForm.appendChild(ghDirInput);
-  devForm.appendChild(saveBtn);
-  devForm.appendChild(saveStatus);
+  const devActions = el('div', 'settings-dev-config-actions');
+  devActions.appendChild(saveBtn);
+  devActions.appendChild(saveStatus);
+  devForm.appendChild(devActions);
   devSec.appendChild(devForm);
 
   saveBtn.addEventListener('click', async () => {
@@ -11288,7 +11303,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   // wakes it; tasks.max_running_children caps how many run at once.
   const childList = task.dependencies?.subtasks || task.subtasks || [];
   if (task.id && !isFleetTaskId(task.id) && childList.length) {
-    const runKidsBtn = el('button', 'run-children-btn', '▶ Run all children');
+    const runKidsBtn = el('button', 'btn btn-secondary run-children-btn', '▶ Run all children');
     runKidsBtn.type = 'button';
     runKidsBtn.title = 'Queue every backlog/todo child (Board, passkey)';
     runKidsBtn.addEventListener('click', async () => {
