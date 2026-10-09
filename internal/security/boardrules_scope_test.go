@@ -102,6 +102,7 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"GIT_PAGER='sh -c claude' git log",
 		"export GIT_PAGER=claude; git log",
 		"GIT_PAGER=gemini; git log",
+		"GIT_PAGER=claude export GIT_PAGER; git log",
 		"bash -n +n scripts/reinstall-daemon.sh",
 		"bash -n +o noexec scripts/reinstall-daemon.sh",
 		// The gate's env: unset or overridden for anything but go test/vet.

@@ -244,9 +244,9 @@ func runsAgent(code string, depth int) bool {
 		argv, viaXargs := unwrapArgv(s.argv)
 		// GIT_PAGER=claude, EDITOR='sh -c codex': a variable naming an
 		// agent may run it, set for one command, the line or exported.
-		assigns := s.argv[:len(s.argv)-len(argv)]
+		assigns := append([]string{}, s.argv[:len(s.argv)-len(argv)]...)
 		if len(argv) > 0 && exportLike[baseCmd(argv)] {
-			assigns = argv[1:]
+			assigns = append(assigns, argv[1:]...)
 		}
 		for _, a := range assigns {
 			if isAssign(a) && runsAgent(a[strings.IndexByte(a, '=')+1:], depth+1) {
