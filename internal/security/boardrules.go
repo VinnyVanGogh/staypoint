@@ -814,22 +814,26 @@ func psPlainArgs(args []string) bool {
 var psColumns = []string{"SsRUITZNLWXE+<", "AM", "PM", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun",
 	"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
 
-var letterRe = regexp.MustCompile(`[A-Za-z]`)
+// psPatternRe is a grep pattern that stays inside one ps column: no
+// space, digit or operator beyond . and a bracket class ([n]ode), so it
+// cannot span columns or read differently as a basic regexp.
+var psPatternRe = regexp.MustCompile(`^[A-Za-z._/\[\]-]*[A-Za-z][A-Za-z._/\[\]-]*$`)
 
-// grepPatternsOther reports patterns that each have a letter, no
-// backslash (grep's basic regexps read \| \( \+ as operators, Go as
-// literals) and cannot match selfProcNames, the user name or psColumns.
+// statOnlyRe is a pattern made only of letters a STAT column can hold.
+var statOnlyRe = regexp.MustCompile(`(?i)^[sruitznlwxe.\[\]]+$`)
+
+// grepPatternsOther reports patterns that each fit psPatternRe, are not
+// made only of STAT letters, and cannot match selfProcNames, the user
+// name or psColumns. grep reads each line of a pattern as its own
+// pattern, and a newline fails psPatternRe.
 func grepPatternsOther(pats []string) bool {
 	names := append(selfProcNames(), psColumns...)
 	if home, err := os.UserHomeDir(); err == nil {
 		names = append(names, path.Base(home))
 	}
-	for _, ps := range pats {
-		// grep reads each line of a pattern as its own pattern.
-		for _, p := range strings.Split(ps, "\n") {
-			if !letterRe.MatchString(p) || strings.ContainsAny(p, "\\\r\x00") || patternMatches(p, names) {
-				return false
-			}
+	for _, p := range pats {
+		if !psPatternRe.MatchString(p) || statOnlyRe.MatchString(p) || patternMatches(p, names) {
+			return false
 		}
 	}
 	return true
