@@ -671,7 +671,7 @@ func pidKill(code string, depth int) (dynKill, src bool) {
 			case "lsof":
 				src = src || i == 0 && viaXargs || !lsofOtherPorts(argv[i+1:], s.dyn[off+i+1:])
 			case "ps":
-				src = src || !psFiltered(segs, k)
+				src = src || i == 0 && viaXargs || !psFiltered(segs, k, argv[i+1:], s.dyn[off+i+1:])
 			default:
 				// Code in a word (python3 -c "os.system('kill ...')") is
 				// read as shell.
@@ -689,15 +689,24 @@ func pidKill(code string, depth int) (dynKill, src bool) {
 // match.
 var lsofSpecRe = regexp.MustCompile(`(?i)^[46]?(tcp|udp)?(@[^:@\s]*)?:([0-9]+(,[0-9]+)*)$`)
 
+// lsofStateRe is an lsof -s protocol:state filter.
+var lsofStateRe = regexp.MustCompile(`^(TCP|UDP):\^?[A-Z_]+(,\^?[A-Z_]+)*$`)
+
+// daemonClientPorts are ports the daemon itself connects to (Paperclip,
+// Ollama, local Supabase): lsof on them lists the daemon's own client
+// socket, so only lsof -sTCP:LISTEN on them passes.
+var daemonClientPorts = map[string]bool{"3100": true, "11434": true, "54321": true}
+
 // lsofOtherPorts reports lsof args that select only network files on
 // literal ports other than StayPoint's (lsof -ti:8080, lsof -t -i
 // tcp:5173 -sTCP:LISTEN). A file operand, another selector (-c, -p, -u),
 // an -i with no port, an expanding word or any other option is not.
+// daemonClientPorts pass only with -sTCP:LISTEN.
 func lsofOtherPorts(args []string, dyn []bool) bool {
 	if anyTrue(dyn) {
 		return false
 	}
-	sawI := false
+	sawI, listen, client := false, false, false
 	for j := 0; j < len(args); j++ {
 		a := args[j]
 		if len(a) < 2 || a[0] != '-' || a[1] == '-' {
@@ -716,55 +725,126 @@ func lsofOtherPorts(args []string, dyn []bool) bool {
 					j++
 					v = args[j]
 				}
-				if a[c] == 'i' {
-					m := lsofSpecRe.FindStringSubmatch(v)
-					if m == nil {
+				if a[c] == 's' {
+					if !lsofStateRe.MatchString(v) {
 						return false
 					}
-					for _, p := range strings.Split(m[3], ",") {
-						if strings.TrimLeft(p, "0") == StayPointPort {
-							return false
-						}
-					}
-					sawI = true
+					listen = listen || v == "TCP:LISTEN"
+					break
 				}
+				m := lsofSpecRe.FindStringSubmatch(v)
+				if m == nil {
+					return false
+				}
+				for _, p := range strings.Split(m[3], ",") {
+					p = strings.TrimLeft(p, "0")
+					if p == StayPointPort {
+						return false
+					}
+					client = client || daemonClientPorts[p]
+				}
+				sawI = true
 			default:
 				return false
 			}
 			break
 		}
 	}
-	return sawI
+	return sawI && (listen || !client)
 }
 
 // psGreps are filters whose matching lines are all ps passes on.
 var psGreps = map[string]bool{"grep": true, "egrep": true, "fgrep": true}
 
-// psFiltered reports ps in segs[k] piped (directly or through other
-// stages) into a grep whose only input is that pipe and whose patterns
-// each have a letter and cannot match selfProcNames or the ps columns of
-// the daemon's line: ps aux | grep vite | awk '{print $2}'. grep -v, -f,
-// -r, a file operand, an expanding pattern or an awk filter do not count.
-func psFiltered(segs []segment, k int) bool {
+// psFiltered reports ps (args psArgs) in segs[k] piped into a grep whose
+// only input is that pipe and whose patterns each have a letter and cannot
+// match the daemon's ps line: ps aux | grep vite | awk '{print $2}'. Only
+// grep -v may come between them. ps options other than plain listing
+// ones (o, O, E, BSD e print more columns), grep options outside a small
+// set that keeps whole matching lines (-z, -A, -r, -f), a file operand or
+// input redirect, an expanding pattern or an awk filter do not count.
+func psFiltered(segs []segment, k int, psArgs []string, psDyn []bool) bool {
+	if anyTrue(psDyn) || !psPlainArgs(psArgs) {
+		return false
+	}
 	for j := k; j+1 < len(segs) && segs[j].piped; j++ {
-		if s := segs[j+1]; len(s.argv) > 0 && psGreps[baseCmd(s.argv)] && !anyTrue(s.dyn) && grepPatternsOther(s.argv[1:]) {
-			return true
+		s := segs[j+1]
+		if len(s.argv) == 0 || !psGreps[baseCmd(s.argv)] || anyTrue(s.dyn) {
+			return false
+		}
+		for _, r := range s.redirects {
+			if strings.HasPrefix(r.op, "<") {
+				return false
+			}
+		}
+		pats, invert, ok := grepArgs(s.argv[1:])
+		if !ok {
+			return false
+		}
+		if !invert {
+			return grepPatternsOther(pats)
 		}
 	}
 	return false
 }
 
-// psColumns are words on any ps line that a pattern matching them would
-// also select the daemon's line by: AM/PM start times and month names.
-var psColumns = []string{"AM", "PM", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+// psPlainArgs reports ps options that only pick processes and the
+// standard columns: -A, -e (same as -A on macOS), -a, -x, -f, -c, -w and
+// BSD aux/ax/auxww.
+func psPlainArgs(args []string) bool {
+	for _, a := range args {
+		allowed := "auxwc"
+		if strings.HasPrefix(a, "-") {
+			a, allowed = a[1:], "Aaxfcwe"
+		}
+		if a == "" {
+			return false
+		}
+		for _, c := range a {
+			if !strings.ContainsRune(allowed, c) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// psColumns are words on the daemon's ps line besides its path and user:
+// start times (3:15PM, Thu03PM, 9Oct26).
+var psColumns = []string{"AM", "PM", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun",
+	"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
 
 var letterRe = regexp.MustCompile(`[A-Za-z]`)
 
-// grepPatternsOther reads grep args: -e values or the one operand are the
-// patterns. Options other than -e that take a separate value make the
-// value an extra operand, so the args do not count.
-func grepPatternsOther(args []string) bool {
-	var pats, ops []string
+// grepPatternsOther reports patterns that each have a letter, no
+// backslash (grep's basic regexps read \| \( \+ as operators, Go as
+// literals) and cannot match selfProcNames, the user name or psColumns.
+func grepPatternsOther(pats []string) bool {
+	names := append(selfProcNames(), psColumns...)
+	if home, err := os.UserHomeDir(); err == nil {
+		names = append(names, path.Base(home))
+	}
+	for _, p := range pats {
+		if !letterRe.MatchString(p) || strings.Contains(p, `\`) || patternMatches(p, names) {
+			return false
+		}
+	}
+	return true
+}
+
+// grepShort and grepLong are grep options that keep whole matching lines
+// of stdin (or count them); v inverts.
+const grepShort = "iwxEFGsnhHcv"
+
+var grepLong = map[string]bool{"--ignore-case": true, "--word-regexp": true, "--line-regexp": true,
+	"--extended-regexp": true, "--fixed-strings": true, "--basic-regexp": true, "--no-messages": true,
+	"--line-number": true, "--count": true, "--invert-match": true}
+
+// grepArgs reads grep args: -e values or the one operand are the
+// patterns. ok is false for any option outside grepShort/grepLong or an
+// operand besides the pattern (a file).
+func grepArgs(args []string) (pats []string, invert, ok bool) {
+	var ops []string
 	hasE := false
 	for j := 0; j < len(args); j++ {
 		a := args[j]
@@ -776,24 +856,26 @@ func grepPatternsOther(args []string) bool {
 			pats, hasE = append(pats, strings.TrimPrefix(a, "--regexp=")), true
 		case a == "--regexp":
 			if j+1 >= len(args) {
-				return false
+				return nil, false, false
 			}
 			j++
 			pats, hasE = append(pats, args[j]), true
 		case strings.HasPrefix(a, "--"):
-			if strings.HasPrefix(a, "--invert") || strings.HasPrefix(a, "--file") || strings.Contains(a, "recursive") {
-				return false
+			if !grepLong[a] {
+				return nil, false, false
 			}
+			invert = invert || a == "--invert-match"
 		case len(a) > 1 && a[0] == '-':
 			for c := 1; c < len(a); c++ {
-				if strings.IndexByte("vfrR", a[c]) >= 0 {
-					return false
+				if a[c] != 'e' && strings.IndexByte(grepShort, a[c]) < 0 {
+					return nil, false, false
 				}
+				invert = invert || a[c] == 'v'
 				if a[c] == 'e' {
 					v := a[c+1:]
 					if v == "" {
 						if j+1 >= len(args) {
-							return false
+							return nil, false, false
 						}
 						j++
 						v = args[j]
@@ -808,19 +890,14 @@ func grepPatternsOther(args []string) bool {
 	}
 	if !hasE {
 		if len(ops) != 1 {
-			return false
+			return nil, false, false
 		}
 		pats, ops = ops, nil
 	}
 	if len(ops) > 0 || len(pats) == 0 {
-		return false
+		return nil, false, false
 	}
-	for _, p := range pats {
-		if !letterRe.MatchString(p) || patternMatches(p, append(selfProcNames(), psColumns...)) {
-			return false
-		}
-	}
-	return true
+	return pats, invert, true
 }
 
 // patternMatches reports a pattern, read as a case-insensitive regexp,
