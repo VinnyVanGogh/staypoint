@@ -247,6 +247,9 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"cd cmd/staypointd && go build -o /tmp/d .//",
 		"cd -P cmd/staypointd && go build -o /tmp/d",
 		"cd -- cmd/staypointd && go build -race -o /tmp/d .",
+		"cd cmd/staypointd && go build -o /tmp/d ./...",
+		"cd cmd/staypointd/x && go build -o /tmp/d ..",
+		"cd cmd/staypointd && go build -o /tmp/d ./x/..",
 		// A write that may carry what a command naming the script prints.
 		"f(){ cat scripts/reinstall-daemon.sh; }; f > /tmp/r.sh",
 		"cat <(cat scripts/reinstall-daemon.sh) > /tmp/r.sh",
