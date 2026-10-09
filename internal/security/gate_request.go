@@ -68,6 +68,10 @@ type GateRequestInput struct {
 	Org     string
 	CWD     string
 	Scripts []ScriptHash
+	// MaxWait, when set, is the longest the caller can hold the tool call:
+	// the request is skipped (deferred) no later than this. It only ever
+	// shortens the deadline, so a caller cannot use it to get anything run.
+	MaxWait time.Duration
 }
 
 const gateRequestCols = `id, cmdline, reasons_json, run_id, status, created_at, decided_at,

@@ -36,7 +36,9 @@ type OrgTrustSpec struct {
 	Note    string `json:"note"`
 }
 
-// NormalizeOrg keys an org trust exactly as an org hold is keyed.
+// NormalizeOrg keys an org trust: SQLite's lower(trim()), matching the SQL
+// below. Unlike an org hold it does not fold lookalikes (names.Normalize):
+// a trust approves, and wider folding would widen what it approves.
 func NormalizeOrg(org string) string { return governance.NormalizeOrg(org) }
 
 // NewOrgTrust builds the trust rule for spec.Org.

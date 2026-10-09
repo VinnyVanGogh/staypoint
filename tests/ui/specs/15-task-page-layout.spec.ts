@@ -282,6 +282,9 @@ async function selectTab(page: Page, name: RegExp): Promise<Locator> {
 }
 
 const TABS = [/^\W*Review\b/, /^\W*Diff\b/, /^\W*Migrations\b/, /^\W*Brief\b/, /^\W*Artifacts\b/];
+// Every tab in order: Decisions (task-e3fe2c0b) comes first, then the content
+// tabs above.
+const ALL_TABS = [/^\W*Decisions\b/, ...TABS];
 
 test('seeded heavy task renders and is captured at 1512x900', async ({ page, api }) => {
   test.setTimeout(60_000);
@@ -358,16 +361,16 @@ test('step 2: one screen at 1512x900 with sticky header actions, stats strip and
   await expectInViewport(page, runHeader.getByRole('button', { name: /Stop( now)?\b/i }), 'header Stop button');
 });
 
-test('step 3: right panel tabs Review / Diff / Migrations / Brief / Artifacts swap the existing content', async ({ page, api }) => {
+test('step 3: right panel tabs Decisions / Review / Diff / Migrations / Brief / Artifacts swap the existing content', async ({ page, api }) => {
   test.setTimeout(60_000);
   await openHeavyTask(page, api);
 
   const panel = page.locator('#task-page-content .task-page-panel');
   await expectInViewport(page, panel.getByRole('tablist'), '.task-page-panel tablist');
   const tabs = panel.getByRole('tab');
-  await expect(tabs).toHaveCount(TABS.length);
-  for (let i = 0; i < TABS.length; i++) {
-    await expect(tabs.nth(i)).toHaveAccessibleName(TABS[i]);
+  await expect(tabs).toHaveCount(ALL_TABS.length);
+  for (let i = 0; i < ALL_TABS.length; i++) {
+    await expect(tabs.nth(i)).toHaveAccessibleName(ALL_TABS[i]);
   }
 
   // Each tab shows its existing renderer's content and hides the others.
@@ -625,7 +628,7 @@ test('step 6: at 800x900 the page stacks, tabs are a segmented control, nothing 
       overflows: list.scrollWidth > list.clientWidth + 1,
     };
   });
-  expect(seg.count).toBe(TABS.length);
+  expect(seg.count).toBe(ALL_TABS.length);
   expect(seg.oneRow, 'tabs wrap onto more than one row').toBe(true);
   expect(seg.filled, 'tabs do not fill the row like a segmented control').toBeGreaterThanOrEqual(0.9);
   expect(seg.overflows, 'tablist overflows horizontally').toBe(false);

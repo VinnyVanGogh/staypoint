@@ -1642,6 +1642,59 @@ func TestUpsertDevConfig_BoardGate_AuditLog(t *testing.T) {
 	}
 }
 
+// TestUpsertDevConfig_PushPolicy: the Board sets push_policy through the PUT,
+// an unknown value is refused, and a PUT that omits it keeps it (STA-562).
+func TestUpsertDevConfig_PushPolicy(t *testing.T) {
+	database := setupTestDB(t)
+	seedBoardWebAuthnCredential(t, database)
+	srv, token := startTestServer(t, database)
+	if s, ok := any(srv).(webAuthnVerifierSetter); ok {
+		s.SetWebAuthnVerifier(func(_ *http.Request, _ string) error { return nil })
+	}
+	boardToken := srv.BoardToken()
+	base := srv.URL()
+
+	put := func(body string) (int, map[string]any) {
+		t.Helper()
+		req, _ := http.NewRequest("PUT", base+"/api/project-dev-configs", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: "staypoint_board", Value: boardToken})
+		req.Header.Set("X-WebAuthn-Assertion", "stub-assertion")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("PUT: %v", err)
+		}
+		defer resp.Body.Close()
+		var got map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&got)
+		return resp.StatusCode, got
+	}
+
+	for _, bad := range []string{`"always"`, `""`, `"Branch_Only"`} {
+		if code, _ := put(`{"repo_path":"/tmp/pp-repo","push_policy":` + bad + `}`); code != http.StatusBadRequest {
+			t.Errorf("push_policy %s: want 400, got %d", bad, code)
+		}
+	}
+	// No explicit choice is branch_only (Board decision 2026-10-08).
+	if code, got := put(`{"repo_path":"/tmp/pp-repo","dev_command":"make dev"}`); code != http.StatusOK || got["push_policy"] != "branch_only" {
+		t.Errorf("new row default: code %d push_policy %v, want 200 branch_only", code, got["push_policy"])
+	}
+	// An explicit never survives a PUT that omits push_policy.
+	if code, got := put(`{"repo_path":"/tmp/pp-repo","push_policy":"never"}`); code != http.StatusOK || got["push_policy"] != "never" {
+		t.Errorf("set never: code %d push_policy %v", code, got["push_policy"])
+	}
+	if code, got := put(`{"repo_path":"/tmp/pp-repo","dev_command":"make dev2"}`); code != http.StatusOK || got["push_policy"] != "never" {
+		t.Errorf("partial PUT kept never: code %d push_policy %v, want never", code, got["push_policy"])
+	}
+	if code, got := put(`{"repo_path":"/tmp/pp-repo","push_policy":"branch_only"}`); code != http.StatusOK || got["push_policy"] != "branch_only" {
+		t.Errorf("set branch_only: code %d push_policy %v", code, got["push_policy"])
+	}
+	if code, got := put(`{"repo_path":"/tmp/pp-repo","dev_command":"npm run dev"}`); code != http.StatusOK || got["push_policy"] != "branch_only" {
+		t.Errorf("partial PUT kept push_policy: code %d push_policy %v, want branch_only", code, got["push_policy"])
+	}
+}
+
 // TestUpsertDevConfig_PartialUpdate verifies that a PUT carrying only dev_command
 // does not blank dev_url, sql_editor_url, or supabase_enabled (fix for STA-520 blocker).
 func TestUpsertDevConfig_PartialUpdate(t *testing.T) {

@@ -187,7 +187,7 @@ func TestWebUI_DetailPanelPolishAndDismiss(t *testing.T) {
 	// container query on the drawer, not the viewport. A sequence guard keeps
 	// a slow drawer load from rendering after a newer open.
 	for _, pattern := range []string{
-		"renderTaskPage(content, task, comments, interactions, task._diffData, task._checkpoints, task.runErrors, shipCard, { drawer: true })",
+		"renderTaskPage(content, task, comments, interactions, undefined, undefined, task.runErrors, shipCard, { drawer: true })",
 		"let taskViewSeq",
 		"if (seq !== taskViewSeq) return;",
 		"classList.add('task-page-drawer')",

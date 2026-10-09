@@ -35,6 +35,19 @@ func (a ClaudeAdapter) Execute(ctx context.Context, req ExecRequest) error {
 	return runCommandWithEnv(ctx, req.Dir, req.Bin, args, req.ExtraEnv, req.Stdin, req.Stdout, req.Stderr)
 }
 
+// PreToolHookTimeoutSeconds is the timeout given to the run's PreToolUse hook.
+// Claude Code runs the tool anyway when a command hook times out (default 600s;
+// https://code.claude.com/docs/en/hooks: "A timed-out command ... hook doesn't
+// block the tool call"), so a Board gate wait must end inside this limit with
+// an explicit deny. The daemon skips a task's held request after
+// gates.trust_defer_minutes (default 2); this is the backstop behind it. The
+// hook stops waiting HookGateWaitMargin before it.
+const PreToolHookTimeoutSeconds = 600
+
+// HookGateWaitMargin is how long before PreToolHookTimeoutSeconds the hook gives
+// up waiting on the Board and blocks the command itself.
+const HookGateWaitMargin = 120
+
 // writePreToolHookSettings writes a per-run temp settings JSON that registers
 // staypoint hook pre-tool as a Claude Code PreToolUse hook, then returns its
 // path.  Returns "" (fail-open) if no hook binary can be found or the file
@@ -51,6 +64,7 @@ func writePreToolHookSettings(extraEnv []string) string {
 	type hookEntry struct {
 		Type    string `json:"type"`
 		Command string `json:"command"`
+		Timeout int    `json:"timeout"`
 	}
 	type hookGroup struct {
 		Hooks []hookEntry `json:"hooks"`
@@ -58,7 +72,7 @@ func writePreToolHookSettings(extraEnv []string) string {
 	settings := map[string]any{
 		"hooks": map[string]any{
 			"PreToolUse": []hookGroup{
-				{Hooks: []hookEntry{{Type: "command", Command: hookBin + " hook pre-tool"}}},
+				{Hooks: []hookEntry{{Type: "command", Command: hookBin + " hook pre-tool", Timeout: PreToolHookTimeoutSeconds}}},
 			},
 		},
 	}

@@ -105,6 +105,9 @@ func (h *SecurityGateHandler) CreateGateRequest(w http.ResponseWriter, r *http.R
 		// Pinned says the hook will run exactly those bytes (STA-868).
 		Scripts []gates.HookScript `json:"scripts"`
 		Pinned  bool               `json:"pinned"`
+		// MaxWaitSeconds: the hook cannot hold the tool call longer than
+		// this (agy kills its hook at 30s), so skip the request by then.
+		MaxWaitSeconds int `json:"max_wait_seconds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Cmdline == "" {
 		http.Error(w, `{"error":"cmdline required"}`, http.StatusBadRequest)
@@ -135,6 +138,9 @@ func (h *SecurityGateHandler) CreateGateRequest(w http.ResponseWriter, r *http.R
 		return
 	}
 	in := security.GateRequestInput{Cmdline: req.Cmdline, Reasons: req.Reasons, RunID: req.RunID, TaskID: req.TaskID, CWD: req.CWD}
+	if req.MaxWaitSeconds > 0 {
+		in.MaxWait = time.Duration(req.MaxWaitSeconds) * time.Second
+	}
 	var scripts []security.ScriptRef
 	if !gates.SpecialRunIDs[req.RunID] {
 		if req.Scripts != nil {
@@ -235,8 +241,13 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 				boardRule = "file edit outside the task worktree (Board rule: edits stay in the worktree)"
 			}
 			facts = security.AnalyzeForTrust(in.Cmdline, gates.TrustContextFor(h.db, in.TaskID, in.CWD, in.Scripts))
-			deferMins = gates.TrustDeferMinutes(h.db)
 		}
+		// Every task's held request gets a deadline, trusted or not: past it
+		// the hook skips the command (never runs it) and the agent moves on;
+		// a later approval wakes the task to perform it. Without one the hook
+		// waited until Claude Code's own hook timeout, which runs the command
+		// (task-cae83e7f).
+		deferMins = gates.TrustDeferMinutes(h.db)
 	}
 
 	tx, err := h.db.Begin()
@@ -256,6 +267,11 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 			trust = nil
 		}
 	}
+	// MaxWait may only shorten the deadline, never extend it.
+	holdFor := time.Duration(deferMins) * time.Minute
+	if in.MaxWait > 0 && (holdFor == 0 || in.MaxWait < holdFor) {
+		holdFor = in.MaxWait
+	}
 	pending, approved := string(security.GateRequestPending), string(security.GateRequestApproved)
 	if rule == nil && trust != nil && !facts.Protected && boardRule == "" && !facts.DeleteOutside && !trust.Tev1 {
 		rule = trust
@@ -269,7 +285,7 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 		if trust != nil {
 			event, payload := "", map[string]any{"rule_id": trust.ID, "cmdline": gr.Cmdline, "task_id": gr.TaskID}
 			deferHeld := func() error {
-				at := now.Add(time.Duration(deferMins) * time.Minute)
+				at := now.Add(holdFor)
 				if err := security.SetDeferAt(tx, gr.ID, at); err != nil {
 					return err
 				}
@@ -299,10 +315,22 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 			default:
 				event, out.tev1 = "security_gate_tev1_asked", trust
 				payload["message"] = fmt.Sprintf("tev1 decides (threshold %.2f)", trust.Tev1Threshold)
+				if in.MaxWait > 0 {
+					// The caller cannot outwait tev1; skip if it is late.
+					if err := deferHeld(); err != nil {
+						return nil, err
+					}
+				}
 			}
 			if err := governance.LogGateEventTx(tx, gr.ID, gates.DecidedByTrust(trust.ID), event, nil, &pending, payload); err != nil {
 				return nil, err
 			}
+		} else if holdFor > 0 {
+			at := now.Add(holdFor)
+			if err := security.SetDeferAt(tx, gr.ID, at); err != nil {
+				return nil, err
+			}
+			gr.DeferAt = &at
 		}
 		return out, tx.Commit()
 	}

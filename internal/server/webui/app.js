@@ -414,6 +414,31 @@ async function boardActionError(r) {
   return new Error(boardActionErrorText(r, body));
 }
 
+// postRunNow is the Run Now request: POST stage in_progress, retried with
+// Touch ID when the server asks for it (a prod-targeting agent task leaving
+// backlog). Returns null when the Board cancelled the passkey prompt, else
+// the Response; throws the server's error when it refused.
+async function postRunNow(taskId) {
+  const send = (sessionToken, assertion) => {
+    const headers = { 'Content-Type': 'application/json', ...authHeader() };
+    if (sessionToken) headers['X-WebAuthn-Session'] = sessionToken;
+    if (assertion) headers['X-WebAuthn-Assertion'] = assertion;
+    return fetch(`/api/tasks/${encodeURIComponent(taskId)}/stage`, {
+      method: 'POST', headers, body: JSON.stringify({ stage: 'in_progress' }),
+    });
+  };
+  let res = await send('', '');
+  if (res.status === 403) {
+    const err = await res.clone().json().catch(() => ({}));
+    if (err.error === 'board_passkey_assertion_required') {
+      res = await withBoardWebAuthn(send, 'running this prod-targeting task');
+      if (res === null) return null;
+    }
+  }
+  if (!res.ok) throw await boardActionError(res);
+  return res;
+}
+
 // Close any open .report-dl-menu when clicking outside its wrapper.
 document.addEventListener('click', () => {
   document.querySelectorAll('.report-dl-menu').forEach(m => { m.hidden = true; });
@@ -502,6 +527,9 @@ function updateShowHiddenCounts() {
 }
 
 // ── Initial data load ─────────────────────────────────────
+// Fields only the task view fetches (run steps, run errors, diff, checkpoints).
+const TASK_VIEW_FIELDS = ['runSteps', 'runErrors', '_diffData', '_checkpoints', 'governance'];
+
 async function loadAll() {
   try {
     const [fleetResp, tasksResp, sessionsResp] = await Promise.all([
@@ -516,6 +544,14 @@ async function loadAll() {
 
     if (fleetResp) state.fleet = fleetResp;
     for (const t of (tasksResp.tasks || [])) {
+      // A task page opened from a direct link usually loads before this list;
+      // keep what it fetched that the list does not carry (STA-775).
+      const prev = state.tasks[t.id];
+      if (prev) {
+        for (const k of TASK_VIEW_FIELDS) {
+          if (k in prev && !(k in t)) t[k] = prev[k];
+        }
+      }
       state.tasks[t.id] = t;
       if (t.description) state.taskDescriptions[t.id] = t.description;
       if (t.comments && t.comments.length) state.taskComments[t.id] = t.comments;
@@ -571,6 +607,7 @@ async function loadAll() {
     populateRecentTasksFilters();
     renderAll();
     renderSidebarOrgTree();
+    canonicalizeTaskPageURL(state.openDetailTaskId);
     prefetchTaskComments();
   } catch (err) {
     console.error('load failed', err);
@@ -594,6 +631,8 @@ function connectSSE() {
     badge.className = 'badge badge-live';
     badge.textContent = 'live';
     if (sseRetryTimer) { clearTimeout(sseRetryTimer); sseRetryTimer = null; }
+    // Catch up on alerts raised or dismissed while disconnected.
+    loadBoardAlerts();
   };
   sseSource.onerror = () => {
     badge.className = 'badge badge-error';
@@ -610,12 +649,161 @@ function connectSSE() {
   };
 }
 
+// ── Board alerts (STA-705) ───────────────────────────────
+// Breaker trips and quota alerts from the daemon and the hook CLI, persisted
+// in board_alerts and pushed over SSE. Shown until the Board dismisses them.
+const BOARD_ALERTS_VISIBLE = 3;
+const BOARD_ALERT_SEVERITY_RANK = { critical: 0, warning: 1, info: 2 };
+const boardAlerts = {
+  byId: new Map(),
+  errors: new Map(),   // id -> dismiss error text
+  expanded: false,
+  seq: 0,              // bumped on every SSE change
+  touched: new Map(),  // id -> seq of its latest SSE change
+  loadSeq: 0,
+};
+
+// loadBoardAlerts replaces the list from GET /api/board/alerts. SSE changes
+// that land while the fetch is in flight win over the (older) response, and
+// an older fetch never overwrites a newer one.
+async function loadBoardAlerts() {
+  const loadSeq = ++boardAlerts.loadSeq;
+  const startSeq = boardAlerts.seq;
+  let resp;
+  try {
+    resp = await apiFetch('/api/board/alerts');
+  } catch (err) {
+    console.warn('board alerts load failed', err);
+    return;
+  }
+  if (loadSeq !== boardAlerts.loadSeq) return;
+  const next = new Map();
+  for (const a of (resp.alerts || [])) next.set(a.id, a);
+  for (const [id, seq] of boardAlerts.touched) {
+    if (seq <= startSeq) continue;
+    if (boardAlerts.byId.has(id)) next.set(id, boardAlerts.byId.get(id));
+    else next.delete(id);
+  }
+  boardAlerts.byId = next;
+  boardAlerts.touched.clear();
+  renderBoardAlerts();
+}
+
+function upsertBoardAlert(a) {
+  if (!a || a.id == null) return;
+  boardAlerts.touched.set(a.id, ++boardAlerts.seq);
+  if (a.acknowledged_at) {
+    boardAlerts.byId.delete(a.id);
+  } else {
+    boardAlerts.byId.set(a.id, a);
+  }
+  renderBoardAlerts();
+}
+
+function removeBoardAlert(id) {
+  if (id == null) return;
+  boardAlerts.touched.set(id, ++boardAlerts.seq);
+  boardAlerts.byId.delete(id);
+  boardAlerts.errors.delete(id);
+  renderBoardAlerts();
+}
+
+function sortedBoardAlerts() {
+  return [...boardAlerts.byId.values()].sort((a, b) => {
+    const ra = BOARD_ALERT_SEVERITY_RANK[a.severity] ?? 3;
+    const rb = BOARD_ALERT_SEVERITY_RANK[b.severity] ?? 3;
+    if (ra !== rb) return ra - rb;
+    return new Date(b.last_seen_at).getTime() - new Date(a.last_seen_at).getTime();
+  });
+}
+
+async function dismissBoardAlert(id) {
+  boardAlerts.errors.delete(id);
+  renderBoardAlerts();
+  let r;
+  try {
+    r = await fetch(`/api/board/alerts/${encodeURIComponent(id)}/ack`, { method: 'POST', headers: authHeader() });
+  } catch {
+    boardAlerts.errors.set(id, 'Dismiss failed: daemon unreachable.');
+    renderBoardAlerts();
+    return;
+  }
+  if (r.ok) {
+    removeBoardAlert(id);
+    return;
+  }
+  boardAlerts.errors.set(id, (r.status === 401 || r.status === 403)
+    ? 'Dismiss needs a Board session.'
+    : `Dismiss failed (${r.status}).`);
+  renderBoardAlerts();
+}
+
+function renderBoardAlerts() {
+  const box = document.getElementById('board-alerts');
+  if (!box) return;
+  const list = sortedBoardAlerts();
+  box.innerHTML = '';
+  box.hidden = list.length === 0;
+  if (!list.length) {
+    boardAlerts.expanded = false;
+    return;
+  }
+  const shown = boardAlerts.expanded ? list : list.slice(0, BOARD_ALERTS_VISIBLE);
+  for (const a of shown) {
+    const sev = BOARD_ALERT_SEVERITY_RANK[a.severity] !== undefined ? a.severity : 'info';
+    const row = el('div', `board-alert board-alert-${sev}`);
+    row.setAttribute('data-testid', 'board-alert');
+    row.dataset.alertId = String(a.id);
+    row.dataset.severity = sev;
+    row.setAttribute('role', sev === 'critical' ? 'alert' : 'status');
+
+    const body = el('div', 'board-alert-body');
+    const head = el('div', 'board-alert-head');
+    head.appendChild(el('span', 'board-alert-title', a.title || a.kind || 'Alert'));
+    if (a.occurrences > 1) head.appendChild(el('span', 'board-alert-count', `×${a.occurrences}`));
+    const when = el('span', 'board-alert-time', fmtRelTime(a.last_seen_at));
+    if (a.last_seen_at) when.title = new Date(a.last_seen_at).toLocaleString();
+    head.appendChild(when);
+    body.appendChild(head);
+    if (a.message) body.appendChild(el('div', 'board-alert-message', a.message));
+    const err = boardAlerts.errors.get(a.id);
+    if (err) body.appendChild(el('div', 'board-alert-error', err));
+    row.appendChild(body);
+
+    const btn = el('button', 'board-alert-dismiss', 'Dismiss');
+    btn.type = 'button';
+    btn.setAttribute('data-testid', 'board-alert-dismiss');
+    btn.addEventListener('click', () => dismissBoardAlert(a.id));
+    row.appendChild(btn);
+    box.appendChild(row);
+  }
+  const hidden = list.length - BOARD_ALERTS_VISIBLE;
+  if (hidden > 0) {
+    const toggle = el('button', 'board-alerts-toggle', boardAlerts.expanded ? 'Show fewer' : `+${hidden} more`);
+    toggle.type = 'button';
+    toggle.setAttribute('aria-expanded', String(boardAlerts.expanded));
+    toggle.addEventListener('click', () => {
+      boardAlerts.expanded = !boardAlerts.expanded;
+      renderBoardAlerts();
+    });
+    box.appendChild(toggle);
+  }
+}
+
 // ── Event dispatch ────────────────────────────────────────
 function handleEvent(evt) {
   state.events.unshift(evt);
   if (state.events.length > state.maxEvents) state.events.pop();
 
   const type = evt.type || '';
+  if (type === 'board_alert' && evt.data) {
+    upsertBoardAlert(evt.data);
+    return;
+  }
+  if (type === 'board_alert_acknowledged' && evt.data) {
+    removeBoardAlert(evt.data.id);
+    return;
+  }
   if (type === 'run.step' && evt.data) {
     const step = evt.data;
     const tid = step.task_id;
@@ -7422,18 +7610,29 @@ let detailOpenEvent = null;
 let taskViewSeq = 0;
 
 // Fetches everything the task layout renders, for the full page and the drawer.
+// The page renders as soon as the cheap DB-backed calls return. The diff and
+// checkpoint list each run several git processes (seconds on a loaded
+// machine), so they arrive later through `diff`, which resolves to
+// { diffData, checkpoints } (STA-775). The ship review card stays in the first
+// batch: it decides whether Run Now and Mark done are offered at all.
 async function fetchTaskViewData(resolvedId) {
   const isFleet = isFleetTaskId(resolvedId);
   const apiBase = isFleet ? '/api/fleet/tasks' : '/api/tasks';
-  const [taskResp, commentsResp, stepsResp, interactionsResp, diffResp, checkpointsResp, runErrorsResp, shipCardResp] = await Promise.all([
+  const diff = isFleet
+    ? Promise.resolve({ diffData: { diff: '', files: [], checkpoint_id: '' }, checkpoints: [] })
+    : Promise.all([fetchTaskDiff(resolvedId, ''), fetchTaskCheckpoints(resolvedId)])
+      .then(([diffData, checkpoints]) => ({ diffData, checkpoints }));
+  // Ordered with fetchWholeRunDiff: a newer whole-run fetch wins the stats strip.
+  const diffSeq = wholeRunDiffSeq[resolvedId] = (wholeRunDiffSeq[resolvedId] || 0) + 1;
+  const [taskResp, commentsResp, stepsResp, interactionsResp, runErrorsResp, shipCardResp, govResp] = await Promise.all([
     apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}`),
     apiFetch(`${apiBase}/${encodeURIComponent(resolvedId)}/comments`).catch(() => ({ comments: [] })),
     (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/run-steps`).catch(() => ({ steps: [] })) : Promise.resolve({ steps: [] })),
     (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/interactions`).catch(() => ({ interactions: [] })) : Promise.resolve({ interactions: [] })),
-    (!isFleet ? fetchTaskDiff(resolvedId, '') : Promise.resolve({ diff: '', files: [], checkpoint_id: '' })),
-    (!isFleet ? fetchTaskCheckpoints(resolvedId) : Promise.resolve([])),
     (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/run-errors?limit=20`).catch(() => ({ errors: [] })) : Promise.resolve({ errors: [] })),
     (!isFleet ? apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/ship-review`).catch(() => null) : Promise.resolve(null)),
+    // Governance is optional, so it no longer waits for the rest to finish.
+    apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}/governance`).catch(() => null),
   ]);
   const task = taskResp.task || taskResp;
   if (taskResp.dependencies) task.dependencies = taskResp.dependencies;
@@ -7446,17 +7645,30 @@ async function fetchTaskViewData(resolvedId) {
   task.comments = comments;
   task.runSteps = stepsResp?.steps || [];
   task.runErrors = runErrorsResp?.errors || [];
-  task._diffData = diffResp;
-  task._checkpoints = checkpointsResp;
   const interactions = interactionsResp?.interactions || [];
   const shipCard = (shipCardResp && !shipCardResp.error) ? shipCardResp : null;
+  if (govResp && !govResp.error) task.governance = govResp;
 
-  try {
-    const govResp = await apiFetch(`/api/tasks/${encodeURIComponent(task.id || resolvedId)}/governance`);
-    if (govResp && !govResp.error) task.governance = govResp;
-  } catch { /* governance optional */ }
+  return { task, comments, interactions, shipCard, diff, diffSeq };
+}
 
-  return { task, comments, interactions, shipCard };
+// Fills in the diff and checkpoints once fetchTaskViewData's `diff` resolves,
+// if the same task view (seq) is still showing.
+function fillTaskViewDiff(view, data, key, seq) {
+  data.diff.then(({ diffData, checkpoints }) => {
+    if (seq !== taskViewSeq) return;
+    const cached = state.tasks[key];
+    if (cached) {
+      cached._checkpoints = checkpoints;
+      // fetchWholeRunDiff keeps the last good numbers on an error, and a
+      // run-step refresh started after this fetch is newer: keep both.
+      if (wholeRunDiffSeq[key] === data.diffSeq && diffData && ('file_stats' in diffData || !cached._diffData)) {
+        cached._diffData = diffData;
+      }
+    }
+    view.setDiff(diffData, checkpoints);
+    refreshTaskStatsBar(key);
+  });
 }
 
 function cacheTaskView(task, comments, fallbackId) {
@@ -7545,7 +7757,8 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
   }
 
   try {
-    const { task, comments, interactions, shipCard } = await fetchTaskViewData(resolvedId);
+    const data = await fetchTaskViewData(resolvedId);
+    const { task, comments, interactions, shipCard } = data;
     if (seq !== taskViewSeq) return;
 
     // Use robust UUID for internal state
@@ -7560,7 +7773,8 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
     }
 
     const detailKey = cacheTaskView(task, comments, resolvedId);
-    renderTaskPage(content, task, comments, interactions, task._diffData, task._checkpoints, task.runErrors, shipCard, { drawer: true });
+    const view = renderTaskPage(content, task, comments, interactions, undefined, undefined, task.runErrors, shipCard, { drawer: true });
+    fillTaskViewDiff(view, data, detailKey, seq);
     startChatPoll(detailKey);
   } catch (err) {
     if (seq !== taskViewSeq) return;
@@ -8228,16 +8442,22 @@ function buildTimelineStats(task, steps, elapsedMs, isStuck) {
   add(stat('Files read', filesRead));
   add(stat('Files edited', filesEdited));
 
-  // Lines +/- over the whole run, from the diff the page already loaded.
+  // Lines +/- over the whole run, from the diff the page loads after first
+  // render; "…" until it arrives.
   const fileStats = (task._diffData && task._diffData.file_stats) || [];
   const added = fileStats.reduce((n, f) => n + (f.added || 0), 0);
   const removed = fileStats.reduce((n, f) => n + (f.removed || 0), 0);
   const linesTile = el('span', 'timeline-stat');
   linesTile.appendChild(el('span', 'timeline-stat-label', 'Lines'));
   const linesVal = el('span', 'timeline-stat-val');
-  linesVal.appendChild(el('span', 'lines-added', `+${added}`));
-  linesVal.appendChild(document.createTextNode(' '));
-  linesVal.appendChild(el('span', 'lines-removed', `−${removed}`));
+  if (task._diffData === undefined) {
+    linesVal.textContent = '…';
+    linesVal.title = 'Loading diff';
+  } else {
+    linesVal.appendChild(el('span', 'lines-added', `+${added}`));
+    linesVal.appendChild(document.createTextNode(' '));
+    linesVal.appendChild(el('span', 'lines-removed', `−${removed}`));
+  }
   linesTile.appendChild(linesVal);
   add(linesTile);
 
@@ -8487,6 +8707,23 @@ function appendRunStepToTimeline(taskId, step) {
 
 // ── Full-page task view ────────────────────────────────────
 
+// Puts the open task page's canonical /tasks/<org>/<project>/<id> path in the
+// address bar. Runs when the task loads and again after loadAll: the org
+// prefix comes from the fleet overview, which a direct link can beat.
+// Set once the full page has rendered a task; a miss ("Task not found") keeps
+// the URL it was given.
+let taskPageRenderedId = null;
+
+function canonicalizeTaskPageURL(taskId) {
+  if (!taskId || taskId !== taskPageRenderedId || state.openDetailTaskId !== taskId || !isTaskPageShowing()) return;
+  const path = window.location.pathname;
+  if (!path.startsWith('/tasks/') && !path.startsWith('/issues/')) return;
+  const finalPath = taskToPath(state.tasks[taskId] || { id: taskId });
+  if (path !== finalPath) {
+    history.replaceState({ taskId, canonicalPath: finalPath, taskPage: true }, '', finalPath);
+  }
+}
+
 // fromRouteMiss: this call re-opens a task found by resolveTaskRouteMiss, so
 // the URL that missed is replaced with the canonical one.
 async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
@@ -8502,6 +8739,7 @@ async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
   stopChatPoll();
   stopElapsedTicker();
   const seq = ++taskViewSeq;
+  taskPageRenderedId = null;
 
   let targetId = target;
   let orgHint = null;
@@ -8530,18 +8768,19 @@ async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
   if (pageContent) pageContent.innerHTML = '<p style="color:var(--muted);padding:2rem">Loading…</p>';
 
   try {
-    const { task, comments, interactions, shipCard } = await fetchTaskViewData(resolvedId);
+    const data = await fetchTaskViewData(resolvedId);
+    const { task, comments, interactions, shipCard } = data;
     if (seq !== taskViewSeq) return;
 
     if (task.id) state.openDetailTaskId = task.id;
 
-    const finalPath = taskToPath(task);
-    if ((pushHistory || fromRouteMiss) && window.location.pathname !== finalPath) {
-      history.replaceState({ taskId: task.id, canonicalPath: finalPath, taskPage: true }, '', finalPath);
-    }
-
     const activeId = cacheTaskView(task, comments, resolvedId);
-    renderTaskPage(pageContent, task, comments, interactions, task._diffData, task._checkpoints, task.runErrors, shipCard);
+    // Every way onto the page ends on its canonical /tasks/<org>/<project>/<id>
+    // URL, including a pasted or bookmarked /tasks/<id> (STA-775).
+    taskPageRenderedId = activeId;
+    canonicalizeTaskPageURL(activeId);
+    const view = renderTaskPage(pageContent, task, comments, interactions, undefined, undefined, task.runErrors, shipCard);
+    fillTaskViewDiff(view, data, activeId, seq);
     startChatPoll(activeId);
   } catch (err) {
     if (seq !== taskViewSeq) return;
@@ -10244,13 +10483,57 @@ async function renderMigrationsPanel(container, taskId) {
   container.appendChild(section);
 }
 
-function renderInteractionCards(container, taskId, interactions) {
+// Stages where an agent is mid-run (or queued to run) and waiting on a card:
+// answering resumes it by default. Anywhere else (error, stopped, backlog,
+// in_review, done…) answering defaults to recording the answer only.
+const DECISION_RESUME_STAGES = ['todo', 'in_progress', 'blocked', 'paused'];
+
+// A ship review card in pending/sent_back/approved/rejected state blocks Run
+// Now and Mark done: starting a new run on finished work or closing without
+// merging both confuse the review flow.
+const SHIP_CARD_ACTIVE_STATUSES = new Set(['pending', 'sent_back', 'approved', 'rejected']);
+const RUN_NOW_STATUSES = new Set(['active', 'todo', 'backlog', 'blocked', 'in_review']);
+
+function shipCardBlocksRun(shipCard) {
+  return !!(shipCard && SHIP_CARD_ACTIVE_STATUSES.has(shipCard.status));
+}
+
+// runNowOffered reports whether the task page shows Run Now for task.
+function runNowOffered(task, shipCard) {
+  return !!(task && task.id && RUN_NOW_STATUSES.has(task.status) && !shipCardBlocksRun(shipCard));
+}
+
+function decisionResumesByDefault(task) {
+  return DECISION_RESUME_STAGES.includes(String((task && task.execution_stage) || '').toLowerCase());
+}
+
+// Renders pending decision cards into container and returns how many.
+// Each card answers with "Accept & resume", "Accept only" or "Reject". Accept
+// only sends resume:false, so the task stays where it is. Accept & resume on
+// a task that is not waiting mid-run records the answer, then presses Run Now
+// so Run Now's Board, hold and backlog gates apply (task-e3fe2c0b).
+// opts.canRunNow says whether the page offers Run Now (no active ship review
+// card, a runnable status); a parked task where it does not gets no Accept &
+// resume, so a card answer never starts a run the Run Now button would not.
+function renderInteractionCards(container, task, interactions, opts = {}) {
+  const taskId = (task && task.id) || '';
   const pending = (interactions || []).filter(i => i.status === 'pending');
-  if (!pending.length) return;
+  if (!pending.length) {
+    container.appendChild(el('p', 'panel-field-muted task-page-tab-empty', 'No decisions waiting on you.'));
+    return 0;
+  }
+  const resumeDefault = decisionResumesByDefault(task);
+  const offerResume = resumeDefault || !!opts.canRunNow;
 
   const section = el('div', 'task-page-section');
   section.id = 'interaction-cards-section';
-  section.appendChild(el('div', 'task-page-section-title', `Pending (${pending.length})`));
+  section.appendChild(el('div', 'task-page-section-title', `Waiting on you (${pending.length})`));
+  const stageName = task.execution_stage || 'not running';
+  section.appendChild(el('p', 'panel-field-muted decision-stage-hint', resumeDefault
+    ? 'The agent is waiting on this. Accept & resume lets it continue.'
+    : offerResume
+      ? `This task is ${stageName}. Accept only records your answer and leaves it there; Accept & resume also starts a run.`
+      : `This task is ${stageName}. Accept only records your answer and leaves it there.`));
 
   for (const interaction of pending) {
     const kind = interaction.interaction_kind || '';
@@ -10312,9 +10595,14 @@ function renderInteractionCards(container, taskId, interactions) {
     // Actions
     const actions = el('div', 'interaction-card-actions');
 
-    const resolveInteraction = async (status) => {
-      acceptBtn.disabled = true;
-      rejectBtn.disabled = true;
+    const allBtns = () => [resumeBtn, acceptOnlyBtn, rejectBtn];
+    const showError = (text) => {
+      const prev = header.querySelector('.interaction-resolve-error');
+      if (prev) prev.remove();
+      header.appendChild(el('span', 'interaction-resolve-error', text));
+    };
+    const resolveInteraction = async (status, resume) => {
+      allBtns().forEach(b => { b.disabled = true; });
       try {
         // Build response payload for ask_user_questions
         let response;
@@ -10325,26 +10613,60 @@ function renderInteractionCards(container, taskId, interactions) {
         await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/interactions/${interaction.id}/resolve`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status, ...(response !== undefined ? { response } : {}) })
+          // A mid-run task resumes from the card's own wake; a parked one
+          // is answered quietly and, when asked, started by Run Now below.
+          body: JSON.stringify({ status, resume: resume && resumeDefault, ...(response !== undefined ? { response } : {}) })
         });
-        card.classList.add('resolved');
-        const resolvedBadge = el('span', `interaction-resolved-badge status-${status}`, status === 'accepted' ? '✓ Accepted' : '✗ Rejected');
-        header.appendChild(resolvedBadge);
-      } catch { acceptBtn.disabled = false; rejectBtn.disabled = false; }
+      } catch (err) {
+        allBtns().forEach(b => { b.disabled = false; });
+        showError(`Failed: ${(err && err.message) || err}`);
+        return;
+      }
+      // The answer is recorded from here on: the card is resolved whatever
+      // Run Now does, and its buttons stay off (a second resolve would fail).
+      card.classList.add('resolved');
+      let resumed = resume;
+      if (resume && !resumeDefault) {
+        try {
+          // Run Now itself, with its Touch ID retry for prod-targeting tasks.
+          resumed = (await postRunNow(taskId)) !== null;
+          if (!resumed) showError('Answer recorded; Run Now was cancelled.');
+        } catch (err) {
+          resumed = false;
+          showError(`Answer recorded; Run Now failed: ${(err && err.message) || err}`);
+        }
+      }
+      const label = status !== 'accepted' ? '✗ Rejected' : (resumed ? '✓ Accepted · resumed' : '✓ Accepted · answer only');
+      header.appendChild(el('span', `interaction-resolved-badge status-${status}`, label));
     };
 
-    const acceptBtn = el('button', 'interaction-accept-btn', 'Accept');
-    acceptBtn.addEventListener('click', () => resolveInteraction('accepted'));
+    const resumeBtn = el('button', 'interaction-accept-btn', 'Accept & resume');
+    resumeBtn.type = 'button';
+    resumeBtn.title = resumeDefault ? 'Record the answer; the waiting agent continues' : 'Record the answer, then Run Now';
+    resumeBtn.addEventListener('click', () => resolveInteraction('accepted', true));
+
+    const acceptOnlyBtn = el('button', 'interaction-accept-btn interaction-accept-only-btn', 'Accept only');
+    acceptOnlyBtn.type = 'button';
+    acceptOnlyBtn.title = 'Record the answer; the task stays where it is';
+    acceptOnlyBtn.addEventListener('click', () => resolveInteraction('accepted', false));
+
+    // The default action for this task's state is the primary button.
+    (resumeDefault ? resumeBtn : acceptOnlyBtn).classList.add('is-default');
 
     const rejectBtn = el('button', 'interaction-reject-btn', 'Reject');
-    rejectBtn.addEventListener('click', () => resolveInteraction('rejected'));
+    rejectBtn.type = 'button';
+    // A rejection resumes only an agent that is waiting mid-run.
+    rejectBtn.addEventListener('click', () => resolveInteraction('rejected', resumeDefault));
 
-    actions.appendChild(acceptBtn);
+    actions.appendChild(resumeDefault ? resumeBtn : acceptOnlyBtn);
+    if (resumeDefault) actions.appendChild(acceptOnlyBtn);
+    else if (offerResume) actions.appendChild(resumeBtn);
     actions.appendChild(rejectBtn);
     card.appendChild(actions);
     section.appendChild(card);
   }
   container.appendChild(section);
+  return pending.length;
 }
 
 // Header line under the back button: "STA-12 · assigned to X (claude · sonnet)".
@@ -10368,6 +10690,7 @@ function taskPageHeaderMeta(task, ident) {
 let taskPagePanelTab = { taskId: null, key: null };
 
 const TASK_PAGE_TABS = [
+  { key: 'decisions', label: 'Decisions' },
   { key: 'review', label: 'Review' },
   { key: 'diff', label: 'Diff' },
   { key: 'migrations', label: 'Migrations' },
@@ -10375,8 +10698,8 @@ const TASK_PAGE_TABS = [
   { key: 'artifacts', label: 'Artifacts' },
 ];
 
-// Right column of the task page (STA-638): one tablist over Review / Diff /
-// Migrations / Brief / Artifacts. Returns the column, the tabpanel per key (callers fill
+// Right column of the task page (STA-638): one tablist over Decisions /
+// Review / Diff / Migrations / Brief / Artifacts. Returns the column, the tabpanel per key (callers fill
 // them with the existing renderers), and setters for the tab badges.
 function buildTaskPagePanel(taskId, defaultKey) {
   const side = el('div', 'task-page-side task-page-panel');
@@ -10445,7 +10768,11 @@ function buildTaskPagePanel(taskId, defaultKey) {
 
   side.appendChild(tablist);
   side.appendChild(body);
-  const setCount = (key, n) => { counts[key].textContent = n ? String(n) : ''; };
+  const setCount = (key, n) => {
+    counts[key].textContent = n ? String(n) : '';
+    // Decisions waiting on the Board are the one count that needs attention.
+    if (key === 'decisions') tabs[key].classList.toggle('has-pending', n > 0);
+  };
   return { side, panels, select, setCount };
 }
 
@@ -10549,11 +10876,13 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   // ── Left column: timeline ──
   const main = el('div', 'task-page-main task-page-timeline');
 
-  // ── Right column: tabs over review, diff, migrations, brief ──
-  // Open on Review while the Board has a ship review to act on, else Diff.
+  // ── Right column: tabs over decisions, review, diff, migrations, brief ──
+  // Open on Decisions while a card waits on the Board, then Review while a
+  // ship review does, else Diff.
   const reviewPending = !!(shipCard && shipCard.status === 'pending');
+  const decisionsPending = (interactions || []).some(i => i.status === 'pending');
   const { side, panels: tabPanels, select: selectPanelTab, setCount: setTabCount } =
-    buildTaskPagePanel(task.id || '', reviewPending ? 'review' : 'diff');
+    buildTaskPagePanel(task.id || '', decisionsPending ? 'decisions' : (reviewPending ? 'review' : 'diff'));
   // The ship review card mounts here; SSE updates re-render into the same slot.
   const reviewCardSlot = el('div', 'task-page-review-card-slot');
   tabPanels.review.appendChild(reviewCardSlot);
@@ -10721,8 +11050,10 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     renderTaskTrust(main, task.id);
   }
 
-  // Interaction cards (pending ask_user_questions / request_confirmation / suggest_tasks)
-  renderInteractionCards(main, task.id || '', interactions || []);
+  // Decision cards (pending ask_user_questions / request_confirmation /
+  // suggest_tasks) live on the Decisions tab (task-e3fe2c0b).
+  setTabCount('decisions', renderInteractionCards(tabPanels.decisions, task, interactions || [],
+    { canRunNow: runNowOffered(task, shipCard) }));
 
   layout.appendChild(main);
 
@@ -10824,13 +11155,22 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   chatSection.appendChild(compose);
 
   // ── Diff ──
+  // diffData undefined means it is still loading: the page renders first and
+  // the caller fills the pane through the returned setDiff (STA-775).
   const diffPane = el('div', 'task-page-diff');
-  if (!isFleetTaskId(task.id || '')) {
-    renderDiffPane(diffPane, task, checkpoints || [], diffData || { diff: '', files: [], checkpoint_id: '' });
-    const d = diffData || {};
+  const isFleetTask = isFleetTaskId(task.id || '');
+  const setDiff = (data, cps) => {
+    if (isFleetTask) return;
+    renderDiffPane(diffPane, task, cps || [], data || { diff: '', files: [], checkpoint_id: '' });
+    const d = data || {};
     setTabCount('diff', (d.file_stats && d.file_stats.length) || (d.files && d.files.length) || 0);
-  } else {
+  };
+  if (isFleetTask) {
     diffPane.appendChild(el('p', 'panel-field-muted task-page-tab-empty', 'Fleet tasks have no diff.'));
+  } else if (diffData === undefined) {
+    diffPane.appendChild(el('p', 'panel-field-muted task-page-diff-loading', 'Loading diff…'));
+  } else {
+    setDiff(diffData, checkpoints);
   }
   tabPanels.diff.appendChild(diffPane);
 
@@ -10908,39 +11248,19 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   }
   appendTaskRelations(meta, task, openTask);
 
-  // A ship review card in pending/sent_back/approved/rejected state blocks
-  // Run Now and Mark done — starting a new run on finished work or closing
-  // without merging both confuse the review flow.
-  const activeCardStatuses = new Set(['pending', 'sent_back', 'approved', 'rejected']);
-  const hasActiveCard = !!(shipCard && activeCardStatuses.has(shipCard.status));
+  // An active ship review card blocks Run Now and Mark done (shipCardBlocksRun).
+  const hasActiveCard = shipCardBlocksRun(shipCard);
 
   // ── Run Now button ──
-  const runableStatuses = new Set(['active', 'todo', 'backlog', 'blocked', 'in_review']);
-  if (task.id && runableStatuses.has(task.status) && !hasActiveCard) {
+  if (runNowOffered(task, shipCard)) {
     const runBtn = el('button', 'run-now-btn', '▶ Run Now');
     runBtn.type = 'button';
     runBtn.addEventListener('click', async () => {
       runBtn.disabled = true;
       runBtn.textContent = 'Starting…';
       try {
-        const send = (sessionToken, assertion) => {
-          const headers = { 'Content-Type': 'application/json', ...authHeader() };
-          if (sessionToken) headers['X-WebAuthn-Session'] = sessionToken;
-          if (assertion) headers['X-WebAuthn-Assertion'] = assertion;
-          return fetch(`/api/tasks/${encodeURIComponent(task.id)}/stage`, {
-            method: 'POST', headers, body: JSON.stringify({ stage: 'in_progress' }),
-          });
-        };
-        let res = await send('', '');
-        // A prod-targeting agent task needs Touch ID to leave backlog.
-        if (res.status === 403) {
-          const err = await res.clone().json().catch(() => ({}));
-          if (err.error === 'board_passkey_assertion_required') {
-            res = await withBoardWebAuthn(send, 'running this prod-targeting task');
-            if (res === null) { runBtn.disabled = false; runBtn.textContent = '▶ Run Now'; return; }
-          }
-        }
-        if (!res.ok) throw await boardActionError(res);
+        const res = await postRunNow(task.id);
+        if (res === null) { runBtn.disabled = false; runBtn.textContent = '▶ Run Now'; return; }
         runBtn.textContent = '✓ Started';
         setTimeout(reopen, 800);
       } catch (err) {
@@ -10951,7 +11271,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
       }
     });
     headerActions.prepend(runBtn);
-  } else if (task.id && runableStatuses.has(task.status) && shipCard && ['pending', 'sent_back'].includes(shipCard.status)) {
+  } else if (task.id && RUN_NOW_STATUSES.has(task.status) && shipCard && ['pending', 'sent_back'].includes(shipCard.status)) {
     const reviewLink = el('a', 'ship-review-see-card-link', '↓ See review card');
     reviewLink.href = '#';
     reviewLink.style.cssText = 'display:block;margin-top:8px;font-size:0.85rem;';
@@ -11079,6 +11399,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   layout.appendChild(side);
   container.appendChild(layout);
   container.appendChild(chatSection);
+  return { setDiff };
 }
 
 document.addEventListener('click', (e) => {
@@ -12511,6 +12832,7 @@ document.getElementById('projects-org-filter')?.addEventListener('change', (e) =
     bannerEnrollBtn.disabled = true;
     try { await enrollBoardPasskey(); } finally { bannerEnrollBtn.disabled = false; }
   });
+  loadBoardAlerts();
   updateDevTourToggleUI();
   if (isWalkthroughActive()) {
     renderWalkthroughHUD();
@@ -12863,12 +13185,15 @@ async function renderTaskArtifacts(panel, taskId) {
     dl.type = 'button';
     dl.title = `Download ${artifactFileName(named, doc.version)}`;
     dl.addEventListener('click', () => downloadArtifact(named));
+    const body = el('div', 'md-body markdown-body artifact-viewer-body');
+    body.innerHTML = renderMarkdown(doc.content || '');
+    // Full view in the shared long-content dialog, like the Brief's Open.
+    head.appendChild(longContentTrigger(`artifact-${doc.doc_key}`, `${doc.doc_key} v${doc.version}`,
+      () => cloneChildren(body, 'md-body markdown-body artifact-full-body')));
     head.appendChild(dl);
     viewer.appendChild(head);
     viewer.appendChild(el('div', 'artifact-viewer-meta',
       `Version ${doc.version} of ${summary.latest_version} · ${formatDocSize(new Blob([doc.content || '']).size)} · ${artifactDate(doc.created_at)}`));
-    const body = el('div', 'md-body markdown-body artifact-viewer-body');
-    body.innerHTML = renderMarkdown(doc.content || '');
     viewer.appendChild(body);
   };
 
@@ -12887,6 +13212,21 @@ async function renderTaskArtifacts(panel, taskId) {
   const focusKey = artifactFocus.taskId === taskId ? artifactFocus.docKey : null;
   show(docs.find(d => d.doc_key === focusKey) || docs[0]);
   return docs.length;
+}
+
+// Shows a document's latest version in the full long-content dialog without
+// leaving the Artifacts page (task-e3fe2c0b).
+async function viewArtifactFull(taskId, docKey) {
+  let doc;
+  try {
+    doc = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/documents/${encodeURIComponent(docKey)}`);
+  } catch (err) {
+    openContentModal(docKey, el('p', 'panel-field-muted', `Failed to load ${docKey}: ${err.message}`));
+    return;
+  }
+  const body = el('div', 'md-body markdown-body artifact-full-body');
+  body.innerHTML = renderMarkdown(doc.content || '');
+  openContentModal(`${doc.doc_key} v${doc.version}`, body);
 }
 
 // Opens a task on its Artifacts tab with docKey selected.
@@ -12928,7 +13268,7 @@ function renderArtifactsTable() {
   const table = el('table', 'global-task-table artifacts-table');
   const thead = el('thead');
   const hr = el('tr');
-  for (const h of ['Document', 'Task', 'Org', 'Version', 'Size', 'Updated']) hr.appendChild(el('th', '', h));
+  for (const h of ['Document', 'Task', 'Org', 'Version', 'Size', 'Updated', '']) hr.appendChild(el('th', '', h));
   thead.appendChild(hr);
   table.appendChild(thead);
   const tbody = el('tbody');
@@ -12942,6 +13282,13 @@ function renderArtifactsTable() {
     tr.appendChild(el('td', '', d.version_count > 1 ? `v${d.latest_version} (${d.version_count} versions)` : `v${d.latest_version}`));
     tr.appendChild(el('td', '', formatDocSize(d.size)));
     tr.appendChild(el('td', '', artifactDate(d.updated_at)));
+    const viewCell = el('td', 'artifacts-view-cell');
+    const viewBtn = el('button', 'btn btn-secondary btn-sm artifact-view-btn', 'View');
+    viewBtn.type = 'button';
+    viewBtn.title = `View ${d.doc_key} in full`;
+    viewBtn.addEventListener('click', (e) => { e.stopPropagation(); viewArtifactFull(d.task_id, d.doc_key); });
+    viewCell.appendChild(viewBtn);
+    tr.appendChild(viewCell);
     const open = () => openTaskArtifact(d.task_id, d.doc_key);
     tr.addEventListener('click', open);
     tr.addEventListener('keydown', (e) => { if (e.key === 'Enter') open(); });

@@ -30,7 +30,7 @@ var (
 	ErrTaskNotFound   = errors.New("task not found")
 	// ErrNotRunnable: the task is parked (backlog) or closed (done,
 	// cancelled, rejected). Run Now moves a backlog task to todo first.
-	ErrNotRunnable    = errors.New("Can't start run: this task is not runnable in its current stage (backlog, stopped, done or cancelled). Move it to todo or press Run Now first.")
+	ErrNotRunnable    = errors.New("Can't start run: this task is not runnable in its current stage (backlog, stopped, error, done or cancelled). Move it to todo or press Run Now first.")
 	ErrConcurrencyCap = errors.New("Can't start run: the maximum number of parallel runs (max_concurrent_runs) is already active.")
 	// ErrOrgHeld: the task's organization is on a Board hold; nothing in it
 	// is claimed until the Board lifts the hold.
@@ -216,6 +216,18 @@ func (h *Harness) SlotKeyForTask(ctx context.Context, taskID string) SlotKey {
 // newWorktreeManager makes a WorktreeManager that cuts new task branches
 // from the project's target branch (dev-server for work repos), the branch
 // Approve merges into.
+// preflightBranch is the branch a task's git pre-flight fast-forwards
+// against: the branch the task was cut from (its recorded target, then the
+// project's target, then the repo default), not a hardcoded main. A task cut
+// from dev-server can never fast-forward to main, so every run of it ended at
+// pre-flight with zero turns.
+func preflightBranch(ctx context.Context, db *sql.DB, repo, taskID string) string {
+	if b, err := shipreview.TaskTargetBranch(ctx, db, repo, taskID); err == nil && b != "" {
+		return b
+	}
+	return "main"
+}
+
 func newWorktreeManager(repoRoot string, db *sql.DB) *workspace.WorktreeManager {
 	wm := workspace.NewWorktreeManager(repoRoot, db)
 	wm.TargetBranch = func(ctx context.Context, repo string) (string, error) {
@@ -492,7 +504,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// Skipped when cfg.SkipGitPreflight is true (tests running in a non-git dir).
 	if !cfg.SkipGitPreflight && !nonGit {
 		gfCtx, gfCancel := context.WithTimeout(ctx, 60*time.Second)
-		gfResult, gfErr := gitgate.PreFlight(gfCtx, wtPath, "main")
+		gfResult, gfErr := gitgate.PreFlight(gfCtx, wtPath, preflightBranch(gfCtx, h.DB, repoPath, taskID))
 		gfCancel()
 		gfSummary := "git-preflight: "
 		if gfErr != nil {
@@ -1118,6 +1130,10 @@ type taskBrief struct {
 	PlainDir bool
 	// Handoff is the daemon-stored handoff from the parent task (STA-820).
 	Handoff string
+	// PushPolicy is the project's push_policy (STA-562), resolved by
+	// GetProjectPushPolicy (no row is branch_only). "" means it was never
+	// resolved (a zero-value brief) and is shown as never.
+	PushPolicy shipreview.PushPolicy
 }
 
 // harnessComment is a non-harness comment visible to the agent.
@@ -1143,6 +1159,7 @@ func fetchTaskBrief(ctx context.Context, db *sql.DB, taskID string) taskBrief {
 	var gateVal string
 	_ = db.QueryRowContext(ctx, `SELECT value FROM settings_kv WHERE key='gates.ship_review'`).Scan(&gateVal)
 	b.ShipReviewGate = gateVal != "false"
+	b.PushPolicy = shipreview.GetProjectPushPolicy(db, b.RepoPath)
 	return b
 }
 
@@ -1231,6 +1248,15 @@ func buildBriefBlock(brief taskBrief, comments []harnessComment, isFirstTurn boo
 		}
 		if brief.GitBranch != "" {
 			b.WriteString("Branch: " + safeField(brief.GitBranch) + "\n")
+		}
+		// Inject push policy so agents know their git push permissions up front.
+		policy := brief.PushPolicy
+		if policy == "" {
+			policy = shipreview.PushPolicyNever
+		}
+		b.WriteString("Push-Policy: " + string(policy) + "\n")
+		if policy == shipreview.PushPolicyNever {
+			b.WriteString("Push-Note: DO NOT run git push. The Board pushes the branch after Ship Review. git push is a Red-tier action and will be blocked by the pre-tool gate.\n")
 		}
 		if brief.Description != "" {
 			b.WriteString("---\nDescription:\n" + safeField(brief.Description) + "\n")

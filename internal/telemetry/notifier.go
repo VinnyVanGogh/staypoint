@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/alerts"
 	"github.com/VinnyVanGogh/staypoint/internal/osascript"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 )
@@ -76,7 +77,7 @@ func (n *RateLimitNotifier) check() {
 		if !poolPers.LockoutUntil.IsZero() {
 			resetStr = poolPers.LockoutUntil.Format("3:04pm")
 		}
-		SendNotification(
+		SendQuotaAlert(router.PoolPersonalClaude, QuotaWarning,
 			"[Staypoint] Claude 5h Limit Warning (15% left)",
 			fmt.Sprintf("Claude Code 5-hour quota at %.0f%% (resets @%s). Handoff to Gemini staged in clipboard. Switch via /model gemini-3.8-flash-high or open agy.", poolPers.FiveHour.UsedPct, resetStr),
 		)
@@ -91,7 +92,7 @@ func (n *RateLimitNotifier) check() {
 		if !pool3P.LockoutUntil.IsZero() {
 			resetStr = pool3P.LockoutUntil.Format("3:04pm")
 		}
-		SendNotification(
+		SendQuotaAlert(router.Pool3PClaude, QuotaWarning,
 			"[Staypoint] 5h Quota Warning (15% left)",
 			fmt.Sprintf("3P Claude quota at %.0f%% (resets @%s). Handoff to Gemini staged in clipboard. Switch via /model gemini-3.8-flash-high or paste prompt.", pool3P.FiveHour.UsedPct, resetStr),
 		)
@@ -107,7 +108,7 @@ func (n *RateLimitNotifier) check() {
 		if pool3P != nil && !pool3P.LockoutUntil.IsZero() {
 			resetStr = pool3P.LockoutUntil.Format("3:04pm")
 		}
-		SendNotification(
+		SendQuotaAlert(router.Pool3PClaude, QuotaLocked,
 			"[Switch -> Gemini] 3P Quota Locked",
 			fmt.Sprintf("3P 5-hour quota exhausted (resets @%s). Switch to Gemini 3.8 Flash for unblocked progress.", resetStr),
 		)
@@ -115,7 +116,7 @@ func (n *RateLimitNotifier) check() {
 
 	// 3P Transition: Locked -> Reset
 	if !is3PLocked && n.last3PLocked {
-		SendNotification(
+		SendQuotaAlert(router.Pool3PClaude, QuotaReady,
 			"[Switch -> Claude] 3P Quota Ready",
 			"3P quota has reset! Ready to switch back to Claude 4.6 for deep architecture.",
 		)
@@ -128,7 +129,7 @@ func (n *RateLimitNotifier) check() {
 		if poolPers != nil && !poolPers.LockoutUntil.IsZero() {
 			resetStr = poolPers.LockoutUntil.Format("3:04pm")
 		}
-		SendNotification(
+		SendQuotaAlert(router.PoolPersonalClaude, QuotaLocked,
 			"[Switch -> Gemini] Claude Quota Locked",
 			fmt.Sprintf("Claude Code quota exhausted (resets @%s). Switch to Gemini 3.8 Flash in Antigravity (agy).", resetStr),
 		)
@@ -136,7 +137,7 @@ func (n *RateLimitNotifier) check() {
 
 	// Personal Claude Transition: Locked -> Reset
 	if !isPersLocked && n.lastPersLocked {
-		SendNotification(
+		SendQuotaAlert(router.PoolPersonalClaude, QuotaReady,
 			"[Switch -> Claude] Claude Quota Ready",
 			"Claude Code quota has reset! Ready to switch back to Claude for deep architecture.",
 		)
@@ -144,7 +145,7 @@ func (n *RateLimitNotifier) check() {
 
 	// Gemini Transition: Unlocked -> Locked
 	if isGemLocked && !n.lastGeminiLocked {
-		SendNotification(
+		SendQuotaAlert(router.PoolGeminiNative, QuotaLocked,
 			"[Switch -> Claude] Gemini Quota Locked",
 			"Gemini quota exhausted. Switch to Claude Sonnet or 3P for immediate progress.",
 		)
@@ -152,7 +153,7 @@ func (n *RateLimitNotifier) check() {
 
 	// Gemini Transition: Locked -> Reset
 	if !isGemLocked && n.lastGeminiLocked {
-		SendNotification(
+		SendQuotaAlert(router.PoolGeminiNative, QuotaReady,
 			"[Switch -> Gemini] Gemini Quota Ready",
 			"Gemini quota has reset! Ready to switch back to primary Gemini model.",
 		)
@@ -161,6 +162,40 @@ func (n *RateLimitNotifier) check() {
 	n.last3PLocked = is3PLocked
 	n.lastGeminiLocked = isGemLocked
 	n.lastPersLocked = isPersLocked
+}
+
+// QuotaState is the quota pool transition an alert reports.
+type QuotaState string
+
+const (
+	QuotaWarning QuotaState = "warning"
+	QuotaLocked  QuotaState = "locked"
+	QuotaReady   QuotaState = "ready"
+)
+
+// quotaAlert builds the Board alert for a quota pool changing state. The
+// dedupe key is shared with the hook CLI's pre-lock warning, so both
+// processes bump one alert.
+func quotaAlert(pool router.PoolID, state QuotaState, title, message string) alerts.Alert {
+	a := alerts.Alert{
+		Title:     title,
+		Message:   message,
+		DedupeKey: fmt.Sprintf("quota:%s:%s", pool, state),
+	}
+	switch state {
+	case QuotaWarning:
+		a.Kind, a.Severity = "quota_warning", alerts.SeverityWarning
+	case QuotaLocked:
+		a.Kind, a.Severity = "quota_locked", alerts.SeverityWarning
+	default:
+		a.Kind, a.Severity = "quota_ready", alerts.SeverityInfo
+	}
+	return a
+}
+
+// SendQuotaAlert raises the Board alert for a quota pool changing state.
+func SendQuotaAlert(pool router.PoolID, state QuotaState, title, message string) {
+	SendAlert(quotaAlert(pool, state, title, message))
 }
 
 // runScript runs AppleScript; tests replace it.

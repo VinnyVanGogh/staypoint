@@ -30,6 +30,7 @@ type Server struct {
 	port       int
 	mu         sync.Mutex
 	running    bool
+	stopAlerts chan struct{}
 }
 
 // New creates and configures a new Server instance.
@@ -274,7 +275,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		// live_credentials projects need the Board session + passkey (STA-727); others stay agent-callable.
 		mux.Handle("POST /api/tasks/{id}/ship-review/start-dev", shipH.StartDevGated(s.secMid.WrapBoardAction))
 		mux.HandleFunc("POST /api/tasks/{id}/ship-review/stop-dev", shipH.StopDev)
-		// Board-only: these three actions merge / reject / revise the branch — agents cannot call them.
+		// Board-only: these actions merge / push / reject / revise the branch — agents cannot call them.
+		mux.Handle("POST /api/tasks/{id}/ship-review/push-branch", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.PushBranch)))
 		mux.Handle("POST /api/tasks/{id}/ship-review/approve", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.Approve)))
 		mux.Handle("POST /api/tasks/{id}/ship-review/send-back", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.SendBack)))
 		mux.Handle("POST /api/tasks/{id}/ship-review/reject", s.secMid.WrapBoardAction(http.HandlerFunc(shipH.Reject)))
@@ -302,6 +304,15 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		if s.opts.TestMode {
 			mux.HandleFunc("PUT /api/tasks/{id}/ship-review/seed", shipH.SeedCard)
 			mux.HandleFunc("PUT /api/tasks/{id}/test/base", shipH.SeedTaskBase)
+		}
+
+		// Board alert feed (STA-705). Reading is open to the session token;
+		// dismissing needs a Board session so agents can't silence alerts.
+		alertsH := NewBoardAlertsHandler(s.opts.DB, s.hub)
+		mux.HandleFunc("GET /api/board/alerts", alertsH.List)
+		mux.Handle("POST /api/board/alerts/{id}/ack", s.secMid.WrapBoardSession(http.HandlerFunc(alertsH.Ack)))
+		if s.opts.TestMode {
+			mux.HandleFunc("POST /api/board/alerts/test/seed", alertsH.Seed)
 		}
 
 		// WebAuthn / passkey endpoints (Board session required; assertion enforced on delete)
@@ -364,6 +375,11 @@ func (s *Server) Start() error {
 
 	s.running = true
 
+	if s.opts.DB != nil {
+		s.stopAlerts = make(chan struct{})
+		go s.pollAlerts(s.stopAlerts, time.Now(), s.opts.AlertPollInterval)
+	}
+
 	go func() {
 		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			// server closed unexpectedly
@@ -383,6 +399,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	s.running = false
+	if s.stopAlerts != nil {
+		close(s.stopAlerts)
+		s.stopAlerts = nil
+	}
 	return s.httpServer.Shutdown(ctx)
 }
 

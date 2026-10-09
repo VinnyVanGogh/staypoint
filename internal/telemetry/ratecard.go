@@ -159,3 +159,12 @@ func priceMicros(m modelRate, u Usage) int64 {
 		u.CacheCreation1h*write1h
 	return (num + 500_000) / 1_000_000
 }
+
+// RateCardSource returns the upstream source URL of the embedded rate card.
+func RateCardSource() string {
+	c, err := loadRateCard()
+	if err != nil || c == nil || c.Source == "" {
+		return "https://models.dev/api.json"
+	}
+	return c.Source
+}

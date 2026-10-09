@@ -81,9 +81,10 @@ func TestPreToolHookRedCommands(t *testing.T) {
 }
 
 // TestPreToolHookAllowedCommands verifies feature-branch pushes are NOT Red
-// and will pass through the hook without a Board approval request.
+// under the "branch_only" policy and will pass through the hook without a
+// Board approval request.
 func TestPreToolHookAllowedCommands(t *testing.T) {
-	c := &Classifier{}
+	c := &Classifier{PushPolicy: "branch_only"}
 	allowed := []string{
 		"git push origin feature-branch",
 		"git push origin HEAD:refs/heads/feature-xyz",
@@ -116,7 +117,8 @@ func TestBarePushViaClassifier(t *testing.T) {
 	run("git", "-C", dir, "config", "user.email", "test@test.com")
 	run("git", "-C", dir, "config", "user.name", "Test")
 
-	cwd := func() *Classifier { return &Classifier{CWD: dir} }
+	// Use "branch_only" for notRed assertions; "never" tests are in TestPushPolicy.
+	cwd := func() *Classifier { return &Classifier{CWD: dir, PushPolicy: "branch_only"} }
 
 	red := func(t *testing.T, cmd string) {
 		t.Helper()

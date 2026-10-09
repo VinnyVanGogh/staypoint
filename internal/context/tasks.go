@@ -964,6 +964,34 @@ func MarkTaskDone(db *sql.DB, id string) error {
 	return MarkTaskDoneWithOptions(db, id, DoneOptions{})
 }
 
+// ErrWatchdogBlocked is returned by CheckDoneGate when the watchdog blocks
+// the task.
+var ErrWatchdogBlocked = errors.New("task is blocked by watchdog")
+
+// CheckDoneGate is the done gate for anyone but the Board: the task needs a
+// registered work product and must not be blocked by the watchdog. Every path
+// to done that is not a Board close runs it.
+func CheckDoneGate(db *sql.DB, taskID string) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM task_work_products WHERE task_id = ?`, taskID).Scan(&count); err != nil {
+		return fmt.Errorf("failed to check work products: %w", err)
+	}
+	if count == 0 {
+		return ErrNoWorkProduct
+	}
+
+	// Watchdog: evaluate criteria on deliverable-status change before allowing done.
+	_ = governance.TriggerWatchdogEval(db, taskID, "deliverable_update")
+	// Re-read block status — watchdog may have just set is_blocked = 1.
+	var isBlocked int
+	var blockReason string
+	_ = db.QueryRow(`SELECT is_blocked, COALESCE(block_reason,'') FROM tasks WHERE id = ?`, taskID).Scan(&isBlocked, &blockReason)
+	if isBlocked == 1 {
+		return fmt.Errorf("%w: %s", ErrWatchdogBlocked, blockReason)
+	}
+	return nil
+}
+
 // MarkTaskDoneWithOptions is MarkTaskDone with the Board override.
 func MarkTaskDoneWithOptions(db *sql.DB, id string, opts DoneOptions) error {
 	task, err := GetTask(db, id)
@@ -977,22 +1005,8 @@ func MarkTaskDoneWithOptions(db *sql.DB, id string, opts DoneOptions) error {
 	}
 
 	if !opts.BoardDone {
-		var count int
-		if err := db.QueryRow(`SELECT COUNT(*) FROM task_work_products WHERE task_id = ?`, task.ID).Scan(&count); err != nil {
-			return fmt.Errorf("failed to check work products: %w", err)
-		}
-		if count == 0 {
-			return ErrNoWorkProduct
-		}
-
-		// Watchdog: evaluate criteria on deliverable-status change before allowing done.
-		_ = governance.TriggerWatchdogEval(db, task.ID, "deliverable_update")
-		// Re-read block status — watchdog may have just set is_blocked = 1.
-		var isBlocked int
-		var blockReason string
-		_ = db.QueryRow(`SELECT is_blocked, COALESCE(block_reason,'') FROM tasks WHERE id = ?`, task.ID).Scan(&isBlocked, &blockReason)
-		if isBlocked == 1 {
-			return fmt.Errorf("task is blocked by watchdog: %s", blockReason)
+		if err := CheckDoneGate(db, task.ID); err != nil {
+			return err
 		}
 	}
 

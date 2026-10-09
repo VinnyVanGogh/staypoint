@@ -60,10 +60,55 @@ html, body {
 }
 .sidebar-toggle:hover { color: var(--text); background: var(--surface2); }
 
+/* ── Board alerts (STA-705) ─────────────────────────────── */
+/* body is a column so the alert stack pushes the layout down instead of
+   being clipped by body's overflow: hidden. */
+body { display: flex; flex-direction: column; }
+.board-alerts {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 20px; flex-shrink: 0;
+  max-height: 40vh; overflow-y: auto;
+  background: var(--bg); border-bottom: 1px solid var(--border);
+}
+.board-alerts[hidden] { display: none; }
+.board-alert {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 8px 12px; border-radius: var(--radius);
+  border: 1px solid var(--border); border-left-width: 4px;
+  background: var(--surface);
+}
+.board-alert-critical { border-color: rgba(248,81,73,.5); border-left-color: var(--red); background: rgba(248,81,73,.10); }
+.board-alert-warning  { border-color: rgba(245,158,11,.45); border-left-color: var(--amber); background: rgba(245,158,11,.08); }
+.board-alert-info     { border-left-color: var(--border-light); }
+.board-alert-body { flex: 1; min-width: 0; }
+.board-alert-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.board-alert-title { font-weight: 600; }
+.board-alert-critical .board-alert-title { color: var(--red); }
+.board-alert-warning .board-alert-title { color: var(--amber); }
+.board-alert-count {
+  font-size: 11px; font-weight: 600; padding: 0 6px; border-radius: 10px;
+  background: var(--surface3); color: var(--text);
+}
+.board-alert-time { font-size: 11px; color: var(--muted); }
+.board-alert-message { margin-top: 2px; font-size: 13px; color: var(--text); overflow-wrap: anywhere; }
+.board-alert-error { margin-top: 4px; font-size: 12px; color: var(--red); }
+.board-alert-dismiss {
+  flex-shrink: 0; background: var(--surface2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 10px; font-size: 12px; cursor: pointer;
+}
+.board-alert-dismiss:hover { border-color: var(--border-light); }
+.board-alerts-toggle {
+  align-self: flex-start; background: none; border: none; padding: 2px 0;
+  color: var(--accent-light); font-size: 12px; cursor: pointer;
+}
+.board-alerts-toggle:hover { text-decoration: underline; }
+
 /* ── App Layout ─────────────────────────────────────────── */
 .app-layout {
   display: flex;
-  height: calc(100vh - var(--header-h) - var(--passkey-banner-h));
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -3105,6 +3150,9 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
   padding: 0 6px;
 }
 .task-page-tab-count:empty { display: none; }
+/* Decisions waiting on the Board (task-e3fe2c0b). */
+.task-page-tab.has-pending .task-page-tab-label { color: var(--yellow, #e3b341); }
+.task-page-tab.has-pending .task-page-tab-count { background: var(--yellow, #e3b341); color: #1a1a1a; font-weight: 700; }
 .task-page-tabpanels {
   flex: 1;
   min-height: 0;
@@ -4087,6 +4135,13 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 }
 .interaction-accept-btn:hover { background: rgba(63,185,80,.28); }
 .interaction-accept-btn:disabled { opacity: .5; cursor: default; }
+/* The default answer for the task's state is solid; the alternative is outlined. */
+.interaction-accept-btn.is-default { background: var(--green); color: #0d1117; border-color: var(--green); }
+.interaction-accept-btn.is-default:hover { filter: brightness(1.08); }
+.interaction-accept-only-btn:not(.is-default) { background: transparent; }
+.decision-stage-hint { margin: 2px 0 10px; font-size: 12px; }
+.interaction-resolve-error { margin-left: 8px; font-size: 12px; color: var(--red); }
+.artifacts-view-cell { text-align: right; white-space: nowrap; }
 .interaction-reject-btn {
   background: rgba(248,81,73,.1);
   color: var(--red);
@@ -4749,6 +4804,8 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .gate-reasons { font-size: 11px; color: var(--muted); margin-top: 3px; }
 .gate-run-link { font-size: 11px; color: var(--accent-light, #a78bfa); text-decoration: none; }
 .gate-run-link:hover { text-decoration: underline; }
+.gate-task-link { color: var(--accent-light, #a78bfa); text-decoration: underline; text-underline-offset: 2px; }
+.gate-task-link:focus-visible { outline: 2px solid var(--accent-light, #a78bfa); outline-offset: 2px; border-radius: 2px; }
 .gate-status-pending  { color: var(--amber, #f59e0b); font-weight: 600; }
 .gate-status-approved { color: var(--green, #3fb950); font-weight: 600; }
 .gate-status-denied   { color: var(--red, #f85149); font-weight: 600; }

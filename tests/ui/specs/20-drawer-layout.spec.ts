@@ -268,9 +268,9 @@ test.describe('drawer behaviour', () => {
     let release!: () => void;
     const held = new Promise<void>((r) => { release = r; });
     let calls = 0;
-    let governance = 0;
+    let taskResponses = 0;
     page.on('response', (r) => {
-      if (r.url().includes(`/api/tasks/${task.id}/governance`)) governance += 1;
+      if (new URL(r.url()).pathname === `/api/tasks/${task.id}`) taskResponses += 1;
     });
     await page.route(`**/api/tasks/${task.id}`, async (route) => {
       calls += 1;
@@ -283,11 +283,11 @@ test.describe('drawer behaviour', () => {
     await page.locator('#panel-open').click();
     await expect(page.locator('#task-page-content .task-page-title')).toHaveText(task.name, { timeout: 20_000 });
 
-    expect(governance).toBe(1);
+    expect(taskResponses).toBe(1);
     release();
-    // The drawer's load asks for governance last, right before it would
-    // render: once that answers, its render (or no render) has happened.
-    await expect.poll(() => governance).toBe(2);
+    // The held task fetch is the last of the drawer's first-render calls to
+    // answer: once it has, its render (or no render) follows right after.
+    await expect.poll(() => taskResponses).toBe(2);
     await page.waitForTimeout(250);
     await expect(page.locator('#panel-content .task-page-header')).toHaveCount(0);
     await expect(page.locator('.task-page-header')).toHaveCount(1);

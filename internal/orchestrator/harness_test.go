@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS project_dev_configs (
     gh_config_dir        TEXT NOT NULL DEFAULT '',
     live_credentials     INTEGER NOT NULL DEFAULT 0,
     target_branch        TEXT NOT NULL DEFAULT '',
+    push_policy          TEXT NOT NULL DEFAULT 'branch_only',
     updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE TABLE IF NOT EXISTS ship_review_cards (

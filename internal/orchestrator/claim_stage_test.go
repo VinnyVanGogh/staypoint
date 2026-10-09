@@ -9,7 +9,7 @@ import (
 // A parked (backlog) or closed (cancelled, done) task is never claimed, so no
 // wake, queue re-dispatch or MCP call can start a run on it.
 func TestClaim_RefusesNonRunnableStages(t *testing.T) {
-	for _, stage := range []string{"backlog", "cancelled", "done", "rejected", "stopped"} {
+	for _, stage := range []string{"backlog", "cancelled", "done", "rejected", "stopped", "error"} {
 		t.Run(stage, func(t *testing.T) {
 			useSlots(t, 1)
 			db := openTestDB(t)

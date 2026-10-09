@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/gates"
 )
@@ -90,6 +91,10 @@ type Options struct {
 	// userscripts via GM_xmlhttpRequest) can reach the local API from any page origin.
 	// Disabled by default; enable via [server] cors_allow_all = true in config.toml.
 	CORSAllowAll bool
+
+	// AlertPollInterval is how often the server checks board_alerts for new
+	// rows to publish as SSE board_alert events (default 3s).
+	AlertPollInterval time.Duration
 
 	// TestMode enables test-only routes (e.g. ship-review seed endpoint).
 	// Must never be set in production.
@@ -201,6 +206,10 @@ func (o *Options) Validate() error {
 
 	if o.SubscriberBufferSize <= 0 {
 		o.SubscriberBufferSize = 128
+	}
+
+	if o.AlertPollInterval <= 0 {
+		o.AlertPollInterval = DefaultAlertPollInterval
 	}
 
 	return nil

@@ -31,14 +31,17 @@ func runGit(ctx context.Context, dir string, env []string, args ...string) (stri
 }
 
 func getGitPaths(ctx context.Context, dir string) (rootDir string, gitDir string, err error) {
-	rootDir, err = runGit(ctx, dir, nil, "rev-parse", "--show-toplevel")
+	// One process for both paths: every checkpoint call starts here, and each
+	// git spawn costs 100ms+ on a loaded machine (STA-775).
+	out, err := runGit(ctx, dir, nil, "rev-parse", "--show-toplevel", "--git-dir")
 	if err != nil {
 		return "", "", fmt.Errorf("not in a git repository: %w", err)
 	}
-	gitDir, err = runGit(ctx, dir, nil, "rev-parse", "--git-dir")
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get git directory: %w", err)
+	lines := strings.Split(out, "\n")
+	if len(lines) != 2 {
+		return "", "", fmt.Errorf("failed to get git directory: unexpected rev-parse output %q", out)
 	}
+	rootDir, gitDir = strings.TrimSpace(lines[0]), strings.TrimSpace(lines[1])
 	if !filepath.IsAbs(gitDir) {
 		gitDir = filepath.Join(rootDir, gitDir)
 	}
@@ -502,22 +505,24 @@ func RestoreFile(ctx context.Context, workDir, checkpointID, filePath string) er
 	return err
 }
 
-// FindPreRunCheckpoint returns the ID of the checkpoint created as the pre-run
-// baseline for taskID (message prefix "pre-run <taskID>"). Returns "" when none
-// is found; the caller falls back to "latest" in that case.
-func FindPreRunCheckpoint(ctx context.Context, repoPath, taskID string) (string, error) {
+// FindPreRunCheckpointRef returns the ID and full ref of the checkpoint
+// created as the pre-run baseline for taskID (message prefix
+// "pre-run <taskID>"). Returns "" when none is found; the caller falls back
+// to "latest" in that case. Diffing against the ref skips the for-each-ref
+// lookup a bare ID costs (STA-775).
+func FindPreRunCheckpointRef(ctx context.Context, repoPath, taskID string) (id, ref string, err error) {
 	cps, err := ListCheckpoints(ctx, repoPath, 0)
 	if err != nil {
-		return "", nil //nolint:nilerr // best-effort; caller uses fallback
+		return "", "", nil //nolint:nilerr // best-effort; caller uses fallback
 	}
 	prefix := "pre-run " + taskID
 	// Checkpoints are newest-first; walk from oldest end to pick the earliest pre-run.
 	for i := len(cps) - 1; i >= 0; i-- {
 		if strings.HasPrefix(cps[i].Message, prefix) {
-			return cps[i].ID, nil
+			return cps[i].ID, cps[i].Ref, nil
 		}
 	}
-	return "", nil
+	return "", "", nil
 }
 
 // PruneCheckpoints deletes older checkpoint refs, keeping keepLast checkpoints.

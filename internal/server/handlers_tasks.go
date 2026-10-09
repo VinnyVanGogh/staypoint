@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/context"
@@ -741,6 +742,12 @@ func (h *TasksHandler) ResolveInteraction(w http.ResponseWriter, r *http.Request
 	var req struct {
 		Status   string `json:"status"`
 		Response any    `json:"response"`
+		// Resume false is "Answer only": record the answer without waking
+		// the task. Omitted keeps the old behaviour, a wake that the claim
+		// still refuses for non-runnable stages (backlog, stopped, error…).
+		// "Answer & resume" on a parked task is answer-only plus Run Now, so
+		// Run Now's Board, hold and backlog gates apply (task-e3fe2c0b).
+		Resume *bool `json:"resume"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -773,8 +780,10 @@ func (h *TasksHandler) ResolveInteraction(w http.ResponseWriter, r *http.Request
 		})
 	}
 
-	orchestrator.GlobalDispatcher.Wake(id, "interaction_resolved",
-		fmt.Sprintf("interaction_resolved:%s:%d", id, iid))
+	if req.Resume == nil || *req.Resume {
+		orchestrator.GlobalDispatcher.Wake(id, "interaction_resolved",
+			fmt.Sprintf("interaction_resolved:%s:%d", id, iid))
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(updated)
@@ -818,6 +827,20 @@ func (h *TasksHandler) SetStage(w http.ResponseWriter, r *http.Request) {
 	}
 	if !h.requireBoardToLeave(w, r, task, req.Stage) {
 		return
+	}
+	// Done through the stage endpoint keeps the done gate of POST /done:
+	// without the Board override (which needs the Board gate) it needs a work
+	// product and no watchdog block. It let an agent token close any task
+	// (task-70e08aca).
+	if req.Stage == governance.StageDone && !req.Override {
+		if err := context.CheckDoneGate(h.db, task.ID); err != nil {
+			if errors.Is(err, context.ErrNoWorkProduct) || errors.Is(err, context.ErrWatchdogBlocked) {
+				writeError(w, http.StatusConflict, err.Error())
+			} else {
+				writeError(w, http.StatusInternalServerError, err.Error())
+			}
+			return
+		}
 	}
 	if req.Stage == governance.StageInProgress {
 		if held, org := governance.TaskOrgHeld(h.db, task.ID); held {
@@ -1113,11 +1136,14 @@ func (h *TasksHandler) GetTaskDiff(w http.ResponseWriter, r *http.Request) {
 
 	// "Whole run" (empty checkpoint) diffs against the task's base: the same
 	// verified commit the ship review card and Approve use (STA-774).
+	// target is what git diffs against: the base commit or pre-run ref when
+	// known (no ref lookup needed), else the ID the caller asked for.
 	wholeRun := cpID == ""
 	baseVerified := false
+	target := cpID
 	if wholeRun {
 		var err error
-		cpID, baseVerified, err = wholeRunBase(ctx, h.db, task)
+		cpID, target, baseVerified, err = wholeRunBase(ctx, h.db, task)
 		if err != nil {
 			writeWholeRunBaseError(w, err)
 			return
@@ -1128,15 +1154,26 @@ func (h *TasksHandler) GetTaskDiff(w http.ResponseWriter, r *http.Request) {
 	var stat string
 	var fileStats []checkpoint.FileDiffStat
 	var statErr, filesErr error
+	// The stat and numstat diffs are independent git processes; run them side
+	// by side so the task page waits for one, not both (STA-775).
+	var wg sync.WaitGroup
+	wg.Add(1)
 	if hasWorktree {
-		stat, statErr = checkpoint.DiffCheckpoint(ctx, workDir, cpID)
-		fileStats, filesErr = checkpoint.DiffCheckpointFiles(ctx, workDir, cpID)
+		go func() {
+			defer wg.Done()
+			stat, statErr = checkpoint.DiffCheckpoint(ctx, workDir, target)
+		}()
+		fileStats, filesErr = checkpoint.DiffCheckpointFiles(ctx, workDir, target)
 	} else {
 		// Worktree pruned — compare checkpoint against the task branch tip.
 		branch := "staypoint/" + task.ID
-		stat, statErr = checkpoint.DiffCheckpointAgainstRef(ctx, task.RepoPath, cpID, branch)
-		fileStats, filesErr = checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, cpID, branch)
+		go func() {
+			defer wg.Done()
+			stat, statErr = checkpoint.DiffCheckpointAgainstRef(ctx, task.RepoPath, target, branch)
+		}()
+		fileStats, filesErr = checkpoint.DiffCheckpointFilesAgainstRef(ctx, task.RepoPath, target, branch)
 	}
+	wg.Wait()
 	// A timeout is not "no changes": say so instead of showing an empty diff.
 	for _, e := range []error{statErr, filesErr} {
 		if gitexec.IsTimeout(e) {
@@ -1183,16 +1220,23 @@ func (h *TasksHandler) GetTaskDiff(w http.ResponseWriter, r *http.Request) {
 // (created before STA-774) falls back to its pre-run checkpoint for display
 // only, reported as verified=false: such a task can never get a card or an
 // Approve. A moved pin or a git/DB error is returned.
-func wholeRunBase(ctx gocontext.Context, db *sql.DB, task *context.Task) (cpID string, verified bool, err error) {
+//
+// target is what git should diff against: the commit itself, or the pre-run
+// checkpoint's full ref, so the diff skips the for-each-ref lookup a bare
+// checkpoint ID costs (STA-775).
+func wholeRunBase(ctx gocontext.Context, db *sql.DB, task *context.Task) (cpID, target string, verified bool, err error) {
 	base, err := workspace.VerifiedBase(ctx, db, task.RepoPath, task.ID)
 	if err == nil {
-		return base, true, nil
+		return base, base, true, nil
 	}
 	if !errors.Is(err, workspace.ErrNoTaskBase) {
-		return "", false, err
+		return "", "", false, err
 	}
-	preRunID, _ := checkpoint.FindPreRunCheckpoint(ctx, task.RepoPath, task.ID)
-	return preRunID, false, nil
+	preRunID, preRunRef, _ := checkpoint.FindPreRunCheckpointRef(ctx, task.RepoPath, task.ID)
+	if preRunID == "" {
+		return "", "", false, nil
+	}
+	return preRunID, preRunRef, false, nil
 }
 
 // writeWholeRunBaseError answers a whole-run diff whose base failed
@@ -1251,7 +1295,7 @@ func (h *TasksHandler) GetTaskFileDiff(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := gitRequestContext(r)
 	defer cancel()
 	if cpID == "" {
-		base, _, baseErr := wholeRunBase(ctx, h.db, task)
+		_, base, _, baseErr := wholeRunBase(ctx, h.db, task)
 		if baseErr != nil {
 			writeWholeRunBaseError(w, baseErr)
 			return
@@ -1485,7 +1529,7 @@ func (h *TasksHandler) GetTaskMigrations(w http.ResponseWriter, r *http.Request)
 	// Get the full diff file list.
 	ctx, cancel := gitRequestContext(r)
 	defer cancel()
-	cpID, _, baseErr := wholeRunBase(ctx, h.db, task)
+	_, cpID, _, baseErr := wholeRunBase(ctx, h.db, task)
 	if baseErr != nil {
 		writeWholeRunBaseError(w, baseErr)
 		return
@@ -1514,9 +1558,13 @@ func (h *TasksHandler) GetTaskMigrations(w http.ResponseWriter, r *http.Request)
 	migPaths := migration.Detect(filePaths, globs)
 
 	// Determine if a read-only DB connection is configured for auto-verify.
+	// The Keychain lookup spawns `security`, so skip it when there is nothing
+	// to verify (STA-775).
 	hasAutoConn := false
-	if dsn, _ := migration.GetProjectDSN(task.RepoPath); dsn != "" {
-		hasAutoConn = true
+	if len(migPaths) > 0 {
+		if dsn, _ := migration.GetProjectDSN(task.RepoPath); dsn != "" {
+			hasAutoConn = true
+		}
 	}
 
 	// Read SQL content and check risk for each detected migration file.

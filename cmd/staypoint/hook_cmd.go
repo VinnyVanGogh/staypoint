@@ -5,19 +5,24 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/adapter"
 	"github.com/VinnyVanGogh/staypoint/internal/bridge"
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
+	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
+	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
 	"github.com/VinnyVanGogh/staypoint/internal/trackgate"
 	"github.com/VinnyVanGogh/staypoint/internal/wire"
@@ -114,6 +119,9 @@ func handleHookPrompt() {
 		if store, err := db.Open(cfg.DBPath); err == nil {
 			dbConn = store.DB()
 			defer store.Close()
+			// Alerts raised by this hook reach the Board through board_alerts.
+			telemetry.SetAlertSink(telemetry.DBAlertSink(dbConn))
+			defer telemetry.SetAlertSink(nil)
 		}
 	}
 
@@ -313,7 +321,7 @@ func handleHookPrompt() {
 					DB:                dbConn,
 				})
 
-				telemetry.SendNotification(
+				telemetry.SendQuotaAlert(triggeredPool.ID, telemetry.QuotaWarning,
 					"[Staypoint] Quota Limit Warning (15% left)",
 					fmt.Sprintf("%s %s. Handoff staged in clipboard. Switch to %s.", triggeredPool.Name, warningReason, targetDisplay),
 				)
@@ -351,39 +359,29 @@ func handleHookPrompt() {
 		}
 	}
 
+	fmt.Println(promptHookOutput(isAntigravity, notices))
+}
+
+// promptHookOutput renders the prompt hook's notices for the calling client:
+// agy PreInvocation takes injectSteps (camelCase, protojson); Claude Code
+// UserPromptSubmit takes additionalContext inside hookSpecificOutput. A
+// top-level additionalContext is not in Claude's schema, so notices sent that
+// way never reached the model.
+func promptHookOutput(isAntigravity bool, notices []string) string {
+	if len(notices) == 0 {
+		return "{}"
+	}
+	text := strings.Join(notices, "\n\n")
+	var resp any
 	if isAntigravity {
-		if len(notices) > 0 {
-			type InjectedStep struct {
-				EphemeralMessage string `json:"ephemeralMessage,omitempty"`
-			}
-			type HookResp struct {
-				InjectSteps []InjectedStep `json:"injectSteps"`
-			}
-			resp := HookResp{
-				InjectSteps: []InjectedStep{
-					{
-						EphemeralMessage: strings.Join(notices, "\n\n"),
-					},
-				},
-			}
-			out, _ := json.Marshal(resp)
-			fmt.Println(string(out))
-			return
-		}
-		fmt.Println("{}")
-		return
+		resp = map[string]any{"injectSteps": []map[string]string{{"ephemeralMessage": text}}}
+	} else {
+		resp = map[string]any{"hookSpecificOutput": map[string]string{
+			"hookEventName": "UserPromptSubmit", "additionalContext": text,
+		}}
 	}
-
-	if len(notices) > 0 {
-		resp := map[string]string{
-			"additionalContext": strings.Join(notices, "\n\n"),
-		}
-		out, _ := json.Marshal(resp)
-		fmt.Println(string(out))
-		return
-	}
-
-	fmt.Println("{}")
+	out, _ := json.Marshal(resp)
+	return string(out)
 }
 
 var hookInstallCmd = &cobra.Command{
@@ -407,7 +405,7 @@ var hookPreToolCmd = &cobra.Command{
 }
 
 // preToolAllow is the response that lets the tool call proceed.
-func preToolAllow() { fmt.Println("{}") }
+func preToolAllow() { fmt.Println(preToolAllowJSON(trackgate.ClientClaude)) }
 
 // preToolAllowPinned lets the tool call proceed with its command replaced by
 // pinned (STA-868): scripts judged or approved by content run from the exact
@@ -500,7 +498,7 @@ func handleHookPreTool() {
 	// flight when Pause was clicked finishes; subsequent steps are held here
 	// until Resume is clicked (or Stop cancels the turn).
 	if taskID := os.Getenv("STAYPOINT_TASK_ID"); taskID != "" {
-		daemonURL, token := resolveDaemonConn()
+		daemonURL, token := gateDaemonConn()
 		if daemonURL != "" {
 			waitForStepResume(daemonURL, token, taskID)
 		}
@@ -513,9 +511,14 @@ func handleHookPreTool() {
 		fmt.Println(blockOut)
 		return
 	}
-	if client == trackgate.ClientGemini || hookPreToolTrackingOnly {
-		// The Red-tier Board gate below understands Claude payloads only, and
-		// interactive registrations (hook install) opt out of it.
+	if client == trackgate.ClientGemini {
+		// agy gets the same Red-tier Board gate as Claude (task-21e96721).
+		fmt.Println(gateGeminiPreTool(raw))
+		return
+	}
+	if hookPreToolTrackingOnly {
+		// Interactive Claude registrations (hook install) opt out of the
+		// Board gate below.
 		fmt.Println(preToolAllowJSON(client))
 		return
 	}
@@ -574,7 +577,8 @@ func handleHookPreTool() {
 	// Board and pinned into the command that runs.
 	snap := security.NewSnapshotter()
 	c := &security.Classifier{CWD: cwd, CWDTrusted: cwdTrusted, Snap: snap,
-		ScratchDirs: hookScratchDirs(os.Getenv("STAYPOINT_TASK_ID"))}
+		ScratchDirs:   hookScratchDirs(os.Getenv("STAYPOINT_TASK_ID")),
+		PushPolicyFor: hookPushPolicy}
 	verdict := c.Classify(bashInput.Command)
 	// A daemon-run agent (STAYPOINT_TASK_ID is in the hook's own env, which
 	// the command cannot change) asks the Board for anything that breaks an
@@ -601,7 +605,7 @@ func handleHookPreTool() {
 	}
 
 	// Red-tier command: post to daemon for Board approval.
-	daemonURL, token := resolveDaemonConn()
+	daemonURL, token := gateDaemonConn()
 	if daemonURL == "" {
 		// Fail-closed: daemon unreachable, cannot get Board decision.
 		preToolBlock(fmt.Sprintf("Board gate unreachable; command blocked (%s)", strings.Join(verdict.Reasons, "; ")))
@@ -638,9 +642,14 @@ func handleHookPreTool() {
 	// worktree has a deadline, kept by the daemon: then it reports "deferred"
 	// and the command is skipped, not run (task-6c1ed91f).
 	// The hook process sits here; Claude Code cannot call the tool while we hold.
+	// The wait is bounded: past the hook's timeout Claude Code would run the
+	// command anyway, so waitGateDecision gives up first and we block.
 	for {
-		status, decidedBy := pollGateRequest(daemonURL, token, gr.ID)
+		status, decidedBy := waitGateDecision(daemonURL, token, gr.ID)
 		switch status {
+		case "expired":
+			preToolBlock(heldPastWaitMessage(gr.ID))
+			return
 		case "approved":
 			allow()
 			return
@@ -683,8 +692,9 @@ func raiseForBoardRules(cmd, cwd string, snap *security.Snapshotter, v *security
 	}
 }
 
-// fileEditDaemonConn is resolveDaemonConn; tests point it at a fake daemon.
-var fileEditDaemonConn = resolveDaemonConn
+// gateDaemonConn is resolveDaemonConn for the PreToolUse gates (pause, Red
+// Bash, file edit); tests point it at a fake or test daemon.
+var gateDaemonConn = resolveDaemonConn
 
 // fileEditTools are the Claude Code tools that write files.
 var fileEditTools = map[string]bool{"write": true, "edit": true, "multiedit": true, "notebookedit": true}
@@ -769,7 +779,7 @@ func gateFileEdit(tool string, toolInput json.RawMessage, sessionID, cwd, taskID
 		return
 	}
 	reasons := []string{why}
-	daemonURL, token := fileEditDaemonConn()
+	daemonURL, token := gateDaemonConn()
 	if daemonURL == "" {
 		preToolBlock(fmt.Sprintf("Board gate unreachable; edit blocked (%s)", why))
 		return
@@ -786,8 +796,11 @@ func gateFileEdit(tool string, toolInput json.RawMessage, sessionID, cwd, taskID
 		return
 	}
 	for {
-		status, _ := pollGateRequest(daemonURL, token, gr.ID)
+		status, _ := waitGateDecision(daemonURL, token, gr.ID)
 		switch status {
+		case "expired":
+			preToolBlock(heldPastWaitMessage(gr.ID))
+			return
 		case "approved":
 			preToolAllow()
 			return
@@ -833,11 +846,42 @@ type gateRequestBody struct {
 	// hook will run exactly those bytes when approved.
 	Scripts []hookScript `json:"scripts,omitempty"`
 	Pinned  bool         `json:"pinned,omitempty"`
+	// MaxWaitSeconds asks the daemon to skip the request by then, for a
+	// hook that cannot hold the tool call longer (agy).
+	MaxWaitSeconds int `json:"max_wait_seconds,omitempty"`
 }
 
 type hookScript struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+}
+
+// hookPushPolicy resolves the push_policy (STA-562) of the repo a push runs
+// in. A task worktree resolves to its main checkout through the git common
+// dir, which is where project_dev_configs rows are keyed. The database is
+// opened read-only, so a hook built from another version never migrates the
+// daemon's schema. A repo with no row (or no explicit choice) is
+// "branch_only", per the Board decision of 2026-10-08. It fails closed: a
+// relative dir, no repo, no configured or openable database, a lookup error
+// (including a missing column) or an unknown value all return "never".
+func hookPushPolicy(dir string) string {
+	never := string(shipreview.PushPolicyNever)
+	if dir == "" || !filepath.IsAbs(dir) || cfg == nil || cfg.DBPath == "" {
+		return never
+	}
+	root := ""
+	if common := gitexec.CommonDir(dir); filepath.Base(common) == ".git" {
+		root = filepath.Dir(common)
+	}
+	if root == "" {
+		return never
+	}
+	conn, err := db.OpenReadOnly(cfg.DBPath)
+	if err != nil {
+		return never
+	}
+	defer conn.Close()
+	return string(shipreview.GetProjectPushPolicy(conn, root))
 }
 
 // hookScratchDirs are the system temp dirs plus the task's scratch dir.
@@ -872,21 +916,82 @@ func createGateRequest(daemonURL, token string, in gateRequestBody) *gateRequest
 	return &gr
 }
 
+// gateWaitBudget is how long a held tool call waits for the Board before the
+// hook blocks it itself. It must end before the hook's own timeout
+// (adapter.PreToolHookTimeoutSeconds): a timed-out Claude Code hook does not
+// block, so the command would run unapproved (task-cae83e7f).
+var gateWaitBudget = time.Duration(adapter.PreToolHookTimeoutSeconds-adapter.HookGateWaitMargin) * time.Second
+
+// gateNow is the clock for gateWaitBudget; tests replace it.
+var gateNow = time.Now
+
+// waitGateDecision long-polls the gate request until it is no longer pending
+// or gateWaitBudget runs out, which it reports as "expired". Other statuses
+// are pollGateRequest's.
+func waitGateDecision(daemonURL, token, id string) (status, decidedBy string) {
+	return waitGateDecisionWithin(daemonURL, token, id, gateWaitBudget)
+}
+
+// waitGateDecisionWithin is waitGateDecision with its own budget. Each poll is
+// cut off at the time left, so no single long-poll outlasts the budget.
+func waitGateDecisionWithin(daemonURL, token, id string, budget time.Duration) (status, decidedBy string) {
+	deadline := gateNow().Add(budget)
+	for {
+		left := deadline.Sub(gateNow())
+		if left <= 0 {
+			return "expired", ""
+		}
+		pollTimeout := gatePollTimeout
+		if left < pollTimeout {
+			pollTimeout = left
+		}
+		status, decidedBy = pollGateRequestWithin(daemonURL, token, id, pollTimeout)
+		if status != "pending" {
+			return status, decidedBy
+		}
+	}
+}
+
+// heldPastWaitMessage is what the agent is told when the Board did not decide
+// within gateWaitBudget: the command was not run and the request stays open.
+func heldPastWaitMessage(id string) string {
+	return fmt.Sprintf("held: the Board has not decided yet, so this command was blocked and NOT run (gate %s stays pending). Do not retry it or work around it; continue with other work or stop and say what you are waiting on.", id)
+}
+
 // pollGateRequest long-polls the gate request and returns its status —
 // "approved", "denied", "deferred" (skipped at its deadline), "pending"
 // (still waiting), or "" (connection error) — and who decided it.
 func pollGateRequest(daemonURL, token, id string) (status, decidedBy string) {
+	return pollGateRequestWithin(daemonURL, token, id, gatePollTimeout)
+}
+
+// gatePollTimeout is one long-poll's client timeout: slightly longer than the
+// server's 29s hold.
+const gatePollTimeout = 35 * time.Second
+
+// pollGateRequestWithin is pollGateRequest with the client timeout given. A
+// timeout reads as "pending"; the caller's budget decides what happens next.
+func pollGateRequestWithin(daemonURL, token, id string, timeout time.Duration) (status, decidedBy string) {
 	url := fmt.Sprintf("%s/api/security/gate-requests/%s?wait=true", daemonURL, id)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 	if err != nil {
 		return "", ""
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	client := &http.Client{Timeout: 35 * time.Second} // slightly longer than server 29s
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		// Daemon may be restarting; wait briefly then retry (still no timeout).
-		time.Sleep(2 * time.Second)
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			// The poll ran its full time; the caller's budget decides.
+			return "pending", ""
+		}
+		// Daemon may be restarting; wait briefly then retry.
+		pause := 2 * time.Second
+		if timeout < pause {
+			pause = timeout
+		}
+		time.Sleep(pause)
 		return "pending", ""
 	}
 	defer resp.Body.Close()
