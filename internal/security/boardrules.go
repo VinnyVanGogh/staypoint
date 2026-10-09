@@ -863,8 +863,10 @@ func goBuildsCwd(args []string, dyn []bool) bool {
 	for i, a := range args {
 		switch {
 		case strings.HasPrefix(a, "-"), i > 0 && strings.HasPrefix(args[i-1], "-") && !strings.Contains(args[i-1], "="):
-		// ./... includes the cwd, .. may be it from a subdirectory.
-		case dyn[i] || strings.ContainsAny(a, "*?[{") || path.Clean(a) == "." || strings.HasSuffix(a, ".go") || strings.Contains(a, ".."):
+		// ./... includes the cwd, .. may be it from a subdirectory, ~+ is
+		// $PWD.
+		case dyn[i] || strings.ContainsAny(a, "*?[{") || strings.HasPrefix(a, "~") || path.Clean(a) == "." ||
+			strings.HasSuffix(a, ".go") || strings.Contains(a, ".."):
 			return true
 		}
 	}
