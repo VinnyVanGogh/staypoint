@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     spent_tokens      INTEGER NOT NULL DEFAULT 0,
     spent_usd         REAL NOT NULL DEFAULT 0.0,
     spent_turns       INTEGER NOT NULL DEFAULT 0,
+    is_blocked        INTEGER NOT NULL DEFAULT 0,
+    block_reason      TEXT,
     updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE TABLE IF NOT EXISTS task_documents (

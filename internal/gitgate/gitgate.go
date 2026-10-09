@@ -24,6 +24,9 @@ type Result struct {
 	// MissingFromMain lists SHAs that are not in origin/main (used by PostFlight
 	// and MainContains only).
 	MissingFromMain []string
+	// Conflicts lists the files a PreFlight merge of upstream conflicted on.
+	// The merge is aborted, so the branch is left as it was.
+	Conflicts []string
 	// Details is a human-readable summary of all checked conditions.
 	Details []string
 	// Errors lists blocking error descriptions.
@@ -64,7 +67,8 @@ func gitNoFail(ctx context.Context, dir string, args ...string) string {
 // PreFlight runs before every agent wake/run:
 //  1. git fetch --all --prune
 //  2. Fails if the worktree is dirty (uncommitted tracked changes or staged files)
-//  3. If the branch is behind upstream, fast-forwards and fails on conflict
+//  3. If the branch is behind upstream, fast-forwards it, or merges upstream
+//     when the branch has commits of its own; fails (merge aborted) on conflict
 //  4. Reports ahead/behind counts
 //
 // repo is the worktree directory. branch is the local branch name (e.g. "main").
@@ -105,13 +109,33 @@ func PreFlight(ctx context.Context, repo, branch string) (*Result, error) {
 	}
 	r.addInfo(fmt.Sprintf("ahead=%d behind=%d vs %s", r.Ahead, r.Behind, upstream))
 
-	// 4. Fast-forward if behind
+	// 4. Catch up if behind: fast-forward a branch with no commits of its own,
+	// merge into one that has them (a resumed task branch kept from an
+	// earlier run). Merge, not rebase: the branch may already be pushed, and
+	// rewriting it would need a force-push.
 	if r.Behind > 0 {
-		if _, err := git(ctx, repo, "merge", "--ff-only", upstream); err != nil {
-			r.addErr(fmt.Sprintf("fast-forward failed (conflict or diverged): %v", err))
+		if r.Ahead == 0 {
+			if _, err := git(ctx, repo, "merge", "--ff-only", upstream); err != nil {
+				r.addErr(fmt.Sprintf("fast-forward from %s failed: %v", upstream, err))
+				return r, nil
+			}
+			r.addInfo(fmt.Sprintf("fast-forwarded %d commit(s) from %s", r.Behind, upstream))
 			return r, nil
 		}
-		r.addInfo(fmt.Sprintf("fast-forwarded %d commit(s) from %s", r.Behind, upstream))
+		msg := fmt.Sprintf("Merge %s into task branch (git pre-flight)", upstream)
+		if _, err := git(ctx, repo, "merge", "--no-edit", "-m", msg, upstream); err != nil {
+			conflicts := gitNoFail(ctx, repo, "diff", "--name-only", "--diff-filter=U")
+			_, _ = git(ctx, repo, "merge", "--abort")
+			if conflicts != "" {
+				r.Conflicts = strings.Split(conflicts, "\n")
+				r.addErr(fmt.Sprintf("branch has %d commit(s) of its own and is %d behind %s; merging %s conflicts in: %s (merge aborted, branch unchanged)",
+					r.Ahead, r.Behind, upstream, upstream, strings.Join(r.Conflicts, ", ")))
+			} else {
+				r.addErr(fmt.Sprintf("merging %s into the branch failed (merge aborted, branch unchanged): %v", upstream, err))
+			}
+			return r, nil
+		}
+		r.addInfo(fmt.Sprintf("merged %d commit(s) from %s into a branch %d ahead", r.Behind, upstream, r.Ahead))
 	}
 
 	return r, nil
