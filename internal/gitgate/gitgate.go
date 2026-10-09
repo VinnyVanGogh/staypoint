@@ -67,12 +67,23 @@ func gitNoFail(ctx context.Context, dir string, args ...string) string {
 // PreFlight runs before every agent wake/run:
 //  1. git fetch --all --prune
 //  2. Fails if the worktree is dirty (uncommitted tracked changes or staged files)
-//  3. If the branch is behind upstream, fast-forwards it, or merges upstream
-//     when the branch has commits of its own; fails (merge aborted) on conflict
+//  3. If the branch is behind upstream, fast-forwards it; a branch with
+//     commits of its own fails (use PreFlightMerge to merge upstream in)
 //  4. Reports ahead/behind counts
 //
 // repo is the worktree directory. branch is the local branch name (e.g. "main").
 func PreFlight(ctx context.Context, repo, branch string) (*Result, error) {
+	return PreFlightMerge(ctx, repo, branch, "")
+}
+
+// PreFlightMerge is PreFlight that, when the branch has commits of its own
+// and is behind origin/<branch>, merges origin/<branch> in instead of failing.
+// base is the commit the branch was cut from. The merge only happens when
+// base is an ancestor of origin/<branch>: a branch cut from dev-server must
+// never have main merged into it because the wrong target was resolved. An
+// empty base means fast-forward only. A conflicting merge is aborted, the
+// branch is left unchanged and the conflicting files are in Result.Conflicts.
+func PreFlightMerge(ctx context.Context, repo, branch, base string) (*Result, error) {
 	r := &Result{OK: true}
 
 	// 1. Fetch
@@ -120,6 +131,16 @@ func PreFlight(ctx context.Context, repo, branch string) (*Result, error) {
 				return r, nil
 			}
 			r.addInfo(fmt.Sprintf("fast-forwarded %d commit(s) from %s", r.Behind, upstream))
+			return r, nil
+		}
+		if base == "" {
+			r.addErr(fmt.Sprintf("branch has %d commit(s) of its own and is %d behind %s; not merging %s without the branch's recorded target and base (fast-forward only)",
+				r.Ahead, r.Behind, upstream, upstream))
+			return r, nil
+		}
+		if _, err := git(ctx, repo, "merge-base", "--is-ancestor", base, upstream); err != nil {
+			r.addErr(fmt.Sprintf("branch has %d commit(s) of its own and is %d behind %s; not merging: %s does not contain the branch's base %.8s, so it is not the line the branch was cut from",
+				r.Ahead, r.Behind, upstream, upstream, base))
 			return r, nil
 		}
 		msg := fmt.Sprintf("Merge %s into task branch (git pre-flight)", upstream)

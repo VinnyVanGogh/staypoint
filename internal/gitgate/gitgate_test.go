@@ -149,12 +149,22 @@ func TestPreFlight_BehindUpstream(t *testing.T) {
 	}
 }
 
+func headOf(t *testing.T, dir string) string {
+	t.Helper()
+	out, err := runNoFail(dir, "git", "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
 // A resumed task branch has a commit from an earlier run and main has moved
-// on: --ff-only cannot catch it up, so PreFlight merges main in.
+// on: --ff-only cannot catch it up, so PreFlightMerge merges main in.
 func TestPreFlight_DivergedBranchMerges(t *testing.T) {
 	origin := initRepo(t)
 	commit(t, origin, "initial", "a.txt")
 	clone := cloneRepo(t, origin)
+	base := headOf(t, clone)
 
 	commit(t, clone, "task work", "task.txt")
 	commit(t, origin, "main moved", "b.txt")
@@ -162,7 +172,7 @@ func TestPreFlight_DivergedBranchMerges(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	r, err := gitgate.PreFlight(ctx, clone, "main")
+	r, err := gitgate.PreFlightMerge(ctx, clone, "main", base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,6 +203,7 @@ func TestPreFlight_DivergedBranchConflictAborts(t *testing.T) {
 	origin := initRepo(t)
 	commit(t, origin, "initial", "a.txt")
 	clone := cloneRepo(t, origin)
+	base := headOf(t, clone)
 
 	commit(t, clone, "task edit", "a.txt")
 	before, _ := runNoFail(clone, "git", "rev-parse", "HEAD")
@@ -201,7 +212,7 @@ func TestPreFlight_DivergedBranchConflictAborts(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	r, err := gitgate.PreFlight(ctx, clone, "main")
+	r, err := gitgate.PreFlightMerge(ctx, clone, "main", base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,6 +234,73 @@ func TestPreFlight_DivergedBranchConflictAborts(t *testing.T) {
 	}
 	if status, _ := runNoFail(clone, "git", "status", "--porcelain"); status != "" {
 		t.Errorf("worktree dirty after abort: %q", status)
+	}
+}
+
+// Without a base (no recorded target), a diverged branch stays fast-forward
+// only: PreFlight fails and leaves it alone rather than merge a branch that
+// may not be the one the task was cut from.
+func TestPreFlight_DivergedBranchWithoutBaseFailsSafe(t *testing.T) {
+	origin := initRepo(t)
+	commit(t, origin, "initial", "a.txt")
+	clone := cloneRepo(t, origin)
+
+	commit(t, clone, "task work", "task.txt")
+	before := headOf(t, clone)
+	commit(t, origin, "main moved", "b.txt")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	r, err := gitgate.PreFlight(ctx, clone, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.OK {
+		t.Fatal("expected failure: diverged branch with no base must not be merged")
+	}
+	if !containsAny(r.Errors, "fast-forward only") {
+		t.Errorf("error should say why it did not merge, got %v", r.Errors)
+	}
+	if after := headOf(t, clone); after != before {
+		t.Errorf("HEAD moved: %s -> %s", before, after)
+	}
+}
+
+// A branch cut from dev-server, pre-flighted against main (the wrong target),
+// is refused: main does not contain the branch's base.
+func TestPreFlight_WrongLineRefusesMerge(t *testing.T) {
+	origin := initRepo(t)
+	commit(t, origin, "initial", "a.txt")
+	run(t, origin, "git", "checkout", "-q", "-b", "dev-server")
+	commit(t, origin, "dev only", "dev.txt")
+	run(t, origin, "git", "checkout", "-q", "main")
+	commit(t, origin, "main only", "main.txt")
+
+	clone := cloneRepo(t, origin)
+	run(t, clone, "git", "checkout", "-q", "-b", "staypoint/task-dev", "origin/dev-server")
+	base := headOf(t, clone)
+	commit(t, clone, "task work", "task.txt")
+	before := headOf(t, clone)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	r, err := gitgate.PreFlightMerge(ctx, clone, "main", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.OK {
+		t.Fatal("expected refusal: origin/main does not contain the dev-server base")
+	}
+	if !containsAny(r.Errors, "not the line the branch was cut from") {
+		t.Errorf("error should name the wrong-line guard, got %v", r.Errors)
+	}
+	if after := headOf(t, clone); after != before {
+		t.Errorf("HEAD moved: %s -> %s", before, after)
+	}
+	if _, err := os.Stat(filepath.Join(clone, "main.txt")); err == nil {
+		t.Error("main-only file landed in the dev-server task branch")
 	}
 }
 

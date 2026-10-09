@@ -56,7 +56,7 @@ func TestPreflightBranch_FallsBackToMain(t *testing.T) {
 
 // A task cut from dev-server, in a repo where dev-server and main have
 // diverged, must fast-forward against dev-server. Against main (the old
-// hardcoded branch) pre-flight would merge main into the dev-server task.
+// hardcoded branch) pre-flight must fail, never merge main into the task.
 func TestPreflightBranch_DevServerTaskFastForwards(t *testing.T) {
 	ctx := context.Background()
 	origin := t.TempDir()
@@ -86,6 +86,20 @@ func TestPreflightBranch_DevServerTaskFastForwards(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if got := preflightMergeBase(ctx, db, clone, "task-dev"); got != base {
+		t.Fatalf("preflightMergeBase = %q, want the recorded base %q", got, base)
+	}
+	// The old wrong-target bug: pre-flight against main, ff-only or with the
+	// task's base, must fail and leave the dev-server task branch alone.
+	for _, mergeBase := range []string{"", base} {
+		if r, err := gitgate.PreFlightMerge(ctx, wt, "main", mergeBase); err != nil || r.OK {
+			t.Fatalf("pre-flight against main should fail for a dev-server task (base %q); got ok=%v err=%v", mergeBase, r != nil && r.OK, err)
+		}
+		if head := gitOutT(t, wt, "rev-parse", "HEAD"); head != base {
+			t.Fatalf("pre-flight against main moved the dev-server task branch: %s -> %s", base, head)
+		}
+	}
+
 	branch := preflightBranch(ctx, db, clone, "task-dev")
 	if branch != "dev-server" {
 		t.Fatalf("preflightBranch = %q, want dev-server", branch)
@@ -104,21 +118,36 @@ func TestPreflightBranch_DevServerTaskFastForwards(t *testing.T) {
 
 // resumedTaskRepo sets up a clone whose task branch staypoint/<taskID> holds
 // one pushed commit from an earlier run (writing taskFile) while origin/main
-// moved on with a commit writing mainFile.
+// moved on with a commit writing mainFile. The task is cut from main with
+// main as its recorded target.
 func resumedTaskRepo(t *testing.T, taskID, taskFile, mainFile string) (string, *Harness) {
+	t.Helper()
+	return resumedTaskRepoFrom(t, taskID, taskFile, mainFile, "main", "main")
+}
+
+// resumedTaskRepoFrom is resumedTaskRepo for a task cut from cutFrom, with
+// target recorded as its target ("" records none, as for tasks cut before
+// targets were recorded). A cutFrom other than main is created on origin with
+// one commit of its own before the clone.
+func resumedTaskRepoFrom(t *testing.T, taskID, taskFile, mainFile, cutFrom, target string) (string, *Harness) {
 	t.Helper()
 	ctx := context.Background()
 	origin := t.TempDir()
 	initGitRepo(t, origin)
+	if cutFrom != "main" {
+		gitT(t, origin, "checkout", "-q", "-b", cutFrom)
+		commitFile(t, origin, cutFrom+".txt", "only on "+cutFrom+"\n")
+		gitT(t, origin, "checkout", "-q", "main")
+	}
 
 	clone := filepath.Join(t.TempDir(), "clone")
 	gitT(t, origin, "clone", "-q", origin, clone)
 	gitT(t, clone, "config", "user.email", "test@test.com")
 	gitT(t, clone, "config", "user.name", "Test")
-	base := gitOutT(t, clone, "rev-parse", "HEAD")
+	base := gitOutT(t, clone, "rev-parse", "origin/"+cutFrom)
 
 	branch := "staypoint/" + taskID
-	gitT(t, clone, "checkout", "-q", "-b", branch)
+	gitT(t, clone, "checkout", "-q", "-b", branch, base)
 	commitFile(t, clone, taskFile, "from the earlier run\n")
 	gitT(t, clone, "push", "-q", "origin", branch)
 	gitT(t, clone, "checkout", "-q", "main")
@@ -129,6 +158,11 @@ func resumedTaskRepo(t *testing.T, taskID, taskFile, mainFile string) (string, *
 	insertTask(t, db, taskID, clone)
 	if err := workspace.RecordTaskBase(ctx, db, clone, taskID, base); err != nil {
 		t.Fatal(err)
+	}
+	if target != "" {
+		if err := workspace.RecordTaskTarget(ctx, db, taskID, target); err != nil {
+			t.Fatal(err)
+		}
 	}
 	h := &Harness{
 		DB:          db,
@@ -237,5 +271,56 @@ func TestRun_ConflictingTaskBranchBlocksWithReason(t *testing.T) {
 	_ = h.DB.QueryRow(`SELECT COUNT(1) FROM task_comments WHERE task_id=? AND message LIKE '%shared.txt%'`, taskID).Scan(&comments)
 	if comments == 0 {
 		t.Error("no task comment names the conflicting file")
+	}
+}
+
+// Review guard for the old wrong-target bug: a resumed dev-server task with
+// no recorded target falls back to pre-flighting against main. Pre-flight
+// must not merge main (prod-only commits) into it; the task is parked as
+// blocked with a visible reason and its branch is left where it was.
+func TestRun_DevServerTaskWithoutRecordedTargetDoesNotMergeMain(t *testing.T) {
+	useSlots(t, 1)
+	const taskID = "devserver-task"
+	clone, h := resumedTaskRepoFrom(t, taskID, "task.txt", "main.txt", "dev-server", "")
+	branch := "staypoint/" + taskID
+	before := gitOutT(t, clone, "rev-parse", branch)
+
+	if got := preflightBranch(context.Background(), h.DB, clone, taskID); got != "main" {
+		t.Fatalf("preflightBranch = %q, want the main fallback this test guards", got)
+	}
+
+	result, err := h.Run(context.Background(), taskID, RunConfig{
+		MaxTurns:     1,
+		AgentID:      "tester",
+		MaxWallclock: 30 * time.Second,
+		RunAdapter: func(context.Context, string, string, []string, []string, io.Writer, io.Writer) error {
+			t.Error("adapter ran despite a refused pre-flight")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != "blocked" {
+		t.Fatalf("disposition = %q, want blocked", result.Disposition)
+	}
+	if after := gitOutT(t, clone, "rev-parse", branch); after != before {
+		t.Errorf("task branch moved: %s -> %s", before, after)
+	}
+	if err := exec.Command("git", "-C", clone, "merge-base", "--is-ancestor", "origin/main", branch).Run(); err == nil {
+		t.Error("origin/main was merged into the dev-server task branch")
+	}
+
+	var stage, reason string
+	var blocked int
+	if err := h.DB.QueryRow(`SELECT execution_stage, is_blocked, COALESCE(block_reason,'') FROM tasks WHERE id=?`, taskID).
+		Scan(&stage, &blocked, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if stage != "blocked" || blocked != 1 {
+		t.Errorf("stage=%q is_blocked=%d, want blocked/1", stage, blocked)
+	}
+	if !strings.Contains(reason, "fast-forward only") {
+		t.Errorf("block_reason should say why pre-flight did not merge, got %q", reason)
 	}
 }

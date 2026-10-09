@@ -228,6 +228,23 @@ func preflightBranch(ctx context.Context, db *sql.DB, repo, taskID string) strin
 	return "main"
 }
 
+// preflightMergeBase is the base pre-flight may merge a diverged task branch
+// over: the task's verified recorded base, and only when the task also has a
+// recorded target. Otherwise preflightBranch fell back to a project or repo
+// default, which may not be the line the task was cut from, and "" keeps
+// pre-flight fast-forward only so it fails safe instead of merging main into
+// a dev-server task.
+func preflightMergeBase(ctx context.Context, db *sql.DB, repo, taskID string) string {
+	if target, err := workspace.RecordedTaskTarget(ctx, db, taskID); err != nil || target == "" {
+		return ""
+	}
+	base, err := workspace.VerifiedBase(ctx, db, repo, taskID)
+	if err != nil {
+		return ""
+	}
+	return base
+}
+
 func newWorktreeManager(repoRoot string, db *sql.DB) *workspace.WorktreeManager {
 	wm := workspace.NewWorktreeManager(repoRoot, db)
 	wm.TargetBranch = func(ctx context.Context, repo string) (string, error) {
@@ -504,7 +521,8 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// Skipped when cfg.SkipGitPreflight is true (tests running in a non-git dir).
 	if !cfg.SkipGitPreflight && !nonGit {
 		gfCtx, gfCancel := context.WithTimeout(ctx, 60*time.Second)
-		gfResult, gfErr := gitgate.PreFlight(gfCtx, wtPath, preflightBranch(gfCtx, h.DB, repoPath, taskID))
+		gfBranch := preflightBranch(gfCtx, h.DB, repoPath, taskID)
+		gfResult, gfErr := gitgate.PreFlightMerge(gfCtx, wtPath, gfBranch, preflightMergeBase(gfCtx, h.DB, repoPath, taskID))
 		gfCancel()
 		gfSummary := "git-preflight: "
 		if gfErr != nil {
@@ -526,7 +544,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			blockReason := "git pre-flight failed: " + strings.TrimPrefix(gfSummary, "git-preflight: ")
 			if gfResult != nil && len(gfResult.Conflicts) > 0 {
 				blockReason = fmt.Sprintf("git pre-flight: task branch conflicts with origin/%s in %s. Resolve the merge on the branch, then Run Now.",
-					preflightBranch(ctx, h.DB, repoPath, taskID), strings.Join(gfResult.Conflicts, ", "))
+					gfBranch, strings.Join(gfResult.Conflicts, ", "))
 			}
 			result.Disposition = governance.StageBlocked
 			result.DiagnosticMsg = gfSummary
