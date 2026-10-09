@@ -99,6 +99,11 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"xargs -a scripts/reinstall-daemon.sh echo",
 		"GIT_PAGER=claude git log",
 		"EDITOR=/opt/bin/codex git commit",
+		"GIT_PAGER='sh -c claude' git log",
+		"export GIT_PAGER=claude; git log",
+		"GIT_PAGER=gemini; git log",
+		"bash -n +n scripts/reinstall-daemon.sh",
+		"bash -n +o noexec scripts/reinstall-daemon.sh",
 		// The gate's env: unset or overridden for anything but go test/vet.
 		"env -u STAYPOINT_TASK_ID claude -p x",
 		"env -u STAYPOINT_TASK_ID staypoint task list",
@@ -185,6 +190,7 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"rg -n 'x|claude|y' internal/",
 		"git commit -m 'route x | gemini fallback'",
 		"cd internal/agy && go test ./...",
+		"CLAUDE_CONFIG_DIR=~/.claude-work go test ./internal/adapter/",
 	}
 	for _, c := range allowed {
 		if why := AnalyzeBoardRulesForTask(task, c, nil); why != "" {

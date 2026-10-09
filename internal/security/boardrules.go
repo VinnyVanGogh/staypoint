@@ -216,6 +216,8 @@ func unwrapArgv(argv []string) (out []string, viaXargs bool) {
 
 var agentWordRe = regexp.MustCompile(`(?i)\b(claude|claude-code|gemini|codex|agy|cursor-agent|aider)\b`)
 
+var exportLike = map[string]bool{"export": true, "declare": true, "typeset": true, "local": true, "readonly": true}
+
 var pkgRunners = map[string]bool{"pnpm dlx": true, "yarn dlx": true, "npm exec": true, "pipx run": true}
 
 // runsAgent reports a nested agent CLI that may run (task-9d94997c):
@@ -240,17 +242,22 @@ func runsAgent(code string, depth int) bool {
 	}
 	for _, s := range segs {
 		argv, viaXargs := unwrapArgv(s.argv)
+		// GIT_PAGER=claude, EDITOR='sh -c codex': a variable naming an
+		// agent may run it, set for one command, the line or exported.
+		assigns := s.argv[:len(s.argv)-len(argv)]
+		if len(argv) > 0 && exportLike[baseCmd(argv)] {
+			assigns = argv[1:]
+		}
+		for _, a := range assigns {
+			if isAssign(a) && runsAgent(a[strings.IndexByte(a, '=')+1:], depth+1) {
+				return true
+			}
+		}
 		if len(argv) == 0 {
 			continue
 		}
 		if nestedAgentRe.MatchString(argv[0]) {
 			return true
-		}
-		// GIT_PAGER=claude, EDITOR=codex: a variable naming an agent runs it.
-		for _, a := range s.argv[:len(s.argv)-len(argv)] {
-			if isAssign(a) && nestedAgentRe.MatchString(a[strings.IndexByte(a, '=')+1:]) {
-				return true
-			}
 		}
 		if shells[baseCmd(argv)] {
 			if ci, ok := shellCommandArg(argv[1:]); ok && runsAgent(argv[1+ci], depth+1) {

@@ -343,8 +343,10 @@ func shellNoExec(argv []string) bool {
 	for i := 0; i < end; i++ {
 		a := args[i]
 		switch {
-		case a == "-o" || a == "+o":
-			if a == "-o" && i+1 < end && args[i+1] == "noexec" {
+		case strings.HasPrefix(a, "+"):
+			return false // +n, +o noexec turn it back off
+		case a == "-o":
+			if i+1 < end && args[i+1] == "noexec" {
 				noexec = true
 			}
 			i++
@@ -353,11 +355,11 @@ func shellNoExec(argv []string) bool {
 			if a != "--norc" && a != "--noprofile" && a != "--posix" {
 				return false
 			}
-		case len(a) > 1 && (a[0] == '-' || a[0] == '+'):
+		case len(a) > 1 && a[0] == '-':
 			if strings.ContainsAny(a[1:], "csil") {
 				return false
 			}
-			if a[0] == '-' && strings.ContainsRune(a[1:], 'n') {
+			if strings.ContainsRune(a[1:], 'n') {
 				noexec = true
 			}
 		}
