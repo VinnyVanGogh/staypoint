@@ -810,8 +810,8 @@ func psPlainArgs(args []string) bool {
 }
 
 // psColumns are words on the daemon's ps line besides its path and user:
-// start times (3:15PM, Thu03PM, 9Oct26).
-var psColumns = []string{"AM", "PM", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun",
+// STAT letters, start times (3:15PM, Thu03PM, 9Oct26).
+var psColumns = []string{"SsRUITZNLWXE+<", "AM", "PM", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun",
 	"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
 
 var letterRe = regexp.MustCompile(`[A-Za-z]`)
@@ -824,9 +824,12 @@ func grepPatternsOther(pats []string) bool {
 	if home, err := os.UserHomeDir(); err == nil {
 		names = append(names, path.Base(home))
 	}
-	for _, p := range pats {
-		if !letterRe.MatchString(p) || strings.Contains(p, `\`) || patternMatches(p, names) {
-			return false
+	for _, ps := range pats {
+		// grep reads each line of a pattern as its own pattern.
+		for _, p := range strings.Split(ps, "\n") {
+			if !letterRe.MatchString(p) || strings.ContainsAny(p, "\\\r\x00") || patternMatches(p, names) {
+				return false
+			}
 		}
 	}
 	return true
