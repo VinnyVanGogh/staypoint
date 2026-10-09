@@ -444,7 +444,15 @@ func CandidatesForRoute(r router.KindRoute) []providerCandidate {
 // was resolved is skipped, and the switch is reported via WithAttemptObserver.
 func RunRoute(ctx context.Context, cwd string, pacer *router.PacerState, route router.KindRoute, rawArgs []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
 	if route.AllLocked() {
-		return fmt.Errorf("[staypoint-adapter] all providers locked: %s", route.Body())
+		seats := make([]string, 0, len(route.Locked))
+		for _, l := range route.Locked {
+			seats = append(seats, l.Reason)
+		}
+		if len(seats) == 0 {
+			// Nothing locked yet nothing viable: a configuration problem, not a wait.
+			return fmt.Errorf("[staypoint-adapter] all providers locked: %s", route.Body())
+		}
+		return &SeatLimitError{Seats: seats, AllLocked: true}
 	}
 	var resolve func(ProviderAdapter) (string, error)
 	if testBin, ok := ctx.Value(testBinKey).(string); ok && testBin != "" {
@@ -488,6 +496,15 @@ func runChain(ctx context.Context, cwd string, pacerState *router.PacerState, ch
 			Pools: make(map[router.PoolID]*router.QuotaPool),
 		}
 	}
+	// A seat whose CLI answered with a limit earlier (this run or another)
+	// is out until its reset, even if the caller's pacer predates that.
+	router.ApplySeatLimits(pacerState, time.Now())
+
+	// limitedSeats collects seats skipped as locked or refused with a limit
+	// message; quotaOnly stays true while that is the only reason any
+	// candidate did not run, so the result is a wait, not a failure.
+	var limitedSeats []string
+	quotaOnly := true
 
 	// Merge harness-supplied extra env (sanitized upstream) with per-candidate env.
 	var ctxEnv []string
@@ -502,6 +519,7 @@ func runChain(ctx context.Context, cwd string, pacerState *router.PacerState, ch
 		if locked, why := router.PoolLockReason(pool, time.Now()); locked {
 			fmt.Fprintf(stderr, "[staypoint-adapter] skipping %s (quota locked: %s)\n", candidate.Name, why)
 			fallbackReasons = append(fallbackReasons, candidateLockReason(candidate, why))
+			limitedSeats = append(limitedSeats, candidateLockReason(candidate, why))
 			continue
 		}
 
@@ -523,6 +541,7 @@ func runChain(ctx context.Context, cwd string, pacerState *router.PacerState, ch
 			fmt.Fprintf(stderr, "[staypoint-adapter] %s failed to resolve (%v), trying next provider...\n", candidate.Name, err)
 			fallbackReasons = append(fallbackReasons, candidateLabel(candidate)+" unavailable ("+err.Error()+")")
 			lastErr = err
+			quotaOnly = false
 			continue
 		}
 
@@ -568,10 +587,37 @@ func runChain(ctx context.Context, cwd string, pacerState *router.PacerState, ch
 		}(candidate, bin, candidateOpts, extraEnv)
 
 		parse := candidate.Adapter.ParseStreamDelta
-		committed, prebuf := streamWithCommit(pr, stdout, func(line []byte) bool {
+		// The CLI's own limit answer ("You've hit your session limit") is
+		// an assistant text event, but it is not the model working: it must
+		// not commit, so the next seat can take the same turn.
+		var limitMsg string
+		committed, prebuf := streamWithCommitWatch(pr, stdout, func(line []byte) bool {
+			if _, ok := seatLimitText(line, parse); ok {
+				return false
+			}
 			return isAssistantEvent(line, parse)
+		}, func(line []byte) {
+			if limitMsg == "" {
+				limitMsg, _ = seatLimitText(line, parse)
+			}
 		})
 		execErr := <-execErrCh
+
+		if limitMsg != "" {
+			// The seat is out: record it so later turns and the run queue
+			// skip it until its reset, then hand the turn to the next seat.
+			router.NoteSeatLimit(candidate.PoolID, router.SeatLimitResetAt(limitMsg, time.Now()), limitMsg)
+			reason := candidateLockReason(candidate, limitMsg)
+			fmt.Fprintf(stderr, "[staypoint-adapter] %s hit its limit (%s), trying next provider...\n", candidate.Name, limitMsg)
+			fallbackReasons = append(fallbackReasons, reason)
+			limitedSeats = append(limitedSeats, reason)
+			if committed {
+				// It worked part of the turn before the limit: the turn ends
+				// here and the next one re-routes past this seat.
+				return &SeatLimitError{Seats: limitedSeats}
+			}
+			continue
+		}
 
 		if committed || execErr == nil {
 			if !committed && len(prebuf) > 0 {
@@ -585,6 +631,12 @@ func runChain(ctx context.Context, cwd string, pacerState *router.PacerState, ch
 		fmt.Fprintf(stderr, "[staypoint-adapter] %s failed (%v), trying next provider...\n", candidate.Name, execErr)
 		fallbackReasons = append(fallbackReasons, candidateLabel(candidate)+" failed ("+execErr.Error()+")")
 		lastErr = execErr
+		quotaOnly = false
+	}
+
+	// Every candidate was locked or refused with its limit: wait for a reset.
+	if quotaOnly && len(limitedSeats) > 0 {
+		return &SeatLimitError{Seats: limitedSeats, AllLocked: true}
 	}
 
 	// All candidates exhausted

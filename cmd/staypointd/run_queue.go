@@ -8,6 +8,7 @@ import (
 
 	"github.com/VinnyVanGogh/staypoint/internal/config"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
+	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/server"
 )
 
@@ -64,6 +65,8 @@ var taskQuotaLocked = func(dbConn *sql.DB, taskID, repoRoot string) bool {
 	if err != nil || pacer == nil {
 		return false // unknown quota state: let the run try
 	}
+	// A seat whose CLI answered with its limit stays out until its reset.
+	router.ApplySeatLimits(pacer, time.Now())
 	return resolveTaskRoute(dbConn, taskID, repoRoot, pacer, time.Now()).AllLocked()
 }
 
