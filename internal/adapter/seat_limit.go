@@ -30,9 +30,15 @@ func (e *SeatLimitError) Error() string {
 // The orchestrator checks for this method without importing this package.
 func (e *SeatLimitError) SeatsExhausted() bool { return e.AllLocked }
 
+// cliSyntheticModel is the model Claude Code stamps on assistant messages it
+// writes itself (API errors, limit answers) rather than the model producing.
+const cliSyntheticModel = "<synthetic>"
+
 // seatLimitText returns the limit message carried by line, if line is a
-// Claude CLI limit answer: an assistant text block or an error result whose
-// text is the CLI's limit message (router.IsSeatLimitMessage).
+// Claude CLI limit answer (router.IsSeatLimitMessage). Only CLI-written events
+// count: a synthetic assistant message or an error result. Text the model
+// itself writes can never mark a seat out, or an agent (or content injected
+// into it) could lock a seat for days by printing the right sentence.
 func seatLimitText(line []byte, parse func([]byte) ([]StreamDelta, error)) (string, bool) {
 	deltas, err := parse(line)
 	if err != nil {
@@ -41,10 +47,13 @@ func seatLimitText(line []byte, parse func([]byte) ([]StreamDelta, error)) (stri
 	for _, d := range deltas {
 		switch d.Kind {
 		case DeltaText:
-			if d.FromUser {
+			if d.FromUser || d.Model != cliSyntheticModel {
 				continue
 			}
 		case DeltaResult:
+			if !d.IsError {
+				continue
+			}
 		default:
 			continue
 		}

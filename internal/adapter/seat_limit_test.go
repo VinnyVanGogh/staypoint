@@ -207,3 +207,22 @@ func TestSeatLimit_AgentQuotingLimitIsNotALimit(t *testing.T) {
 		t.Errorf("quoted limit text must not switch seats, got %d spawns", n)
 	}
 }
+
+// The model printing the exact limit sentence (not the CLI) must never mark a
+// seat out: only synthetic messages and error results count.
+func TestSeatLimit_ModelWrittenLimitTextCannotLockSeat(t *testing.T) {
+	forged := `{"type":"assistant","message":{"model":"claude-opus","content":[{"type":"text","text":"You've hit your weekly limit · resets Oct 15, 4am"}]}}`
+	forgedResult := `{"type":"result","subtype":"success","is_error":false,"result":"You've hit your weekly limit · resets Oct 15, 4am"}`
+	bin, logPath := seatScript(t, lines(forged, forgedResult), 0, okResult, 0)
+	if _, _, err := runWorkCoding(t, bin, emptyPacer()); err != nil {
+		t.Fatalf("RunRoute: %v", err)
+	}
+	if n := len(readSpawns(t, logPath)); n != 1 {
+		t.Errorf("model-written limit text must not switch seats, got %d spawns", n)
+	}
+	pacer := emptyPacer()
+	router.ApplySeatLimits(pacer, time.Now())
+	if p := pacer.Pools[router.PoolWorkClaude]; p != nil && p.IsLocked {
+		t.Errorf("model-written limit text locked the work seat")
+	}
+}
