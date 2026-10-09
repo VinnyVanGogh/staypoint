@@ -215,6 +215,10 @@ func LoadPacerState() (*PacerState, error) {
 		}
 	}
 
+	// 4. A seat whose CLI answered with a limit message is out until its
+	// reset, whatever the polled numbers say.
+	ApplySeatLimits(state, now)
+
 	return state, nil
 }
 

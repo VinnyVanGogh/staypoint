@@ -499,6 +499,7 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			GeminiDocsOnly:     geminiDocsOnly(route),
 			GeminiCodeApproved: route.GeminiCodeApprovalID != "",
 			TurnUsedGemini:     tracker.TakeGeminiSpawned,
+			TurnSeat:           tracker.TakeSeat,
 			TurnTimeout:        turnLimits.turn,
 			StallTimeout:       turnLimits.stall,
 		})
@@ -534,6 +535,12 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			return
 		}
 		sr.EmitState(result.Disposition)
+		if result.QuotaWait {
+			// Every seat in the chain is out (work -> personal -> wait): park
+			// the run in the queue; the quota pump starts it again once a
+			// seat resets (taskQuotaLocked turns false).
+			queueRun(h, taskID, reason, orchestrator.WaitQuota)
+		}
 		slog.Info("harness run complete",
 			slog.String("task", taskID),
 			slog.String("disposition", result.Disposition),

@@ -143,6 +143,29 @@ type RunConfig struct {
 	// TurnUsedGemini reports whether a Gemini CLI was spawned since its last
 	// call, and resets. Nil falls back to the static Provider.
 	TurnUsedGemini func() bool
+	// TurnSeat names the provider and seat the turn that just ran was spawned
+	// on ("Claude Opus · personal seat"), and resets. Nil or "" falls back to
+	// Provider. Recorded per turn so a seat switch mid-run is on the record.
+	TurnSeat func() string
+}
+
+// turnSeat names the seat the turn that just ran used.
+func (cfg RunConfig) turnSeat() string {
+	if cfg.TurnSeat != nil {
+		if s := cfg.TurnSeat(); s != "" {
+			return s
+		}
+	}
+	return cfg.Provider
+}
+
+// seatLimitErr is implemented by adapter errors for a turn that ended because
+// a seat ran out of quota (adapter.SeatLimitError). SeatsExhausted is true when
+// no seat in the chain can take work, so the run must wait for a reset. It is
+// matched by method so this package does not import the adapter.
+type seatLimitErr interface {
+	error
+	SeatsExhausted() bool
 }
 
 // turnUsedGemini reports whether the turn that just ran spawned Gemini.
@@ -162,6 +185,10 @@ type RunResult struct {
 	Disposition   string // "in_review" | "done" | "capped" | "in_progress"
 	DiffStat      string
 	DiagnosticMsg string // non-empty when interceptor blocked the transition
+	// QuotaWait is set when the run ended because every seat in its chain is
+	// out of quota. The task stays in_progress and the caller queues it to
+	// resume when a seat resets (WaitQuota); it is not a failure.
+	QuotaWait bool
 }
 
 // WorktreeManagerIface abstracts worktree operations for testability.
@@ -761,7 +788,47 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			}
 
 			turnDuration := time.Since(turnStart)
-			if turnErr != nil {
+			// Record which seat ran this turn: work -> personal switches
+			// happen inside a run and must be visible afterwards.
+			seat := cfg.turnSeat()
+			if seat != "" {
+				_, _ = h.DB.ExecContext(ctx,
+					`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'turn_seat', ?)`,
+					taskID, fmt.Sprintf("turn %d ran on %s", turn, seat),
+				)
+			}
+			var limitErr seatLimitErr
+			if errors.As(turnErr, &limitErr) {
+				// A seat out of quota is a wait, not a broken provider: it
+				// never counts toward the consecutive-failure stop.
+				consecutiveAdapterErrors = 0
+				runLog.Info("seat out of quota",
+					slog.Int("turn", turn),
+					slog.Bool("all_seats", limitErr.SeatsExhausted()),
+					slog.String("detail", limitErr.Error()),
+				)
+				_, _ = h.DB.ExecContext(ctx,
+					`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'seat_limit', ?)`,
+					taskID, limitErr.Error(),
+				)
+				if limitErr.SeatsExhausted() {
+					if stw, ok := stdout.(*stepTeeWriter); ok {
+						_ = stw.Close()
+					}
+					result.Turns++
+					result.QuotaWait = true
+					result.Disposition = "in_progress"
+					result.DiagnosticMsg = "Waiting for a Claude seat: " + limitErr.Error() +
+						". The run is queued and resumes on its own when a seat resets."
+					sawOutput = true // the wait row explains the run
+					if sr != nil {
+						sr.EmitMessage("Waiting for a Claude seat", limitErr.Error(), "done")
+					}
+					break
+				}
+				// The seat ran out mid-turn after doing work; the next turn
+				// re-routes past it to the next seat.
+			} else if turnErr != nil {
 				lastTurnWasAdapterError = true
 				consecutiveAdapterErrors++
 				stderrTail := stderrBuf.String()
@@ -779,7 +846,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 					uuid.NewString(), runID, taskID, turn, exitCode,
 					truncate(stderrTail, 4096),
 					turnDuration.Milliseconds(),
-					cfg.Provider, cfg.Provider,
+					cfg.Provider, seat,
 				)
 				_, _ = h.DB.ExecContext(ctx,
 					`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'adapter_failure', ?)`,
