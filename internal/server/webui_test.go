@@ -472,7 +472,8 @@ func TestRegisterUIRoutes_TableSortingAndSearchElements(t *testing.T) {
 		`data-col="identifier"`,
 		`data-col="task"`,
 		`data-col="organization"`,
-		`data-col="status"`,
+		`data-col="stage"`,
+		`data-col="running"`,
 		`data-col="priority"`,
 		`data-col="cost"`,
 		`data-col="updated"`,
@@ -608,13 +609,13 @@ func TestRegisterUIRoutes_STA208_TableSortingAndFilterControls(t *testing.T) {
 	idxTaskOrg := strings.Index(html, `id="task-org-filter"`)
 	idxTaskProj := strings.Index(html, `id="task-project-filter"`)
 	idxTaskPri := strings.Index(html, `id="task-priority-filter"`)
-	idxTaskStat := strings.Index(html, `id="task-status-filter"`)
+	idxTaskStat := strings.Index(html, `class="list-filter-mount" data-page="overview"`) // Running + Stage (task-3387cad2)
 	if idxTaskOrg == -1 || idxTaskProj == -1 || idxTaskPri == -1 || idxTaskStat == -1 {
 		t.Fatalf("overview filter controls missing in index.html (org=%d, proj=%d, pri=%d, stat=%d)",
 			idxTaskOrg, idxTaskProj, idxTaskPri, idxTaskStat)
 	}
 	if !(idxTaskOrg < idxTaskProj && idxTaskProj < idxTaskPri && idxTaskPri < idxTaskStat) {
-		t.Errorf("overview filter order incorrect: expected Org < Project < Priority < Status, got %d, %d, %d, %d",
+		t.Errorf("overview filter order incorrect: expected Org < Project < Priority < Running+Stage, got %d, %d, %d, %d",
 			idxTaskOrg, idxTaskProj, idxTaskPri, idxTaskStat)
 	}
 
@@ -635,13 +636,13 @@ func TestRegisterUIRoutes_STA208_TableSortingAndFilterControls(t *testing.T) {
 	idxTSOrg := strings.Index(html, `id="ts-org-filter"`)
 	idxTSProj := strings.Index(html, `id="ts-project-filter"`)
 	idxTSPri := strings.Index(html, `id="ts-priority-filter"`)
-	idxTSStat := strings.Index(html, `id="ts-status-filter"`)
+	idxTSStat := strings.Index(html, `class="list-filter-mount" data-page="task-status"`)
 	if idxTSOrg == -1 || idxTSProj == -1 || idxTSPri == -1 || idxTSStat == -1 {
 		t.Fatalf("task status filter controls missing in index.html (org=%d, proj=%d, pri=%d, stat=%d)",
 			idxTSOrg, idxTSProj, idxTSPri, idxTSStat)
 	}
 	if !(idxTSOrg < idxTSProj && idxTSProj < idxTSPri && idxTSPri < idxTSStat) {
-		t.Errorf("task status filter order incorrect: expected Org < Project < Priority < Status, got %d, %d, %d, %d",
+		t.Errorf("task status filter order incorrect: expected Org < Project < Priority < Running+Stage, got %d, %d, %d, %d",
 			idxTSOrg, idxTSProj, idxTSPri, idxTSStat)
 	}
 

@@ -131,8 +131,8 @@
           <div class="kpi-value highlight-cyan" id="kpi-running-tasks">—</div>
           <div class="kpi-sub" id="kpi-tasks-total">across all orgs</div>
         </div>
-        <div class="kpi-card clickable" id="kpi-card-active" role="button" tabindex="0" title="Click to filter by Active tasks">
-          <div class="kpi-label">Active Tasks</div>
+        <div class="kpi-card clickable" id="kpi-card-active" role="button" tabindex="0" title="Click to filter by open tasks with no run in flight">
+          <div class="kpi-label">Open, Not Running</div>
           <div class="kpi-value" id="kpi-active-tasks">—</div>
           <div class="kpi-sub" id="kpi-active-tasks-sub">In queue &amp; backlog</div>
         </div>
@@ -227,15 +227,7 @@
               <option value="medium">Medium</option>
               <option value="low">Low</option>
             </select>
-            <select id="task-status-filter" class="select-filter">
-              <option value="all">All Statuses</option>
-              <option value="running">Running</option>
-              <option value="active">Active / Todo</option>
-              <option value="blocked">Blocked</option>
-              <option value="stopped">Stopped / Cancelled</option>
-              <option value="errored">Errored</option>
-              <option value="done">Done</option>
-            </select>
+            <span class="list-filter-mount" data-page="overview"></span>
           </div>
         </div>
         <div class="task-table-wrapper">
@@ -245,7 +237,8 @@
                 <th data-col="identifier" class="sortable-th" tabindex="0" role="columnheader">Identifier</th>
                 <th data-col="task" class="sortable-th" tabindex="0" role="columnheader">Task</th>
                 <th data-col="organization" class="sortable-th" tabindex="0" role="columnheader">Organization</th>
-                <th data-col="status" class="sortable-th" tabindex="0" role="columnheader">Status</th>
+                <th data-col="stage" class="sortable-th" tabindex="0" role="columnheader">Stage</th>
+                <th data-col="running" class="sortable-th" tabindex="0" role="columnheader">Running</th>
                 <th data-col="priority" class="sortable-th" tabindex="0" role="columnheader">Priority</th>
                 <th data-col="cost" class="sortable-th" tabindex="0" role="columnheader">Cost &amp; Tokens</th>
                 <th data-col="updated" class="sortable-th" tabindex="0" role="columnheader">Updated</th>
@@ -285,7 +278,7 @@
           </div>
           <select id="projects-status-filter" class="select-filter">
             <option value="all">All Statuses</option>
-            <option value="active">Active</option>
+            <option value="active">Open, not running</option>
             <option value="running">Running</option>
             <option value="done">Done</option>
             <option value="blocked">Blocked</option>
@@ -356,6 +349,7 @@
       <div class="view-header">
         <h1 class="view-title">Kanban Board</h1>
         <div class="table-controls kanban-controls">
+          <span class="list-filter-mount" data-page="kanban"></span>
           <label class="kanban-toggle"><input type="checkbox" id="kanban-group-company"> Group by company</label>
           <label class="kanban-toggle"><input type="checkbox" id="kanban-show-legacy"> Show archive &amp; legacy <span id="kanban-legacy-count" class="muted-text"></span></label>
         </div>
@@ -385,6 +379,7 @@
             <option value="medium">Medium</option>
             <option value="low">Low</option>
           </select>
+          <span class="list-filter-mount" data-page="recent-tasks"></span>
           <label class="kanban-toggle"><input type="checkbox" id="recent-tasks-show-legacy"> Show archive &amp; legacy <span id="recent-tasks-legacy-count" class="muted-text"></span></label>
         </div>
       </div>
@@ -490,15 +485,7 @@
             <option value="medium">Medium</option>
             <option value="low">Low</option>
           </select>
-          <select id="ts-status-filter" class="select-filter">
-            <option value="all">All Statuses</option>
-            <option value="running">Running</option>
-            <option value="active">Active / Todo</option>
-            <option value="blocked">Blocked</option>
-            <option value="stopped">Stopped</option>
-            <option value="errored">Errored</option>
-            <option value="done">Done</option>
-          </select>
+          <span class="list-filter-mount" data-page="task-status"></span>
           <label class="kanban-toggle"><input type="checkbox" id="ts-show-legacy"> Show archive &amp; legacy <span id="ts-legacy-count" class="muted-text"></span></label>
           <button id="open-create-task-btn" class="btn btn-primary" style="margin-left:8px;">+ New Task</button>
         </div>
@@ -513,7 +500,8 @@
                 <th data-col="organization" class="sortable-th" tabindex="0" role="columnheader">Organization</th>
                 <th data-col="project" class="sortable-th" tabindex="0" role="columnheader">Project</th>
                 <th data-col="assignee" class="sortable-th" tabindex="0" role="columnheader">Assignee</th>
-                <th data-col="status" class="sortable-th" tabindex="0" role="columnheader">Status</th>
+                <th data-col="stage" class="sortable-th" tabindex="0" role="columnheader">Stage</th>
+                <th data-col="running" class="sortable-th" tabindex="0" role="columnheader">Running</th>
                 <th data-col="priority" class="sortable-th" tabindex="0" role="columnheader">Priority</th>
                 <th data-col="cost" class="sortable-th" tabindex="0" role="columnheader">Cost</th>
                 <th data-col="updated" class="sortable-th" tabindex="0" role="columnheader">Updated</th>
@@ -543,16 +531,7 @@
             <option value="paperclip_import">Paperclip import</option>
             <option value="legacy">Legacy</option>
           </select>
-          <select id="all-tasks-stage-filter" class="select-filter" aria-label="Stage">
-            <option value="all">All Stages</option>
-            <option value="backlog">Backlog</option>
-            <option value="todo">Todo</option>
-            <option value="in_progress">In Progress</option>
-            <option value="in_review">In Review</option>
-            <option value="blocked">Blocked</option>
-            <option value="done">Done</option>
-            <option value="cancelled">Cancelled</option>
-          </select>
+          <span class="list-filter-mount" data-page="all-tasks"></span>
           <select id="all-tasks-visibility-filter" class="select-filter" aria-label="Legacy and archive">
             <option value="all">Current, legacy &amp; archive</option>
             <option value="current">Current only</option>
@@ -573,6 +552,7 @@
                 <th>Project</th>
                 <th>Origin</th>
                 <th>Stage</th>
+                <th>Running</th>
                 <th>Updated</th>
               </tr>
             </thead>
@@ -861,6 +841,7 @@
 <script src="/ui/lib/runsteps.js"></script>
 <script src="/ui/lib/taskactions.js"></script>
 <script src="/ui/lib/taskboard.js"></script>
+<script src="/ui/lib/taskstate.js"></script>
 <script src="/ui/lib/diffsyntax.js"></script>
 <script src="/ui/lib/markdown.js"></script>
 <script src="/ui/lib/quotagauge.js"></script>

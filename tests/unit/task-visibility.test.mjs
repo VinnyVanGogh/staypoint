@@ -61,9 +61,11 @@ test('All Tasks page is in the sidebar and has no toggle', () => {
   assert.ok(start > 0, 'view-all-tasks section exists');
   const section = html.slice(start, html.indexOf('</section>', start));
   assert.doesNotMatch(section, /show-legacy|Show archive/);
-  for (const id of ['all-tasks-search', 'all-tasks-org-filter', 'all-tasks-origin-filter', 'all-tasks-stage-filter', 'all-tasks-visibility-filter']) {
+  for (const id of ['all-tasks-search', 'all-tasks-org-filter', 'all-tasks-origin-filter', 'all-tasks-visibility-filter']) {
     assert.ok(section.includes(`id="${id}"`), `${id} filter present`);
   }
+  // Running + Stage (multi-select) filters mount here (task-3387cad2).
+  assert.ok(section.includes('class="list-filter-mount" data-page="all-tasks"'), 'Running + Stage filters present');
   // Visibility filter defaults to everything.
   assert.match(section, /id="all-tasks-visibility-filter"[^>]*>\s*<option value="all">/);
 });

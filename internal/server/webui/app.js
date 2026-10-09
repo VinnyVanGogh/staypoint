@@ -112,6 +112,243 @@ function statusPill(status) {
   return el('span', `pill pill-${norm}`, norm.replace(/_/g, ' '));
 }
 
+// ── Stage + Running (task-3387cad2) ──────────────────────
+// Every task list shows two things: the Stage (lib/taskstate.js) and, only
+// while a run is in flight, a Running badge with its elapsed time. Running
+// comes from GET /api/runs/live (state.liveRuns), the same source as the
+// sidebar counts; stage in_progress alone is not running.
+
+function stagePill(task) {
+  const key = taskStageKey(task);
+  const p = el('span', `pill stage-pill pill-stage-${key}`, stageLabel(key));
+  p.dataset.stage = key;
+  return p;
+}
+
+// liveIndex is state.liveRuns once GET /api/runs/live has answered, else
+// null: until then a task's own server-computed `running` flag decides (a
+// task page opened from a direct link renders before the first poll).
+function liveIndex() {
+  return state.liveRunsLoaded ? state.liveRuns : null;
+}
+
+function isRunningNow(task) {
+  return taskIsRunning(task, liveIndex());
+}
+
+// runningBadge is the "Running · 12m" badge, or null when no run is in flight.
+function runningBadge(task) {
+  if (!isRunningNow(task)) return null;
+  const startedAt = state.liveRuns.get(task.id)?.started_at || task.run_started_at || '';
+  const b = el('span', 'pill run-badge');
+  b.dataset.startedAt = startedAt;
+  b.title = startedAt ? `A run is in flight (started ${fmtTime(startedAt)})` : 'A run is in flight';
+  b.textContent = runBadgeText(startedAt);
+  return b;
+}
+
+function runBadgeText(startedAt) {
+  const since = elapsedLabel(startedAt);
+  return since ? `Running · ${since}` : 'Running';
+}
+
+// taskStateBadges: Stage pill, then the Running badge while live.
+function taskStateBadges(task) {
+  const wrap = el('span', 'task-state-badges');
+  wrap.appendChild(stagePill(task));
+  const rb = runningBadge(task);
+  if (rb) wrap.appendChild(rb);
+  return wrap;
+}
+
+// runningCell is a table's Running column: the badge, or a muted dash.
+function runningCell(task) {
+  const td = el('td', 'running-cell');
+  td.appendChild(runningBadge(task) || el('span', 'muted-text', '—'));
+  return td;
+}
+
+function stageCell(task) {
+  const td = el('td', 'stage-cell');
+  td.appendChild(stagePill(task));
+  return td;
+}
+
+state.liveRuns = new Map();
+let liveRunsSig = '';
+
+// refreshLiveRuns reloads GET /api/runs/live; when the set of live runs
+// changed it re-renders the lists and the sidebar.
+async function refreshLiveRuns() {
+  let resp;
+  try {
+    resp = await apiFetch('/api/runs/live');
+  } catch {
+    return;
+  }
+  const next = liveRunIndex(resp?.runs);
+  const sig = [...next.keys()].sort().join(',');
+  const first = !state.liveRunsLoaded;
+  state.liveRuns = next;
+  state.liveRunsLoaded = true;
+  if (sig === liveRunsSig && !first) return;
+  liveRunsSig = sig;
+  renderSidebarOrgTree();
+  rerenderListsForLiveRuns();
+  // The open task page's header: Stage, and Running only while live.
+  const tid = state.openDetailTaskId;
+  const badges = tid && document.getElementById(`task-page-state-${tid}`);
+  if (badges && state.tasks[tid]) {
+    const fresh = taskStateBadges({ ...state.tasks[tid], running: next.has(tid) });
+    fresh.id = badges.id;
+    badges.replaceWith(fresh);
+  }
+}
+
+let liveRunsRefreshTimer = null;
+function scheduleLiveRunsRefresh() {
+  if (liveRunsRefreshTimer) return;
+  liveRunsRefreshTimer = setTimeout(() => { liveRunsRefreshTimer = null; refreshLiveRuns(); }, 400);
+}
+
+function rerenderListsForLiveRuns() {
+  const on = (id) => document.getElementById(id)?.classList.contains('active');
+  if (on('view-overview')) renderGlobalTaskTable();
+  if (on('view-recent-tasks')) renderRecentTasks();
+  if (on('view-task-status')) renderTaskStatusPage();
+  if (on('view-all-tasks')) renderAllTasksPage();
+  if (on('view-kanban')) renderKanban();
+  if (on('view-projects')) renderProjects();
+  if (on('view-org-detail')) rerenderOrgDetail();
+}
+
+setInterval(refreshLiveRuns, 10000);
+// Keep every Running badge's elapsed time current.
+setInterval(() => {
+  document.querySelectorAll('.run-badge[data-started-at]').forEach(b => {
+    if (b.dataset.startedAt) b.textContent = runBadgeText(b.dataset.startedAt);
+  });
+}, 15000);
+
+// ── List filters: Running + Stage, persisted per page ────
+state.listFilters = {};
+const LIST_FILTER_RENDER = {
+  overview: () => renderGlobalTaskTable(),
+  'task-status': () => renderTaskStatusPage(),
+  'recent-tasks': () => renderRecentTasks(),
+  'all-tasks': () => renderAllTasksPage(),
+  kanban: () => renderKanban(),
+  'org-detail': () => rerenderOrgDetail(),
+};
+
+function rerenderOrgDetail() {
+  if (!state.currentOrgDetail) return;
+  const org = (state.fleet?.organizations || []).find(o => o.name === state.currentOrgDetail);
+  if (org) renderOrgDetailView(org);
+}
+
+function listFilter(page) {
+  if (!state.listFilters[page]) state.listFilters[page] = loadListFilter(window.localStorage, page);
+  return state.listFilters[page];
+}
+
+function setListFilter(page, f) {
+  state.listFilters[page] = saveListFilter(window.localStorage, page, f);
+  document.querySelectorAll(`.list-filters[data-page="${page}"]`).forEach(syncListFilterControls);
+}
+
+function taskPassesListFilter(task, page) {
+  return matchesListFilter(task, listFilter(page), liveIndex());
+}
+
+// statusToListFilter maps the old one-word drill-downs (KPI cards, sidebar
+// buttons, org stats) to Running + Stage.
+function statusToListFilter(status) {
+  switch (status) {
+    case 'running': return { running: 'yes', stages: [] };
+    case 'blocked': return { running: 'all', stages: ['blocked'] };
+    case 'done':    return { running: 'all', stages: ['done'] };
+    case 'active':  return { running: 'no', stages: ['backlog', 'todo', 'in_progress', 'in_review'] };
+    default:        return { running: 'all', stages: [] };
+  }
+}
+
+// buildListFilters returns the Running select and Stage multi-select for a
+// page. Changing either saves it for that page and re-renders the page.
+function buildListFilters(page) {
+  const wrap = el('span', 'list-filters');
+  wrap.dataset.page = page;
+
+  const running = el('select', 'select-filter list-filter-running');
+  running.setAttribute('aria-label', 'Running');
+  for (const [v, label] of [['all', 'Running: any'], ['yes', 'Running'], ['no', 'Not running']]) {
+    const o = el('option', null, label);
+    o.value = v;
+    running.appendChild(o);
+  }
+  running.addEventListener('change', () => {
+    setListFilter(page, { ...listFilter(page), running: running.value });
+    LIST_FILTER_RENDER[page]?.();
+  });
+  wrap.appendChild(running);
+
+  const stage = el('details', 'stage-filter');
+  const summary = el('summary', 'select-filter stage-filter-summary');
+  summary.setAttribute('aria-label', 'Stage');
+  stage.appendChild(summary);
+  const menu = el('div', 'stage-filter-menu');
+  for (const s of STAGES) {
+    const label = el('label', 'stage-filter-option');
+    const cb = el('input');
+    cb.type = 'checkbox';
+    cb.value = s;
+    cb.addEventListener('change', () => {
+      const picked = [...menu.querySelectorAll('input:checked')].map(x => x.value);
+      setListFilter(page, { ...listFilter(page), stages: picked });
+      LIST_FILTER_RENDER[page]?.();
+    });
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(' ' + stageLabel(s)));
+    menu.appendChild(label);
+  }
+  const clear = el('button', 'stage-filter-clear', 'All stages');
+  clear.type = 'button';
+  clear.addEventListener('click', () => {
+    setListFilter(page, { ...listFilter(page), stages: [] });
+    LIST_FILTER_RENDER[page]?.();
+  });
+  menu.appendChild(clear);
+  stage.appendChild(menu);
+  wrap.appendChild(stage);
+
+  syncListFilterControls(wrap);
+  return wrap;
+}
+
+function syncListFilterControls(wrap) {
+  const f = listFilter(wrap.dataset.page);
+  const running = wrap.querySelector('.list-filter-running');
+  if (running) running.value = f.running;
+  wrap.querySelectorAll('.stage-filter-menu input').forEach(cb => { cb.checked = f.stages.includes(cb.value); });
+  const summary = wrap.querySelector('.stage-filter-summary');
+  if (summary) summary.textContent = `Stage: ${stageFilterSummary(f.stages)}`;
+}
+
+// Close an open Stage menu on an outside click.
+document.addEventListener('click', (e) => {
+  document.querySelectorAll('details.stage-filter[open]').forEach(d => {
+    if (!d.contains(e.target)) d.open = false;
+  });
+});
+
+function mountListFilters() {
+  document.querySelectorAll('.list-filter-mount[data-page]').forEach(m => {
+    if (m.dataset.mounted) return;
+    m.dataset.mounted = '1';
+    m.appendChild(buildListFilters(m.dataset.page));
+  });
+}
+
 function fmtNum(n) {
   if (n === undefined || n === null) return '0';
   return Number(n).toLocaleString();
@@ -540,6 +777,7 @@ async function loadAll() {
       // can exceed that.
       fetchAllTasks().catch(() => ({ tasks: [] })),
       apiFetch('/api/sessions').catch(() => ({ sessions: [] })),
+      refreshLiveRuns(),
     ]);
 
     if (fleetResp) state.fleet = fleetResp;
@@ -796,6 +1034,12 @@ function handleEvent(evt) {
   if (state.events.length > state.maxEvents) state.events.pop();
 
   const type = evt.type || '';
+  // A run starting or ending changes Running badges and sidebar counts.
+  // (run.step / run.stats / run.turn are per-step chatter; the 10 s poll
+  // covers a run that starts without a stage event.)
+  if (type === 'run.state' || type === 'run.live' || type === 'run.queue' ||
+      type.startsWith('task_') || type.startsWith('task.')) scheduleLiveRunsRefresh();
+  if (type === 'run.live') return;
   if (type === 'board_alert' && evt.data) {
     upsertBoardAlert(evt.data);
     return;
@@ -1012,18 +1256,23 @@ function renderSidebarOrgTree() {
     return;
   }
 
+  // The count is live runs (GET /api/runs/live), the same source as every
+  // list's Running badge, not the fleet overview's cached task_counts.
+  const runningByOrgName = runningByOrg(state.liveRuns);
   for (const org of orgs) {
     const btn = el('button', 'sidebar-org-item');
+    btn.dataset.org = org.name;
     if (state.currentOrgDetail === org.name) btn.classList.add('active');
 
     const dot = el('span', 'sidebar-org-dot');
-    const running = org.task_counts?.running || 0;
+    const running = runningByOrgName[org.name] || 0;
     const blocked = org.task_counts?.blocked || 0;
     if (running > 0) dot.classList.add('has-running');
     else if (blocked > 0) dot.classList.add('has-blocked');
 
     const nameSpan = el('span', null, org.name);
-    const countSpan = el('span', 'muted-text', ` (${running})`);
+    const countSpan = el('span', 'muted-text sidebar-org-running', running ? ` · ${running} running` : '');
+    countSpan.dataset.running = String(running);
 
     btn.appendChild(dot);
     btn.appendChild(nameSpan);
@@ -1344,7 +1593,7 @@ window.addEventListener('popstate', (e) => {
 
 // ── Quick filter buttons ──────────────────────────────────
 document.getElementById('filter-running')?.addEventListener('click', () => {
-  state.taskFilter.status = 'running';
+  setListFilter('overview', statusToListFilter('running'));
   state.taskFilter.org = 'all';
   state.taskFilter.project = 'all';
   state.taskFilter.priority = 'all';
@@ -1353,8 +1602,6 @@ document.getElementById('filter-running')?.addEventListener('click', () => {
     b.classList.toggle('active', b.dataset.view === 'overview');
   });
   renderGlobalTaskTable();
-  const sel = document.getElementById('task-status-filter');
-  if (sel) sel.value = 'running';
   const os = document.getElementById('task-org-filter');
   if (os) os.value = 'all';
   populateOverviewProjectFilter();
@@ -1365,7 +1612,7 @@ document.getElementById('filter-running')?.addEventListener('click', () => {
 });
 
 document.getElementById('filter-blocked')?.addEventListener('click', () => {
-  state.taskFilter.status = 'blocked';
+  setListFilter('overview', statusToListFilter('blocked'));
   state.taskFilter.org = 'all';
   state.taskFilter.project = 'all';
   state.taskFilter.priority = 'all';
@@ -1374,8 +1621,6 @@ document.getElementById('filter-blocked')?.addEventListener('click', () => {
     b.classList.toggle('active', b.dataset.view === 'overview');
   });
   renderGlobalTaskTable();
-  const sel = document.getElementById('task-status-filter');
-  if (sel) sel.value = 'blocked';
   const os = document.getElementById('task-org-filter');
   if (os) os.value = 'all';
   populateOverviewProjectFilter();
@@ -1386,7 +1631,8 @@ document.getElementById('filter-blocked')?.addEventListener('click', () => {
 });
 
 document.getElementById('filter-clear')?.addEventListener('click', () => {
-  state.taskFilter = { search: '', org: 'all', project: 'all', priority: 'all', status: 'all' };
+  state.taskFilter = { search: '', org: 'all', project: 'all', priority: 'all' };
+  setListFilter('overview', statusToListFilter('all'));
   const si = document.getElementById('task-search-input');
   if (si) si.value = '';
   const os = document.getElementById('task-org-filter');
@@ -1396,22 +1642,19 @@ document.getElementById('filter-clear')?.addEventListener('click', () => {
   if (ps) ps.value = 'all';
   const pris = document.getElementById('task-priority-filter');
   if (pris) pris.value = 'all';
-  const ss = document.getElementById('task-status-filter');
-  if (ss) ss.value = 'all';
   renderGlobalTaskTable();
 });
 
 // ── Universal KPI Drill-down Navigation Helpers ───────────
 function drillDownToTasks(status, org = 'all', project = 'all') {
-  state.tsFilter = state.tsFilter || { search: '', org: 'all', project: 'all', priority: 'all', status: 'all' };
-  state.tsFilter.status = status;
+  state.tsFilter = state.tsFilter || { search: '', org: 'all', project: 'all', priority: 'all' };
+  setListFilter('task-status', statusToListFilter(status));
+  setListFilter('overview', statusToListFilter(status));
   state.tsFilter.org = org;
   state.tsFilter.project = project;
   state.tsFilter.priority = 'all';
   state.tsFilter.search = '';
 
-  const tsStatusSel = document.getElementById('ts-status-filter');
-  if (tsStatusSel) tsStatusSel.value = status;
   const tsOrgSel = document.getElementById('ts-org-filter');
   if (tsOrgSel) tsOrgSel.value = org;
   populateTSProjectFilter();
@@ -1423,13 +1666,10 @@ function drillDownToTasks(status, org = 'all', project = 'all') {
   if (tsSearch) tsSearch.value = '';
 
   // Also synchronize Overview table filters so returning retains filter context
-  state.taskFilter = state.taskFilter || { search: '', org: 'all', project: 'all', priority: 'all', status: 'all' };
-  state.taskFilter.status = status;
+  state.taskFilter = state.taskFilter || { search: '', org: 'all', project: 'all', priority: 'all' };
   state.taskFilter.org = org;
   state.taskFilter.project = 'all';
   state.taskFilter.priority = 'all';
-  const ovStatusSel = document.getElementById('task-status-filter');
-  if (ovStatusSel) ovStatusSel.value = status;
   const ovOrgSel = document.getElementById('task-org-filter');
   if (ovOrgSel) ovOrgSel.value = org;
   populateOverviewProjectFilter();
@@ -1492,7 +1732,7 @@ function renderOverview() {
   if (elOrgs) elOrgs.textContent = String(orgCount);
 
   const gt = f.global_tasks || {};
-  const runningTasks = gt.running || 0;
+  const runningTasks = state.liveRuns.size;
   const activeTasks  = gt.active || 0;
   const blockedTasks = gt.blocked || 0;
   const doneTasks    = gt.done || 0;
@@ -2008,10 +2248,12 @@ function sortTasks(tasks, col, dir) {
         const valB = (b.assignee_name || b.assigned_agent || b.checkout_agent_id || '').toLowerCase();
         return mult * valA.localeCompare(valB, undefined, { sensitivity: 'base' });
       }
+      case 'stage':
       case 'status': {
-        const valA = (a.status || '').toLowerCase();
-        const valB = (b.status || '').toLowerCase();
-        return mult * valA.localeCompare(valB, undefined, { sensitivity: 'base' });
+        return mult * (STAGES.indexOf(taskStageKey(a)) - STAGES.indexOf(taskStageKey(b)));
+      }
+      case 'running': {
+        return mult * (Number(isRunningNow(a)) - Number(isRunningNow(b)));
       }
       case 'priority': {
         const rankA = getPrioritySeverity(a.priority);
@@ -2252,15 +2494,14 @@ function renderGlobalTaskTable() {
   const orgFilter = state.taskFilter.org || 'all';
   const projectFilter = state.taskFilter.project || 'all';
   const priorityFilter = state.taskFilter.priority || 'all';
-  const statusFilter = state.taskFilter.status || 'all';
 
-  const filtered = filterTasks(tasks, sTerm, orgFilter, statusFilter, projectFilter, priorityFilter);
+  const filtered = filterTasks(tasks, sTerm, orgFilter, 'overview', projectFilter, priorityFilter);
   const sorted = sortTasks(filtered, state.overviewSort.column, state.overviewSort.direction);
 
   if (!sorted.length) {
     const tr = document.createElement('tr');
     const td = document.createElement('td');
-    td.colSpan = 7;
+    td.colSpan = 8;
     td.textContent = 'No tasks match current filter criteria.';
     td.style.cssText = 'text-align:center;color:var(--muted);padding:24px;';
     tr.appendChild(td);
@@ -2269,12 +2510,14 @@ function renderGlobalTaskTable() {
   }
 
   for (const t of sorted) {
-    const tr = makeTaskTableRow(t, 7);
+    const tr = makeTaskTableRow(t, 8);
     tbody.appendChild(tr);
   }
 }
 
-function filterTasks(tasks, sTerm, orgFilter, statusFilter, projectFilter = 'all', priorityFilter = 'all') {
+// filterTasks narrows a list by org, project, priority, search, and page's
+// Running + Stage filter (listFilter(page)).
+function filterTasks(tasks, sTerm, orgFilter, page, projectFilter = 'all', priorityFilter = 'all') {
   return tasks.filter(t => {
     if (orgFilter && orgFilter !== 'all' && t.organization !== orgFilter) return false;
     if (projectFilter && projectFilter !== 'all') {
@@ -2285,15 +2528,7 @@ function filterTasks(tasks, sTerm, orgFilter, statusFilter, projectFilter = 'all
       const pri = (t.priority || 'medium').toLowerCase();
       if (pri !== priorityFilter.toLowerCase()) return false;
     }
-    if (statusFilter && statusFilter !== 'all') {
-      const st = (t.status || 'active').toLowerCase();
-      if (statusFilter === 'running' && st !== 'running' && st !== 'in_progress') return false;
-      if (statusFilter === 'active'  && st !== 'active'  && st !== 'todo')        return false;
-      if (statusFilter === 'blocked' && st !== 'blocked' && !t.is_blocked)        return false;
-      if (statusFilter === 'stopped' && st !== 'stopped' && st !== 'cancelled' && st !== 'paused') return false;
-      if (statusFilter === 'errored' && st !== 'errored' && st !== 'error' && st !== 'failed') return false;
-      if (statusFilter === 'done'    && st !== 'done')                             return false;
-    }
+    if (!taskPassesListFilter(t, page)) return false;
     if (sTerm) {
       const match = getTaskSearchMatch(t, sTerm);
       if (!match.matches) return false;
@@ -2342,7 +2577,8 @@ function makeTaskTableRow(t, colCount) {
   }
 
   const tdOrg    = el('td', null, t.organization || 'StayPoint');
-  const tdStat   = el('td'); tdStat.appendChild(statusPill(t.status));
+  const tdStage  = stageCell(t);
+  const tdRun    = runningCell(t);
   const tdPri    = el('td', null, t.priority || 'medium');
 
   const spendVal = t.spent_usd > 0
@@ -2351,28 +2587,27 @@ function makeTaskTableRow(t, colCount) {
   const tdSpend  = el('td', null, spendVal);
   const tdUp     = el('td', null, fmtRelTime(t.updated_at || Date.now()));
 
-  for (const td of [tdId, tdTitle, tdOrg, tdStat, tdPri, tdSpend, tdUp]) tr.appendChild(td);
+  for (const td of [tdId, tdTitle, tdOrg, tdStage, tdRun, tdPri, tdSpend, tdUp]) tr.appendChild(td);
+  tr.dataset.id = t.id;
   tr.addEventListener('click', () => openDetail(t.id));
   return tr;
 }
 
 // ── Projects View (STA-192) ───────────────────────────────
-function matchTaskStatus(taskStatus, targetFilter) {
+// projectTaskBucket sorts a task into one Projects-card bucket: running (a
+// run in flight), blocked, done (done or cancelled), else active, which the
+// cards label "Open" (task-3387cad2: never "Active").
+function projectTaskBucket(task) {
+  if (isRunningNow(task)) return 'running';
+  const stage = taskStageKey(task);
+  if (stage === 'blocked') return 'blocked';
+  if (stage === 'done' || stage === 'cancelled') return 'done';
+  return 'active';
+}
+
+function matchTaskStatus(task, targetFilter) {
   if (!targetFilter || targetFilter === 'all') return true;
-  const st = (taskStatus || '').toLowerCase();
-  if (targetFilter === 'running') {
-    return st === 'running' || st === 'in_progress';
-  }
-  if (targetFilter === 'blocked') {
-    return st === 'blocked';
-  }
-  if (targetFilter === 'done') {
-    return st === 'done' || st === 'completed' || st === 'soft_deleted';
-  }
-  if (targetFilter === 'active') {
-    return st === 'active' || st === 'todo' || st === 'backlog' || (!['running', 'in_progress', 'blocked', 'done', 'completed', 'soft_deleted'].includes(st));
-  }
-  return st === targetFilter;
+  return projectTaskBucket(task) === targetFilter;
 }
 
 function populateProjectsOrgFilter() {
@@ -2584,7 +2819,7 @@ function renderProjects() {
   const orgEntries = Object.values(orgMap).map(org => {
     let projs = Object.values(org.projects);
     if (globalStatusFilter !== 'all') {
-      projs = projs.filter(p => p.tasks.some(t => matchTaskStatus(t.status, globalStatusFilter)));
+      projs = projs.filter(p => p.tasks.some(t => matchTaskStatus(t, globalStatusFilter)));
     }
     return {
       name: org.name,
@@ -2664,11 +2899,7 @@ function createProjectCard(p, globalStatusFilter) {
   const counts = { running: 0, blocked: 0, done: 0, active: 0 };
   let totalSpend = 0;
   for (const t of p.tasks) {
-    const st = (t.status || '').toLowerCase();
-    if (st === 'running' || st === 'in_progress') counts.running++;
-    else if (st === 'blocked') counts.blocked++;
-    else if (st === 'done' || st === 'completed' || st === 'soft_deleted') counts.done++;
-    else counts.active++;
+    counts[projectTaskBucket(t)]++;
     totalSpend += t.spent_usd || 0;
   }
 
@@ -2682,7 +2913,7 @@ function createProjectCard(p, globalStatusFilter) {
     { status: 'running', label: 'Running', val: counts.running, cls: 'highlight-cyan' },
     { status: 'blocked', label: 'Blocked', val: counts.blocked, cls: 'highlight-red' },
     { status: 'done',    label: 'Done',    val: counts.done,    cls: 'highlight-green' },
-    { status: 'active',  label: 'Active',  val: counts.active,  cls: '' },
+    { status: 'active',  label: 'Open',    val: counts.active,  cls: '' },
   ];
 
   for (const sDef of statDefs) {
@@ -2723,11 +2954,11 @@ function createProjectCard(p, globalStatusFilter) {
   }
   card.appendChild(statsRow);
 
-  // Status Filter Pill Bar on Card: [All] [Active] [Running] [Done] [Blocked]
+  // Status Filter Pill Bar on Card: [All] [Open] [Running] [Done] [Blocked]
   const filterBar = el('div', 'project-card-filter-bar');
   const pillFilters = [
     { status: 'all',     label: 'All',     count: p.tasks.length },
-    { status: 'active',  label: 'Active',  count: counts.active },
+    { status: 'active',  label: 'Open',    count: counts.active },
     { status: 'running', label: 'Running', count: counts.running },
     { status: 'done',    label: 'Done',    count: counts.done },
     { status: 'blocked', label: 'Blocked', count: counts.blocked },
@@ -2756,19 +2987,19 @@ function createProjectCard(p, globalStatusFilter) {
 
   function renderTaskList() {
     taskList.innerHTML = '';
-    const filteredTasks = p.tasks.filter(t => matchTaskStatus(t.status, activeCardFilter));
+    const filteredTasks = p.tasks.filter(t => matchTaskStatus(t, activeCardFilter));
 
     if (!filteredTasks.length) {
       const emptyMsg = activeCardFilter === 'all'
         ? 'No tasks in this project.'
-        : `No ${activeCardFilter} tasks.`;
+        : `No ${activeCardFilter === 'active' ? 'open' : activeCardFilter} tasks.`;
       taskList.appendChild(el('div', 'project-task-empty muted-text', emptyMsg));
       return;
     }
 
     for (const t of filteredTasks.slice(0, 5)) {
       const item = el('div', 'project-task-item');
-      item.appendChild(statusPill(t.status));
+      item.appendChild(taskStateBadges(t));
       const titleEl = el('span', null, t.title || t.name || '(untitled)');
       titleEl.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
       item.appendChild(titleEl);
@@ -2780,7 +3011,7 @@ function createProjectCard(p, globalStatusFilter) {
     }
 
     if (filteredTasks.length > 5) {
-      const moreMsg = el('div', 'muted-text', `+${filteredTasks.length - 5} more ${activeCardFilter !== 'all' ? activeCardFilter + ' ' : ''}tasks`);
+      const moreMsg = el('div', 'muted-text', `+${filteredTasks.length - 5} more ${activeCardFilter !== 'all' ? (activeCardFilter === 'active' ? 'open' : activeCardFilter) + ' ' : ''}tasks`);
       moreMsg.style.fontSize = '11px';
       moreMsg.style.paddingTop = '2px';
       taskList.appendChild(moreMsg);
@@ -3510,7 +3741,21 @@ function taskMatchesRecentFilter(t, orgFilter, projFilter, priFilter) {
     const pri = (t.priority || 'medium').toLowerCase().trim();
     if (pri !== priFilter.toLowerCase().trim()) return false;
   }
-  return true;
+  return taskPassesListFilter(t, 'recent-tasks');
+}
+
+// recentFilterActive: any Recent Tasks filter narrows the feed.
+function recentFilterActive(orgFilter, projFilter, priFilter) {
+  return orgFilter !== 'all' || projFilter !== 'all' || priFilter !== 'all' || listFilterActive(listFilter('recent-tasks'));
+}
+
+// activityDotColor: cyan while a run is in flight, else by stage.
+function activityDotColor(t) {
+  if (isRunningNow(t)) return 'var(--cyan)';
+  const stage = taskStageKey(t);
+  if (stage === 'blocked') return 'var(--red)';
+  if (stage === 'done') return 'var(--green)';
+  return 'var(--muted)';
 }
 
 function renderSubtaskTree(parentID, childrenMap, taskMap, visited = new Set(), level = 0) {
@@ -3534,7 +3779,7 @@ function renderSubtaskTree(parentID, childrenMap, taskMap, visited = new Set(), 
   const orgFilter = state.recentTasksFilter.org || 'all';
   const projFilter = state.recentTasksFilter.project || 'all';
   const priFilter = state.recentTasksFilter.priority || 'all';
-  const isFilterActive = orgFilter !== 'all' || projFilter !== 'all' || priFilter !== 'all';
+  const isFilterActive = recentFilterActive(orgFilter, projFilter, priFilter);
 
   function nodeOrDescendantMatches(taskId, seen = new Set()) {
     if (seen.has(taskId)) return false;
@@ -3585,11 +3830,7 @@ function renderSubtaskTree(parentID, childrenMap, taskMap, visited = new Set(), 
 
     // Subtask status indicator dot
     const dot = el('span', 'activity-subtask-dot');
-    const st = (child.status || '').toLowerCase();
-    dot.style.background =
-      (st === 'running' || st === 'in_progress') ? 'var(--cyan)' :
-      (st === 'blocked' || st === 'errored' || st === 'failed') ? 'var(--red)' :
-      (st === 'done' || st === 'completed' || st === 'closed') ? 'var(--green)' : 'var(--muted)';
+    dot.style.background = activityDotColor(child);
     row.appendChild(dot);
 
     // Subtask body
@@ -3659,7 +3900,7 @@ function renderSubtaskTree(parentID, childrenMap, taskMap, visited = new Set(), 
     }
 
     row.appendChild(body);
-    row.appendChild(statusPill(child.status));
+    row.appendChild(taskStateBadges(child));
     tree.appendChild(row);
   });
 
@@ -3726,7 +3967,7 @@ function renderRecentTasks() {
   const orgFilter = state.recentTasksFilter.org || 'all';
   const projFilter = state.recentTasksFilter.project || 'all';
   const priFilter = state.recentTasksFilter.priority || 'all';
-  const isFilterActive = orgFilter !== 'all' || projFilter !== 'all' || priFilter !== 'all';
+  const isFilterActive = recentFilterActive(orgFilter, projFilter, priFilter);
 
   function matchesFilter(t) {
     return taskMatchesRecentFilter(t, orgFilter, projFilter, priFilter);
@@ -3786,11 +4027,7 @@ function renderRecentTasks() {
 
     const dotCol = el('div', 'activity-dot-col');
     const dot = el('span', 'activity-dot');
-    const st = (t.status || '').toLowerCase();
-    dot.style.background =
-      (st === 'running' || st === 'in_progress') ? 'var(--cyan)' :
-      (st === 'blocked' || st === 'errored' || st === 'failed') ? 'var(--red)' :
-      (st === 'done' || st === 'completed' || st === 'closed') ? 'var(--green)' : 'var(--muted)';
+    dot.style.background = activityDotColor(t);
     dotCol.appendChild(dot);
     if (i < sorted.length - 1) dotCol.appendChild(el('span', 'activity-line'));
     item.appendChild(dotCol);
@@ -3874,7 +4111,7 @@ function renderRecentTasks() {
     }
 
     item.appendChild(body);
-    item.appendChild(statusPill(t.status));
+    item.appendChild(taskStateBadges(t));
     feed.appendChild(item);
   });
 }
@@ -3905,14 +4142,13 @@ function renderTaskStatusPage() {
   const orgFilter      = state.tsFilter.org || 'all';
   const projectFilter  = state.tsFilter.project || 'all';
   const priorityFilter = state.tsFilter.priority || 'all';
-  const stFilter       = state.tsFilter.status || 'all';
 
-  const filtered = filterTasks(dedupTasks, sTerm, orgFilter, stFilter, projectFilter, priorityFilter);
+  const filtered = filterTasks(dedupTasks, sTerm, orgFilter, 'task-status', projectFilter, priorityFilter);
   const sorted = sortTasks(filtered, state.tsSort.column, state.tsSort.direction);
 
   if (!sorted.length) {
     const tr = document.createElement('tr');
-    const td = document.createElement('td'); td.colSpan = 9;
+    const td = document.createElement('td'); td.colSpan = 10;
     td.textContent = 'No tasks match filter.';
     td.style.cssText = 'text-align:center;color:var(--muted);padding:24px;';
     tr.appendChild(td); tbody.appendChild(tr);
@@ -3958,13 +4194,15 @@ function renderTaskStatusPage() {
     const tdOrg      = el('td', null, t.organization || '—');
     const tdProj     = el('td', null, t.project || '—');
     const tdAssignee = el('td', null, t.assignee_name || t.assigned_agent || t.checkout_agent_id?.slice(0, 8) || '—');
-    const tdStat     = el('td'); tdStat.appendChild(statusPill(t.status));
+    const tdStage    = stageCell(t);
+    const tdRun      = runningCell(t);
     const tdPri      = el('td', null, t.priority || '—');
     const tdSpend    = el('td', null, t.spent_usd > 0 ? fmtCurrency(t.spent_usd) : '—');
     const tdUp       = el('td', null, fmtRelTime(t.updated_at));
 
-    for (const td of [tdId, tdTitle, tdOrg, tdProj, tdAssignee, tdStat, tdPri, tdSpend, tdUp])
+    for (const td of [tdId, tdTitle, tdOrg, tdProj, tdAssignee, tdStage, tdRun, tdPri, tdSpend, tdUp])
       tr.appendChild(td);
+    tr.dataset.id = t.id;
     tr.addEventListener('click', () => openDetail(t.id));
     tbody.appendChild(tr);
   }
@@ -4017,12 +4255,13 @@ function renderAllTasksPage() {
     seen.add(t.id);
     tasks.push(state.tasks[t.id] ? { ...t, ...state.tasks[t.id] } : t);
   }
-  const rows = filterAllTasks(tasks, state.allTasksFilter);
+  const rows = filterAllTasks(tasks, { ...state.allTasksFilter, stage: 'all' })
+    .filter(t => taskPassesListFilter(t, 'all-tasks'));
   tbody.innerHTML = '';
   if (!rows.length) {
     const tr = document.createElement('tr');
     const td = el('td', null, 'No tasks match these filters.');
-    td.colSpan = 7;
+    td.colSpan = 8;
     td.style.cssText = 'text-align:center;color:var(--muted);padding:24px;';
     tr.appendChild(td);
     tbody.appendChild(tr);
@@ -4039,9 +4278,10 @@ function renderAllTasksPage() {
     const tdOrg = el('td', null, companyOf(t));
     const tdProj = el('td', null, t.project || '—');
     const tdOrigin = el('td', null, t.origin || '—');
-    const tdStage = el('td', null, taskStageOf(t) || '—');
+    const tdStage = stageCell(t);
+    const tdRun = runningCell(t);
     const tdUp = el('td', null, fmtRelTime(t.updated_at));
-    for (const td of [tdId, tdTitle, tdOrg, tdProj, tdOrigin, tdStage, tdUp]) tr.appendChild(td);
+    for (const td of [tdId, tdTitle, tdOrg, tdProj, tdOrigin, tdStage, tdRun, tdUp]) tr.appendChild(td);
     tr.addEventListener('click', () => openDetail(t.id));
     tbody.appendChild(tr);
   }
@@ -4068,7 +4308,6 @@ function wireAllTasksControls() {
   bind('all-tasks-search', 'q', 'input');
   bind('all-tasks-org-filter', 'org', 'change');
   bind('all-tasks-origin-filter', 'origin', 'change');
-  bind('all-tasks-stage-filter', 'stage', 'change');
   bind('all-tasks-visibility-filter', 'visibility', 'change');
 }
 
@@ -5699,8 +5938,9 @@ function renderFleetModalOrganizations(body, footerInfo) {
         const tdTasks = el('td');
         const tc = org.task_counts || {};
         const group = el('div', 'chip-group');
-        if (tc.running) group.appendChild(el('span', 'chip-sm chip-cyan', `${tc.running} running`));
-        if (tc.active) group.appendChild(el('span', 'chip-sm chip-blue', `${tc.active} active`));
+        const liveHere = runningByOrg(state.liveRuns)[org.name] || 0;
+        if (liveHere) group.appendChild(el('span', 'chip-sm chip-cyan', `${liveHere} running`));
+        if (tc.active) group.appendChild(el('span', 'chip-sm chip-blue', `${tc.active} open`));
         if (tc.blocked) group.appendChild(el('span', 'chip-sm chip-red', `${tc.blocked} blocked`));
         if (tc.done) group.appendChild(el('span', 'chip-sm chip-green', `${tc.done} done`));
         group.appendChild(el('span', 'chip-sm chip-gray', `${tc.total || 0} total`));
@@ -5742,12 +5982,12 @@ function renderFleetModalTasks(body, footerInfo) {
   const allTasks = getFleetTasks();
   const orgs = state.fleet?.organizations || [];
 
+  // Running (a run in flight) is counted on its own; every task also counts
+  // under its stage.
   const counts = { running: 0, in_progress: 0, blocked: 0, in_review: 0, todo: 0, done: 0 };
   for (const t of allTasks) {
-    const rawSt = (t.status || '').toLowerCase();
-    let st = normalizeFleetStatus(t.status);
-    if (rawSt === 'running') st = 'running';
-    else if (rawSt === 'in_review') st = 'in_review';
+    if (isRunningNow(t)) counts.running++;
+    const st = taskStageKey(t);
     if (counts[st] !== undefined) counts[st]++;
   }
 
@@ -5780,8 +6020,8 @@ function renderFleetModalTasks(body, footerInfo) {
 
   const statusSelect = el('select', 'modal-filter-select');
   for (const [sVal, sLbl] of [
-    ['all', 'All Statuses'],
-    ['running', 'Running'],
+    ['all', 'All Stages'],
+    ['running', 'Running now'],
     ['in_progress', 'In Progress'],
     ['blocked', 'Blocked'],
     ['in_review', 'In Review'],
@@ -5812,7 +6052,7 @@ function renderFleetModalTasks(body, footerInfo) {
   const table = el('table', 'modal-table');
   const thead = el('thead');
   const thr = el('tr');
-  for (const h of ['ID', 'Title', 'Organization', 'Status', 'Assignee', 'Priority', 'Action']) {
+  for (const h of ['ID', 'Title', 'Organization', 'Stage', 'Assignee', 'Priority', 'Action']) {
     thr.appendChild(el('th', null, h));
   }
   thead.appendChild(thr);
@@ -5830,12 +6070,9 @@ function renderFleetModalTasks(body, footerInfo) {
     const orgFilter = fleetModalState.taskOrg || 'all';
 
     const filtered = allTasks.filter(t => {
-      const rawSt = (t.status || '').toLowerCase();
-      let st = normalizeFleetStatus(t.status);
-      if (rawSt === 'running') st = 'running';
-      else if (rawSt === 'in_review') st = 'in_review';
-
-      if (stFilter !== 'all' && st !== stFilter) return false;
+      if (stFilter === 'running') {
+        if (!isRunningNow(t)) return false;
+      } else if (stFilter !== 'all' && taskStageKey(t) !== stFilter) return false;
       const orgName = t.organization || t.org || '';
       if (orgFilter !== 'all' && orgName.toLowerCase() !== orgFilter.toLowerCase()) return false;
       if (q) {
@@ -5874,20 +6111,9 @@ function renderFleetModalTasks(body, footerInfo) {
         const tdOrg = el('td', 'muted-text', t.organization || t.org || 'StayPoint');
         tr.appendChild(tdOrg);
 
-        // Status
+        // Stage, plus Running while a run is in flight
         const tdStatus = el('td');
-        const rawSt = (t.status || '').toLowerCase();
-        let st = normalizeFleetStatus(t.status);
-        if (rawSt === 'running') st = 'running';
-        else if (rawSt === 'in_review') st = 'in_review';
-
-        let pillCls = 'pill-gray';
-        if (st === 'running') pillCls = 'pill-cyan';
-        else if (st === 'in_progress') pillCls = 'pill-blue';
-        else if (st === 'blocked') pillCls = 'pill-red';
-        else if (st === 'in_review') pillCls = 'pill-purple';
-        else if (st === 'done') pillCls = 'pill-green';
-        tdStatus.appendChild(el('span', `pill ${pillCls}`, st.replace('_', ' ')));
+        tdStatus.appendChild(taskStateBadges(t));
         tr.appendChild(tdStatus);
 
         // Assignee
@@ -6173,9 +6399,11 @@ function renderOrgDetailView(org) {
   // Stats row
   const statsRow = el('div', 'org-detail-stats');
   const tc = org.task_counts || {};
+  // Running is live runs (GET /api/runs/live), as in the sidebar.
+  const liveHere = runningByOrg(state.liveRuns)[org.name] || 0;
   const statItems = [
-    { val: tc.running || 0,  label: 'Running',  cls: 'highlight-cyan', status: 'running' },
-    { val: tc.active  || 0,  label: 'Active',   status: 'active' },
+    { val: liveHere,         label: 'Running',  cls: 'highlight-cyan', status: 'running' },
+    { val: tc.active  || 0,  label: 'Open, not running', status: 'active' },
     { val: tc.blocked || 0,  label: 'Blocked',  cls: 'highlight-red',  status: 'blocked' },
     { val: tc.done    || 0,  label: 'Done',     cls: 'highlight-green',status: 'done' },
     { val: tc.total   || 0,  label: 'Total',    status: 'all' },
@@ -6242,15 +6470,21 @@ function renderOrgDetailView(org) {
   }
 
   // Tasks section
-  const orgTasks = visibleTasks(org.tasks, false).concat(
+  const allOrgTasks = visibleTasks(org.tasks, false).concat(
     taskValues().filter(t =>
       t.organization === org.name && !(org.tasks || []).find(ot => ot.id === t.id)
     )
   );
+  const orgTasks = allOrgTasks.filter(t => taskPassesListFilter(t, 'org-detail'));
 
-  if (orgTasks.length) {
+  if (allOrgTasks.length) {
     const tasksSec = el('div', 'org-detail-section');
-    tasksSec.appendChild(el('div', 'org-detail-section-title', `Tasks (${orgTasks.length})`));
+    const secHdr = el('div', 'org-detail-section-title org-detail-tasks-header');
+    secHdr.appendChild(el('span', null, orgTasks.length === allOrgTasks.length
+      ? `Tasks (${allOrgTasks.length})`
+      : `Tasks (${orgTasks.length} of ${allOrgTasks.length})`));
+    secHdr.appendChild(buildListFilters('org-detail'));
+    tasksSec.appendChild(secHdr);
     const tbl = document.createElement('table');
     tbl.className = 'global-task-table';
     tbl.id = 'org-task-table';
@@ -6259,7 +6493,8 @@ function renderOrgDetailView(org) {
     thead.innerHTML = '<tr>' +
       '<th data-col="identifier" class="sortable-th" tabindex="0" role="columnheader">ID</th>' +
       '<th data-col="task" class="sortable-th" tabindex="0" role="columnheader">Task</th>' +
-      '<th data-col="status" class="sortable-th" tabindex="0" role="columnheader">Status</th>' +
+      '<th data-col="stage" class="sortable-th" tabindex="0" role="columnheader">Stage</th>' +
+      '<th data-col="running" class="sortable-th" tabindex="0" role="columnheader">Running</th>' +
       '<th data-col="priority" class="sortable-th" tabindex="0" role="columnheader">Priority</th>' +
       '<th data-col="cost" class="sortable-th" tabindex="0" role="columnheader">Spend</th>' +
       '</tr>';
@@ -6279,10 +6514,12 @@ function renderOrgDetailView(org) {
         const tdId = el('td', null, t.identifier || (t.id ? `#${t.id.slice(0, 8)}` : '—'));
         tdId.style.cssText = 'font-family:monospace;font-weight:600;';
         const tdTitle = el('td', null, t.title || t.name || '(untitled)');
-        const tdStat  = el('td'); tdStat.appendChild(statusPill(t.status));
+        const tdStage = stageCell(t);
+        const tdRun   = runningCell(t);
         const tdPri   = el('td', null, t.priority || '—');
         const tdSpend = el('td', null, t.spent_usd > 0 ? fmtCurrency(t.spent_usd) : '—');
-        for (const td of [tdId, tdTitle, tdStat, tdPri, tdSpend]) tr.appendChild(td);
+        for (const td of [tdId, tdTitle, tdStage, tdRun, tdPri, tdSpend]) tr.appendChild(td);
+        tr.dataset.id = t.id;
         tr.addEventListener('click', () => openDetail(t.id));
         tbody.appendChild(tr);
       }
@@ -6410,7 +6647,7 @@ function renderKanban() {
   if (legacyCount) legacyCount.textContent = `(${countLegacy(tasks)})`;
 
   board.innerHTML = '';
-  const groups = buildBoard(tasks, { groupByCompany, showLegacy });
+  const groups = buildBoard(tasks.filter(t => taskPassesListFilter(t, 'kanban')), { groupByCompany, showLegacy });
   for (const g of groups) {
     if (!groupByCompany) {
       board.appendChild(renderKanbanColumns(g.columns));
@@ -6435,6 +6672,9 @@ function makeTaskCard(task) {
   meta.appendChild(el('span', 'card-id', task.source_ref || task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : '')));
   if (isLegacy(task)) meta.appendChild(el('span', 'card-origin-badge', 'legacy'));
   else if (isArchived(task)) meta.appendChild(el('span', 'card-origin-badge', 'archive'));
+  // The column is the stage; Running shows only while a run is in flight.
+  const rb = runningBadge(task);
+  if (rb) meta.appendChild(rb);
   card.appendChild(meta);
   card.addEventListener('click', () => openDetail(task.id));
   return card;
@@ -10811,7 +11051,10 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   const titleRow = el('div', 'task-page-title-row');
   titleRow.appendChild(el('h1', 'task-page-title', task.title || task.name || '(untitled)'));
   const pillsRow = el('div', 'task-page-pills');
-  if (task.status) pillsRow.appendChild(statusPill(task.status));
+  // Stage, and Running only while a run is in flight (task-3387cad2).
+  const stateBadges = taskStateBadges(task);
+  stateBadges.id = `task-page-state-${task.id}`;
+  pillsRow.appendChild(stateBadges);
   if (task.priority) pillsRow.appendChild(statusPill(task.priority));
   const hiddenBadge = originBadge(task);
   if (hiddenBadge) {
@@ -12812,6 +13055,7 @@ document.getElementById('projects-org-filter')?.addEventListener('change', (e) =
 // Non-task views that depend on fleet data will show a loading state until
 // loadAll() populates state; SSE updates fill in the rest incrementally.
 (function boot() {
+  mountListFilters();
   const initialRoute = pathToRoute();
   const isTaskRoute = !!(initialRoute.taskId || initialRoute.identifier);
 
