@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/VinnyVanGogh/staypoint/internal/decision"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
@@ -197,11 +198,21 @@ func (t TogetherAdvisor) Advise(ctx context.Context, gr *security.GateRequest, s
 	return a, nil
 }
 
+// DescribeLimit caps DescribeRequest in bytes. tev1's /v1/systemone rejects
+// prompts over 2048 tokens; code runs ~2.6 bytes/token there plus ~180
+// tokens of question and template, so 3500 bytes stays under ~1,800.
+const DescribeLimit = 3500
+
+// describeCmdLimit caps the command; scripts share what is left.
+const describeCmdLimit = 2000
+
 // DescribeRequest is the context an advisor sees: command, reasons,
-// task/repo/org and the (truncated) scripts it runs.
+// task/repo/org and the scripts it runs, head+tail cut to DescribeLimit.
+// Binary files are named but never shown (a Mach-O pasted as a
+// "script" became 17K tokens).
 func DescribeRequest(gr *security.GateRequest, scripts []security.ScriptRef) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Command:\n%s\n\nHeld because: %s\n", truncate(gr.Cmdline, 4000), strings.Join(gr.Reasons, "; "))
+	fmt.Fprintf(&b, "Command:\n%s\n\nHeld because: %s\n", headTail(printable(gr.Cmdline), describeCmdLimit), strings.Join(gr.Reasons, "; "))
 	if gr.TaskID != "" {
 		fmt.Fprintf(&b, "Task: %s\n", gr.TaskID)
 	}
@@ -214,14 +225,62 @@ func DescribeRequest(gr *security.GateRequest, scripts []security.ScriptRef) str
 	if gr.CWD != "" {
 		fmt.Fprintf(&b, "Working dir: %s\n", gr.CWD)
 	}
-	for _, s := range scripts {
-		if s.Content == "" {
+	for i, s := range scripts {
+		switch {
+		case s.Content == "":
 			fmt.Fprintf(&b, "\nScript %s: (unreadable)\n", s.Path)
-			continue
+		case looksBinary(s.Content):
+			fmt.Fprintf(&b, "\nScript %s (sha256 %.12s): binary, not shown\n", s.Path, s.SHA256)
+		default:
+			head := fmt.Sprintf("\nScript %s (sha256 %.12s):\n", s.Path, s.SHA256)
+			share := (DescribeLimit - b.Len()) / (len(scripts) - i)
+			fmt.Fprintf(&b, "%s%s\n", head, headTail(printable(s.Content), share-len(head)-1))
 		}
-		fmt.Fprintf(&b, "\nScript %s (sha256 %.12s):\n%s\n", s.Path, s.SHA256, s.Content)
 	}
-	return b.String()
+	return headTail(printable(b.String()), DescribeLimit)
+}
+
+// headTail keeps the first and last parts of s within n bytes, marking the
+// cut, on rune boundaries.
+func headTail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	const mark = "\n…(truncated)…\n"
+	keep := n - len(mark)
+	if keep < 2 {
+		return strings.ToValidUTF8(s[:max(n, 0)], "")
+	}
+	h, t := keep/2, len(s)-(keep-keep/2)
+	for h > 0 && !utf8.RuneStart(s[h]) {
+		h--
+	}
+	for t < len(s) && !utf8.RuneStart(s[t]) {
+		t++
+	}
+	return s[:h] + mark + s[t:]
+}
+
+// looksBinary mirrors bash's own check (check_binary_file): a NUL in the
+// first line of the first 80 bytes, unless it starts with "#!". Mach-O, ELF
+// and PE headers all qualify. Anything bash would run as a script is shown,
+// so stray bytes cannot hide a script from the advisor.
+func looksBinary(s string) bool {
+	if strings.HasPrefix(s, "#!") {
+		return false
+	}
+	if len(s) > 80 {
+		s = s[:80]
+	}
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return strings.IndexByte(s, 0) >= 0
+}
+
+// printable replaces NULs and invalid UTF-8 with U+FFFD.
+func printable(s string) string {
+	return strings.ReplaceAll(strings.ToValidUTF8(s, "�"), "\x00", "�")
 }
 
 func truncate(s string, n int) string {
