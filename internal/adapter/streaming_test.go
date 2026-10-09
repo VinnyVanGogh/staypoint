@@ -13,6 +13,11 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 )
 
+// streamWithCommit is streamWithCommitWatch with no watcher.
+func streamWithCommit(r io.Reader, dst io.Writer, isCommit func(line []byte) bool) (bool, []byte) {
+	return streamWithCommitWatch(r, dst, isCommit, nil)
+}
+
 // TestStreamWithCommit_CommitsOnAssistantEvent verifies that output is forwarded
 // to dst once a commit event arrives, and pre-commit lines are flushed first.
 func TestStreamWithCommit_CommitsOnAssistantEvent(t *testing.T) {
