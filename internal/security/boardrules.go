@@ -756,11 +756,14 @@ func runsDaemon(code string, depth int) bool {
 			if a != "cd" && a != "pushd" && a != "-C" && a != "--chdir" && !strings.HasPrefix(a, "--chdir=") {
 				continue
 			}
+			// Every word after it (cd -P dir, env -C dir go ...), fail closed.
 			if strings.HasPrefix(a, "--chdir=") {
 				i--
 			}
-			if i+1 < len(s.argv) && (daemonRe.MatchString(s.argv[i+1]) || s.dyn[i+1] || strings.ContainsAny(s.argv[i+1], "*?[{")) {
-				cdDaemon = true
+			for j := i + 1; j < len(s.argv); j++ {
+				if daemonRe.MatchString(s.argv[j]) || s.dyn[j] || strings.ContainsAny(s.argv[j], "*?[{") {
+					cdDaemon = true
+				}
 			}
 		}
 	}
@@ -860,9 +863,14 @@ func goBuildsCwd(args []string, dyn []bool) bool {
 	for i, a := range args {
 		switch {
 		case strings.HasPrefix(a, "-"), i > 0 && strings.HasPrefix(args[i-1], "-") && !strings.Contains(args[i-1], "="):
-		case dyn[i] || strings.ContainsAny(a, "*?[{"):
+		case dyn[i] || strings.ContainsAny(a, "*?[{") || path.Clean(a) == "." || strings.HasSuffix(a, ".go"):
 			return true
-		case a != "." && a != "./":
+		}
+	}
+	// No package (or only flag values) builds the cwd; any other is
+	// another directory.
+	for i, a := range args {
+		if !strings.HasPrefix(a, "-") && !(i > 0 && strings.HasPrefix(args[i-1], "-") && !strings.Contains(args[i-1], "=")) {
 			return false
 		}
 	}
