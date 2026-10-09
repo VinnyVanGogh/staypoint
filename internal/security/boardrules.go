@@ -435,7 +435,9 @@ func inputShell(code string, depth int) bool {
 	return false
 }
 
-var envWordRe = regexp.MustCompile(`\benv\b`)
+// envWordRe: words that may change the env without naming STAYPOINT_ in
+// full (env -i, unset STAY{POINT,X}_TASK_ID).
+var envWordRe = regexp.MustCompile(`\b(env|unset|export|declare|typeset|local|readonly)\b`)
 
 // stayEnvChange reports a command that unsets, clears or overrides the
 // StayPoint env the gate relies on (gateVarRe) for anything but go test or
@@ -472,9 +474,10 @@ func stayEnvChange(code string, depth int) bool {
 }
 
 // gateVarName reports a name that is, or may expand to, a gate variable:
-// STAYPOINT_{TASK,SESSION}_ID is two of them once the shell expands it.
+// STAYPOINT_{TASK,SESSION}_ID is two of them once the shell expands it, and
+// ST*_TASK_ID may glob to one. Any name the shell may still rewrite counts.
 func gateVarName(n string) bool {
-	return gateVarRe.MatchString(n) || strings.HasPrefix(n, "STAYPOINT_") && strings.ContainsAny(n, "{*?[\\")
+	return gateVarRe.MatchString(n) || strings.ContainsAny(n, "{}*?[]\\'\"")
 }
 
 // envState tracks one command's env changes. other is any change besides
@@ -884,15 +887,21 @@ func gitNamesOnly(re *regexp.Regexp, args []string) bool {
 // gitRunsProgram reports subcommand options that run a program (grep -O
 // opens a pager through the shell, --ext-diff an external diff) or copy
 // what they show (--output).
+// Every word is checked, past a "--" too: "--" may be an option's value
+// (git grep -e -- -O...).
 func gitRunsProgram(args []string) bool {
 	for _, a := range args {
-		if a == "--" {
-			return false
-		}
-		// -O may close a short-flag cluster (-nO<pager>).
-		short := strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--")
-		if short && strings.ContainsRune(a, 'O') || strings.HasPrefix(a, "--open-files-in-pager") ||
-			strings.HasPrefix(a, "--output") || a == "--ext-diff" {
+		switch {
+		case strings.HasPrefix(a, "--") && len(a) > 2:
+			// git takes any unambiguous prefix: --open, --out, --ext.
+			name, _, _ := strings.Cut(a[2:], "=")
+			for _, o := range []string{"open-files-in-pager", "output", "ext-diff"} {
+				if name != "" && strings.HasPrefix(o, name) || strings.HasPrefix(name, o) {
+					return true
+				}
+			}
+		case strings.HasPrefix(a, "-") && strings.ContainsRune(a, 'O'):
+			// -O may close a short-flag cluster (-nO<pager>).
 			return true
 		}
 	}
