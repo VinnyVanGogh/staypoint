@@ -343,13 +343,15 @@ func shellNoExec(argv []string) bool {
 	for i := 0; i < end; i++ {
 		a := args[i]
 		switch {
-		case strings.HasPrefix(a, "+"):
-			return false // +n, +o noexec turn it back off
-		case a == "-o":
+		case a == "-o" || a == "+o":
 			if i+1 < end && args[i+1] == "noexec" {
-				noexec = true
+				noexec = a == "-o" // the last setting wins
 			}
 			i++
+		case len(a) > 1 && a[0] == '+':
+			if strings.ContainsRune(a[1:], 'n') {
+				noexec = false
+			}
 		case strings.HasPrefix(a, "--"):
 			// --login and --rcfile read startup files.
 			if a != "--norc" && a != "--noprofile" && a != "--posix" {

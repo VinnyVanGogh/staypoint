@@ -531,7 +531,7 @@ func goTestOrVet(argv []string) bool {
 	return true
 }
 
-var launchctlRe = regexp.MustCompile(`(?i)\blaunchctl\b`)
+var launchctlRe = regexp.MustCompile(`(?i)launchctl`)
 
 // runsLaunchctl reports launchctl that may run (any subcommand: it starts,
 // stops and replaces the daemon's LaunchAgent). grep launchctl does not.
@@ -703,34 +703,81 @@ func namesOnly(re *regexp.Regexp, s segment, argv []string, viaXargs bool, depth
 
 var greenGoNames = map[string]bool{"vet": true, "build": true, "test": true, "list": true, "doc": true, "fmt": true}
 
-// sedRunsRe: a sed script that may run a command or write a file: GNU
-// sed's e and w commands and s///e, s///w flags. Over-broad on purpose.
-var sedRunsRe = regexp.MustCompile(`(^|[;{}\n0-9$/!,])\s*[ewW](\s|$|[;}])|[/|#,:][gpiImM0-9]*[ewW]`)
+// sedPrintRe: one sed command that only prints or stops: an optional
+// address or range (line, $, /regex/) and p, l, =, q or nothing. Anything
+// else (s with any delimiter and its e/w flags, e, w, r, a, i, c, y, {})
+// is not known to be harmless.
+var sedPrintRe = regexp.MustCompile(`^\s*((\d+|\$|/[^/\\\n]*/)(\s*,\s*(\d+|\$|/[^/\\\n]*/))?)?\s*!?\s*[pl=qQ]?\s*\d*\s*$`)
 
-// sedNamesOnly: sed that only prints: no -i, no script file, and no script
-// that can run a command or write a file.
+func sedPrintsOnly(script string) bool {
+	for _, c := range strings.FieldsFunc(script, func(r rune) bool { return r == ';' || r == '\n' }) {
+		if !sedPrintRe.MatchString(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// sedOptionsSafe are sed's short options that take no value and change
+// nothing but output format.
+const sedOptionsSafe = "nErsuz"
+
+// sedNamesOnly: sed that only prints. Every script must be sedPrintsOnly,
+// and -i, -f (a script we cannot read) or an unknown option means no.
 func sedNamesOnly(re *regexp.Regexp, args []string) bool {
 	hasScript := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
-		case strings.HasPrefix(a, "-i") || strings.HasPrefix(a, "--in-place") || strings.HasPrefix(a, "-f") || strings.HasPrefix(a, "--file"):
-			return false
-		case a == "-e" || a == "--expression":
-			hasScript = true
-			if i+1 < len(args) && sedRunsRe.MatchString(args[i+1]) {
+		case a == "--":
+			if !hasScript && i+1 < len(args) && !sedPrintsOnly(args[i+1]) {
 				return false
 			}
-			i++
-		case strings.HasPrefix(a, "-e") || strings.HasPrefix(a, "--expression="):
+			return true
+		case a == "--expression" || strings.HasPrefix(a, "--expression="):
 			hasScript = true
-			if sedRunsRe.MatchString(strings.TrimPrefix(strings.TrimPrefix(a, "--expression="), "-e")) {
+			s := strings.TrimPrefix(a, "--expression=")
+			if a == "--expression" {
+				i++
+				if i >= len(args) {
+					return false
+				}
+				s = args[i]
+			}
+			if !sedPrintsOnly(s) {
 				return false
 			}
-		case strings.HasPrefix(a, "-"):
+		case strings.HasPrefix(a, "--"):
+			switch a {
+			case "--quiet", "--silent", "--regexp-extended", "--posix", "--debug", "--separate", "--unbuffered", "--null-data":
+			default:
+				return false
+			}
+		case len(a) > 1 && a[0] == '-':
+			// A cluster like -ne: e takes the rest, or the next argument.
+			for j := 1; j < len(a); j++ {
+				if a[j] == 'e' {
+					hasScript = true
+					s := a[j+1:]
+					if s == "" {
+						i++
+						if i >= len(args) {
+							return false
+						}
+						s = args[i]
+					}
+					if !sedPrintsOnly(s) {
+						return false
+					}
+					break
+				}
+				if !strings.ContainsRune(sedOptionsSafe, rune(a[j])) {
+					return false
+				}
+			}
 		case !hasScript:
 			hasScript = true
-			if sedRunsRe.MatchString(a) {
+			if !sedPrintsOnly(a) {
 				return false
 			}
 		}
