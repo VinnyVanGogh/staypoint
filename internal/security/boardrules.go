@@ -57,7 +57,7 @@ var (
 	// Running the reinstall script is reinstallExec, launchctl runsLaunchctl.
 	// A cd (or -C) into ~/.local makes a relative `go build -o staypointd`
 	// or `cp x staypoint` replace the installed binary.
-	selfCmdRe = regexp.MustCompile(`(?i)(\b(cd|pushd)\b[^;&|\n]*(\.local\b|\.l[^\s/;&|]*[*?\[])|\s-C\s*['"]?[^\s;&|]*\.local\b|\bgo\s+install\b[^;&|\n]*staypoint|\bgo\s+(install|build)\b[^;&|\n]*\.local/bin|\b(cp|mv|ln|install|rsync|ditto)\b[^;&|\n]*\.local/bin|\b(kill|pkill|killall)\b[^;&|\n]*\bstaypointd?([^\w-]|$)|\bbrew\s+(re)?install\b[^;&|\n]*staypoint)`)
+	selfCmdRe = regexp.MustCompile(`(?i)(\b(cd|pushd)\b[^;&|\n]*(\.local\b|[*?\[{])|\s-C\s*['"]?[^\s;&|]*\.local\b|\bgo\s+install\b[^;&|\n]*staypoint|\bgo\s+(install|build)\b[^;&|\n]*\.local/bin|\b(cp|mv|ln|install|rsync|ditto)\b[^;&|\n]*\.local/bin|\b(kill|pkill|killall)\b[^;&|\n]*\bstaypointd?([^\w-]|$)|\bbrew\s+(re)?install\b[^;&|\n]*staypoint)`)
 	// selfPathRe: paths StayPoint and the agent guards depend on. Any
 	// reference holds, reads included: they hold tokens and the guards. The
 	// one exception is reading the run's own handoff files (ownHandoffRead).
@@ -611,11 +611,18 @@ func namedRun(code string, re *regexp.Regexp, depth int) bool {
 			return true
 		}
 	}
-	fed := false // a pipe from a segment that read the script
+	fed := false     // a pipe from a segment that read the script
+	execOut := false // exec >file: later output goes to that file
 	for _, s := range segs {
 		argv, viaXargs := unwrapArgv(s.argv)
 		named := anyNames(re, s.argv) || redirectNames(re, s) || heredocNames(re, s)
-		if fed && (viaXargs || len(argv) == 0 || !pipeFilters[baseCmd(argv)] || argv[0] != baseCmd(argv) || writesFile(s)) {
+		if len(argv) == 0 && writesFile(s) {
+			execOut = true
+		}
+		if execOut && named {
+			return true
+		}
+		if fed &&(viaXargs || len(argv) == 0 || !pipeFilters[baseCmd(argv)] || argv[0] != baseCmd(argv) || writesFile(s)) {
 			return true
 		}
 		// Named in an assignment or a wrapper's args (BASH_ENV=...,
