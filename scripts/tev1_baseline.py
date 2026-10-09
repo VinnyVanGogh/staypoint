@@ -119,17 +119,40 @@ def _gate_decision(r, source):
             "task_id": r["task_id"] or ""}
 
 
+BULK_MIN = 10  # this many Board denials in one decided_at minute = queue clear
+
+
+def bulk_minutes(con):
+    """decided_at minutes in which the Board denied BULK_MIN+ requests at once.
+
+    Clearing a backlog denies everything pending (on 2026-10-08 that included
+    `bash -n` and `go build`); it says nothing about each command."""
+    return {r[0] for r in con.execute(
+        "SELECT substr(decided_at, 1, 16) FROM security_gate_requests WHERE status = 'denied' "
+        "AND decided_by NOT LIKE 'rule%' AND decided_at IS NOT NULL GROUP BY 1 HAVING count(*) >= ?",
+        (BULK_MIN,))}
+
+
+def _bulk(r, bulk):
+    return r["status"] == DENY and (r["decided_at"] or "")[:16] in bulk
+
+
 def load_db_gates(con):
-    """Board-decided requests. Rule and tev1 decisions are not Board truth."""
+    """Board-decided requests. Rule and tev1 decisions are not Board truth,
+    and neither are bulk denials. Returns (decisions, bulk-denied count)."""
     rows = con.execute(
         "SELECT * FROM security_gate_requests WHERE status IN ('approved','denied') "
         "AND decided_by NOT LIKE 'rule%' ORDER BY created_at").fetchall()
-    out = []
+    bulk = bulk_minutes(con)
+    out, skipped = [], 0
     for r in rows:
+        if _bulk(r, bulk):
+            skipped += 1
+            continue
         d = _gate_decision(r, "gate")
         d["actual"] = r["status"]
         out.append(d)
-    return out
+    return out, skipped
 
 
 _LOGGED = re.compile(r"p=([0-9.]+)(?:,\s*confidence\s*([0-9.]+))?")
@@ -157,10 +180,11 @@ def load_db_live(con, since):
         "AND d.created_at >= ? AND d.id IN (SELECT MAX(id) FROM decision_log "
         "WHERE subject_kind = 'security_gate' AND advisor = 'together' GROUP BY subject_id) "
         "ORDER BY d.created_at", (since,)).fetchall()
+    bulk = bulk_minutes(con)
     out = []
     for r in rows:
         d = _gate_decision(r, "live")
-        board = r["decided_by"] == "board" and r["status"] in (APPROVE, DENY)
+        board = r["decided_by"] == "board" and r["status"] in (APPROVE, DENY) and not _bulk(r, bulk)
         d["actual"] = r["status"] if board else None
         d["decided_by"] = r["decided_by"]
         p, conf = parse_logged(r["recommendation"], r["reason"])
@@ -468,6 +492,10 @@ def selftest():
               ('g2','ls','[]','r','approved','2026-10-08T02:00:00Z',NULL,'t','repo','StayPoint','/w','[]','rule:3'),
               ('g3','cat x','[]','r','approved','2026-10-09T02:00:00Z',NULL,'t','repo','StayPoint','/w','[]','rule:4:tev1'),
               ('g4','git push','[]','r','denied','2026-10-09T03:00:00Z',NULL,'t','repo','StayPoint','/w','[]','board');
+            WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 9)
+            INSERT INTO security_gate_requests SELECT 'b' || i, 'go build', '[]', 'r', 'denied',
+              '2026-10-08T05:00:00Z', '2026-10-08T15:44:0' || i || 'Z', 't', 'repo', 'StayPoint', '/w', '[]', 'board'
+              FROM n;
             INSERT INTO decision_log (subject_kind,subject_id,advisor,model,recommendation,reason,latency_ms,error,created_at) VALUES
               ('security_gate','g3','together','tev1-4b','approved','p=0.91, confidence 0.80',300,'','2026-10-09T02:00:01Z'),
               ('security_gate','g4','together','tev1-4b','','',20,'decision: server 400: prompt 0 has 2431 tokens','2026-10-09T03:00:01Z'),
@@ -481,8 +509,8 @@ def selftest():
             raise AssertionError("read-only DB accepted a write")
         except sqlite3.OperationalError:
             pass
-        gates = load_db_gates(ro)
-        assert [g["id"] for g in gates] == ["g1", "g4"], gates
+        gates, skipped = load_db_gates(ro)
+        assert [g["id"] for g in gates] == ["g1", "g4"] and skipped == 10, (gates, skipped)
         live = load_db_live(ro, "2026-10-09T00:00:00Z")
         assert [d["id"] for d in live] == ["g3", "g4"], live
         assert live[0]["actual"] is None and live[0]["logged"]["p_approve"] == 0.91
@@ -518,7 +546,9 @@ def main():
     if args.db:
         con = open_db()
         if not args.from_jsonl:
-            decisions += load_db_gates(con)
+            gates, skipped = load_db_gates(con)
+            decisions += gates
+            print("skipped %d bulk Board denials (%d+ in one minute)" % (skipped, BULK_MIN))
         live = load_db_live(con, args.since)
         con.close()
         decisions += live
