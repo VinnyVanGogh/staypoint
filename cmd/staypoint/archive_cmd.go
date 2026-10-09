@@ -82,12 +82,89 @@ var archiveStatusCmd = &cobra.Command{
 	},
 }
 
+var archivePaperclipCmd = &cobra.Command{
+	Use:   "paperclip",
+	Short: "One-time export of the frozen Paperclip database (Board only)",
+	Long: `Dump every public table of Paperclip's Postgres (issues, comments, runs,
+decisions, ...) to ~/.staypoint/archive/paperclip/<timestamp>/<table>.jsonl.zst
+with a manifest.json of row counts and checksums, so ~/.paperclip can later
+be cleaned without losing history. Every statement runs in a read-only
+transaction; nothing in Paperclip is changed or deleted. Secrets are redacted.
+Stops before a table if less than 1 GiB of disk is free.
+
+Paperclip's embedded Postgres must be running (start Paperclip). Run with
+--dry-run first to see the tables and their sizes; --exclude skips bulky
+tables you don't need (e.g. raw run logs).`,
+	RunE: runArchivePaperclip,
+}
+
 func init() {
 	rootCmd.AddCommand(archiveCmd)
-	archiveCmd.AddCommand(archiveRunCmd, archiveStatusCmd)
+	archiveCmd.AddCommand(archiveRunCmd, archiveStatusCmd, archivePaperclipCmd)
 	for _, c := range []*cobra.Command{archiveRunCmd, archiveStatusCmd} {
 		c.Flags().Bool("json", false, "Print JSON")
 	}
+	archivePaperclipCmd.Flags().String("dsn", "", "Postgres URL (default PAPERCLIP_DATABASE_URL or "+archive.DefaultPaperclipDSN+")")
+	archivePaperclipCmd.Flags().String("psql", "", "psql binary (default PATH, then ~/.paperclip)")
+	archivePaperclipCmd.Flags().StringSlice("tables", nil, "Only these tables")
+	archivePaperclipCmd.Flags().StringSlice("exclude", nil, "Skip these tables")
+	archivePaperclipCmd.Flags().Bool("dry-run", false, "List tables and sizes; write nothing")
+}
+
+func runArchivePaperclip(cmd *cobra.Command, _ []string) error {
+	if os.Getenv("STAYPOINT_TASK_ID") != "" {
+		return fmt.Errorf("archive paperclip: refused in agent context (STAYPOINT_TASK_ID is set); this is a Board command")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	o := archive.PaperclipOptions{OutDir: archive.DefaultDir(cfg.DataDir)}
+	o.DSN, _ = cmd.Flags().GetString("dsn")
+	if o.DSN == "" {
+		o.DSN = os.Getenv("PAPERCLIP_DATABASE_URL")
+	}
+	if o.DSN == "" {
+		o.DSN = archive.DefaultPaperclipDSN
+	}
+	if o.PSQL, _ = cmd.Flags().GetString("psql"); o.PSQL == "" {
+		if o.PSQL, err = archive.FindPSQL(home); err != nil {
+			return err
+		}
+	}
+	o.Tables, _ = cmd.Flags().GetStringSlice("tables")
+	o.Exclude, _ = cmd.Flags().GetStringSlice("exclude")
+	out := cmd.OutOrStdout()
+	ctx := context.Background()
+
+	if dry, _ := cmd.Flags().GetBool("dry-run"); dry {
+		tables, err := archive.PlanPaperclip(ctx, o)
+		if err != nil {
+			return err
+		}
+		var total int64
+		for _, t := range tables {
+			fmt.Fprintf(out, "  %-40s %10s\n", t.Name, human(t.SourceBytes))
+			total += t.SourceBytes
+		}
+		fmt.Fprintf(out, "%d tables, %s in Postgres (export is compressed JSON, usually far smaller)\n", len(tables), human(total))
+		return nil
+	}
+	m, err := archive.ExportPaperclip(ctx, o)
+	if m != nil {
+		var rows, stored int64
+		for _, t := range m.Tables {
+			fmt.Fprintf(out, "  %-40s %10d rows %10s\n", t.Name, t.Rows, human(t.StoredBytes))
+			rows += t.Rows
+			stored += t.StoredBytes
+		}
+		fmt.Fprintf(out, "%d tables, %d rows, %s stored in %s (complete=%v)\n", len(m.Tables), rows, human(stored), m.Dir, m.Complete)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "Verify the manifest before cleaning ~/.paperclip; this command never deletes it.")
+	return nil
 }
 
 func printArchiveStats(out io.Writer, st *archive.Stats) {
