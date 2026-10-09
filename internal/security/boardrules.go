@@ -346,11 +346,10 @@ func shellCommandArg(args []string) (int, bool) {
 		a := args[i]
 		switch {
 		// Flags that take a value: the value is not the script.
-		// A shell that takes no value there (sh -O -c x) leaves -c a flag.
+		// Their value is always the next word, as bash reads it (sh -O -c x
+		// fails on the option name and runs nothing).
 		case a == "-o" || a == "+o" || a == "-O" || a == "+O" || a == "--rcfile" || a == "--init-file":
-			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && !strings.HasPrefix(args[i+1], "+") {
-				i++
-			}
+			i++
 		case a == "--" || (!strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+")):
 			return 0, false
 		case !strings.HasPrefix(a, "--") && strings.Contains(a, "c") && i+1 < len(args):
