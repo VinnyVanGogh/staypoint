@@ -812,6 +812,11 @@ echo "$@" > /tmp/staypoint-test-claude-args.txt
 	if !strings.Contains(string(data), "/usr/local/bin/staypoint hook pre-tool") {
 		t.Errorf("settings file missing hook command: %s", string(data))
 	}
+	// Without an explicit timeout Claude Code kills the hook at 600s and runs
+	// the held command anyway (task-cae83e7f).
+	if want := fmt.Sprintf(`"timeout":%d`, PreToolHookTimeoutSeconds); !strings.Contains(string(data), want) {
+		t.Errorf("settings file missing %s: %s", want, string(data))
+	}
 
 	// Verify Execute prepends --settings to the CLI args.
 	a := ClaudeAdapter{}

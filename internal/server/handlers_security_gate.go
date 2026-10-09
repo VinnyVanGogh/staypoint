@@ -235,8 +235,13 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 				boardRule = "file edit outside the task worktree (Board rule: edits stay in the worktree)"
 			}
 			facts = security.AnalyzeForTrust(in.Cmdline, gates.TrustContextFor(h.db, in.TaskID, in.CWD, in.Scripts))
-			deferMins = gates.TrustDeferMinutes(h.db)
 		}
+		// Every task's held request gets a deadline, trusted or not: past it
+		// the hook skips the command (never runs it) and the agent moves on;
+		// a later approval wakes the task to perform it. Without one the hook
+		// waited until Claude Code's own hook timeout, which runs the command
+		// (task-cae83e7f).
+		deferMins = gates.TrustDeferMinutes(h.db)
 	}
 
 	tx, err := h.db.Begin()
@@ -303,6 +308,12 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 			if err := governance.LogGateEventTx(tx, gr.ID, gates.DecidedByTrust(trust.ID), event, nil, &pending, payload); err != nil {
 				return nil, err
 			}
+		} else if deferMins > 0 {
+			at := now.Add(time.Duration(deferMins) * time.Minute)
+			if err := security.SetDeferAt(tx, gr.ID, at); err != nil {
+				return nil, err
+			}
+			gr.DeferAt = &at
 		}
 		return out, tx.Commit()
 	}

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/adapter"
 	"github.com/VinnyVanGogh/staypoint/internal/bridge"
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
@@ -634,9 +635,14 @@ func handleHookPreTool() {
 	// worktree has a deadline, kept by the daemon: then it reports "deferred"
 	// and the command is skipped, not run (task-6c1ed91f).
 	// The hook process sits here; Claude Code cannot call the tool while we hold.
+	// The wait is bounded: past the hook's timeout Claude Code would run the
+	// command anyway, so waitGateDecision gives up first and we block.
 	for {
-		status, decidedBy := pollGateRequest(daemonURL, token, gr.ID)
+		status, decidedBy := waitGateDecision(daemonURL, token, gr.ID)
 		switch status {
+		case "expired":
+			preToolBlock(heldPastWaitMessage(gr.ID))
+			return
 		case "approved":
 			allow()
 			return
@@ -783,8 +789,11 @@ func gateFileEdit(tool string, toolInput json.RawMessage, sessionID, cwd, taskID
 		return
 	}
 	for {
-		status, _ := pollGateRequest(daemonURL, token, gr.ID)
+		status, _ := waitGateDecision(daemonURL, token, gr.ID)
 		switch status {
+		case "expired":
+			preToolBlock(heldPastWaitMessage(gr.ID))
+			return
 		case "approved":
 			preToolAllow()
 			return
@@ -895,6 +904,37 @@ func createGateRequest(daemonURL, token string, in gateRequestBody) *gateRequest
 		return nil
 	}
 	return &gr
+}
+
+// gateWaitBudget is how long a held tool call waits for the Board before the
+// hook blocks it itself. It must end before the hook's own timeout
+// (adapter.PreToolHookTimeoutSeconds): a timed-out Claude Code hook does not
+// block, so the command would run unapproved (task-cae83e7f).
+var gateWaitBudget = time.Duration(adapter.PreToolHookTimeoutSeconds-adapter.HookGateWaitMargin) * time.Second
+
+// gateNow is the clock for gateWaitBudget; tests replace it.
+var gateNow = time.Now
+
+// waitGateDecision long-polls the gate request until it is no longer pending
+// or gateWaitBudget runs out, which it reports as "expired". Other statuses
+// are pollGateRequest's.
+func waitGateDecision(daemonURL, token, id string) (status, decidedBy string) {
+	deadline := gateNow().Add(gateWaitBudget)
+	for {
+		if !gateNow().Before(deadline) {
+			return "expired", ""
+		}
+		status, decidedBy = pollGateRequest(daemonURL, token, id)
+		if status != "pending" {
+			return status, decidedBy
+		}
+	}
+}
+
+// heldPastWaitMessage is what the agent is told when the Board did not decide
+// within gateWaitBudget: the command was not run and the request stays open.
+func heldPastWaitMessage(id string) string {
+	return fmt.Sprintf("held: the Board has not decided yet, so this command was blocked and NOT run (gate %s stays pending). Do not retry it or work around it; continue with other work or stop and say what you are waiting on.", id)
 }
 
 // pollGateRequest long-polls the gate request and returns its status —
