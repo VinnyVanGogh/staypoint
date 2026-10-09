@@ -884,9 +884,10 @@ func gitNamesOnly(re *regexp.Regexp, args []string) bool {
 	return false
 }
 
-// gitBoolShort: git grep short flags that take no value, so a cluster of
-// them can end in -O.
-const gitBoolShort = "nilvwchHqzEFPIarW"
+// gitValueShort: git short flags whose value is the rest of the word
+// (grep -e/-f/-A/-B/-C/-m, log -S/-G): an O after one is data. Any other
+// letter may be a valueless flag that a closing -O follows.
+const gitValueShort = "efABCmSG"
 
 // gitRunsProgram reports subcommand options that run a program (grep -O
 // opens a pager through the shell, --ext-diff an external diff) or copy
@@ -910,7 +911,7 @@ func gitRunsProgram(args []string) bool {
 				if r == 'O' {
 					return true
 				}
-				if !strings.ContainsRune(gitBoolShort, r) {
+				if strings.ContainsRune(gitValueShort, r) {
 					break
 				}
 			}
