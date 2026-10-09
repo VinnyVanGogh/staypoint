@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/adapter"
+	"github.com/VinnyVanGogh/staypoint/internal/archive"
 	"github.com/VinnyVanGogh/staypoint/internal/config"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
 	"github.com/VinnyVanGogh/staypoint/internal/decision"
@@ -307,6 +308,16 @@ func runDaemon(ctx context.Context) error {
 	go repoChecker.Run(ctx, 10*time.Minute, func() ([]repoaccess.Target, error) {
 		return repoaccess.RepoTargets(dbStore.DB(), cfg.HarnessRepoRoot)
 	})
+
+	// Copy agent transcripts into the compressed archive before the providers'
+	// cleanup deletes them: once shortly after start, then nightly.
+	if home, herr := os.UserHomeDir(); herr == nil {
+		go archive.RunLoop(ctx, archive.Options{
+			Dir:               archive.DefaultDir(cfg.DataDir),
+			Sources:           archive.DefaultSources(home),
+			ExcludeFromBackup: true,
+		}, 2*time.Minute)
+	}
 
 	// 5. Wire GlobalDispatcher.OnWake to launch harness runs.
 	// HarnessRepoRoot comes from STAYPOINT_REPO_ROOT env or harness_repo_root config key.
