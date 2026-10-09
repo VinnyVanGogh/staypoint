@@ -34,7 +34,7 @@ func TestRaiseForBoardRules(t *testing.T) {
 	} {
 		snap := security.NewSnapshotter()
 		v := (&security.Classifier{CWD: cwd, CWDTrusted: true, Snap: snap}).Classify(cmd)
-		raiseForBoardRules(cmd, cwd, snap, &v)
+		raiseForBoardRules(cmd, cwd, snap, &v, "T1")
 		if v.Tier < security.Red || !strings.Contains(strings.Join(v.Reasons, ";"), "board rule:") {
 			t.Errorf("%q not raised to Red: %+v", cmd, v)
 		}
@@ -43,7 +43,7 @@ func TestRaiseForBoardRules(t *testing.T) {
 		snap := security.NewSnapshotter()
 		v := (&security.Classifier{CWD: cwd, CWDTrusted: true, Snap: snap}).Classify(cmd)
 		before := v.Tier
-		raiseForBoardRules(cmd, cwd, snap, &v)
+		raiseForBoardRules(cmd, cwd, snap, &v, "T1")
 		if v.Tier != before {
 			t.Errorf("%q raised: %+v", cmd, v)
 		}
@@ -55,9 +55,33 @@ func TestRaiseForBoardRules(t *testing.T) {
 	}
 	snap := security.NewSnapshotter()
 	v := (&security.Classifier{CWD: cwd, CWDTrusted: true, Snap: snap}).Classify("bash run.sh")
-	raiseForBoardRules("bash run.sh", cwd, snap, &v)
+	raiseForBoardRules("bash run.sh", cwd, snap, &v, "T1")
 	if v.Tier < security.Red {
 		t.Errorf("script with launchctl not raised: %+v", v)
+	}
+
+	// task-6e2bcd75: a syntax check (bash -n) does not run the script, so its
+	// contents are not judged; running it is (task-800b532d).
+	if err := os.MkdirAll(filepath.Join(cwd, "scripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rd := filepath.Join(cwd, "scripts", "reinstall-daemon.sh")
+	if err := os.WriteFile(rd, []byte("#!/bin/sh\nlaunchctl kickstart -k gui/501/com.staypoint.daemon\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for cmd, raised := range map[string]bool{
+		"bash -n scripts/reinstall-daemon.sh":  false,
+		"zsh -n scripts/reinstall-daemon.sh":   false,
+		"bash scripts/reinstall-daemon.sh":     true,
+		"bash -xn scripts/reinstall-daemon.sh": false,
+		"bash -x scripts/reinstall-daemon.sh":  true,
+	} {
+		snap := security.NewSnapshotter()
+		v := security.Verdict{}
+		raiseForBoardRules(cmd, cwd, snap, &v, "T1")
+		if got := v.Tier == security.Red; got != raised {
+			t.Errorf("%q raised=%v, want %v: %+v", cmd, got, raised, v)
+		}
 	}
 }
 

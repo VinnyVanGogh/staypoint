@@ -584,7 +584,7 @@ func handleHookPreTool() {
 	// the command cannot change) asks the Board for anything that breaks an
 	// unattended-run Board rule, whatever its tier (task-9d94997c).
 	if taskID != "" {
-		raiseForBoardRules(bashInput.Command, cwd, snap, &verdict)
+		raiseForBoardRules(bashInput.Command, cwd, snap, &verdict, taskID)
 	}
 
 	if pinned := pinJudged(bashInput.Command, &verdict); pinned != "" {
@@ -680,13 +680,14 @@ func deferredMessage(id string) string {
 }
 
 // raiseForBoardRules raises v to Red when cmd, or a script it runs, breaks a
-// Board rule. Scripts are read through snap, as on the Red path.
-func raiseForBoardRules(cmd, cwd string, snap *security.Snapshotter, v *security.Verdict) {
+// Board rule. Scripts are read through snap, as on the Red path. taskID is
+// the run's own task, whose handoff files it may read.
+func raiseForBoardRules(cmd, cwd string, snap *security.Snapshotter, v *security.Verdict, taskID string) {
 	var hashes []security.ScriptHash
 	for _, r := range security.ScriptRefs(cmd, cwd, snap, 0) {
 		hashes = append(hashes, security.ScriptHash{Path: r.Path, Content: string(r.Full)})
 	}
-	if why := security.AnalyzeBoardRules(cmd, hashes); why != "" {
+	if why := security.AnalyzeBoardRulesForTask(taskID, cmd, hashes); why != "" {
 		v.Tier = security.Red
 		v.Reasons = append(v.Reasons, "board rule: "+why)
 	}
