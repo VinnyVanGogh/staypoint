@@ -884,10 +884,13 @@ func gitNamesOnly(re *regexp.Regexp, args []string) bool {
 	return false
 }
 
+// gitBoolShort: git grep short flags that take no value, so a cluster of
+// them can end in -O.
+const gitBoolShort = "nilvwchHqzEFPIarW"
+
 // gitRunsProgram reports subcommand options that run a program (grep -O
 // opens a pager through the shell, --ext-diff an external diff) or copy
-// what they show (--output).
-// Every word is checked, past a "--" too: "--" may be an option's value
+// what they show (--output). Every word is checked, past a "--" too: "--" may be an option's value
 // (git grep -e -- -O...).
 func gitRunsProgram(args []string) bool {
 	for _, a := range args {
@@ -900,9 +903,17 @@ func gitRunsProgram(args []string) bool {
 					return true
 				}
 			}
-		case strings.HasPrefix(a, "-") && strings.ContainsRune(a, 'O'):
-			// -O may close a short-flag cluster (-nO<pager>).
-			return true
+		case strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--"):
+			// -O may close a cluster of flags without values (-nO<pager>);
+			// in -S'TODO' the O is the value of -S.
+			for _, r := range a[1:] {
+				if r == 'O' {
+					return true
+				}
+				if !strings.ContainsRune(gitBoolShort, r) {
+					break
+				}
+			}
 		}
 	}
 	return false

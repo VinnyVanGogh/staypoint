@@ -267,6 +267,8 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"grep -nE 'launchctl|claude|gemini|codex|agy|ssh' scripts/ui-e2e.sh",
 		"rg -n 'x|claude|y' internal/",
 		"git commit -m 'route x | gemini fallback'",
+		"git log -S'TODO' scripts/reinstall-daemon.sh",
+		"git log -G'FOO' -- scripts/reinstall-daemon.sh",
 		"cd internal/agy && go test ./...",
 		"CLAUDE_CONFIG_DIR=~/.claude-work go test ./internal/adapter/",
 	}
