@@ -885,6 +885,10 @@ var gitNotGrep = map[string]bool{
 	"update-index": true, "whatchanged": true, "worktree": true,
 }
 
+// gitShortRunValue: short flags whose value git runs, by subcommand.
+var gitShortRunValue = map[string]string{"difftool": "xt", "mergetool": "t", "rebase": "x",
+	"clone": "u", "fetch": "u", "pull": "u", "ls-remote": "u"}
+
 // gitGrepValueShort: git grep short flags whose value is the rest of the
 // word (-e'pat', -A3, -m1); an O after one is data.
 const gitGrepValueShort = "efABCm"
@@ -893,6 +897,10 @@ const gitGrepValueShort = "efABCm"
 // grep's -O, read flag by flag. Any other builtin has no -O pager; an
 // alias or an unknown subcommand may be grep, so any O there holds.
 func gitShortRunsPager(sub, cluster string) bool {
+	// difftool/mergetool/rebase -x, clone/fetch/pull -u run their value.
+	if prog := gitShortRunValue[sub]; prog != "" && strings.ContainsAny(cluster, prog) {
+		return true
+	}
 	if gitNotGrep[sub] {
 		return false
 	}
@@ -918,7 +926,7 @@ var (
 	gitGlobalFlag = map[string]bool{"-p": true, "--paginate": true, "-P": true, "--no-pager": true, "--bare": true,
 		"--no-replace-objects": true, "--literal-pathspecs": true, "--glob-pathspecs": true,
 		"--noglob-pathspecs": true, "--icase-pathspecs": true, "--no-optional-locks": true,
-		"--no-lazy-fetch": true, "--no-advice": true, "--exec-path": true}
+		"--no-lazy-fetch": true, "--no-advice": true}
 )
 
 // gitSub splits git's arguments into the subcommand and its arguments. An
@@ -951,7 +959,7 @@ func gitRunsProgram(sub string, args []string) bool {
 		case strings.HasPrefix(a, "--") && len(a) > 2:
 			// git takes any unambiguous prefix: --open, --out, --ext.
 			name, _, _ := strings.Cut(a[2:], "=")
-			for _, o := range []string{"open-files-in-pager", "output", "ext-diff"} {
+			for _, o := range []string{"open-files-in-pager", "output", "ext-diff", "extcmd", "tool", "exec", "upload-pack", "receive-pack"} {
 				if name != "" && strings.HasPrefix(o, name) || strings.HasPrefix(name, o) {
 					return true
 				}
