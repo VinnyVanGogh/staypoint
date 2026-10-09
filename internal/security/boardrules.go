@@ -683,12 +683,13 @@ func anyTrue(bs []bool) bool {
 	return false
 }
 
-// killPatternsSelf reads pkill/killall arguments: the values of -u, -t and
-// similar are skipped, -F (a pidfile) holds.
+// killPatternsSelf reads pkill/killall arguments. Every word that is not
+// an option is tried as a pattern, option values (-u user) included: a
+// signal such as -TERM or -HUP looks like an option taking one, so
+// skipping values would skip the pattern. -F (a pidfile) holds.
 func killPatternsSelf(args []string) bool {
 	names := selfProcNames()
-	for i := 0; i < len(args); i++ {
-		a := args[i]
+	for _, a := range args {
 		switch {
 		case strings.HasPrefix(a, "--"):
 			if strings.HasPrefix(a, "--pidfile") {
@@ -698,9 +699,6 @@ func killPatternsSelf(args []string) bool {
 		case len(a) > 1 && a[0] == '-':
 			if strings.ContainsRune(a, 'F') {
 				return true
-			}
-			if strings.ContainsRune("gGJMNPstuU", rune(a[len(a)-1])) {
-				i++
 			}
 			continue
 		}
@@ -722,11 +720,16 @@ var daemonRe = regexp.MustCompile(`(?i)staypointd`)
 // daemonProgRe: a program named like the daemon (staypointd, staypointd-x).
 var daemonProgRe = regexp.MustCompile(`(?i)^staypointd`)
 
+// isDaemonName reports a path whose name is the daemon's (staypointd*).
+func isDaemonName(p string) bool { return daemonProgRe.MatchString(path.Base(p)) }
+
 // runsDaemon reports a line that may start a StayPoint daemon, which takes
 // over the live one's socket and DB: a program named staypointd*, go run
-// of it, a binary this line builds from it (go build -o /tmp/d
-// ./cmd/staypointd && /tmp/d) or copies from one, or such a name handed to
-// find -exec, xargs or watch. Building or naming it does not hold.
+// of it, or such a name handed to find -exec, xargs or watch. A daemon
+// built or copied under another name could run in a later command, so
+// go build of it with -o to a name that is not staypointd* holds, and so
+// does cp, mv or ln of one to such a name. Building it as staypointd* or
+// naming it does not hold.
 func runsDaemon(code string, depth int) bool {
 	if !daemonRe.MatchString(code) {
 		return false
@@ -743,37 +746,6 @@ func runsDaemon(code string, depth int) bool {
 			return true
 		}
 	}
-	built := map[string]bool{}
-	isDaemon := func(p string) bool {
-		return daemonProgRe.MatchString(path.Base(p)) || built[p] || built[path.Base(p)]
-	}
-	for _, s := range segs {
-		argv, _ := unwrapArgv(s.argv)
-		if len(argv) < 2 {
-			continue
-		}
-		switch name := baseCmd(argv); name {
-		case "go":
-			if argv[1] != "build" || !anyNames(daemonRe, argv[2:]) {
-				continue
-			}
-			for i, a := range argv {
-				f := strings.TrimLeft(a, "-")
-				if f == "o" && a != f && i+1 < len(argv) {
-					built[argv[i+1]], built[path.Base(argv[i+1])] = true, true
-				} else if v, ok := strings.CutPrefix(f, "o="); ok && a != f {
-					built[v], built[path.Base(v)] = true, true
-				}
-			}
-		case "cp", "mv", "ln", "install", "ditto", "rsync":
-			dst := argv[len(argv)-1]
-			for _, a := range argv[1 : len(argv)-1] {
-				if isDaemon(a) {
-					built[dst], built[path.Base(dst)] = true, true
-				}
-			}
-		}
-	}
 	for _, s := range segs {
 		argv, viaXargs := unwrapArgv(s.argv)
 		if len(argv) == 0 {
@@ -782,27 +754,35 @@ func runsDaemon(code string, depth int) bool {
 		name := baseCmd(argv)
 		runner := viaXargs || name == "watch"
 		switch {
-		// "$D" may be the daemon built on this line.
-		case isDaemon(argv[0]) || len(built) > 0 && s.dyn[len(s.argv)-len(argv)]:
+		case isDaemonName(argv[0]):
 			return true
 		case name == "go" && len(argv) > 1 && argv[1] == "run" && anyNames(daemonRe, argv[2:]):
 			return true
-		case shells[name]:
-			if ci, ok := shellCommandArg(name, argv[1:]); ok {
-				if runsDaemon(argv[1+ci], depth+1) {
+		case name == "go" && len(argv) > 1 && argv[1] == "build" && anyNames(daemonRe, argv[2:]):
+			if goBuildRenames(argv[2:], s.dyn[len(s.argv)-len(argv)+2:]) {
+				return true
+			}
+			continue
+		case name == "cp" || name == "mv" || name == "ln" || name == "install" || name == "ditto" || name == "rsync":
+			dst := argv[len(argv)-1]
+			if strings.HasSuffix(dst, "/") || isDaemonName(dst) {
+				continue
+			}
+			for _, a := range argv[1 : len(argv)-1] {
+				if isDaemonName(a) {
 					return true
 				}
-				for _, w := range strings.Fields(argv[1+ci]) {
-					if built[w] {
-						return true
-					}
-				}
+			}
+		case shells[name]:
+			if ci, ok := shellCommandArg(name, argv[1:]); ok && runsDaemon(argv[1+ci], depth+1) {
+				return true
 			}
 			for _, r := range s.redirects {
 				if r.heredoc && runsDaemon(r.body, depth+1) {
 					return true
 				}
 			}
+			continue
 		case name == "find":
 			for _, a := range argv[1:] {
 				runner = runner || a == "-exec" || a == "-execdir" || a == "-ok" || a == "-okdir"
@@ -810,10 +790,49 @@ func runsDaemon(code string, depth int) bool {
 		}
 		if runner {
 			for _, a := range argv[1:] {
-				if isDaemon(a) {
+				if isDaemonName(a) {
 					return true
 				}
 			}
+			continue
+		}
+		// Code handed to another interpreter (python3 -c
+		// "subprocess.run(['/tmp/staypointd'])"): read it as shell, and
+		// hold where it does not parse.
+		if dataArgs(argv) {
+			continue
+		}
+		for _, a := range argv[1:] {
+			if daemonRe.MatchString(a) && strings.ContainsAny(a, " \t\n;()[]'\"") && runsDaemon(a, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// goBuildRenames reports go build -o to a name that is not staypointd*,
+// or to one that expands ("$D"). A directory (trailing /) keeps the name.
+func goBuildRenames(args []string, dyn []bool) bool {
+	for i, a := range args {
+		f := strings.TrimLeft(a, "-")
+		out, ok := "", false
+		switch {
+		case a == f:
+			continue
+		case f == "o" && i+1 < len(args):
+			out, ok = args[i+1], true
+			if dyn[i+1] {
+				return true
+			}
+		case strings.HasPrefix(f, "o="):
+			out, ok = f[2:], true
+			if dyn[i] {
+				return true
+			}
+		}
+		if ok && !strings.HasSuffix(out, "/") && !isDaemonName(out) {
+			return true
 		}
 	}
 	return false
