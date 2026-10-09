@@ -720,6 +720,8 @@ var daemonRe = regexp.MustCompile(`(?i)staypointd`)
 // daemonProgRe: a program named like the daemon (staypointd, staypointd-x).
 var daemonProgRe = regexp.MustCompile(`(?i)^staypointd`)
 
+var goEnvRe = regexp.MustCompile(`GOFLAGS|GOENV|\bgo\s+env\s+-w\b`)
+
 // isDaemonName reports a path whose name is the daemon's (staypointd*).
 func isDaemonName(p string) bool { return daemonProgRe.MatchString(path.Base(p)) }
 
@@ -746,11 +748,20 @@ func runsDaemon(code string, depth int) bool {
 			return true
 		}
 	}
-	// A cd into the daemon's directory makes go build . build it.
+	// A cd (or env -C) into the daemon's directory, or one that expands or
+	// globs, makes go build . build it.
 	cdDaemon := false
 	for _, s := range segs {
-		if argv, _ := unwrapArgv(s.argv); len(argv) > 1 && (argv[0] == "cd" || argv[0] == "pushd") && anyNames(daemonRe, argv[1:]) {
-			cdDaemon = true
+		for i, a := range s.argv {
+			if a != "cd" && a != "pushd" && a != "-C" && a != "--chdir" && !strings.HasPrefix(a, "--chdir=") {
+				continue
+			}
+			if strings.HasPrefix(a, "--chdir=") {
+				i--
+			}
+			if i+1 < len(s.argv) && (daemonRe.MatchString(s.argv[i+1]) || s.dyn[i+1] || strings.ContainsAny(s.argv[i+1], "*?[{")) {
+				cdDaemon = true
+			}
 		}
 	}
 	for _, s := range segs {
@@ -764,26 +775,32 @@ func runsDaemon(code string, depth int) bool {
 		case isDaemonName(argv[0]):
 			return true
 		case name == "go":
-			// go -C dir build: the one flag before the subcommand.
+			// go -C dir build: -C (or --C) is the one flag before the
+			// subcommand; any other flag there holds.
 			i, inDaemon := 1, cdDaemon
-			for i < len(argv) && strings.HasPrefix(argv[i], "-C") {
-				v := strings.TrimPrefix(strings.TrimPrefix(argv[i], "-C"), "=")
-				if v == "" && i+1 < len(argv) {
-					i++
-					v = argv[i]
+			for i < len(argv) && strings.HasPrefix(argv[i], "-") {
+				f := strings.TrimPrefix(strings.TrimPrefix(argv[i], "-"), "-")
+				if f != "C" && !strings.HasPrefix(f, "C=") {
+					return true
 				}
-				inDaemon = inDaemon || daemonRe.MatchString(v)
+				dyn, v := s.dyn[len(s.argv)-len(argv)+i], strings.TrimPrefix(f[1:], "=")
+				if f == "C" && i+1 < len(argv) {
+					i++
+					dyn, v = s.dyn[len(s.argv)-len(argv)+i], argv[i]
+				}
+				inDaemon = inDaemon || dyn || daemonRe.MatchString(v) || strings.ContainsAny(v, "*?[{")
 				i++
 			}
 			if i >= len(argv) || (argv[i] != "run" && argv[i] != "build") {
 				continue
 			}
 			rest := argv[i+1:]
-			if !inDaemon && !anyNames(daemonRe, rest) {
+			if !anyNames(daemonRe, rest) && !(inDaemon && goBuildsCwd(rest, s.dyn[len(s.argv)-len(rest):])) {
 				continue
 			}
-			// GOFLAGS may carry -o; the env is not read.
-			if argv[i] == "run" || strings.Contains(code, "GOFLAGS") || goBuildRenames(rest, s.dyn[len(s.argv)-len(rest):]) {
+			// GOFLAGS (set here, or by go env -w or a GOENV file) may carry
+			// -o; the env is not read.
+			if argv[i] == "run" || goEnvRe.MatchString(code) || goBuildRenames(rest, s.dyn[len(s.argv)-len(rest):]) {
 				return true
 			}
 			continue
@@ -833,6 +850,23 @@ func runsDaemon(code string, depth int) bool {
 		}
 	}
 	return false
+}
+
+// goBuildsCwd reports go build or run arguments whose package may be the
+// current directory: none, ".", or one that expands or globs. A word after
+// a flag without "=" is taken as its value, so a package after a boolean
+// flag reads as none (fail closed).
+func goBuildsCwd(args []string, dyn []bool) bool {
+	for i, a := range args {
+		switch {
+		case strings.HasPrefix(a, "-"), i > 0 && strings.HasPrefix(args[i-1], "-") && !strings.Contains(args[i-1], "="):
+		case dyn[i] || strings.ContainsAny(a, "*?[{"):
+			return true
+		case a != "." && a != "./":
+			return false
+		}
+	}
+	return true
 }
 
 // goBuildRenames reports go build -o to a name that is not staypointd*,
