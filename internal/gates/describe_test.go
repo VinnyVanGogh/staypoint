@@ -19,8 +19,8 @@ func TestDescribeRequestBoundsLargeScripts(t *testing.T) {
 		{Path: "/r/also.sh", SHA256: strings.Repeat("cd", 32), Content: big},
 	}
 	d := DescribeRequest(gr, scripts)
-	if len(d) > DescribeLimit {
-		t.Fatalf("description is %d bytes, want <= %d", len(d), DescribeLimit)
+	if cost(d) > DescribeLimit {
+		t.Fatalf("description costs %d, want <= %d", cost(d), DescribeLimit)
 	}
 	for _, want := range []string{"Script /r/big.sh (sha256 abababababab)", "Script /r/also.sh (sha256 cdcdcdcdcdcd)", "HEAD-MARK", "TAIL-MARK", "bash big.sh", "…(truncated)…"} {
 		if !strings.Contains(d, want) {
@@ -38,8 +38,38 @@ func TestDescribeRequestManyScriptsStayBounded(t *testing.T) {
 		scripts = append(scripts, security.ScriptRef{Path: "/r/" + strings.Repeat("p", 60) + ".sh", SHA256: "ff", Content: strings.Repeat("ü", 3000)})
 	}
 	d := DescribeRequest(&security.GateRequest{Cmdline: "bash x.sh"}, scripts)
-	if len(d) > DescribeLimit || !utf8.ValidString(d) {
-		t.Fatalf("len %d valid %v", len(d), utf8.ValidString(d))
+	if cost(d) > DescribeLimit || !utf8.ValidString(d) {
+		t.Fatalf("cost %d valid %v", cost(d), utf8.ValidString(d))
+	}
+}
+
+// A byte cap let these through: 3500 B of base64 measured 2,738 tev1
+// tokens and 2 KB of CJK 3,827, both over the 2048 limit.
+func TestDescribeRequestBoundsDenseContent(t *testing.T) {
+	b64 := strings.Repeat("q83v3+/x8vP09fb3+Pn6+/z9/v8AAQIDBAUGBwgJCgsMDQ4P", 1000)
+	for name, s := range map[string]string{
+		"base64": b64,
+		"cjk":    strings.Repeat("删除所有文件 ", 2000),
+		"emoji":  strings.Repeat("🔥", 5000),
+		"quotes": strings.Repeat(`"\`, 5000),
+		"ctrl":   strings.Repeat("\x01\x1b", 5000),
+	} {
+		d := DescribeRequest(&security.GateRequest{Cmdline: "echo " + s, Reasons: []string{"r"}},
+			[]security.ScriptRef{{Path: "/a.sh", SHA256: "aa", Content: s}, {Path: "/b.sh", SHA256: "bb", Content: s}})
+		if c := cost(d); c > DescribeLimit || !utf8.ValidString(d) {
+			t.Errorf("%s: cost %d (limit %d), valid %v", name, c, DescribeLimit, utf8.ValidString(d))
+		}
+		if !strings.Contains(d, "Script /b.sh (sha256 bb):") {
+			t.Errorf("%s: second script header dropped:\n%s", name, d)
+		}
+	}
+}
+
+func TestCostIsWorstCase(t *testing.T) {
+	for s, want := range map[string]int{"ab": 2, "\n": 2, `"`: 2, "\x00": 6, "é": 6, "删": 6, "🔥": 12} {
+		if got := cost(s); got != want {
+			t.Errorf("cost(%q) = %d, want %d", s, got, want)
+		}
 	}
 }
 
@@ -103,8 +133,8 @@ func TestHeadTail(t *testing.T) {
 	s := strings.Repeat("✓", 100)
 	for _, n := range []int{-5, 0, 3, 17, 18, 40, 299} {
 		got := headTail(s, n)
-		if len(got) > max(n, 0) || !utf8.ValidString(got) {
-			t.Errorf("headTail(n=%d) = %q (%d bytes)", n, got, len(got))
+		if cost(got) > max(n, 0) || !utf8.ValidString(got) {
+			t.Errorf("headTail(n=%d) = %q (cost %d)", n, got, cost(got))
 		}
 	}
 }

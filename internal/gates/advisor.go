@@ -198,13 +198,15 @@ func (t TogetherAdvisor) Advise(ctx context.Context, gr *security.GateRequest, s
 	return a, nil
 }
 
-// DescribeLimit caps DescribeRequest in bytes. tev1's /v1/systemone rejects
-// prompts over 2048 tokens; code runs ~2.6 bytes/token there plus ~180
-// tokens of question and template, so 3500 bytes stays under ~1,800.
-const DescribeLimit = 3500
+// DescribeLimit caps DescribeRequest in worst-case tokens (see cost).
+// tev1's /v1/systemone rejects prompts over 2048 tokens and adds ~120 of
+// question and template, so 1600 stays under ~1,750 whatever the content.
+// A byte cap does not: 3500 B of base64 measured 2,738 tokens and 2 KB of
+// CJK 3,827.
+const DescribeLimit = 1600
 
 // describeCmdLimit caps the command; scripts share what is left.
-const describeCmdLimit = 2000
+const describeCmdLimit = 900
 
 // DescribeRequest is the context an advisor sees: command, reasons,
 // task/repo/org and the scripts it runs, head+tail cut to DescribeLimit.
@@ -233,32 +235,73 @@ func DescribeRequest(gr *security.GateRequest, scripts []security.ScriptRef) str
 			fmt.Fprintf(&b, "\nScript %s (sha256 %.12s): binary, not shown\n", s.Path, s.SHA256)
 		default:
 			head := fmt.Sprintf("\nScript %s (sha256 %.12s):\n", s.Path, s.SHA256)
-			share := (DescribeLimit - b.Len()) / (len(scripts) - i)
-			fmt.Fprintf(&b, "%s%s\n", head, headTail(printable(s.Content), share-len(head)-1))
+			share := (DescribeLimit - cost(b.String())) / (len(scripts) - i)
+			fmt.Fprintf(&b, "%s%s\n", head, headTail(printable(s.Content), share-cost(head)-cost("\n")))
 		}
 	}
 	return headTail(printable(b.String()), DescribeLimit)
 }
 
-// headTail keeps the first and last parts of s within n bytes, marking the
+// runeCost bounds the tokens r can take in tev1's prompt. Byte-level BPE
+// never spends more than one token per ASCII byte; anything the prompt
+// JSON-escapes can cost a token per escaped char (\" is 2, é is 6, a
+// surrogate pair 12). CJK measured ~5.3 tokens a rune.
+func runeCost(r rune) int {
+	switch {
+	case r == '"' || r == '\\' || r == '\n' || r == '\t' || r == '\r':
+		return 2
+	case r < 0x20 || r == 0x7f:
+		return 6
+	case r < 0x80:
+		return 1
+	case r > 0xffff:
+		return 12
+	default:
+		return 6
+	}
+}
+
+// cost is the worst-case token count of s (see runeCost).
+func cost(s string) int {
+	n := 0
+	for _, r := range s {
+		n += runeCost(r)
+	}
+	return n
+}
+
+// headTail keeps the first and last parts of s within cost n, marking the
 // cut, on rune boundaries.
 func headTail(s string, n int) string {
-	if len(s) <= n {
+	if cost(s) <= n {
 		return s
 	}
 	const mark = "\n…(truncated)…\n"
-	keep := n - len(mark)
+	keep := n - cost(mark)
 	if keep < 2 {
-		return strings.ToValidUTF8(s[:max(n, 0)], "")
+		return prefix(s, max(n, 0))
 	}
-	h, t := keep/2, len(s)-(keep-keep/2)
-	for h > 0 && !utf8.RuneStart(s[h]) {
-		h--
+	h := prefix(s, keep/2)
+	tailBudget, t := keep-cost(h), len(s)
+	for t > len(h) {
+		r, size := utf8.DecodeLastRuneInString(s[:t])
+		if runeCost(r) > tailBudget {
+			break
+		}
+		tailBudget -= runeCost(r)
+		t -= size
 	}
-	for t < len(s) && !utf8.RuneStart(s[t]) {
-		t++
+	return h + mark + s[t:]
+}
+
+// prefix is the longest prefix of s within cost n.
+func prefix(s string, n int) string {
+	for i, r := range s {
+		if n -= runeCost(r); n < 0 {
+			return s[:i]
+		}
 	}
-	return s[:h] + mark + s[t:]
+	return s
 }
 
 // looksBinary mirrors bash's own check (check_binary_file): a NUL in the
