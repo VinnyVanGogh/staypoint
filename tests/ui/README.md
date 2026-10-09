@@ -51,13 +51,14 @@ the live Paperclip API are never touched.
 | `01-task-list` | List loads with a seeded task; live update over SSE; New Task form |
 | `02-task-page` | Full page `/tasks/:org/:project/:id` renders; deep link survives reload; list row opens the task |
 | `03-comments` | Comment typed in the UI shows in the thread, is stored, survives reload |
-| `04-run-now-timeline` | Run Now moves the task to `in_progress` (the UI's only status control); timeline shows steps recorded by the real `StepRecorder` |
+| `04-run-now-timeline` | Run Now moves the task to `in_progress`; timeline shows steps recorded by the real `StepRecorder` |
 | `05-interactions` | Accept, Reject, and answering a question by picking an option (STA-350) |
 | `06-checklist` | Checklist items and the DoD commit-hash gate banner |
 | `07-errors` | Unknown task id shows an error; unknown route is a 404; daemon going down shows an error |
 | `15-task-page-layout` | Task page matches the STA-289 mock (STA-638): one screen at 1512×900, sticky header actions, stats strip, pinned composer, tabbed right panel, grouped timeline, modals for long content, 800px stacking. One test per step, each `knownBug('STA-638-<step>')` until that step lands. Saves `task-page-1512x900.png` to the artifacts dir for the side-by-side check. STA-679 test: a long agent summary on the Review tab is an overflow-hidden preview with a `::after` gradient fade, bounded height, and stays above the applied-migration banner, at 1512×900 and 800×900; saves `task-page-review-long-summary.png` (and `-800x900.png`) |
 | `16-ship-review-live` | Ship review card on a `live_credentials` project (STA-727): exact red LIVE banner above Preview, Start dev server marked LIVE, inline confirm with the full warning before Start/Restart, Cancel sends nothing, confirm sends start-dev with the passkey headers and `confirm_live`; non-live Restart unchanged. Route-faked card; server gate covered by `handlers_ship_review_live_test.go` |
 | `20-passkey-enroll` | Board passkey enrollment without a real action (STA-694): `boardSessionPage` (Board session, virtual authenticator, zero passkeys) shows the "No passkey enrolled" banner; enrolling from the banner or Settings → Security hides it and lists the passkey; Delete goes through the passkey gate and brings the banner back; enrolling mid-action asks "Continue with <action>?" and then performs it. A page without a Board session shows no banner. Both Enroll buttons surface STA-696's "Couldn't show the pairing code: …" and never prompt for a code; enrolling still works when passkeys were removed without the page seeing an SSE event |
+| `23-task-stage` | "Move to…" stage control (task-40f0a2f0): the Board moves an agent-created backlog task to In review while the agent token gets 403 `board_session_required`; a refused move (no repo) shows the server message and keeps the stage; a page without a Board session is refused; Trust on a backlog task is "Move to todo and trust" under one Touch ID, with no dead-end alert |
 
 The throwaway daemon has no agent runner, so Run Now cannot start a real run.
 `stepsim` stands in for one: it drives `orchestrator.StepRecorder` against the

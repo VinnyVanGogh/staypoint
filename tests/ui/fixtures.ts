@@ -62,6 +62,22 @@ export class StayPointAPI {
     return { ...created, organization: body.organization, project: body.project };
   }
 
+  /** Creates a task the way an agent does (token only): backlog, origin agent. */
+  async createAgentTask(label: string, extra: Record<string, unknown> = {}): Promise<Task> {
+    const name = `${label} ${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const body = { name, organization: 'STA', project: 'ui-e2e', ...extra };
+    const created = await this.json<Task>('POST', '/api/tasks', body, false);
+    return { ...created, organization: body.organization, project: body.project };
+  }
+
+  /** POSTs /stage with the agent token only; returns the raw status and body. */
+  async setStageAsAgent(id: string, stage: string): Promise<{ status: number; body: { error?: string } }> {
+    const res = await this.request.fetch(`/api/tasks/${encodeURIComponent(id)}/stage`, {
+      method: 'POST', headers: this.headers(false), data: { stage },
+    });
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
+  }
+
   async getTask(id: string): Promise<Task> {
     const r = await this.json<{ task: Task }>('GET', `/api/tasks/${encodeURIComponent(id)}`);
     return r.task;

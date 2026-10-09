@@ -414,29 +414,35 @@ async function boardActionError(r) {
   return new Error(boardActionErrorText(r, body));
 }
 
-// postRunNow is the Run Now request: POST stage in_progress, retried with
-// Touch ID when the server asks for it (a prod-targeting agent task leaving
-// backlog). Returns null when the Board cancelled the passkey prompt, else
-// the Response; throws the server's error when it refused.
-async function postRunNow(taskId) {
+// postStage moves a task to stage as the Board: POST /stage with the Board
+// session cookie, retried with Touch ID when the server asks for it (a
+// prod-targeting agent task leaving backlog). Returns null when the Board
+// cancelled the passkey prompt, else the Response; throws the server's error
+// when it refused.
+async function postStage(taskId, stage, actionLabel) {
   const send = (sessionToken, assertion) => {
     const headers = { 'Content-Type': 'application/json', ...authHeader() };
     if (sessionToken) headers['X-WebAuthn-Session'] = sessionToken;
     if (assertion) headers['X-WebAuthn-Assertion'] = assertion;
     return fetch(`/api/tasks/${encodeURIComponent(taskId)}/stage`, {
-      method: 'POST', headers, body: JSON.stringify({ stage: 'in_progress' }),
+      method: 'POST', headers, body: JSON.stringify({ stage }),
     });
   };
   let res = await send('', '');
   if (res.status === 403) {
     const err = await res.clone().json().catch(() => ({}));
     if (err.error === 'board_passkey_assertion_required') {
-      res = await withBoardWebAuthn(send, 'running this prod-targeting task');
+      res = await withBoardWebAuthn(send, actionLabel);
       if (res === null) return null;
     }
   }
   if (!res.ok) throw await boardActionError(res);
   return res;
+}
+
+// postRunNow is the Run Now request: postStage to in_progress.
+function postRunNow(taskId) {
+  return postStage(taskId, 'in_progress', 'running this prod-targeting task');
 }
 
 // Close any open .report-dl-menu when clicking outside its wrapper.
@@ -11047,7 +11053,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
 
   // "Trust this task until…" (task-6c1ed91f): banner, auto-approvals, create.
   if (task.id && !isFleetTaskId(task.id)) {
-    renderTaskTrust(main, task.id);
+    renderTaskTrust(main, task.id, reopen);
   }
 
   // Decision cards (pending ask_user_questions / request_confirmation /
@@ -11319,21 +11325,21 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   // Board gate (passkey) with {board: true}, so no work product is needed; an
   // active run is stopped first.
   const closeActions = taskCloseActions(task);
+  const stopRunFirst = async () => {
+    if (!taskRunActive(task)) return;
+    const r = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/run-control`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeader() },
+      body: JSON.stringify({ action: 'stop' }),
+    });
+    if (!r.ok) throw await boardActionError(r);
+  };
   if (closeActions.markDone && !isFleetTaskId(task.id)) {
     const doneError = el('div', 'mark-done-error');
     doneError.style.display = 'none';
     const showCloseError = (msg) => {
       doneError.textContent = msg;
       doneError.style.display = 'block';
-    };
-    const stopRunFirst = async () => {
-      if (!taskRunActive(task)) return;
-      const r = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/run-control`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeader() },
-        body: JSON.stringify({ action: 'stop' }),
-      });
-      if (!r.ok) throw await boardActionError(r);
     };
 
     const doneBtn = el('button', 'mark-done-btn', '✓ Mark done');
@@ -11393,6 +11399,64 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
     headerActions.prepend(cancelBtn);
     headerActions.prepend(doneBtn);
     actionTray.appendChild(doneError);
+  }
+
+  // ── Move to… (task-40f0a2f0) ──
+  // The Board sets the stage. Agent-created tasks leave backlog only this
+  // way; the server decides, and a refusal shows its message here.
+  const stageOptions = isFleetTaskId(task.id) ? [] : stageMenuOptions(task, { canRun: runNowOffered(task, shipCard) });
+  if (stageOptions.length) {
+    const stageError = el('div', 'task-stage-error');
+    stageError.style.display = 'none';
+    const select = el('select', 'select-filter task-stage-select');
+    select.title = 'Move this task to another stage (Board)';
+    select.setAttribute('aria-label', 'Move to stage');
+    const placeholder = el('option', '', 'Move to…');
+    placeholder.value = '';
+    select.appendChild(placeholder);
+    for (const o of stageOptions) {
+      const opt = el('option', '', o.label);
+      opt.value = o.stage;
+      select.appendChild(opt);
+    }
+    const moveTo = async (o) => {
+      if (o.via === 'done') { headerActions.querySelector('.mark-done-btn')?.click(); return false; }
+      if (o.via === 'run') return (await postRunNow(task.id)) !== null;
+      const confirmText = stageChangeConfirmText(task, o.stage);
+      if (confirmText && !confirm(confirmText)) return false;
+      if (o.via === 'block') {
+        const reason = prompt('Why is this task blocked?', '');
+        if (reason === null) return false;
+        if (!reason.trim()) throw new Error('A blocked task needs a reason.');
+        await stopRunFirst();
+        const r = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/block`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...authHeader() },
+          body: JSON.stringify({ reason: reason.trim() }),
+        });
+        if (!r.ok) throw await boardActionError(r);
+        return true;
+      }
+      await stopRunFirst();
+      return (await postStage(task.id, o.stage, `moving this task to ${o.label}`)) !== null;
+    };
+    select.addEventListener('change', async () => {
+      const o = stageOptions.find(x => x.stage === select.value);
+      if (!o) return;
+      select.disabled = true;
+      stageError.style.display = 'none';
+      try {
+        if (await moveTo(o)) { setTimeout(reopen, 300); return; }
+      } catch (err) {
+        stageError.textContent = `Move to ${o.label.replace(/…$/, '')} failed: ${err.message || err}`;
+        stageError.style.display = 'block';
+        console.error('stage change failed:', err);
+      }
+      select.value = '';
+      select.disabled = false;
+    });
+    headerActions.appendChild(select);
+    actionTray.appendChild(stageError);
   }
 
   tabPanels.review.appendChild(meta);
