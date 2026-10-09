@@ -1,6 +1,7 @@
 package security
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -289,4 +290,45 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 			t.Errorf("script %q not held for self-protection: %q", body, why)
 		}
 	}
+}
+
+// TestBoardRulesReplay re-judges held commands exported from the live gate
+// table, which a task run may not read itself. The Board exports them with
+//
+//	sqlite3 -json ~/.staypoint/staypoint.db \
+//	  "select task_id, cmdline from security_gate_requests where task_id='task-800b532d'" > /tmp/replay.json
+//
+// and runs SP_BOARDRULES_REPLAY=/tmp/replay.json go test ./internal/security/ -run Replay -v.
+// Every line still held is listed; the test fails if any is held for
+// self-protection.
+func TestBoardRulesReplay(t *testing.T) {
+	path := os.Getenv("SP_BOARDRULES_REPLAY")
+	if path == "" {
+		t.Skip("SP_BOARDRULES_REPLAY not set")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []struct {
+		TaskID  string `json:"task_id"`
+		Cmdline string `json:"cmdline"`
+	}
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatal(err)
+	}
+	held := 0
+	for _, r := range rows {
+		why := AnalyzeBoardRulesForTask(r.TaskID, r.Cmdline, nil)
+		if why == "" {
+			continue
+		}
+		held++
+		if strings.Contains(why, "self-protection") {
+			t.Errorf("held: %q: %s", r.Cmdline, why)
+		} else {
+			t.Logf("held (other rule): %q: %s", r.Cmdline, why)
+		}
+	}
+	t.Logf("%d of %d rows still held", held, len(rows))
 }
