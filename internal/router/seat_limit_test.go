@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+// clearSeatLimits forgets every recorded seat limit: no limit outlives
+// seatLimitMaxWait, so applying them past it drops them all.
+func clearSeatLimits() {
+	ApplySeatLimits(&PacerState{}, time.Now().Add(seatLimitMaxWait+time.Hour))
+}
+
 func TestIsSeatLimitMessage(t *testing.T) {
 	cases := []struct {
 		text string
@@ -54,7 +60,7 @@ func TestSeatLimitResetAt(t *testing.T) {
 }
 
 func TestApplySeatLimits_LocksUntilResetThenClears(t *testing.T) {
-	t.Cleanup(ResetSeatLimits)
+	t.Cleanup(clearSeatLimits)
 	now := time.Now()
 	NoteSeatLimit(PoolWorkClaude, now.Add(time.Hour), "You've hit your session limit · resets 4:20am")
 
@@ -78,7 +84,7 @@ func TestApplySeatLimits_LocksUntilResetThenClears(t *testing.T) {
 // Both seats out: a work-repo coding route is all-locked (the run queue
 // waits), and Gemini is never offered in its place.
 func TestSeatLimits_BothSeatsOutRouteWaitsNoGemini(t *testing.T) {
-	t.Cleanup(ResetSeatLimits)
+	t.Cleanup(clearSeatLimits)
 	now := time.Now()
 	NoteSeatLimit(PoolWorkClaude, now.Add(time.Hour), "session limit")
 	NoteSeatLimit(PoolPersonalClaude, now.Add(time.Hour), "session limit")
@@ -95,7 +101,7 @@ func TestSeatLimits_BothSeatsOutRouteWaitsNoGemini(t *testing.T) {
 
 // Work seat out: the route runs on the personal seat.
 func TestSeatLimits_WorkOutRouteRunsPersonal(t *testing.T) {
-	t.Cleanup(ResetSeatLimits)
+	t.Cleanup(clearSeatLimits)
 	now := time.Now()
 	NoteSeatLimit(PoolWorkClaude, now.Add(time.Hour), "You've hit your session limit")
 	state := &PacerState{Pools: map[PoolID]*QuotaPool{}}

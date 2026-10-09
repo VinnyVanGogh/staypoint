@@ -43,13 +43,6 @@ func NoteSeatLimit(pool PoolID, until time.Time, reason string) {
 	seatLimits[pool] = seatLimit{until: until, reason: reason}
 }
 
-// ResetSeatLimits forgets every recorded seat limit (tests).
-func ResetSeatLimits() {
-	seatLimitsMu.Lock()
-	defer seatLimitsMu.Unlock()
-	seatLimits = map[PoolID]seatLimit{}
-}
-
 // ApplySeatLimits locks every pool in state whose CLI reported a limit that
 // has not reset yet at now. Expired entries are dropped.
 func ApplySeatLimits(state *PacerState, now time.Time) {

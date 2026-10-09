@@ -14,6 +14,12 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 )
 
+// clearSeatLimits forgets every recorded seat limit: none outlives 7 days, so
+// applying them 8 days ahead drops them all.
+func clearSeatLimits() {
+	router.ApplySeatLimits(&router.PacerState{}, time.Now().Add(8*24*time.Hour))
+}
+
 const (
 	limitInit   = `{"type":"system","subtype":"init","session_id":"s1","model":"claude-opus"}`
 	limitText   = `{"type":"assistant","session_id":"s1","message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your session limit · resets 4:20am"}]}}`
@@ -54,7 +60,7 @@ func lines(l ...string) string { return strings.Join(l, "\n") }
 
 func runWorkCoding(t *testing.T, bin string, pacer *router.PacerState) (*attemptLog, string, error) {
 	t.Helper()
-	t.Cleanup(router.ResetSeatLimits)
+	t.Cleanup(clearSeatLimits)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ctx = context.WithValue(ctx, testBinKey, bin)
@@ -146,7 +152,7 @@ func TestSeatLimit_BothSeatsLimitedIsAWait(t *testing.T) {
 // With both seats already marked out, the route is all-locked and the turn
 // reports a wait without spawning anything.
 func TestSeatLimit_AllLockedRouteIsAWait(t *testing.T) {
-	t.Cleanup(router.ResetSeatLimits)
+	t.Cleanup(clearSeatLimits)
 	until := time.Now().Add(time.Hour)
 	router.NoteSeatLimit(router.PoolWorkClaude, until, "session limit")
 	router.NoteSeatLimit(router.PoolPersonalClaude, until, "session limit")

@@ -6,9 +6,10 @@ import (
 	"io"
 )
 
-// streamWithCommit reads newline-delimited output from r and writes to dst,
-// buffering lines until isCommit returns true for a line. Once committed, all
-// subsequent lines are written directly to dst without buffering.
+// streamWithCommitWatch reads newline-delimited output from r and writes to
+// dst, buffering lines until isCommit returns true for a line. Once committed,
+// all subsequent lines are written directly to dst without buffering. Every
+// line, before and after the commit, is also passed to watch (when non-nil).
 //
 // Returns (committed, prebuf):
 //   - committed=true:  at least one line was forwarded to dst; prebuf is nil.
@@ -18,12 +19,6 @@ import (
 // Write errors to dst are silently swallowed (matching the original io.Copy
 // behaviour in the pre-streaming code). Scanner errors from a closed pipe are
 // treated as normal EOF.
-func streamWithCommit(r io.Reader, dst io.Writer, isCommit func(line []byte) bool) (committed bool, prebuf []byte) {
-	return streamWithCommitWatch(r, dst, isCommit, nil)
-}
-
-// streamWithCommitWatch is streamWithCommit that also passes every line, before
-// and after the commit, to watch (when non-nil).
 func streamWithCommitWatch(r io.Reader, dst io.Writer, isCommit func(line []byte) bool, watch func(line []byte)) (committed bool, prebuf []byte) {
 	var buf bytes.Buffer
 	sc := bufio.NewScanner(r)
