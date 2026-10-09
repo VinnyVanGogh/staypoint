@@ -2,7 +2,7 @@ import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { test, expect, gotoTaskPage } from '../fixtures';
+import { test, expect, gotoTaskPage, recordTaskBase } from '../fixtures';
 import type { APIRequestContext, Page, Route } from '@playwright/test';
 
 // STA-734: the merge test gate on the ship review card. Most specs serve the
@@ -46,6 +46,7 @@ async function createCardTask(request: APIRequestContext, label: string, files: 
     data: { name: `${label} ${Date.now().toString(36)}`, organization: 'STA', project: 'ui-e2e', repo_path: work, git_branch: 'main' },
   });
   const task = (await res.json()) as ShipTask;
+  await recordTaskBase(request, task.id, work);
   run(['checkout', '-b', `staypoint/${task.id}`]);
   for (const [p, body] of Object.entries(files)) {
     fs.mkdirSync(path.dirname(path.join(work, p)), { recursive: true });

@@ -1,9 +1,10 @@
 import { test, expect, gotoTaskPage, openTaskPanelTab } from '../fixtures';
 
-// STA-568: while a ship review card is pending/sent_back, Run Now and Mark done
-// must be absent. The card itself must appear within 1 s of the page title.
+// STA-568: while a ship review card is pending/sent_back, Run Now must be
+// absent. The card itself must appear within 1 s of the page title. Mark done
+// stays: the Board can close any open task, card or not (STA-861).
 
-test('pending card: no Run Now, no Mark done, card visible within 1s', async ({ page, api, request }) => {
+test('pending card: no Run Now, Mark done stays, card visible within 1s', async ({ page, api, request }) => {
   const task = await api.createTask('Ship review gate pending');
 
   // Move task to in_review so Mark done would normally show.
@@ -16,16 +17,16 @@ test('pending card: no Run Now, no Mark done, card visible within 1s', async ({ 
   await gotoTaskPage(page, task);
   const content = page.locator('#task-page-content');
 
-  // Buttons must be absent — not hidden, absent.
+  // Run Now must be absent — not hidden, absent.
   await expect(content.locator('.run-now-btn')).toHaveCount(0);
-  await expect(content.locator('.mark-done-btn')).toHaveCount(0);
+  await expect(content.locator('.mark-done-btn')).toHaveCount(1);
 
   // Card must be visible within 1 s of the title (gotoTaskPage already confirmed the title).
   await expect(content.locator(`#ship-review-${task.id}`)).toBeVisible({ timeout: 1_000 });
   await expect(content.locator(`#ship-review-${task.id} .ship-review-status-badge`)).toContainText(/pending/i);
 });
 
-test('sent_back card: no Run Now, no Mark done, card visible within 1s', async ({ page, api, request }) => {
+test('sent_back card: no Run Now, Mark done stays, card visible within 1s', async ({ page, api, request }) => {
   const task = await api.createTask('Ship review gate sent_back');
 
   const headers = { Authorization: `Bearer ${process.env.STAYPOINT_API_TOKEN || ''}`, 'Content-Type': 'application/json' };
@@ -39,7 +40,7 @@ test('sent_back card: no Run Now, no Mark done, card visible within 1s', async (
   const content = page.locator('#task-page-content');
 
   await expect(content.locator('.run-now-btn')).toHaveCount(0);
-  await expect(content.locator('.mark-done-btn')).toHaveCount(0);
+  await expect(content.locator('.mark-done-btn')).toHaveCount(1);
 
   await expect(content.locator(`#ship-review-${task.id}`)).toBeVisible({ timeout: 1_000 });
   await expect(content.locator(`#ship-review-${task.id} .ship-review-status-badge`)).toContainText(/sent back/i);
@@ -55,7 +56,7 @@ test('no card: Run Now visible for todo task', async ({ page, api }) => {
   await expect(content.locator('.run-now-btn')).toBeVisible({ timeout: 3_000 });
 });
 
-test('approved card: no Run Now, no Mark done, final card visible', async ({ page, api, request }) => {
+test('approved card: no Run Now, Mark done stays, final card visible', async ({ page, api, request }) => {
   const task = await api.createTask('Ship review gate approved');
 
   const headers = { Authorization: `Bearer ${process.env.STAYPOINT_API_TOKEN || ''}`, 'Content-Type': 'application/json' };
@@ -69,7 +70,7 @@ test('approved card: no Run Now, no Mark done, final card visible', async ({ pag
   const content = page.locator('#task-page-content');
 
   await expect(content.locator('.run-now-btn')).toHaveCount(0);
-  await expect(content.locator('.mark-done-btn')).toHaveCount(0);
+  await expect(content.locator('.mark-done-btn')).toHaveCount(1);
 
   await expect(content.locator(`#ship-review-${task.id}`)).toBeVisible({ timeout: 1_000 });
   await expect(content.locator(`#ship-review-${task.id} .ship-review-status-badge`)).toContainText(/approved/i);

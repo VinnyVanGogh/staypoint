@@ -2,7 +2,7 @@ import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { test, expect, gotoTaskPage } from '../fixtures';
+import { test, expect, gotoTaskPage, recordTaskBase } from '../fixtures';
 import type { APIRequestContext, Page } from '@playwright/test';
 
 // The Approve & Merge / Send Back / Reject buttons and their inline forms live
@@ -61,6 +61,7 @@ async function createShipReviewTask(
   const task = (await res.json()) as ShipTask;
   const taskId = task.id;
 
+  await recordTaskBase(request, taskId, work);
   const branch = `staypoint/${taskId}`;
   run(['checkout', '-b', branch]);
   fs.writeFileSync(path.join(work, 'task.txt'), 'task work\n');
