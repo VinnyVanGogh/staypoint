@@ -163,6 +163,45 @@ func TestGeminiGate_AllowRuleApprovesWithoutWaiting(t *testing.T) {
 	}
 }
 
+func rawCall(t *testing.T, name string, args map[string]any) []byte {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"conversationId": "c", "toolCall": map[string]any{"name": name, "args": args}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// Parser differential (security review of cd91bea): every way agy could carry
+// a command the gate did not read must end held or denied, never allowed.
+func TestGeminiGate_UnreadOrHiddenCommandsNeverAllowed(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name string
+		raw  []byte
+	}{
+		{"red command in an unexpected key", rawCall(t, "run_command", map[string]any{"Cmd": redCmd, "Cwd": dir})},
+		{"safe CommandLine, red Command", rawCall(t, "run_command", map[string]any{"CommandLine": "ls", "Command": redCmd, "Cwd": dir})},
+		{"red input to a running shell", rawCall(t, "send_command_input", map[string]any{"Input": redCmd})},
+		{"step-type tool name", rawCall(t, "CORTEX_STEP_TYPE_RUN_COMMAND", map[string]any{"CommandLine": redCmd, "Cwd": dir})},
+		{"bypass sandbox on a safe command", rawCall(t, "run_command", map[string]any{"CommandLine": "ls", "Cwd": dir, "BypassSandbox": true})},
+		{"bypass sandbox not a bool", rawCall(t, "run_command", map[string]any{"CommandLine": "ls", "Cwd": dir, "BypassSandbox": "yes"})},
+		{"argv array", rawCall(t, "run_command", map[string]any{"Argv": []string{"git", "push", "--force", "origin", "main"}, "Cwd": dir})},
+		{"shell call with no command", rawCall(t, "run_command", map[string]any{"Cwd": dir})},
+		{"unreadable payload", []byte(`{"toolCall":`)},
+		{"no tool call", []byte(`{"conversationId":"c"}`)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeGateDaemon{createStat: "pending", pollStatus: "denied"}
+			withGeminiDaemon(t, f.server(t).URL, 5*time.Second)
+			if got, reason := decision(t, gateGeminiPreTool(tc.raw)); got != "deny" {
+				t.Fatalf("decision %q (%q), want deny", got, reason)
+			}
+		})
+	}
+}
+
 func TestGeminiGate_SafeCommandsAndOtherToolsPass(t *testing.T) {
 	f := &fakeGateDaemon{createStat: "pending", pollStatus: "denied"}
 	withGeminiDaemon(t, f.server(t).URL, 5*time.Second)
