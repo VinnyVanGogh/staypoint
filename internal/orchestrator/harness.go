@@ -255,6 +255,23 @@ func preflightBranch(ctx context.Context, db *sql.DB, repo, taskID string) strin
 	return "main"
 }
 
+// preflightMergeBase is the base pre-flight may merge a diverged task branch
+// over: the task's verified recorded base, and only when the task also has a
+// recorded target. Otherwise preflightBranch fell back to a project or repo
+// default, which may not be the line the task was cut from, and "" keeps
+// pre-flight fast-forward only so it fails safe instead of merging main into
+// a dev-server task.
+func preflightMergeBase(ctx context.Context, db *sql.DB, repo, taskID string) string {
+	if target, err := workspace.RecordedTaskTarget(ctx, db, taskID); err != nil || target == "" {
+		return ""
+	}
+	base, err := workspace.VerifiedBase(ctx, db, repo, taskID)
+	if err != nil {
+		return ""
+	}
+	return base
+}
+
 func newWorktreeManager(repoRoot string, db *sql.DB) *workspace.WorktreeManager {
 	wm := workspace.NewWorktreeManager(repoRoot, db)
 	wm.TargetBranch = func(ctx context.Context, repo string) (string, error) {
@@ -531,7 +548,8 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// Skipped when cfg.SkipGitPreflight is true (tests running in a non-git dir).
 	if !cfg.SkipGitPreflight && !nonGit {
 		gfCtx, gfCancel := context.WithTimeout(ctx, 60*time.Second)
-		gfResult, gfErr := gitgate.PreFlight(gfCtx, wtPath, preflightBranch(gfCtx, h.DB, repoPath, taskID))
+		gfBranch := preflightBranch(gfCtx, h.DB, repoPath, taskID)
+		gfResult, gfErr := gitgate.PreFlightMerge(gfCtx, wtPath, gfBranch, preflightMergeBase(gfCtx, h.DB, repoPath, taskID))
 		gfCancel()
 		gfSummary := "git-preflight: "
 		if gfErr != nil {
@@ -547,22 +565,31 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			taskID, gfSummary,
 		)
 		if gfErr != nil || (gfResult != nil && !gfResult.OK) {
-			result.Disposition = "in_progress"
+			// Park the task as blocked with the reason on it: ending as
+			// in_progress showed the Board only "Finished: in_progress" and a
+			// 3s run that looked like it had worked (task-25ac4f3b).
+			blockReason := "git pre-flight failed: " + strings.TrimPrefix(gfSummary, "git-preflight: ")
+			if gfResult != nil && len(gfResult.Conflicts) > 0 {
+				blockReason = fmt.Sprintf("git pre-flight: task branch conflicts with origin/%s in %s. Resolve the merge on the branch, then Run Now.",
+					gfBranch, strings.Join(gfResult.Conflicts, ", "))
+			}
+			result.Disposition = governance.StageBlocked
 			result.DiagnosticMsg = gfSummary
 			if sr != nil {
-				sr.EmitState("in_progress")
+				sr.EmitMessage("Git pre-flight failed", blockReason, "error")
+				sr.EmitState(governance.StageBlocked)
 				sr.Close()
 			}
 			cleanCtx2, cleanCancel2 := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cleanCancel2()
 			now2 := time.Now().UTC().Format(time.RFC3339Nano)
 			_, _ = h.DB.ExecContext(cleanCtx2,
-				`UPDATE tasks SET execution_stage='in_progress', updated_at=? WHERE id=?`+closedStageGuard,
-				now2, taskID,
+				`UPDATE tasks SET execution_stage='blocked', is_blocked=1, block_reason=?, updated_at=? WHERE id=?`+closedStageGuard,
+				blockReason, now2, taskID,
 			)
 			_, _ = h.DB.ExecContext(cleanCtx2,
 				`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'run_complete', ?)`,
-				taskID, "disposition=in_progress turns=0 reason=git_preflight_failed",
+				taskID, "disposition=blocked turns=0 reason=git_preflight_failed",
 			)
 			return result, nil
 		}
