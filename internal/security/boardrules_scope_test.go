@@ -131,6 +131,8 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"if unset STAYPOINT_TASK_ID; then true; fi",
 		"while env -u STAYPOINT_TASK_ID staypoint task list; do break; done",
 		"until unset STAYPOINT_SESSION_ID; do :; done",
+		"zsh -O -c 'unset STAYPOINT_TASK_ID'",
+		"zsh +O -c 'claude -p x'",
 		"zsh -no exec scripts/reinstall-daemon.sh",
 		"cat scripts/reinstall-daemon.sh | cat > /tmp/r.sh",
 		"git show HEAD:scripts/reinstall-daemon.sh | grep . > /tmp/r.sh",

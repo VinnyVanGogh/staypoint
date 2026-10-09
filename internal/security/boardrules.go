@@ -273,7 +273,7 @@ func runsAgent(code string, depth int) bool {
 			return true
 		}
 		if shells[baseCmd(argv)] {
-			if ci, ok := shellCommandArg(argv[1:]); ok && runsAgent(argv[1+ci], depth+1) {
+			if ci, ok := shellCommandArg(baseCmd(argv), argv[1:]); ok && runsAgent(argv[1+ci], depth+1) {
 				return true
 			}
 			for _, r := range s.redirects {
@@ -339,16 +339,16 @@ func dataArgs(argv []string) bool {
 	return false
 }
 
-// shellCommandArg returns the index of a shell's -c command string in its
+// shellCommandArg returns the index of shell's -c command string in its
 // args.
-func shellCommandArg(args []string) (int, bool) {
+func shellCommandArg(shell string, args []string) (int, bool) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
-		// Flags that take a value: the value is not the script.
-		// Their value is always the next word, as bash reads it (sh -O -c x
-		// fails on the option name and runs nothing).
-		case a == "-o" || a == "+o" || a == "-O" || a == "+O" || a == "--rcfile" || a == "--init-file":
+		// Flags whose value is always the next word. -O takes one in bash
+		// (sh -O -c x fails on the option name) but is a plain option in zsh.
+		case a == "-o" || a == "+o" || a == "--rcfile" || a == "--init-file",
+			(a == "-O" || a == "+O") && shell != "zsh":
 			i++
 		case a == "--" || (!strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+")):
 			return 0, false
@@ -408,7 +408,7 @@ func inputShell(code string, depth int) bool {
 			if viaXargs {
 				return true
 			}
-			if ci, ok := shellCommandArg(args); ok {
+			if ci, ok := shellCommandArg(baseCmd(argv), args); ok {
 				if inputShell(args[ci], depth+1) {
 					return true
 				}
@@ -546,7 +546,7 @@ func envChange(argv []string, st *envState, depth int) bool {
 		}
 		return envChange(skipWrapper(name, args), st, depth)
 	case shells[name]:
-		if ci, ok := shellCommandArg(args); ok && stayEnvChange(args[ci], depth+1) {
+		if ci, ok := shellCommandArg(baseCmd(argv), args); ok && stayEnvChange(args[ci], depth+1) {
 			return true
 		}
 		return changed
@@ -696,7 +696,7 @@ func namesOnly(re *regexp.Regexp, s segment, argv []string, viaXargs bool, depth
 				return false
 			}
 		}
-		if ci, ok := shellCommandArg(args); ok {
+		if ci, ok := shellCommandArg(baseCmd(argv), args); ok {
 			return !namedRun(args[ci], re, depth+1) && !anyNames(re, args[:ci]) && !anyNames(re, args[ci+1:]) && !redirectNames(re, s)
 		}
 		// A script argument or stdin naming it runs it.
