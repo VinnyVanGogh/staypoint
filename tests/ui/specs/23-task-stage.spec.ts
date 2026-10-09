@@ -1,5 +1,5 @@
 import * as os from 'node:os';
-import { test, expect, gotoTaskPage } from '../fixtures';
+import { test, expect, gotoTaskPage, clearTaskRepo } from '../fixtures';
 
 // task-40f0a2f0: the Board changes a task's stage from the task page. Agent
 // tasks land in backlog and only the Board can move them out.
@@ -34,6 +34,8 @@ test.describe('Task stage control', () => {
     // No repo: the server refuses any runnable stage until one is set.
     const task = await api.createAgentTask('stage refused');
     expect(task.execution_stage).toBe('backlog');
+    clearTaskRepo(task.id);
+    expect((await api.getTask(task.id)).repo_path || '').toBe('');
 
     await gotoTaskPage(boardPage, task);
     const content = boardPage.locator('#task-page-content');

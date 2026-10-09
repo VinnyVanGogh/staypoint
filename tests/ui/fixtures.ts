@@ -19,6 +19,7 @@ export type Task = {
   name: string;
   status: string;
   execution_stage: string;
+  repo_path?: string;
   organization?: string;
   project?: string;
 };
@@ -255,6 +256,19 @@ export function addTaskDocument(taskId: string, key: string, content: string): n
   const m = out.match(/^VERSION (\d+)$/m);
   if (!m) throw new Error(`stepsim stored no document: ${out}`);
   return Number(m[1]);
+}
+
+/**
+ * Clears a task's repo through tests/ui/stepsim. POST /api/tasks fills an
+ * empty repo_path with the daemon's cwd, so this is the only way a spec gets
+ * a task with no repo (as a Paperclip import leaves it).
+ */
+export function clearTaskRepo(taskId: string): void {
+  const bin = process.env.STAYPOINT_UI_STEPSIM;
+  const db = process.env.STAYPOINT_UI_DB;
+  if (!bin || !db) throw new Error('STAYPOINT_UI_STEPSIM / STAYPOINT_UI_DB not set: run via scripts/ui-e2e.sh');
+  const out = execFileSync(bin, ['--db', db, '--task', taskId, '--clear-repo'], { encoding: 'utf8' });
+  if (!/^CLEARED$/m.test(out)) throw new Error(`stepsim did not clear the repo: ${out}`);
 }
 
 /**
