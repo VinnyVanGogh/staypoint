@@ -1,0 +1,211 @@
+package security
+
+import (
+	"os"
+	"strings"
+	"testing"
+)
+
+// task-6e2bcd75: self-protection holds what changes StayPoint (running the
+// reinstall script, the installed binaries, the live state, the guards, the
+// gate's env), not commands that only name it. task-800b532d looped for six
+// hours on `bash -n`, `git add` and `sed -n` of the reinstall script.
+func TestBoardRulesSelfProtectionScope(t *testing.T) {
+	const task = "task-T1"
+	held := []string{
+		// Running the reinstall script, however it is wrapped.
+		"bash scripts/reinstall-daemon.sh",
+		"./scripts/reinstall-daemon.sh",
+		"scripts/reinstall-daemon.sh --allow-dev-build",
+		"sh -c 'scripts/reinstall-daemon.sh'",
+		`zsh -lc "cd /r && ./scripts/reinstall-daemon.sh"`,
+		"bash -c '\"$0\"' scripts/reinstall-daemon.sh",
+		"env FOO=1 scripts/reinstall-daemon.sh",
+		"nohup ./scripts/reinstall-daemon.sh &",
+		"timeout 600 bash scripts/reinstall-daemon.sh",
+		"bash -x scripts/reinstall-daemon.sh",
+		"bash -n x.sh && bash scripts/reinstall-daemon.sh",
+		"bash -n scripts/reinstall-daemon.sh; bash scripts/reinstall-daemon.sh",
+		"(cd scripts && ./reinstall-daemon.sh)",
+		"cd scripts && bash reinstall-daemon.sh",
+		"echo $(scripts/reinstall-daemon.sh)",
+		"source scripts/reinstall-daemon.sh",
+		". scripts/reinstall-daemon.sh",
+		"bash < scripts/reinstall-daemon.sh",
+		"cat scripts/reinstall-daemon.sh | bash",
+		"cat scripts/reinstall-daemon.sh | grep -v '^#' | sh",
+		"echo scripts/reinstall-daemon.sh | xargs bash",
+		"bash <<'EOF'\nscripts/reinstall-daemon.sh\nEOF",
+		"F=scripts/reinstall-daemon.sh; bash $F",
+		"for f in scripts/reinstall-daemon.sh; do bash $f; done",
+		"git -c alias.r='!scripts/reinstall-daemon.sh' r",
+		"git rebase -x scripts/reinstall-daemon.sh main",
+		"go test -exec scripts/reinstall-daemon.sh ./...",
+		// A copy or symlink of the script, run now or later.
+		"ln -s scripts/reinstall-daemon.sh /tmp/r && /tmp/r",
+		"cp scripts/reinstall-daemon.sh /tmp/r.sh; bash /tmp/r.sh",
+		"cat scripts/reinstall-daemon.sh > /tmp/r.sh",
+		"sed -n p scripts/reinstall-daemon.sh > /tmp/r.sh",
+		"sed -n 'w /tmp/r.sh' scripts/reinstall-daemon.sh",
+		"sed -n '1e scripts/reinstall-daemon.sh' x",
+		"sed 's/x/scripts\\/reinstall-daemon.sh/e' x",
+		"sed -f cmds.sed scripts/reinstall-daemon.sh",
+		"sed -n '1e launchctl kickstart -k gui/501/com.staypoint.daemon' x",
+		"find . -name x -exec launchctl load {} \\;",
+		`python3 -c "import os; os.system('launchctl kickstart -k gui/501/x')"`,
+		"grep -l x launchctl.txt | xargs launchctl load",
+		"tee /tmp/r.sh < scripts/reinstall-daemon.sh",
+		// Commands read from input or a file cannot be checked.
+		"xargs bash < list",
+		"xargs -n1 sh < list",
+		"bash < cmds.txt",
+		"cat list | sh -s",
+		// Installed binaries, launchd, the daemon process.
+		"launchctl bootout gui/501/com.staypoint.daemon",
+		"cp bin/staypointd ~/.local/bin/staypointd",
+		"go build -o ~/.local/bin/staypointd ./cmd/staypointd",
+		"go install ./cmd/staypoint",
+		"pkill -f staypointd",
+		"killall staypointd",
+		"kill $(pgrep staypointd)",
+		// Live state and guard config.
+		"cat ~/.gemini/config/hooks.json",
+		"cat ~/.staypoint/config.toml",
+		"cat ~/.staypoint/handoffs/task-OTHER/latest.md",
+		"cat ~/.staypoint/handoffs/task-T10/latest.md",
+		"cat ~/.staypoint/handoffs/task-T1/../../board_token",
+		"cat ~/.staypoint/handoffs/task-T1/latest.md ~/.staypoint/board_token",
+		"cat ~/.staypoint/handoffs/task-T1/latest.md; cat ~/.staypoint/auth_token",
+		"cat ~/.staypoint/handoffs/task-T1/latest.md > /tmp/x",
+		"cp ~/.staypoint/handoffs/task-T1/latest.md ~/.staypoint/config.toml",
+		"sed -i '' s/a/b/ ~/.staypoint/handoffs/task-T1/latest.md",
+		"rm ~/.staypoint/handoffs/task-T1/latest.md",
+		// The gate's env: unset or overridden for anything but go test/vet.
+		"env -u STAYPOINT_TASK_ID claude -p x",
+		"env -u STAYPOINT_TASK_ID staypoint task list",
+		"env -u STAYPOINT_TASK_ID ./go test ./...",
+		"env -u STAYPOINT_TASK_ID go test -exec ./x ./...",
+		"env -u STAYPOINT_TASK_ID go test -toolexec=./x ./...",
+		"env -u STAYPOINT_TASK_ID go vet -vettool=./x ./...",
+		"env -u STAYPOINT_TASK_ID go run ./cmd/staypoint",
+		"env -u STAYPOINT_TASK_ID go test ./... && env -u STAYPOINT_TASK_ID make",
+		"env -uSTAYPOINT_TASK_ID bash",
+		"env --unset=STAYPOINT_SESSION_ID bash",
+		"env -i go test ./...",
+		"STAYPOINT_TASK_ID=task-OTHER staypoint task comment x y",
+		"STAYPOINT_SCRATCH_ROOT=/ go run .",
+		"STAYPOINT_HOOK_BIN=/tmp/h make",
+		"unset STAYPOINT_SESSION_ID",
+		"export -n STAYPOINT_TASK_ID",
+		"declare -x STAYPOINT_TASK_ID=x",
+		"sh -c 'STAYPOINT_TASK_ID= staypoint task list'",
+		// Nested agents still hold wherever they run.
+		"watch 'ls | claude -p x'",
+		"python3 <<EOF\nimport os; os.system('x; claude -p y')\nEOF",
+		"bash -c 'echo hi; gemini -p x'",
+		"echo $(codex exec x)",
+		"pnpm dlx @google/gemini-cli -p x",
+		"timeout 60 claude -p x",
+		"echo claude -p x > /tmp/r.sh",
+		"git -c alias.x='!claude -p y' x",
+		"echo 'claude -p x' | sh",
+	}
+	for _, c := range held {
+		why := AnalyzeBoardRulesForTask(task, c, nil)
+		if why == "" {
+			t.Errorf("not held: %q", c)
+		}
+	}
+
+	allowed := []string{
+		// Naming the reinstall script without running it (task-800b532d).
+		"bash -n scripts/reinstall-daemon.sh",
+		"bash -n scripts/reinstall-daemon.sh && echo ok",
+		"sh -n scripts/reinstall-daemon.sh",
+		"git add internal/security/boardrules.go scripts/reinstall-daemon.sh",
+		"git add -- scripts/reinstall-daemon.sh && git commit -m 'fix: guard reinstall-daemon.sh deploys'",
+		"git diff -- scripts/reinstall-daemon.sh",
+		"git log -p scripts/reinstall-daemon.sh | head -50",
+		"git show HEAD:scripts/reinstall-daemon.sh",
+		"sed -n 1,40p scripts/reinstall-daemon.sh",
+		"sed -n '/launchctl/p' scripts/reinstall-daemon.sh",
+		"grep -n launchctl scripts/reinstall-daemon.sh",
+		"grep -rn reinstall-daemon docs/ scripts/",
+		"cat scripts/reinstall-daemon.sh",
+		"head -20 scripts/reinstall-daemon.sh | wc -l",
+		"wc -l scripts/reinstall-daemon.sh",
+		"shellcheck scripts/reinstall-daemon.sh",
+		"go vet ./... && bash -n scripts/reinstall-daemon.sh",
+		"staypoint task comment T1 'ran bash -n scripts/reinstall-daemon.sh'",
+		`gh pr create --title x --body "does not run scripts/reinstall-daemon.sh"`,
+		"echo 'deploy with scripts/reinstall-daemon.sh after merge'",
+		// Tests clear the task id to isolate themselves.
+		"env -u STAYPOINT_TASK_ID go test ./cmd/staypoint/",
+		"env -u STAYPOINT_TASK_ID go test -count=1 -run TestHook ./cmd/staypoint ./internal/...",
+		"env -u STAYPOINT_TASK_ID go vet ./...",
+		"STAYPOINT_TASK_ID= go test ./...",
+		"cd /r/.worktrees/x && env -u STAYPOINT_TASK_ID go test ./cmd/staypoint/ 2>&1 | tail -20",
+		// Board 2026-10-09 false positives.
+		"STAYPOINT_STYLE_AUDIT_DIR=/tmp/sa bash .worktrees/task-T1/scripts/style-audit.sh",
+		"STAYPOINT_UI_STRICT=1 scripts/ui-e2e.sh specs/timeline.spec.ts",
+		"go build -o /tmp/sa-e2e/staypoint-apitest-server ./cmd/staypoint-apitest-server",
+		"go build -o /tmp/staypointd-x ./cmd/staypointd",
+		"git add cmd/staypointd/*.go",
+		"cat ~/.staypoint/handoffs/task-T1/latest.md",
+		"cat $HOME/.staypoint/handoffs/task-T1/latest.md",
+		"head -50 /Users/v/.staypoint/handoffs/task-T1/latest.md",
+		"ls ~/.staypoint/handoffs/task-T1/",
+		"cat ~/.staypoint/handoffs/task-T1/*.md 2>/dev/null",
+		"pkill -f staypoint-apitest-server",
+		"HOME=/tmp/h STAYPOINT_API_TOKEN=x STAYPOINT_BOARD_TOKEN=y /tmp/sa/staypoint-apitest-server",
+		"local deadline=$(( $(date +%s) + 30 ))",
+		// An agent name as data: grep patterns and test filters this run
+		// was itself held on.
+		"go test ./cmd/staypoint/ -run 'TestRaise|Hook|Gemini|Gate' -count=1",
+		"grep -nE 'launchctl|claude|gemini|codex|agy|ssh' scripts/ui-e2e.sh",
+		"rg -n 'x|claude|y' internal/",
+		"git commit -m 'route x | gemini fallback'",
+		"cd internal/agy && go test ./...",
+	}
+	for _, c := range allowed {
+		if why := AnalyzeBoardRulesForTask(task, c, nil); why != "" {
+			t.Errorf("held: %q: %s", c, why)
+		}
+	}
+	// Without a task, no handoff dir is anyone's own.
+	if AnalyzeBoardRules("cat ~/.staypoint/handoffs/task-T1/latest.md", nil) == "" {
+		t.Error("handoff read held only by task")
+	}
+
+	// A script the command runs is judged by its contents: scripts/ui-e2e.sh
+	// builds and kills its own test server and sets STAYPOINT_UI_* and test
+	// tokens, none of which is self-protection.
+	ui, err := os.ReadFile("../../scripts/ui-e2e.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if why := AnalyzeBoardRulesForTask(task, "scripts/ui-e2e.sh specs/x.spec.ts",
+		[]ScriptHash{{Path: "/r/scripts/ui-e2e.sh", Content: string(ui)}}); why != "" {
+		t.Errorf("ui-e2e.sh held: %s", why)
+	}
+	for _, body := range []string{
+		"#!/bin/sh\nbash -n scripts/reinstall-daemon.sh\n",
+		"#!/bin/sh\nset -eu\ngo build -o \"$TMP/staypoint-apitest-server\" ./cmd/staypoint-apitest-server\nSTAYPOINT_API_TOKEN=\"$T\" \"$TMP/staypoint-apitest-server\" &\nkill \"$!\"\n",
+	} {
+		if why := AnalyzeBoardRulesForTask(task, "./run.sh", []ScriptHash{{Path: "/w/run.sh", Content: body}}); why != "" {
+			t.Errorf("script %q held: %s", body, why)
+		}
+	}
+	for _, body := range []string{
+		"#!/bin/sh\ncat ~/.staypoint/auth_token\n",
+		"#!/bin/sh\n  scripts/reinstall-daemon.sh\n",
+		"#!/bin/sh\nlaunchctl kickstart -k gui/501/com.staypoint.daemon # restart\n",
+		"#!/bin/sh\ncat <<EOF\n# x\nEOF\nsource ~/.staypoint/config.toml\n",
+		"#!/bin/sh\n#cat ~/.staypoint/auth_token\nbash -c \"$(sed -n 's/^#//p' \"$0\")\"\n",
+	} {
+		why := AnalyzeBoardRulesForTask(task, "./run.sh", []ScriptHash{{Path: "/w/run.sh", Content: body}})
+		if !strings.Contains(why, "self-protection") {
+			t.Errorf("script %q not held for self-protection: %q", body, why)
+		}
+	}
+}

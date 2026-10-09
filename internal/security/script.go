@@ -327,6 +327,29 @@ func strictShellFlags(flags []string) bool {
 	return true
 }
 
+// shellNoExec reports whether argv is a shell told only to read its script
+// (-n, -o noexec: a syntax check), so the script does not run.
+func shellNoExec(argv []string) bool {
+	if len(argv) == 0 || !shells[baseCmd(argv)] {
+		return false
+	}
+	args := argv[1:]
+	end, ok := shellScriptIndex(args)
+	if !ok {
+		end = len(args)
+	}
+	for i := 0; i < end; i++ {
+		a := args[i]
+		switch {
+		case a == "-o" && i+1 < end && args[i+1] == "noexec":
+			return true
+		case len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.ContainsRune(a[1:], 'n'):
+			return true
+		}
+	}
+	return false
+}
+
 // shellReadsInput reports whether a shell's flags make it read commands from
 // somewhere other than stdin (so a heredoc on stdin is not the whole script).
 func shellReadsInput(args []string) bool {
@@ -1485,7 +1508,7 @@ func ScriptRefs(line, cwd string, snap *Snapshotter, contentLimit int) []ScriptR
 					walk(r.body, dir, depth+1)
 				}
 			}
-			if isScriptCall(argv) {
+			if isScriptCall(argv) && !shellNoExec(argv) {
 				p := argv[0]
 				direct := !shells[baseCmd(argv)]
 				if !direct {
