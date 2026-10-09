@@ -3,6 +3,8 @@ package security
 import (
 	"net"
 	"net/url"
+	"os"
+	"path"
 	"regexp"
 	"strings"
 )
@@ -156,7 +158,7 @@ func boardRuleText(code, what, taskID string) string {
 		return what + " runs shell commands it reads from input or a file, which cannot be checked"
 	case remoteShellRe.MatchString(code):
 		return what + " opens a remote shell or tunnel, which may write prod or delete data (Board rule: no prod writes or deletes)"
-	case selfCmdRe.MatchString(code) || runsLaunchctl(code, 0) || reinstallExec(code, 0):
+	case selfCmdRe.MatchString(code) || runsLaunchctl(code, 0) || reinstallExec(code, 0) || killsSelf(code, 0) || runsDaemon(code, 0):
 		return what + " rebuilds, restarts or replaces StayPoint or its guards (Board rule: self-protection)"
 	case selfPathRe.MatchString(code) && !ownHandoffRead(code, taskID):
 		return what + " touches StayPoint state or agent guard config (Board rule: self-protection)"
@@ -605,6 +607,218 @@ var launchctlRe = regexp.MustCompile(`(?i)launchctl`)
 // stops and replaces the daemon's LaunchAgent). grep launchctl does not.
 func runsLaunchctl(code string, depth int) bool { return namedRun(code, launchctlRe, depth) }
 
+var killRe = regexp.MustCompile(`(?i)\b(pkill|killall)\b`)
+
+// selfProcNames are what pkill -f and killall match the daemon and the CLI
+// against: the process names and the installed paths.
+func selfProcNames() []string {
+	names := []string{"staypointd", "staypoint"}
+	if home, err := os.UserHomeDir(); err == nil {
+		names = append(names, home+"/.local/bin/staypointd", home+"/.local/bin/staypoint")
+	}
+	return names
+}
+
+// killsSelf reports pkill or killall whose pattern may match the daemon or
+// the CLI. Each pattern is read as a regexp and tried on selfProcNames, so
+// pkill -f 'x|staypointd' and killall -m 'stay.*' hold and pkill -f
+// staypoint-apitest-server does not. A pattern that does not compile, a
+// pidfile, patterns from xargs or code that does not parse hold.
+func killsSelf(code string, depth int) bool {
+	if !killRe.MatchString(code) {
+		return false
+	}
+	if depth > maxDepth {
+		return true
+	}
+	segs, subs, err := parseShell(code)
+	if err != nil {
+		return true
+	}
+	for _, s := range subs {
+		if killsSelf(s, depth+1) {
+			return true
+		}
+	}
+	for _, s := range segs {
+		argv, viaXargs := unwrapArgv(s.argv)
+		if len(argv) == 0 {
+			continue
+		}
+		if shells[baseCmd(argv)] {
+			if ci, ok := shellCommandArg(baseCmd(argv), argv[1:]); ok && killsSelf(argv[1+ci], depth+1) {
+				return true
+			}
+			for _, r := range s.redirects {
+				if r.heredoc && killsSelf(r.body, depth+1) {
+					return true
+				}
+			}
+			continue
+		}
+		data, off := dataArgs(argv), len(s.argv)-len(argv)
+		for i, a := range argv {
+			switch n := baseCmd([]string{a}); {
+			case n == "pkill" || n == "killall":
+				// find -exec pkill, sudo pkill: its patterns follow it. A
+				// pattern that expands ("$P") cannot be read.
+				if i == 0 && viaXargs || killPatternsSelf(argv[i+1:]) || anyTrue(s.dyn[off+i:]) {
+					return true
+				}
+			case !data && killRe.MatchString(a) && killsSelf(a, depth+1):
+				// python3 -c "os.system('pkill ...')"
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func anyTrue(bs []bool) bool {
+	for _, b := range bs {
+		if b {
+			return true
+		}
+	}
+	return false
+}
+
+// killPatternsSelf reads pkill/killall arguments: the values of -u, -t and
+// similar are skipped, -F (a pidfile) holds.
+func killPatternsSelf(args []string) bool {
+	names := selfProcNames()
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case strings.HasPrefix(a, "--"):
+			if strings.HasPrefix(a, "--pidfile") {
+				return true
+			}
+			continue
+		case len(a) > 1 && a[0] == '-':
+			if strings.ContainsRune(a, 'F') {
+				return true
+			}
+			if strings.ContainsRune("gGJMNPstuU", rune(a[len(a)-1])) {
+				i++
+			}
+			continue
+		}
+		re, err := regexp.Compile("(?i)" + a)
+		if err != nil {
+			return true
+		}
+		for _, n := range names {
+			if re.MatchString(n) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+var daemonRe = regexp.MustCompile(`(?i)staypointd`)
+
+// daemonProgRe: a program named like the daemon (staypointd, staypointd-x).
+var daemonProgRe = regexp.MustCompile(`(?i)^staypointd`)
+
+// runsDaemon reports a line that may start a StayPoint daemon, which takes
+// over the live one's socket and DB: a program named staypointd*, go run
+// of it, a binary this line builds from it (go build -o /tmp/d
+// ./cmd/staypointd && /tmp/d) or copies from one, or such a name handed to
+// find -exec, xargs or watch. Building or naming it does not hold.
+func runsDaemon(code string, depth int) bool {
+	if !daemonRe.MatchString(code) {
+		return false
+	}
+	if depth > maxDepth {
+		return true
+	}
+	segs, subs, err := parseShell(code)
+	if err != nil {
+		return true
+	}
+	for _, s := range subs {
+		if runsDaemon(s, depth+1) {
+			return true
+		}
+	}
+	built := map[string]bool{}
+	isDaemon := func(p string) bool {
+		return daemonProgRe.MatchString(path.Base(p)) || built[p] || built[path.Base(p)]
+	}
+	for _, s := range segs {
+		argv, _ := unwrapArgv(s.argv)
+		if len(argv) < 2 {
+			continue
+		}
+		switch name := baseCmd(argv); name {
+		case "go":
+			if argv[1] != "build" || !anyNames(daemonRe, argv[2:]) {
+				continue
+			}
+			for i, a := range argv {
+				f := strings.TrimLeft(a, "-")
+				if f == "o" && a != f && i+1 < len(argv) {
+					built[argv[i+1]], built[path.Base(argv[i+1])] = true, true
+				} else if v, ok := strings.CutPrefix(f, "o="); ok && a != f {
+					built[v], built[path.Base(v)] = true, true
+				}
+			}
+		case "cp", "mv", "ln", "install", "ditto", "rsync":
+			dst := argv[len(argv)-1]
+			for _, a := range argv[1 : len(argv)-1] {
+				if isDaemon(a) {
+					built[dst], built[path.Base(dst)] = true, true
+				}
+			}
+		}
+	}
+	for _, s := range segs {
+		argv, viaXargs := unwrapArgv(s.argv)
+		if len(argv) == 0 {
+			continue
+		}
+		name := baseCmd(argv)
+		runner := viaXargs || name == "watch"
+		switch {
+		// "$D" may be the daemon built on this line.
+		case isDaemon(argv[0]) || len(built) > 0 && s.dyn[len(s.argv)-len(argv)]:
+			return true
+		case name == "go" && len(argv) > 1 && argv[1] == "run" && anyNames(daemonRe, argv[2:]):
+			return true
+		case shells[name]:
+			if ci, ok := shellCommandArg(name, argv[1:]); ok {
+				if runsDaemon(argv[1+ci], depth+1) {
+					return true
+				}
+				for _, w := range strings.Fields(argv[1+ci]) {
+					if built[w] {
+						return true
+					}
+				}
+			}
+			for _, r := range s.redirects {
+				if r.heredoc && runsDaemon(r.body, depth+1) {
+					return true
+				}
+			}
+		case name == "find":
+			for _, a := range argv[1:] {
+				runner = runner || a == "-exec" || a == "-execdir" || a == "-ok" || a == "-okdir"
+			}
+		}
+		if runner {
+			for _, a := range argv[1:] {
+				if isDaemon(a) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 var reinstallRe = regexp.MustCompile(`(?i)reinstall-daemon`)
 
 // reinstallExec reports whether code runs the daemon reinstall script or
@@ -632,10 +846,18 @@ func namedRun(code string, re *regexp.Regexp, depth int) bool {
 			return true
 		}
 	}
-	// Any file written on a line that names it may hold a copy: exec >f,
-	// { cat x; } > f and ( ... ) > f redirect segments other than their own.
+	// A file written where it may carry what a command naming it prints
+	// may hold a copy. A segment's own write is namesOnly's, and a pipe from
+	// it is fed's below. exec >f, { ...; } > f, ( ... ) > f and done > f
+	// redirect more than their own segment, which the parse does not track,
+	// so they hold; so does any write on a line that defines a function or
+	// alias (f > out runs its body) or substitutes a command naming it.
+	wide := shellFuncRe.MatchString(code)
+	for _, s := range subs {
+		wide = wide || re.MatchString(s)
+	}
 	for _, s := range segs {
-		if writesFile(s) {
+		if writesFile(s) && (wide || groupWrite(s)) {
 			return true
 		}
 	}
@@ -643,7 +865,7 @@ func namedRun(code string, re *regexp.Regexp, depth int) bool {
 	for _, s := range segs {
 		argv, viaXargs := unwrapArgv(s.argv)
 		named := anyNames(re, s.argv) || redirectNames(re, s) || heredocNames(re, s)
-		if fed && (viaXargs || len(argv) == 0 || !pipeFilters[baseCmd(argv)] || argv[0] != baseCmd(argv) || writesFile(s)) {
+		if fed && (viaXargs || len(argv) == 0 || !pipeFilters[baseCmd(argv)] || argv[0] != baseCmd(argv) || writesFile(s) || filterWrites(argv)) {
 			return true
 		}
 		// Named in an assignment or a wrapper's args (BASH_ENV=...,
@@ -686,10 +908,53 @@ func heredocNames(re *regexp.Regexp, s segment) bool {
 	return false
 }
 
-// pipeFilters only print what they read.
+// shellFuncRe: a function or alias definition, whose body runs wherever
+// its name does.
+var shellFuncRe = regexp.MustCompile(`\(\s*\)|\bfunction\b|\balias\b`)
+
+// groupClosers end a compound command; a redirect on one covers its body.
+var groupClosers = map[string]bool{"}": true, ")": true, "done": true, "fi": true, "esac": true}
+
+// groupWrite reports a redirect that covers more than its own segment: on
+// a compound command's closer, or with no command at all (exec >f, ( ... ) >f).
+func groupWrite(s segment) bool {
+	argv, _ := unwrapArgv(s.argv)
+	return len(argv) == 0 || groupClosers[argv[0]] || len(s.argv) > 0 && baseCmd(s.argv) == "exec"
+}
+
+// pipeFilters only print what they read, unless filterWrites.
 var pipeFilters = map[string]bool{
 	"cat": true, "head": true, "tail": true, "grep": true, "egrep": true, "fgrep": true, "wc": true,
 	"sort": true, "uniq": true, "cut": true, "tr": true, "nl": true,
+}
+
+// filterWrites reports a pipe filter told to write a file or run a
+// program: sort -o, --output or --compress-program (any prefix git-style
+// abbreviation of either, any short cluster with an o), or uniq's second operand.
+func filterWrites(argv []string) bool {
+	switch argv[0] {
+	case "sort":
+		for _, a := range argv[1:] {
+			if n, ok := strings.CutPrefix(a, "--"); ok {
+				n, _, _ = strings.Cut(n, "=")
+				if n != "" && (strings.HasPrefix("output", n) || strings.HasPrefix("compress-program", n)) {
+					return true
+				}
+			} else if len(a) > 1 && a[0] == '-' && strings.ContainsRune(a[1:], 'o') {
+				return true
+			}
+		}
+	case "uniq":
+		// uniq [opts] [in [out]]: -f/-s/-w values count too (fail closed).
+		operands := 0
+		for _, a := range argv[1:] {
+			if a == "-" || !strings.HasPrefix(a, "-") {
+				operands++
+			}
+		}
+		return operands > 1
+	}
+	return false
 }
 
 // nameReaders read or print their arguments and never run them.
