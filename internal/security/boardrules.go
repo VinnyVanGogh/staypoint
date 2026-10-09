@@ -884,6 +884,9 @@ func gitNamesOnly(re *regexp.Regexp, args []string) bool {
 	return false
 }
 
+// gitOrderFileSubs: builtins whose -O is a diff orderfile, not a pager.
+var gitOrderFileSubs = map[string]bool{"log": true, "show": true, "diff": true, "whatchanged": true, "format-patch": true, "diff-tree": true}
+
 // gitSub splits git's arguments into the subcommand and its arguments.
 func gitSub(args []string) (string, []string) {
 	for i := 0; i < len(args); i++ {
@@ -913,9 +916,10 @@ func gitRunsProgram(sub string, args []string) bool {
 					return true
 				}
 			}
-		case sub == "grep" && strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 'O'):
-			// -O may close a short-flag cluster (-nO<pager>). Elsewhere
-			// (log -O<orderfile>, -S'TODO') it runs nothing.
+		case !gitOrderFileSubs[sub] && strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 'O'):
+			// -O may close a grep short-flag cluster (-nO<pager>). An
+			// alias or a misread global option may be grep too; only the
+			// diff family's -O<orderfile> (and log -S'TODO') runs nothing.
 			return true
 		}
 	}
