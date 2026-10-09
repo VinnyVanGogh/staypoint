@@ -624,8 +624,9 @@ var plainKillRe = regexp.MustCompile(`(?i)\bkill\b`)
 
 // killsByPID reports kill of a PID that may be StayPoint's: kill with an
 // expanding argument or fed by xargs, on a line whose PID source may name
-// it: pgrep or pidof with a pattern matching selfProcNames, or any ps or
-// lsof (their filters are not read). kill 1234 is not read.
+// it: pgrep or pidof with a pattern matching selfProcNames, lsof not
+// limited to literal ports other than StayPoint's, or ps not piped through
+// a grep for something else. kill 1234 is not read.
 func killsByPID(code string) bool {
 	if !textMatch(plainKillRe, code) {
 		return false
@@ -646,7 +647,7 @@ func pidKill(code string, depth int) (dynKill, src bool) {
 	for _, b := range subs {
 		merge(pidKill(b, depth+1))
 	}
-	for _, s := range segs {
+	for k, s := range segs {
 		argv, viaXargs := unwrapArgv(s.argv)
 		off := len(s.argv) - len(argv)
 		if len(argv) > 0 && shells[baseCmd(argv)] {
@@ -667,8 +668,10 @@ func pidKill(code string, depth int) (dynKill, src bool) {
 				dynKill = dynKill || i == 0 && viaXargs || anyTrue(s.dyn[off+i+1:])
 			case "pgrep", "pidof":
 				src = src || killPatternsSelf(argv[i+1:]) || anyTrue(s.dyn[off+i+1:])
-			case "ps", "lsof":
-				src = true
+			case "lsof":
+				src = src || i == 0 && viaXargs || !lsofOtherPorts(argv[i+1:], s.dyn[off+i+1:])
+			case "ps":
+				src = src || !psFiltered(segs, k)
 			default:
 				// Code in a word (python3 -c "os.system('kill ...')") is
 				// read as shell.
@@ -679,6 +682,160 @@ func pidKill(code string, depth int) (dynKill, src bool) {
 		}
 	}
 	return dynKill, src
+}
+
+// lsofSpecRe is an lsof -i address with a literal port list:
+// [46][protocol][@host]:port[,port...]. Service names and ranges do not
+// match.
+var lsofSpecRe = regexp.MustCompile(`(?i)^[46]?(tcp|udp)?(@[^:@\s]*)?:([0-9]+(,[0-9]+)*)$`)
+
+// lsofOtherPorts reports lsof args that select only network files on
+// literal ports other than StayPoint's (lsof -ti:8080, lsof -t -i
+// tcp:5173 -sTCP:LISTEN). A file operand, another selector (-c, -p, -u),
+// an -i with no port, an expanding word or any other option is not.
+func lsofOtherPorts(args []string, dyn []bool) bool {
+	if anyTrue(dyn) {
+		return false
+	}
+	sawI := false
+	for j := 0; j < len(args); j++ {
+		a := args[j]
+		if len(a) < 2 || a[0] != '-' || a[1] == '-' {
+			return false
+		}
+		for c := 1; c < len(a); c++ {
+			switch a[c] {
+			case 't', 'n', 'P', 'a':
+				continue
+			case 'i', 's':
+				v := a[c+1:]
+				if v == "" {
+					if j+1 >= len(args) || strings.HasPrefix(args[j+1], "-") {
+						return false
+					}
+					j++
+					v = args[j]
+				}
+				if a[c] == 'i' {
+					m := lsofSpecRe.FindStringSubmatch(v)
+					if m == nil {
+						return false
+					}
+					for _, p := range strings.Split(m[3], ",") {
+						if strings.TrimLeft(p, "0") == StayPointPort {
+							return false
+						}
+					}
+					sawI = true
+				}
+			default:
+				return false
+			}
+			break
+		}
+	}
+	return sawI
+}
+
+// psGreps are filters whose matching lines are all ps passes on.
+var psGreps = map[string]bool{"grep": true, "egrep": true, "fgrep": true}
+
+// psFiltered reports ps in segs[k] piped (directly or through other
+// stages) into a grep whose only input is that pipe and whose patterns
+// each have a letter and cannot match selfProcNames or the ps columns of
+// the daemon's line: ps aux | grep vite | awk '{print $2}'. grep -v, -f,
+// -r, a file operand, an expanding pattern or an awk filter do not count.
+func psFiltered(segs []segment, k int) bool {
+	for j := k; j+1 < len(segs) && segs[j].piped; j++ {
+		if s := segs[j+1]; len(s.argv) > 0 && psGreps[baseCmd(s.argv)] && !anyTrue(s.dyn) && grepPatternsOther(s.argv[1:]) {
+			return true
+		}
+	}
+	return false
+}
+
+// psColumns are words on any ps line that a pattern matching them would
+// also select the daemon's line by: AM/PM start times and month names.
+var psColumns = []string{"AM", "PM", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+
+var letterRe = regexp.MustCompile(`[A-Za-z]`)
+
+// grepPatternsOther reads grep args: -e values or the one operand are the
+// patterns. Options other than -e that take a separate value make the
+// value an extra operand, so the args do not count.
+func grepPatternsOther(args []string) bool {
+	var pats, ops []string
+	hasE := false
+	for j := 0; j < len(args); j++ {
+		a := args[j]
+		switch {
+		case a == "--":
+			ops = append(ops, args[j+1:]...)
+			j = len(args)
+		case strings.HasPrefix(a, "--regexp="):
+			pats, hasE = append(pats, strings.TrimPrefix(a, "--regexp=")), true
+		case a == "--regexp":
+			if j+1 >= len(args) {
+				return false
+			}
+			j++
+			pats, hasE = append(pats, args[j]), true
+		case strings.HasPrefix(a, "--"):
+			if strings.HasPrefix(a, "--invert") || strings.HasPrefix(a, "--file") || strings.Contains(a, "recursive") {
+				return false
+			}
+		case len(a) > 1 && a[0] == '-':
+			for c := 1; c < len(a); c++ {
+				if strings.IndexByte("vfrR", a[c]) >= 0 {
+					return false
+				}
+				if a[c] == 'e' {
+					v := a[c+1:]
+					if v == "" {
+						if j+1 >= len(args) {
+							return false
+						}
+						j++
+						v = args[j]
+					}
+					pats, hasE = append(pats, v), true
+					break
+				}
+			}
+		default:
+			ops = append(ops, a)
+		}
+	}
+	if !hasE {
+		if len(ops) != 1 {
+			return false
+		}
+		pats, ops = ops, nil
+	}
+	if len(ops) > 0 || len(pats) == 0 {
+		return false
+	}
+	for _, p := range pats {
+		if !letterRe.MatchString(p) || patternMatches(p, append(selfProcNames(), psColumns...)) {
+			return false
+		}
+	}
+	return true
+}
+
+// patternMatches reports a pattern, read as a case-insensitive regexp,
+// that matches any of names or does not compile.
+func patternMatches(p string, names []string) bool {
+	re, err := regexp.Compile("(?i)" + p)
+	if err != nil {
+		return true
+	}
+	for _, n := range names {
+		if re.MatchString(n) {
+			return true
+		}
+	}
+	return false
 }
 
 // selfProcNames are what pkill -f and killall match the daemon and the CLI
@@ -774,14 +931,8 @@ func killPatternsSelf(args []string) bool {
 			}
 			continue
 		}
-		re, err := regexp.Compile("(?i)" + a)
-		if err != nil {
+		if patternMatches(a, names) {
 			return true
-		}
-		for _, n := range names {
-			if re.MatchString(n) {
-				return true
-			}
 		}
 	}
 	return false
