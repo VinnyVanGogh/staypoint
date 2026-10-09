@@ -15,6 +15,7 @@ import (
 
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/paperclip"
+	"github.com/VinnyVanGogh/staypoint/internal/paperclipimport"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry/quota"
@@ -28,6 +29,11 @@ type Aggregator struct {
 	PaperclipClient *paperclip.Client
 	RateLimitsPath  string
 	Now             func() time.Time
+	// LiveRuns returns the tasks whose run is in flight, with when it
+	// started (the daemon passes orchestrator.GlobalRunSlots.LiveRuns). Nil,
+	// as in the CLI, which cannot see the daemon's runs, falls back to
+	// "checkout_run_id is set".
+	LiveRuns func() map[string]time.Time
 }
 
 // NewAggregator creates an Aggregator with sensible system defaults.
@@ -536,6 +542,34 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 		return s
 	}
 
+	// Paperclip issues are added after local tasks, so a local task (an
+	// imported copy, or a task that shares a title) wins over its frozen
+	// Paperclip record.
+	var paperclipItems []TaskItem
+	localIDs, localTitles := map[string]bool{}, map[string]bool{}
+
+	// live reports whether a task's run is in flight, and since when.
+	var liveRuns map[string]time.Time
+	if a.LiveRuns != nil {
+		liveRuns = a.LiveRuns()
+	}
+	live := func(taskID, checkoutRunID string) (string, bool) {
+		if checkoutRunID == "" {
+			return "", false
+		}
+		if a.LiveRuns == nil {
+			return "", true
+		}
+		since, ok := liveRuns[taskID]
+		if !ok {
+			return "", false
+		}
+		if since.IsZero() {
+			return "", true
+		}
+		return since.UTC().Format(time.RFC3339Nano), true
+	}
+
 	// 2a. Query Paperclip companies if client is usable.
 	// Projects, issues, and agents are fetched in parallel per company to avoid
 	// sequential HTTP round-trips that previously added ≈3–4 s to every boot.
@@ -572,7 +606,11 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 
 			for _, cf := range fetched {
 				c := cf.company
-				orgSummary := ensureOrg(c.Name, c.ID, c.IssuePrefix)
+				// The import mapped each company to an organization already
+				// in use ("RuneLite Plugins" -> "RuneLite"); list it under
+				// that one name, not both (task-3387cad2).
+				orgName := paperclipimport.OrganizationFor(c)
+				orgSummary := ensureOrg(orgName, c.ID, c.IssuePrefix)
 
 				projMap := make(map[string]string)
 				for _, p := range cf.projs {
@@ -592,7 +630,7 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 						Identifier:      iss.Identifier,
 						Title:           iss.Title,
 						Description:     iss.Description,
-						Organization:    c.Name,
+						Organization:    orgName,
 						Project:         projectName,
 						AssigneeAgentID: iss.AssigneeAgentID,
 						CheckoutAgentID: iss.CheckoutAgentID,
@@ -604,38 +642,28 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 						// archive & legacy" like imported legacy tasks.
 						Origin: "legacy",
 					}
+					// Paperclip is frozen: none of its issues has a run in
+					// flight, whatever status it was left in.
 					switch iss.Status {
 					case "in_progress", "running":
-						tItem.Status = "running"
-						orgSummary.TaskCounts.Running++
-						overview.GlobalTasks.Running++
+						tItem.Status, tItem.ExecutionStage = "active", "in_progress"
 					case "blocked":
-						tItem.Status = "blocked"
+						tItem.Status, tItem.ExecutionStage = "blocked", "blocked"
 						tItem.IsBlocked = true
-						orgSummary.TaskCounts.Blocked++
-						overview.GlobalTasks.Blocked++
 					case "stopped", "paused", "cancelled":
-						tItem.Status = "stopped"
-						orgSummary.TaskCounts.Stopped++
-						overview.GlobalTasks.Stopped++
+						tItem.Status, tItem.ExecutionStage = "stopped", "cancelled"
 					case "done", "closed":
-						tItem.Status = "done"
-						orgSummary.TaskCounts.Done++
-						overview.GlobalTasks.Done++
+						tItem.Status, tItem.ExecutionStage = "done", "done"
 					case "error", "failed":
 						tItem.Status = "errored"
-						orgSummary.TaskCounts.Errored++
-						overview.GlobalTasks.Errored++
+					case "backlog":
+						tItem.Status, tItem.ExecutionStage = "active", "backlog"
+					case "in_review":
+						tItem.Status, tItem.ExecutionStage = "active", "in_review"
 					default:
-						tItem.Status = "active"
-						orgSummary.TaskCounts.Active++
-						overview.GlobalTasks.Active++
+						tItem.Status, tItem.ExecutionStage = "active", "todo"
 					}
-					orgSummary.TaskCounts.Total++
-					overview.GlobalTasks.Total++
-
-					orgSummary.Tasks = append(orgSummary.Tasks, tItem)
-					overview.Tasks = append(overview.Tasks, tItem)
+					paperclipItems = append(paperclipItems, tItem)
 				}
 
 				for _, ag := range cf.agents {
@@ -720,18 +748,19 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 			SELECT id, name, COALESCE(organization, ''), COALESCE(project, ''),
 			       status, execution_stage, is_blocked, COALESCE(block_reason, ''),
 			       spent_usd, spent_tokens, updated_at, COALESCE(parent_id, ''),
-			       COALESCE(checkout_agent_id, ''), COALESCE(origin, 'native')
+			       COALESCE(checkout_agent_id, ''), COALESCE(origin, 'native'),
+			       COALESCE(checkout_run_id, '')
 			FROM tasks
 			WHERE status != 'soft_deleted' AND ` + meshContext.VisibleTasksSQL("", includeHidden) + `;
 		`)
 		if err == nil {
 			defer tRows.Close()
 			for tRows.Next() {
-				var id, name, org, proj, st, stage, bReason, upAt, parentID, checkoutAgentID, origin string
+				var id, name, org, proj, st, stage, bReason, upAt, parentID, checkoutAgentID, origin, checkoutRunID string
 				var isBlockedInt int
 				var spentUSD float64
 				var spentTokens int64
-				if err := tRows.Scan(&id, &name, &org, &proj, &st, &stage, &isBlockedInt, &bReason, &spentUSD, &spentTokens, &upAt, &parentID, &checkoutAgentID, &origin); err == nil {
+				if err := tRows.Scan(&id, &name, &org, &proj, &st, &stage, &isBlockedInt, &bReason, &spentUSD, &spentTokens, &upAt, &parentID, &checkoutAgentID, &origin, &checkoutRunID); err == nil {
 					if org == "" {
 						org = "StayPoint"
 					}
@@ -750,18 +779,6 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 						}
 					}
 
-					// Deduplicate if already present from Paperclip
-					found := false
-					for _, existing := range orgSummary.Tasks {
-						if existing.ID == id || existing.Title == name {
-							found = true
-							break
-						}
-					}
-					if found {
-						continue
-					}
-
 					var parsedUp time.Time
 					if t, err := time.Parse(time.RFC3339Nano, upAt); err == nil {
 						parsedUp = t
@@ -769,35 +786,22 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 						parsedUp = now
 					}
 
+					// "running" means a run is in flight, never just stage
+					// in_progress: a stopped or crashed run leaves that behind.
+					runStart, running := live(id, checkoutRunID)
 					taskStatus := "active"
 					switch {
 					case isBlockedInt != 0 || stage == "blocked":
 						taskStatus = "blocked"
-						orgSummary.TaskCounts.Blocked++
-						overview.GlobalTasks.Blocked++
-					case st == "active" && (stage == "in_progress" || stage == "running"):
+					case running:
 						taskStatus = "running"
-						orgSummary.TaskCounts.Running++
-						overview.GlobalTasks.Running++
 					case stage == "error" || stage == "failed" || st == "error":
 						taskStatus = "errored"
-						orgSummary.TaskCounts.Errored++
-						overview.GlobalTasks.Errored++
 					case st == "done" || stage == "done":
 						taskStatus = "done"
-						orgSummary.TaskCounts.Done++
-						overview.GlobalTasks.Done++
 					case st == "stopped" || st == "cancelled" || stage == "cancelled":
 						taskStatus = "stopped"
-						orgSummary.TaskCounts.Stopped++
-						overview.GlobalTasks.Stopped++
-					default:
-						taskStatus = "active"
-						orgSummary.TaskCounts.Active++
-						overview.GlobalTasks.Active++
 					}
-					orgSummary.TaskCounts.Total++
-					overview.GlobalTasks.Total++
 
 					orgSummary.SpentUSD += spentUSD
 					orgSummary.SpentTokens += spentTokens
@@ -826,9 +830,13 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 						UpdatedAt:       parsedUp,
 						CheckoutAgentID: checkoutAgentID,
 						Origin:          origin,
+						Running:         running,
+						RunStartedAt:    runStart,
 					}
 					orgSummary.Tasks = append(orgSummary.Tasks, item)
 					overview.Tasks = append(overview.Tasks, item)
+					localIDs[id] = true
+					localTitles[name] = true
 				}
 			}
 		}
@@ -888,6 +896,27 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 					}
 				}
 			}
+		}
+	}
+
+	for _, item := range paperclipItems {
+		if localIDs[item.ID] || localTitles[item.Title] {
+			continue
+		}
+		orgSummary := ensureOrg(item.Organization, "", "")
+		orgSummary.Tasks = append(orgSummary.Tasks, item)
+		overview.Tasks = append(overview.Tasks, item)
+	}
+
+	// Count once every task is in. Frozen Paperclip issues are legacy, left
+	// out of every count unless includeHidden, like local legacy tasks.
+	for _, s := range orgMap {
+		for _, item := range s.Tasks {
+			if item.Origin == "legacy" && !includeHidden {
+				continue
+			}
+			s.TaskCounts.add(item)
+			overview.GlobalTasks.add(item)
 		}
 	}
 

@@ -7,12 +7,31 @@ import (
 // TaskStatusCounts contains counts of tasks across states.
 type TaskStatusCounts struct {
 	Total   int `json:"total"`
-	Running int `json:"running"` // in_progress / running
+	Running int `json:"running"` // a run in flight (TaskItem.Running), not stage in_progress
 	Active  int `json:"active"`  // todo / backlog / active
 	Stopped int `json:"stopped"` // paused / stopped / cancelled
 	Blocked int `json:"blocked"` // blocked
 	Errored int `json:"errored"` // error / failed
 	Done    int `json:"done"`    // done / closed
+}
+
+// add counts one task under its Status.
+func (c *TaskStatusCounts) add(t TaskItem) {
+	c.Total++
+	switch t.Status {
+	case "running":
+		c.Running++
+	case "blocked":
+		c.Blocked++
+	case "errored":
+		c.Errored++
+	case "done":
+		c.Done++
+	case "stopped":
+		c.Stopped++
+	default:
+		c.Active++
+	}
 }
 
 // TaskItem represents an individual task in the consolidated fleet view.
@@ -38,6 +57,10 @@ type TaskItem struct {
 	// Origin is the local task origin (native, paperclip_import, legacy, agent);
 	// live Paperclip issues are "legacy" (Paperclip is frozen).
 	Origin string `json:"origin,omitempty"`
+	// Running is true only while a run is in flight (Aggregator.LiveRuns);
+	// RunStartedAt is when it started. Status "running" follows Running.
+	Running      bool   `json:"running"`
+	RunStartedAt string `json:"run_started_at,omitempty"`
 }
 
 // AgentItem represents an active or registered agent in an organization.

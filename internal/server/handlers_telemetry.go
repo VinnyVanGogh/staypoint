@@ -38,10 +38,13 @@ type TelemetryHandler struct {
 }
 
 func NewTelemetryHandler(db *sql.DB, hub *EventHub, telemetryDBPath string) *TelemetryHandler {
+	agg := fleet.NewAggregator(db, telemetryDBPath, nil)
+	// Running counts are runs in flight in this daemon (task-3387cad2).
+	agg.LiveRuns = func() map[string]time.Time { return liveRuns() }
 	return &TelemetryHandler{
 		db:              db,
 		hub:             hub,
-		fleetAgg:        fleet.NewAggregator(db, telemetryDBPath, nil),
+		fleetAgg:        agg,
 		telemetryDBPath: telemetryDBPath,
 	}
 }

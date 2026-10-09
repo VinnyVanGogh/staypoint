@@ -26,16 +26,16 @@ func setupTestDB(t *testing.T) *sql.DB {
 
 	// Insert test tasks across organizations
 	_, err = store.DB().Exec(`
-		INSERT INTO tasks (id, name, repo_path, organization, project, status, execution_stage, is_blocked, spent_usd, spent_tokens, parent_id)
+		INSERT INTO tasks (id, name, repo_path, organization, project, status, execution_stage, is_blocked, spent_usd, spent_tokens, parent_id, checkout_run_id)
 		VALUES
-		('task-1', 'Build Fleet UI', '/repo/sta', 'StayPoint', 'Core', 'active', 'in_progress', 0, 12.50, 50000, NULL),
-		('task-2', 'Review PR 122', '/repo/sta', 'StayPoint', 'Core', 'active', 'todo', 0, 0.0, 0, 'task-1'),
-		('task-3', 'Blocked Database Migration', '/repo/sta', 'StayPoint', 'Core', 'active', 'blocked', 1, 3.20, 12000, NULL),
-		('task-4', 'Completed Auth Fix', '/repo/sta', 'StayPoint', 'Core', 'done', 'done', 0, 8.40, 30000, NULL),
-		('task-5', 'Deploy Enterprise Gateway', '/repo/man', 'Managed Solution', 'Cloud', 'active', 'in_progress', 0, 45.00, 150000, NULL),
-		('task-6', 'Sync Client Repos', '/repo/man', 'Managed Solution', 'Platform', 'active', 'todo', 0, 0.0, 0, NULL),
-		('task-7', 'Failed Deployment Rollback', '/repo/man', 'Managed Solution', 'Cloud', 'active', 'failed', 0, 5.00, 18000, NULL),
-		('task-8', 'Cancelled Maintenance Run', '/repo/per', 'Personal', 'Infra', 'soft_deleted', 'cancelled', 0, 0.0, 0, NULL);
+		('task-1', 'Build Fleet UI', '/repo/sta', 'StayPoint', 'Core', 'active', 'in_progress', 0, 12.50, 50000, NULL, 'run-1'),
+		('task-2', 'Review PR 122', '/repo/sta', 'StayPoint', 'Core', 'active', 'todo', 0, 0.0, 0, 'task-1', NULL),
+		('task-3', 'Blocked Database Migration', '/repo/sta', 'StayPoint', 'Core', 'active', 'blocked', 1, 3.20, 12000, NULL, NULL),
+		('task-4', 'Completed Auth Fix', '/repo/sta', 'StayPoint', 'Core', 'done', 'done', 0, 8.40, 30000, NULL, NULL),
+		('task-5', 'Deploy Enterprise Gateway', '/repo/man', 'Managed Solution', 'Cloud', 'active', 'in_progress', 0, 45.00, 150000, NULL, 'run-5'),
+		('task-6', 'Sync Client Repos', '/repo/man', 'Managed Solution', 'Platform', 'active', 'todo', 0, 0.0, 0, NULL, NULL),
+		('task-7', 'Failed Deployment Rollback', '/repo/man', 'Managed Solution', 'Cloud', 'active', 'failed', 0, 5.00, 18000, NULL, NULL),
+		('task-8', 'Cancelled Maintenance Run', '/repo/per', 'Personal', 'Infra', 'soft_deleted', 'cancelled', 0, 0.0, 0, NULL, NULL);
 	`)
 	if err != nil {
 		t.Fatalf("failed to seed tasks: %v", err)
