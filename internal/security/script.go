@@ -327,8 +327,9 @@ func strictShellFlags(flags []string) bool {
 	return true
 }
 
-// shellNoExec reports whether argv is a shell told only to read its script
-// (-n, -o noexec: a syntax check), so the script does not run.
+// shellNoExec reports whether argv is a shell told only to read a script
+// file (-n, -o noexec: a syntax check), so the script does not run. Not
+// with -c (later args are $0...), -s, or -i (interactive shells ignore -n).
 func shellNoExec(argv []string) bool {
 	if len(argv) == 0 || !shells[baseCmd(argv)] {
 		return false
@@ -336,18 +337,32 @@ func shellNoExec(argv []string) bool {
 	args := argv[1:]
 	end, ok := shellScriptIndex(args)
 	if !ok {
-		end = len(args)
+		return false
 	}
+	noexec := false
 	for i := 0; i < end; i++ {
 		a := args[i]
 		switch {
-		case a == "-o" && i+1 < end && args[i+1] == "noexec":
-			return true
-		case len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.ContainsRune(a[1:], 'n'):
-			return true
+		case a == "-o" || a == "+o":
+			if a == "-o" && i+1 < end && args[i+1] == "noexec" {
+				noexec = true
+			}
+			i++
+		case strings.HasPrefix(a, "--"):
+			// --login and --rcfile read startup files.
+			if a != "--norc" && a != "--noprofile" && a != "--posix" {
+				return false
+			}
+		case len(a) > 1 && (a[0] == '-' || a[0] == '+'):
+			if strings.ContainsAny(a[1:], "csil") {
+				return false
+			}
+			if a[0] == '-' && strings.ContainsRune(a[1:], 'n') {
+				noexec = true
+			}
 		}
 	}
-	return false
+	return noexec
 }
 
 // shellReadsInput reports whether a shell's flags make it read commands from

@@ -246,6 +246,12 @@ func runsAgent(code string, depth int) bool {
 		if nestedAgentRe.MatchString(argv[0]) {
 			return true
 		}
+		// GIT_PAGER=claude, EDITOR=codex: a variable naming an agent runs it.
+		for _, a := range s.argv[:len(s.argv)-len(argv)] {
+			if isAssign(a) && nestedAgentRe.MatchString(a[strings.IndexByte(a, '=')+1:]) {
+				return true
+			}
+		}
 		if shells[baseCmd(argv)] {
 			if ci, ok := shellCommandArg(argv[1:]); ok && runsAgent(argv[1+ci], depth+1) {
 				return true
@@ -558,6 +564,11 @@ func namedRun(code string, re *regexp.Regexp, depth int) bool {
 		if fed && (viaXargs || len(argv) == 0 || !pipeFilters[baseCmd(argv)] || argv[0] != baseCmd(argv)) {
 			return true
 		}
+		// Named in an assignment or a wrapper's args (BASH_ENV=...,
+		// GIT_EXTERNAL_DIFF=..., env, timeout), it may run.
+		if anyNames(re, s.argv[:len(s.argv)-len(argv)]) {
+			return true
+		}
 		if named && !namesOnly(re, s, argv, viaXargs, depth) {
 			return true
 		}
@@ -769,12 +780,15 @@ func ownHandoffRead(code, taskID string) bool {
 		if loc == nil || strings.ContainsAny(tok, "`") || strings.Contains(tok[:loc[1]], "..") {
 			return false
 		}
+		// Braces and ? or [..] globs can spell .. ({..,x}, .? in bash 3.2);
+		// * cannot start a name with a dot, so it may stand in one that
+		// does not.
 		rest := tok[loc[1]:]
-		if strings.Contains(rest, "$") {
+		if strings.ContainsAny(rest, "$\\{}[]?") {
 			return false
 		}
 		for _, e := range strings.Split(rest, "/") {
-			if e == ".." {
+			if e == ".." || (strings.HasPrefix(e, ".") && strings.Contains(e, "*")) {
 				return false
 			}
 		}
