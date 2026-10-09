@@ -57,7 +57,7 @@ var (
 	// Running the reinstall script is reinstallExec, launchctl runsLaunchctl.
 	// A cd (or -C) into ~/.local makes a relative `go build -o staypointd`
 	// or `cp x staypoint` replace the installed binary.
-	selfCmdRe = regexp.MustCompile(`(?i)(\b(cd|pushd)\b[^;&|\n]*\.local\b|\s-C\s*['"]?[^\s;&|]*\.local\b|\bgo\s+install\b[^;&|\n]*staypoint|\bgo\s+(install|build)\b[^;&|\n]*\.local/bin|\b(cp|mv|ln|install|rsync|ditto)\b[^;&|\n]*\.local/bin|\b(kill|pkill|killall)\b[^;&|\n]*\bstaypointd?([^\w-]|$)|\bbrew\s+(re)?install\b[^;&|\n]*staypoint)`)
+	selfCmdRe = regexp.MustCompile(`(?i)(\b(cd|pushd)\b[^;&|\n]*(\.local\b|\.l[^\s/;&|]*[*?\[])|\s-C\s*['"]?[^\s;&|]*\.local\b|\bgo\s+install\b[^;&|\n]*staypoint|\bgo\s+(install|build)\b[^;&|\n]*\.local/bin|\b(cp|mv|ln|install|rsync|ditto)\b[^;&|\n]*\.local/bin|\b(kill|pkill|killall)\b[^;&|\n]*\bstaypointd?([^\w-]|$)|\bbrew\s+(re)?install\b[^;&|\n]*staypoint)`)
 	// selfPathRe: paths StayPoint and the agent guards depend on. Any
 	// reference holds, reads included: they hold tokens and the guards. The
 	// one exception is reading the run's own handoff files (ownHandoffRead).
@@ -370,7 +370,8 @@ func writesFile(s segment) bool {
 		if r.heredoc || !strings.Contains(r.op, ">") {
 			continue
 		}
-		if r.target == "/dev/null" || r.target == "-" || (strings.HasSuffix(r.op, "&") && isDigits(r.target)) {
+		// >&1, >&2 go to the terminal; >&3 may be a file opened by exec.
+		if r.target == "/dev/null" || r.target == "-" || (strings.HasSuffix(r.op, "&") && (r.target == "1" || r.target == "2")) {
 			continue
 		}
 		return true
@@ -560,7 +561,7 @@ func envChange(argv []string, st *envState, depth int) bool {
 
 // goShadowRe: a line that can make `go` something else (a function, an
 // alias, PATH or GO* settings, an overlay): no go test exemption.
-var goShadowRe = regexp.MustCompile(`\balias\b|\bfunction\b|\(\s*\)\s*\{|\bPATH=|\bGO\w*=|-overlay|\bgo\s+env\s+-w\b`)
+var goShadowRe = regexp.MustCompile(`\balias\b|\bfunction\b|\(\s*\)\s*\{|\bPATH=|\bGO\w*=|-overlay|\bgo\s+env\s+-w\b|\bread\b|\bhash\b|\bsource\b|(^|[;&|(\n]\s*)\.\s|\bexport\b[^;&|\n]*\b(GO\w*|PATH)\b`)
 
 // goTestOrVet reports `go test` or `go vet` without a flag that runs
 // another program (-exec, -toolexec, -vettool).
