@@ -771,6 +771,41 @@ func TestShipReviewPR_MergeRechecksMigrations(t *testing.T) {
 	}
 }
 
+// task-a5c42165: "Open PR" on a direct-mode card opens a PR so CI runs on
+// the commit, and never merges; the card then follows the pr_merge flow.
+func TestShipReviewPR_OpenPRForCIOnDirectCard(t *testing.T) {
+	notWork(t)
+	state := installFakeGH(t)
+	database, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	setMergeMode(t, database, repoDir, shipreview.MergeModeDirect, "")
+	bare := gitOut(t, repoDir, "remote", "get-url", "origin")
+	mainBefore := gitOut(t, bare, "rev-parse", "main")
+	head := gitOut(t, repoDir, "rev-parse", "staypoint/"+taskID)
+
+	body, _ := json.Marshal(map[string]any{"head_sha": head, "open_pr_for_ci": true})
+	resp, rb := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", body, boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Approve open_pr_for_ci: %d %s", resp.StatusCode, rb)
+	}
+	calls := ghCalls(t, state)
+	if !hasCall(calls, "pr create --head staypoint/"+taskID) || hasCall(calls, "pr merge") {
+		t.Fatalf("want a PR opened and nothing merged, calls: %v", calls)
+	}
+	if got := gitOut(t, bare, "rev-parse", "main"); got != mainBefore {
+		t.Errorf("origin main moved %s -> %s; Open PR must not merge", mainBefore, got)
+	}
+	c := getPRCard(t, client, baseURL, token, taskID)
+	if c.Status != "pending" || c.PRNumber != 7 || c.MergeMode != "pr_merge" || c.EffectiveMode != "pr_merge" {
+		t.Errorf("card after Open PR = %+v", c)
+	}
+
+	// The card now has a PR: open_pr_for_ci no longer applies.
+	resp, rb = shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", body, boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("second open_pr_for_ci: %d %s, want 409", resp.StatusCode, rb)
+	}
+}
+
 func readFile(t *testing.T, p string) string {
 	t.Helper()
 	b, err := os.ReadFile(p)

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,9 +23,31 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 )
 
+// ChangeForCard returns what the card's head changes for the test gate,
+// measured from the task's recorded base: the same base the card's "Files
+// changed" list uses, so the gate never judges files the task did not touch.
+// A task with no recorded base (made before STA-774) falls back to
+// ChangeForGate; a tampered base fails closed.
+func ChangeForCard(ctx context.Context, db *sql.DB, repoDir string, card *Card) ([]string, map[string][]int, error) {
+	if repoDir == "" || card.HeadSHA == "" {
+		return nil, nil, errors.New("card has no repo or head")
+	}
+	base, err := workspace.TaskBase(ctx, db, repoDir, card.TaskID, card.HeadSHA)
+	switch {
+	case err == nil:
+		return changeSince(ctx, repoDir, base, card.HeadSHA)
+	case errors.Is(err, workspace.ErrNoTaskBase):
+		return ChangeForGate(ctx, repoDir, card.HeadSHA, card.TargetBranch)
+	default:
+		return nil, nil, err
+	}
+}
+
 // ChangeForGate returns the files the card's head changes against its
 // merge-base with target (main, or master, when target is ""), and the
-// added/modified lines per file.
+// added/modified lines per file. origin/<target> is preferred to the local
+// branch: the repo root's local main is rarely pulled, and a stale one makes
+// every commit since it look like part of the change.
 func ChangeForGate(ctx context.Context, repoDir, headSHA, target string) ([]string, map[string][]int, error) {
 	if repoDir == "" || headSHA == "" {
 		return nil, nil, errors.New("card has no repo or head")
@@ -42,18 +65,29 @@ func ChangeForGate(ctx context.Context, repoDir, headSHA, target string) ([]stri
 	}
 	// Report main's error: master is only a fallback, and its "unknown
 	// revision" would hide why main failed (e.g. a git timeout).
-	base, mainErr := gitOutput(ctx, repoDir, "merge-base", "main", headSHA)
-	if mainErr != nil || base == "" {
-		if out, err := gitOutput(ctx, repoDir, "merge-base", "master", headSHA); err == nil && out != "" {
+	base, mainErr := mergeBaseWith(ctx, repoDir, "main", headSHA)
+	if mainErr != nil {
+		if out, err := mergeBaseWith(ctx, repoDir, "master", headSHA); err == nil {
 			base = out
 		} else {
-			if mainErr == nil {
-				mainErr = errors.New("empty merge-base")
-			}
 			return nil, nil, fmt.Errorf("no merge-base with main: %w", mainErr)
 		}
 	}
 	return changeSince(ctx, repoDir, base, headSHA)
+}
+
+// mergeBaseWith returns the merge-base of headSHA with origin/<branch>, else
+// with the local branch.
+func mergeBaseWith(ctx context.Context, repoDir, branch, headSHA string) (string, error) {
+	ref, err := workspace.TargetBranchRef(ctx, repoDir, branch)
+	if err != nil {
+		return "", err
+	}
+	base, err := gitOutput(ctx, repoDir, "merge-base", ref, headSHA)
+	if err == nil && base == "" {
+		err = errors.New("empty merge-base")
+	}
+	return base, err
 }
 
 // changeSince lists what headSHA changes since base, for the test gate.
@@ -98,6 +132,41 @@ func WorkflowsAt(ctx context.Context, repoDir, sha string) (map[string]string, e
 	return wf, nil
 }
 
+// maxCIScripts bounds how many scripts ScriptsAt reads for one head.
+const maxCIScripts = 50
+
+// ScriptsAt returns the repo scripts the workflows call at sha, and the
+// scripts those call, by path. A path that is not a file at sha is skipped:
+// it may be generated, or a word that only looks like a script.
+func ScriptsAt(ctx context.Context, repoDir, sha string, workflows map[string]string) map[string]string {
+	scripts := map[string]string{}
+	paths := make([]string, 0, len(workflows))
+	for p := range workflows {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	var queue []string
+	for _, p := range paths {
+		queue = append(queue, testgate.ScriptRefs(workflows[p])...)
+	}
+	tried := map[string]bool{}
+	for len(queue) > 0 && len(tried) < maxCIScripts {
+		p := queue[0]
+		queue = queue[1:]
+		if tried[p] {
+			continue
+		}
+		tried[p] = true
+		body, err := gitOutput(ctx, repoDir, "show", sha+":"+p)
+		if err != nil {
+			continue
+		}
+		scripts[p] = body
+		queue = append(queue, testgate.ScriptRefs(body)...)
+	}
+	return scripts
+}
+
 // ── CI coverage artifacts ───────────────────────────────────────────────────
 
 var (
@@ -140,6 +209,13 @@ func (a GHAuth) CICoverage(ctx context.Context, headSHA string, changed map[stri
 	if len(runs) == 0 {
 		return testgate.CoverageResult{Note: "no CI run for this commit"}
 	}
+	res := ciCoverage(ctx, a, runs, changed, src)
+	res.CIRuns = len(runs)
+	return res
+}
+
+// ciCoverage reads the coverage artifacts of headSHA's CI runs.
+func ciCoverage(ctx context.Context, a GHAuth, runs []ghRun, changed map[string][]int, src func(string) []byte) testgate.CoverageResult {
 	allDone := true
 	for _, r := range runs {
 		if r.Status != "completed" {
@@ -248,12 +324,16 @@ type GateDeps struct {
 // reused (always once final, else for coverageRecheck). An error means the
 // change itself could not be read; callers fail closed.
 func EvaluateTestGate(ctx context.Context, db *sql.DB, card *Card, repoDir string, deps GateDeps) (*testgate.Report, error) {
-	files, lines, err := ChangeForGate(ctx, repoDir, card.HeadSHA, card.TargetBranch)
+	files, lines, err := ChangeForCard(ctx, db, repoDir, card)
 	if err != nil {
 		return nil, err
 	}
 	in := testgate.Input{HeadSHA: card.HeadSHA, Files: files, ExtraExempt: deps.ExtraExempt, ChangedLines: lines}
 	in.CI.Workflows, in.CI.WorkflowsErr = WorkflowsAt(ctx, repoDir, card.HeadSHA)
+	if in.CI.WorkflowsErr == nil {
+		in.CI.Scripts = ScriptsAt(ctx, repoDir, card.HeadSHA, in.CI.Workflows)
+	}
+	in.CI.NoPR = card.PRNumber == 0
 	if card.PRNumber > 0 {
 		in.CI.PRNumber = card.PRNumber
 		// Checks only describe this change once polled for this very head.

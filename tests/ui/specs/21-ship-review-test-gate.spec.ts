@@ -123,6 +123,38 @@ test.describe('ship review merge test gate (STA-734)', () => {
     cleanup();
   });
 
+  // task-a5c42165: a direct-mode card has no PR, so CI never ran on it. That
+  // is a note with a one-click Open PR, not a block.
+  test('no CI run on a direct card: non-blocking note, Open PR sends open_pr_for_ci', async ({ boardPage: page, request }) => {
+    const { task, headSHA, cleanup } = await createCardTask(request, 'Gate no CI run');
+    const NO_CI_RUN: Warning = { kind: 'no_ci_run', blocking: false, message: 'No CI run for this commit: open a PR to run CI.' };
+    await fakeTestCoverage(page, task.id, { head_sha: headSHA, report: report(headSHA, [NO_CI_RUN, NO_COVERAGE], {
+      tests: ['calc/calc_test.go'], untested_sources: [], test_workflows: ['.github/workflows/ci.yml'],
+    }) });
+    let approveBody: Record<string, unknown> | null = null;
+    await page.route('**/ship-review/approve', async (route) => {
+      approveBody = JSON.parse(route.request().postData() || '{}');
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        merge_mode: 'pr_merge', pr_number: 7, pr_url: 'https://github.com/o/r/pull/7',
+        card: { status: 'pending', head_sha: headSHA, merge_mode: 'pr_merge', pr_number: 7, pr_url: 'https://github.com/o/r/pull/7', effective_merge_mode: 'pr_merge', files_changed: [], test_steps: [] },
+      }) });
+    });
+    await gotoTaskPage(page, task);
+
+    const sec = page.locator('.ship-review-test-coverage');
+    await expect(sec).toHaveAttribute('data-state', 'ok', { timeout: 10_000 });
+    const note = sec.locator('.ship-review-test-warning[data-kind="no_ci_run"]');
+    await expect(note).toContainText('No CI run for this commit: open a PR to run CI.');
+    await expect(note).not.toHaveClass(/ship-review-test-warning--blocking/);
+    await expect(reviewActions(page).locator('.ship-review-approve-btn')).toBeEnabled();
+    await expect(sec.getByRole('button', { name: 'Merge without tests' })).toBeHidden();
+
+    await note.getByRole('button', { name: 'Open PR' }).click();
+    await expect.poll(() => approveBody, { timeout: 10_000 }).not.toBeNull();
+    expect(approveBody).toMatchObject({ head_sha: headSHA, open_pr_for_ci: true });
+    cleanup();
+  });
+
   test('coverage report: uncovered changed code blocks; partial test change is a hint only', async ({ page, request }) => {
     const { task, headSHA, cleanup } = await createCardTask(request, 'Gate uncovered');
     await fakeTestCoverage(page, task.id, { head_sha: headSHA, report: report(headSHA, [UNTESTED_SOURCES, UNCOVERED], {

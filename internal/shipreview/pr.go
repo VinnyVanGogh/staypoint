@@ -72,6 +72,16 @@ func EffectiveMergeMode(cfg *ProjectDevConfig, isWork bool) string {
 	return MergeModeDirect
 }
 
+// CardMergeMode is the mode Approve uses for card: a card whose PR was
+// opened in pr_merge mode stays there (the Board chose "Open PR" to run CI
+// on a direct-mode card), else the project's EffectiveMergeMode.
+func CardMergeMode(cfg *ProjectDevConfig, isWork bool, card *Card) string {
+	if card != nil && card.MergeMode == MergeModePRMerge && card.PRNumber > 0 {
+		return MergeModePRMerge
+	}
+	return EffectiveMergeMode(cfg, isWork)
+}
+
 // PRCheck is one CI check on a PR head, as reported by `gh pr checks`.
 type PRCheck struct {
 	Name        string `json:"name"`
