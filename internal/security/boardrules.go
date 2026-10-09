@@ -815,9 +815,10 @@ var psColumns = []string{"SsRUITZNLWXE+<", "AM", "PM", "Mon", "Tue", "Wed", "Thu
 	"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
 
 // psPatternRe is a grep pattern that stays inside one ps column: no
-// space, digit or operator beyond . and a bracket class ([n]ode), so it
-// cannot span columns or read differently as a basic regexp.
-var psPatternRe = regexp.MustCompile(`^[A-Za-z._/\[\]-]*[A-Za-z][A-Za-z._/\[\]-]*$`)
+// space, digit or operator beyond . and a letters-only bracket class
+// ([n]ode; no range, negation or POSIX [[.x.]] class), so it cannot span
+// columns or read differently as a basic regexp.
+var psPatternRe = regexp.MustCompile(`^(?:[A-Za-z._/-]|\[[A-Za-z]+\])*[A-Za-z](?:[A-Za-z._/-]|\[[A-Za-z]+\])*$`)
 
 // statOnlyRe is a pattern made only of letters a STAT column can hold.
 var statOnlyRe = regexp.MustCompile(`(?i)^[sruitznlwxe.\[\]]+$`)
