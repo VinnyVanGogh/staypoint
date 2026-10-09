@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/adapter"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 )
 
@@ -136,6 +137,57 @@ func TestWireOnWake_QuotaLockedRunWaits(t *testing.T) {
 	drain(t)
 	if calls.Load() == 0 {
 		t.Fatal("run did not start after the pool unlocked")
+	}
+}
+
+// TestWireOnWake_SeatsRunOutMidRunWaitsForReset: the 2026-10-09 incident. A
+// run whose seats all answer with their limit mid-run is not an error: it is
+// queued on quota (work -> personal -> wait) and resumes once a seat resets.
+func TestWireOnWake_SeatsRunOutMidRunWaitsForReset(t *testing.T) {
+	orchestrator.GlobalDispatcher = orchestrator.NewDispatcher()
+	slots := freshSlots(t, 3)
+	var locked atomic.Bool
+	stubQuota(t, &locked)
+
+	store := openTestStore(t)
+	dir := t.TempDir()
+	const taskID = "queue-seat-limit-1"
+	insertWakeTask(t, store.DB(), taskID)
+
+	var calls atomic.Int32
+	limited := func(_ context.Context, _ string, _ string, _ []string, _ []string, stdout, _ io.Writer) error {
+		if calls.Add(1) == 1 {
+			// Both seats answer with their limit; the pacer now shows them out.
+			locked.Store(true)
+			return &adapter.SeatLimitError{AllLocked: true, Seats: []string{
+				"work seat locked (You've hit your session limit · resets 4:20am)",
+				"personal seat locked (You've hit your session limit · resets 4:20am)",
+			}}
+		}
+		fmt.Fprintln(stdout, "[[TASK_COMPLETE]]")
+		return nil
+	}
+	wireOnWake(store, dir, nil, limited, &stubWM{dir: dir})
+
+	orchestrator.GlobalDispatcher.Wake(taskID, "run_now", "")
+	drain(t)
+	if calls.Load() != 1 {
+		t.Fatalf("want one turn before the wait, got %d", calls.Load())
+	}
+	if pos := slots.Position(taskID); !pos.Queued || pos.Wait != orchestrator.WaitQuota {
+		t.Fatalf("seat-limited run not queued on quota: %+v", pos)
+	}
+	var stage string
+	_ = store.DB().QueryRow(`SELECT execution_stage FROM tasks WHERE id=?`, taskID).Scan(&stage)
+	if stage == "error" {
+		t.Fatalf("a quota wait must not mark the task errored")
+	}
+
+	locked.Store(false) // a seat reset
+	slots.Pump()
+	drain(t)
+	if calls.Load() < 2 {
+		t.Fatal("run did not resume after a seat reset")
 	}
 }
 

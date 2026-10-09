@@ -22,7 +22,7 @@ test.describe('Task trust', () => {
     expect(res.status(), await res.text()).toBe(201);
     // The body names a preset only: the server sets the expiry.
     expect(Object.keys(JSON.parse(res.request().postData() || '{}'))).toEqual(['preset']);
-    await expect(section.locator('.trust-banner-text')).toHaveText(/^Trusted until \d\d:\d\d · 0 auto-approved$/);
+    await expect(section.locator('.trust-banner-text')).toHaveText(/^Trusted until (\w+ )?\d\d:\d\d · 0 auto-approved$/);
 
     const cmd = `sudo ls trust-${uniq()}`;
     const ok = await api.createGateRequest(cmd, ['sudo: privilege escalation'], 'run-trust', task.id);

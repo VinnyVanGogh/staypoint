@@ -6,6 +6,11 @@
 // orchestrator.StepRecorder against the throwaway database exactly as the
 // harness does during a run. If the recorder cannot persist, no steps reach
 // the UI and the timeline spec fails.
+//
+// With --doc it instead stores one task document version the way
+// `staypoint task doc add` does (context.AddTaskDocument). Specs must not
+// write the throwaway DB with the sqlite3 CLI: on the Linux CI runner its
+// writes stopped reaching the daemon partway through a spec file.
 package main
 
 import (
@@ -14,6 +19,7 @@ import (
 	"fmt"
 	"os"
 
+	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 )
@@ -23,9 +29,11 @@ func main() {
 	taskID  := flag.String("task", "", "task id to record steps for (required)")
 	runID   := flag.String("run", "ui-e2e-run", "run id")
 	partial := flag.Bool("partial", false, "emit a wake step only, no terminal state step (simulates a mid-run task)")
+	docKey  := flag.String("doc", "", "store a task document under this key instead of recording steps")
+	content := flag.String("content", "", "document content for --doc")
 	flag.Parse()
 	if *dbPath == "" || *taskID == "" {
-		fmt.Fprintln(os.Stderr, "usage: stepsim --db PATH --task ID [--run ID] [--partial]")
+		fmt.Fprintln(os.Stderr, "usage: stepsim --db PATH --task ID [--run ID] [--partial] | [--doc KEY --content TEXT]")
 		os.Exit(2)
 	}
 
@@ -35,6 +43,25 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
+
+	if *docKey != "" {
+		// db.Open turns foreign keys on, so a task this process cannot see
+		// fails here instead of leaving an orphan document.
+		if err := meshContext.AddTaskDocument(store.DB(), *taskID, *docKey, *content); err != nil {
+			fmt.Fprintln(os.Stderr, "stepsim: add document:", err)
+			store.Close()
+			os.Exit(1)
+		}
+		var v int
+		if err := store.DB().QueryRow(`SELECT MAX(version) FROM task_documents WHERE task_id = ? AND doc_key = ?`,
+			*taskID, *docKey).Scan(&v); err != nil {
+			fmt.Fprintln(os.Stderr, "stepsim: read document version:", err)
+			store.Close()
+			os.Exit(1)
+		}
+		fmt.Printf("VERSION %d\n", v)
+		return
+	}
 
 	rec := orchestrator.NewStepRecorder(store.DB(), func(string, any) {}, *runID, *taskID)
 	rec.EmitWake("ui-e2e: Run Now")

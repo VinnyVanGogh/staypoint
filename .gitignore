@@ -16,3 +16,4 @@ dist/
 *.log
 .staypoint/
 **/.staypoint/
+__pycache__/
