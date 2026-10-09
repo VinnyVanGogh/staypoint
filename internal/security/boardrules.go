@@ -158,7 +158,7 @@ func boardRuleText(code, what, taskID string) string {
 		return what + " runs shell commands it reads from input or a file, which cannot be checked"
 	case remoteShellRe.MatchString(code):
 		return what + " opens a remote shell or tunnel, which may write prod or delete data (Board rule: no prod writes or deletes)"
-	case selfCmdRe.MatchString(code) || runsLaunchctl(code, 0) || reinstallExec(code, 0) || killsSelf(code, 0) || runsDaemon(code, 0):
+	case selfCmdRe.MatchString(code) || runsLaunchctl(code, 0) || reinstallExec(code, 0) || killsSelf(code, 0) || killsByPID(code) || runsDaemon(code, 0):
 		return what + " rebuilds, restarts or replaces StayPoint or its guards (Board rule: self-protection)"
 	case selfPathRe.MatchString(code) && !ownHandoffRead(code, taskID):
 		return what + " touches StayPoint state or agent guard config (Board rule: self-protection)"
@@ -609,6 +609,71 @@ func runsLaunchctl(code string, depth int) bool { return namedRun(code, launchct
 
 var killRe = regexp.MustCompile(`(?i)\b(pkill|killall)\b`)
 
+// unquoter drops what the shell removes inside a word, so a text
+// prefilter sees a name split by empty quotes or a backslash (p\kill) as
+// the parse will.
+var unquoter = strings.NewReplacer(`'`, "", `"`, "", `\`, "")
+
+func unquoted(code string) string { return unquoter.Replace(code) }
+
+var (
+	plainKillRe = regexp.MustCompile(`(?i)\bkill\b`)
+	// selfMentionRe: a line that may be after the daemon's or CLI's PID.
+	selfMentionRe = regexp.MustCompile(`(?i)staypoint|41421`)
+)
+
+// killsByPID reports kill of a PID that may be StayPoint's: kill with an
+// expanding argument or fed by xargs, on a line whose PID source may name
+// it (pgrep or pidof with a pattern matching selfProcNames, or ps or lsof
+// on a line that mentions StayPoint or its port). kill 1234 is not read.
+func killsByPID(code string) bool {
+	if !plainKillRe.MatchString(unquoted(code)) {
+		return false
+	}
+	dynKill, src, psLike := pidKill(code, 0)
+	return dynKill && (src || psLike && selfMentionRe.MatchString(unquoted(code)))
+}
+
+func pidKill(code string, depth int) (dynKill, src, psLike bool) {
+	if depth > maxDepth {
+		return true, true, true
+	}
+	segs, subs, err := parseShell(code)
+	if err != nil {
+		return true, true, true
+	}
+	merge := func(d, s, p bool) { dynKill, src, psLike = dynKill || d, src || s, psLike || p }
+	for _, b := range subs {
+		merge(pidKill(b, depth+1))
+	}
+	for _, s := range segs {
+		argv, viaXargs := unwrapArgv(s.argv)
+		off := len(s.argv) - len(argv)
+		if len(argv) > 0 && shells[baseCmd(argv)] {
+			if ci, ok := shellCommandArg(baseCmd(argv), argv[1:]); ok {
+				merge(pidKill(argv[1+ci], depth+1))
+			}
+			for _, r := range s.redirects {
+				if r.heredoc {
+					merge(pidKill(r.body, depth+1))
+				}
+			}
+			continue
+		}
+		for i, a := range argv {
+			switch baseCmd([]string{a}) {
+			case "kill":
+				dynKill = dynKill || i == 0 && viaXargs || anyTrue(s.dyn[off+i+1:])
+			case "pgrep", "pidof":
+				src = src || killPatternsSelf(argv[i+1:]) || anyTrue(s.dyn[off+i+1:])
+			case "ps", "lsof":
+				psLike = true
+			}
+		}
+	}
+	return dynKill, src, psLike
+}
+
 // selfProcNames are what pkill -f and killall match the daemon and the CLI
 // against: the process names and the installed paths.
 func selfProcNames() []string {
@@ -625,7 +690,7 @@ func selfProcNames() []string {
 // staypoint-apitest-server does not. A pattern that does not compile, a
 // pidfile, patterns from xargs or code that does not parse hold.
 func killsSelf(code string, depth int) bool {
-	if !killRe.MatchString(code) {
+	if !killRe.MatchString(unquoted(code)) {
 		return false
 	}
 	if depth > maxDepth {
@@ -733,7 +798,7 @@ func isDaemonName(p string) bool { return daemonProgRe.MatchString(path.Base(p))
 // does cp, mv or ln of one to such a name. Building it as staypointd* or
 // naming it does not hold.
 func runsDaemon(code string, depth int) bool {
-	if !daemonRe.MatchString(code) {
+	if !daemonRe.MatchString(unquoted(code)) {
 		return false
 	}
 	if depth > maxDepth {
@@ -919,7 +984,7 @@ func reinstallExec(code string, depth int) bool { return namedRun(code, reinstal
 // holds unless it only reads or records the name (namesOnly), and so does
 // a pipe from it into anything but a filter.
 func namedRun(code string, re *regexp.Regexp, depth int) bool {
-	if !re.MatchString(code) {
+	if !re.MatchString(unquoted(code)) {
 		return false
 	}
 	if depth > maxDepth {

@@ -251,6 +251,18 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"cd cmd/staypointd/x && go build -o /tmp/d ..",
 		"cd cmd/staypointd && go build -o /tmp/d ./x/..",
 		"cd cmd/staypointd && go build -o /tmp/d ~+/",
+		// Quotes the shell removes inside a word; PIDs from a self pattern.
+		"pk''ill -f staypointd",
+		`p\kill -f 'a|staypointd'`,
+		"go build -o /tmp/d ./cmd/stay''pointd",
+		"/tmp/stay''pointd",
+		"scripts/reinstall''-daemon.sh",
+		"launch''ctl list",
+		"kill $(pgrep -f 'a|staypointd')",
+		"pgrep -f 'a|staypointd' | xargs kill",
+		"kill $(lsof -t -i :41421)",
+		"ps aux | grep staypoint[d] | awk '{print $2}' | xargs kill",
+		"kill `pidof staypointd`",
 		// A write that may carry what a command naming the script prints.
 		"f(){ cat scripts/reinstall-daemon.sh; }; f > /tmp/r.sh",
 		"cat <(cat scripts/reinstall-daemon.sh) > /tmp/r.sh",
@@ -369,6 +381,9 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		// Test servers and daemon builds that do not run the daemon.
 		"pkill -f 'staypoint-apitest-server|vite'",
 		"pkill -9 node",
+		"kill $(pgrep -f vite)",
+		`pid=$!; kill "$pid"`,
+		"kill 1234",
 		"go build -o /tmp/sa/ ./cmd/staypointd",
 		"cp /tmp/staypointd /tmp/bin/",
 		"git commit -m 'fix(staypointd): restart (dev)'",
