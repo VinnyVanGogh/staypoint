@@ -344,8 +344,16 @@ func shellNoExec(argv []string) bool {
 		a := args[i]
 		switch {
 		case a == "-o" || a == "+o":
-			if i+1 < end && args[i+1] == "noexec" {
-				noexec = a == "-o" // the last setting wins
+			// zsh reads option names loosely (+o NO_EXEC, -o exec), so
+			// anything but -o noexec or a harmless option fails closed.
+			if i+1 >= end {
+				return false
+			}
+			switch v := args[i+1]; {
+			case a == "-o" && v == "noexec":
+				noexec = true
+			case !safeShellOptions[v]:
+				return false
 			}
 			i++
 		case len(a) > 1 && a[0] == '+':

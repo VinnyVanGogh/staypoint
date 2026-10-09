@@ -110,6 +110,8 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"GIT_PAGER=claude export GIT_PAGER; git log",
 		"bash -n +n scripts/reinstall-daemon.sh",
 		"bash -n +o noexec scripts/reinstall-daemon.sh",
+		"zsh -n +o NO_EXEC scripts/reinstall-daemon.sh",
+		"zsh -n -o exec scripts/reinstall-daemon.sh",
 		// The gate's env: unset or overridden for anything but go test/vet.
 		"env -u STAYPOINT_TASK_ID claude -p x",
 		"env -u STAYPOINT_TASK_ID staypoint task list",
