@@ -195,7 +195,8 @@ var boardWrappers = map[string]bool{"sudo": true, "doas": true, "caffeinate": tr
 	"npx": true, "bunx": true, "uvx": true}
 
 // shellKeywords start a command without being one: `do unset X` runs unset.
-var shellKeywords = map[string]bool{"do": true, "then": true, "else": true, "elif": true, "!": true, "{": true, "time": true}
+var shellKeywords = map[string]bool{"if": true, "while": true, "until": true, "do": true, "then": true,
+	"else": true, "elif": true, "!": true, "{": true, "time": true}
 
 func dropKeywords(argv []string) []string {
 	for len(argv) > 0 && shellKeywords[argv[0]] {
@@ -345,8 +346,11 @@ func shellCommandArg(args []string) (int, bool) {
 		a := args[i]
 		switch {
 		// Flags that take a value: the value is not the script.
+		// A shell that takes no value there (sh -O -c x) leaves -c a flag.
 		case a == "-o" || a == "+o" || a == "-O" || a == "+O" || a == "--rcfile" || a == "--init-file":
-			i++
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && !strings.HasPrefix(args[i+1], "+") {
+				i++
+			}
 		case a == "--" || (!strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+")):
 			return 0, false
 		case !strings.HasPrefix(a, "--") && strings.Contains(a, "c") && i+1 < len(args):
