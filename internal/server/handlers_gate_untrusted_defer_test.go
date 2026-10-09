@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -52,6 +53,38 @@ func TestUntrustedTaskRequestDefersAndApprovalNotifiesTask(t *testing.T) {
 			t.Errorf("audit missing %s:\n%s", want, audit)
 		}
 	}
+}
+
+// agy kills its hook at 30s, so its requests carry max_wait_seconds: the
+// daemon skips them by then. It can only shorten the deadline, with or
+// without a task.
+func TestMaxWaitSecondsShortensDeferDeadline(t *testing.T) {
+	e := startGateServer(t, nil, nil)
+	dir := runningTask(t, e, "T1")
+	post := func(task string, maxWait int) *security.GateRequest {
+		t.Helper()
+		b, _ := json.Marshal(map[string]any{"cmdline": "git push --force origin main", "reasons": []string{"red"},
+			"run_id": "conv", "task_id": task, "cwd": dir, "max_wait_seconds": maxWait})
+		st, out, _ := e.do(t, "POST", "/api/security/gate-requests", string(b), false, "")
+		if st != http.StatusCreated {
+			t.Fatalf("create: %d %v", st, out)
+		}
+		gr, _ := security.GetGateRequest(e.db, out["id"].(string))
+		return gr
+	}
+	near := func(gr *security.GateRequest, want time.Duration) {
+		t.Helper()
+		if gr.DeferAt == nil {
+			t.Fatalf("no defer deadline, want ~%s", want)
+		}
+		if d := gr.DeferAt.Sub(gr.CreatedAt); d < want-2*time.Second || d > want+2*time.Second {
+			t.Fatalf("defer after %s, want ~%s", d, want)
+		}
+	}
+	near(post("T1", 15), 15*time.Second)
+	near(post("", 15), 15*time.Second)
+	// Longer than the task's own deadline: the task deadline wins.
+	near(post("T1", 3600), time.Duration(gates.DefaultTrustDeferMinutes)*time.Minute)
 }
 
 // A request outside any task (interactive session) keeps waiting for the

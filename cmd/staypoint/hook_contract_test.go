@@ -425,13 +425,24 @@ func TestHookContract_PreToolGeminiPathUsesClientRenderers(t *testing.T) {
 	}
 	s := string(src)
 	start := strings.Index(s, "func handleHookPreTool() {")
-	end := strings.Index(s, "client == trackgate.ClientGemini || hookPreToolTrackingOnly")
+	end := strings.Index(s, "fmt.Println(gateGeminiPreTool(raw))")
 	if start < 0 || end < start {
 		t.Fatal("handleHookPreTool Gemini branch not found; update this test with the hook")
 	}
-	for _, bad := range []string{"preToolAllow()", "preToolBlock(", `fmt.Println("{}")`, "claudeBlockJSON("} {
+	bads := []string{"preToolAllow()", "preToolBlock(", `fmt.Println("{}")`, "claudeBlockJSON(", "preToolAllowPinned("}
+	for _, bad := range bads {
 		if strings.Contains(s[start:end], bad) {
 			t.Errorf("handleHookPreTool reaches %s before the Gemini return; agy needs preToolAllowJSON/preToolDeny", bad)
+		}
+	}
+	// The Gemini Board gate answers agy only through the client renderers.
+	g, err := os.ReadFile("hook_gemini_gate.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range append(bads, "fmt.Print") {
+		if strings.Contains(string(g), bad) {
+			t.Errorf("hook_gemini_gate.go uses %s; it must return preToolAllowJSON/preToolDeny output", bad)
 		}
 	}
 	// No hook output in these files is a hand-written {} any more.

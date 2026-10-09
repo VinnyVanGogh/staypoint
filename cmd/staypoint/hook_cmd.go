@@ -5,8 +5,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -509,9 +511,14 @@ func handleHookPreTool() {
 		fmt.Println(blockOut)
 		return
 	}
-	if client == trackgate.ClientGemini || hookPreToolTrackingOnly {
-		// The Red-tier Board gate below understands Claude payloads only, and
-		// interactive registrations (hook install) opt out of it.
+	if client == trackgate.ClientGemini {
+		// agy gets the same Red-tier Board gate as Claude (task-21e96721).
+		fmt.Println(gateGeminiPreTool(raw))
+		return
+	}
+	if hookPreToolTrackingOnly {
+		// Interactive Claude registrations (hook install) opt out of the
+		// Board gate below.
 		fmt.Println(preToolAllowJSON(client))
 		return
 	}
@@ -839,6 +846,9 @@ type gateRequestBody struct {
 	// hook will run exactly those bytes when approved.
 	Scripts []hookScript `json:"scripts,omitempty"`
 	Pinned  bool         `json:"pinned,omitempty"`
+	// MaxWaitSeconds asks the daemon to skip the request by then, for a
+	// hook that cannot hold the tool call longer (agy).
+	MaxWaitSeconds int `json:"max_wait_seconds,omitempty"`
 }
 
 type hookScript struct {
@@ -919,12 +929,23 @@ var gateNow = time.Now
 // or gateWaitBudget runs out, which it reports as "expired". Other statuses
 // are pollGateRequest's.
 func waitGateDecision(daemonURL, token, id string) (status, decidedBy string) {
-	deadline := gateNow().Add(gateWaitBudget)
+	return waitGateDecisionWithin(daemonURL, token, id, gateWaitBudget)
+}
+
+// waitGateDecisionWithin is waitGateDecision with its own budget. Each poll is
+// cut off at the time left, so no single long-poll outlasts the budget.
+func waitGateDecisionWithin(daemonURL, token, id string, budget time.Duration) (status, decidedBy string) {
+	deadline := gateNow().Add(budget)
 	for {
-		if !gateNow().Before(deadline) {
+		left := deadline.Sub(gateNow())
+		if left <= 0 {
 			return "expired", ""
 		}
-		status, decidedBy = pollGateRequest(daemonURL, token, id)
+		poll := gatePollTimeout
+		if left < poll {
+			poll = left
+		}
+		status, decidedBy = pollGateRequestWithin(daemonURL, token, id, poll)
 		if status != "pending" {
 			return status, decidedBy
 		}
@@ -941,17 +962,36 @@ func heldPastWaitMessage(id string) string {
 // "approved", "denied", "deferred" (skipped at its deadline), "pending"
 // (still waiting), or "" (connection error) — and who decided it.
 func pollGateRequest(daemonURL, token, id string) (status, decidedBy string) {
+	return pollGateRequestWithin(daemonURL, token, id, gatePollTimeout)
+}
+
+// gatePollTimeout is one long-poll's client timeout: slightly longer than the
+// server's 29s hold.
+const gatePollTimeout = 35 * time.Second
+
+// pollGateRequestWithin is pollGateRequest with the client timeout given. A
+// timeout reads as "pending"; the caller's budget decides what happens next.
+func pollGateRequestWithin(daemonURL, token, id string, timeout time.Duration) (status, decidedBy string) {
 	url := fmt.Sprintf("%s/api/security/gate-requests/%s?wait=true", daemonURL, id)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 	if err != nil {
 		return "", ""
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	client := &http.Client{Timeout: 35 * time.Second} // slightly longer than server 29s
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		// Daemon may be restarting; wait briefly then retry (still no timeout).
-		time.Sleep(2 * time.Second)
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			// The poll ran its full time; the caller's budget decides.
+			return "pending", ""
+		}
+		// Daemon may be restarting; wait briefly then retry.
+		pause := 2 * time.Second
+		if timeout < pause {
+			pause = timeout
+		}
+		time.Sleep(pause)
 		return "pending", ""
 	}
 	defer resp.Body.Close()
