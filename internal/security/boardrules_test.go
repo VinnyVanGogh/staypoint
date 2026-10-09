@@ -5,6 +5,11 @@ import (
 	"testing"
 )
 
+// AnalyzeBoardRules is AnalyzeBoardRulesForTask with no task.
+func AnalyzeBoardRules(line string, scripts []ScriptHash) string {
+	return AnalyzeBoardRulesForTask("", line, scripts)
+}
+
 // task-33692ffb: the Board's unattended-run rules.
 func TestAnalyzeBoardRules(t *testing.T) {
 	held := map[string][]string{
