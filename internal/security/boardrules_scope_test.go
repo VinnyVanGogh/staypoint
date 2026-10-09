@@ -230,6 +230,11 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"cp /tmp/staypointd /tmp/e",
 		"ln -s /tmp/staypointd-x /tmp/e",
 		`python3 -c "import subprocess; subprocess.run(['/tmp/staypointd'])"`,
+		"cd cmd/staypointd && go build -o /tmp/d .",
+		"go -C cmd/staypointd build -o /tmp/d",
+		"go -C=cmd/staypointd run .",
+		"GOFLAGS=-o=/tmp/d go build ./cmd/staypointd",
+		"cd cmd/staypointd && go run .",
 		// A write that may carry what a command naming the script prints.
 		"f(){ cat scripts/reinstall-daemon.sh; }; f > /tmp/r.sh",
 		"cat <(cat scripts/reinstall-daemon.sh) > /tmp/r.sh",

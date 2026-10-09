@@ -746,6 +746,13 @@ func runsDaemon(code string, depth int) bool {
 			return true
 		}
 	}
+	// A cd into the daemon's directory makes go build . build it.
+	cdDaemon := false
+	for _, s := range segs {
+		if argv, _ := unwrapArgv(s.argv); len(argv) > 1 && (argv[0] == "cd" || argv[0] == "pushd") && anyNames(daemonRe, argv[1:]) {
+			cdDaemon = true
+		}
+	}
 	for _, s := range segs {
 		argv, viaXargs := unwrapArgv(s.argv)
 		if len(argv) == 0 {
@@ -756,10 +763,27 @@ func runsDaemon(code string, depth int) bool {
 		switch {
 		case isDaemonName(argv[0]):
 			return true
-		case name == "go" && len(argv) > 1 && argv[1] == "run" && anyNames(daemonRe, argv[2:]):
-			return true
-		case name == "go" && len(argv) > 1 && argv[1] == "build" && anyNames(daemonRe, argv[2:]):
-			if goBuildRenames(argv[2:], s.dyn[len(s.argv)-len(argv)+2:]) {
+		case name == "go":
+			// go -C dir build: the one flag before the subcommand.
+			i, inDaemon := 1, cdDaemon
+			for i < len(argv) && strings.HasPrefix(argv[i], "-C") {
+				v := strings.TrimPrefix(strings.TrimPrefix(argv[i], "-C"), "=")
+				if v == "" && i+1 < len(argv) {
+					i++
+					v = argv[i]
+				}
+				inDaemon = inDaemon || daemonRe.MatchString(v)
+				i++
+			}
+			if i >= len(argv) || (argv[i] != "run" && argv[i] != "build") {
+				continue
+			}
+			rest := argv[i+1:]
+			if !inDaemon && !anyNames(daemonRe, rest) {
+				continue
+			}
+			// GOFLAGS may carry -o; the env is not read.
+			if argv[i] == "run" || strings.Contains(code, "GOFLAGS") || goBuildRenames(rest, s.dyn[len(s.argv)-len(rest):]) {
 				return true
 			}
 			continue
