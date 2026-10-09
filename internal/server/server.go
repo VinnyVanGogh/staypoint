@@ -144,6 +144,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		// Board-only to start).
 		tasksH.SetBoardSession(s.secMid.IsBoardSession)
 		mux.HandleFunc("GET /api/tasks", tasksH.ListTasks)
+		mux.HandleFunc("GET /api/runs/live", tasksH.LiveRuns)
+		if s.opts.TestMode {
+			mux.HandleFunc("PUT /api/tasks/{id}/test/live-run", tasksH.SeedLiveRun)
+		}
 		mux.HandleFunc("POST /api/tasks", tasksH.CreateTask)
 		mux.HandleFunc("GET /api/tasks/{id}", tasksH.GetTask)
 		mux.HandleFunc("PUT /api/tasks/{id}/description", tasksH.UpdateTaskDescription)

@@ -169,7 +169,10 @@ type RunSlots struct {
 	mu     sync.Mutex
 	limits RunLimits
 	active map[string]SlotKey // taskID -> key
-	queue  []QueuedRun
+	// since is when each active run took its slot (task-3387cad2: the
+	// lists' Running badge and its elapsed time).
+	since map[string]time.Time
+	queue []QueuedRun
 	// dispatched holds queued tasks Pump has woken whose dispatch has not yet
 	// reached Acquire, Enqueue or Dequeue, so back-to-back pumps wake them once.
 	dispatched map[string]bool
@@ -196,6 +199,7 @@ func NewRunSlotsWithLimits(l RunLimits) *RunSlots {
 	return &RunSlots{
 		limits:     l.normalized(),
 		active:     make(map[string]SlotKey),
+		since:      make(map[string]time.Time),
 		dispatched: make(map[string]bool),
 	}
 }
@@ -243,6 +247,20 @@ func (s *RunSlots) Active() int {
 	return len(s.active)
 }
 
+// LiveRuns returns the tasks whose run holds a slot in this process, with
+// when it took the slot. This is the daemon's own record of runs in flight:
+// a task keeps checkout_run_id after a crash until RecoveryScan clears it,
+// but never keeps a slot.
+func (s *RunSlots) LiveRuns() map[string]time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]time.Time, len(s.active))
+	for id := range s.active {
+		out[id] = s.since[id]
+	}
+	return out
+}
+
 // RepoKey normalises a repo path so the same repo always maps to one slot.
 func RepoKey(repoPath string) string {
 	if repoPath == "" {
@@ -278,6 +296,7 @@ func (s *RunSlots) Acquire(taskID string, key SlotKey) error {
 		return err
 	}
 	s.active[taskID] = key
+	s.since[taskID] = time.Now().UTC()
 	changed := s.removeLocked(taskID)
 	q := s.snapshotLocked()
 	s.mu.Unlock()
@@ -292,6 +311,7 @@ func (s *RunSlots) Release(taskID string) {
 	s.mu.Lock()
 	_, ok := s.active[taskID]
 	delete(s.active, taskID)
+	delete(s.since, taskID)
 	s.mu.Unlock()
 	if ok {
 		s.Pump()

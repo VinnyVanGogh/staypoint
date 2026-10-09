@@ -37,6 +37,11 @@ type Task struct {
 	ExecutionStage  string  `json:"execution_stage"`
 	CheckoutRunID   string  `json:"checkout_run_id,omitempty"`
 	CheckoutAgentID string  `json:"checkout_agent_id,omitempty"`
+	// Running is true only while a live run holds the task: checkout_run_id
+	// set and the daemon's run slot held. RunStartedAt is when that run took
+	// its slot. The HTTP handlers fill both; the DB never stores them.
+	Running         bool    `json:"running"`
+	RunStartedAt    string  `json:"run_started_at,omitempty"`
 	AssigneeAgentID string  `json:"assignee_agent_id,omitempty"`
 	CreatedAt       string  `json:"created_at"`
 	UpdatedAt       string  `json:"updated_at"`

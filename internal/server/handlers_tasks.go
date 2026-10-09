@@ -51,7 +51,8 @@ func NewTasksHandler(db *sql.DB, hub *EventHub) *TasksHandler {
 // ListTasks handles GET /api/tasks
 //
 // Query: status (active|done|soft_deleted|all), stage (an execution stage),
-// origin (native|paperclip_import|legacy|agent), include_legacy / include_archive
+// origin (native|paperclip_import|legacy|agent), running (1/0: a live run holds
+// the task, see markLiveRuns), include_legacy / include_archive
 // (1/true; legacy tasks and archived imports are hidden unless set, or
 // origin=legacy), limit, offset.
 func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
@@ -90,11 +91,16 @@ func (h *TasksHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tasks = context.FilterLegacy(tasks, includeLegacy)
+	markLiveRuns(tasks)
+	runningFilter := strings.TrimSpace(r.URL.Query().Get("running"))
 
 	// Filter by specific status if requested and not "all"
 	var filtered []context.Task
 	for _, t := range tasks {
 		if !(status == "" || status == "all" || strings.EqualFold(t.Status, status)) {
+			continue
+		}
+		if runningFilter != "" && t.Running != parseBoolParam(runningFilter) {
 			continue
 		}
 		if stageFilter != "" && !strings.EqualFold(t.ExecutionStage, stageFilter) {
@@ -163,6 +169,7 @@ func (h *TasksHandler) GetTask(w http.ResponseWriter, r *http.Request) {
 
 	comments, _ := context.GetTaskComments(h.db, task.ID)
 	depGraph, _ := context.GetTaskDependencyGraph(h.db, task.ID)
+	applyLiveRun(task, liveRuns())
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
