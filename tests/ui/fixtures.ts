@@ -226,6 +226,22 @@ export function simulateRunSteps(taskId: string): number {
 }
 
 /**
+ * Stores the next version of a task document through tests/ui/stepsim, which
+ * writes it the way `staypoint task doc add` does. Returns the version stored.
+ * Do not use the sqlite3 CLI for this: on the Linux CI runner its inserts
+ * stopped reaching the daemon partway through a spec file.
+ */
+export function addTaskDocument(taskId: string, key: string, content: string): number {
+  const bin = process.env.STAYPOINT_UI_STEPSIM;
+  const db = process.env.STAYPOINT_UI_DB;
+  if (!bin || !db) throw new Error('STAYPOINT_UI_STEPSIM / STAYPOINT_UI_DB not set: run via scripts/ui-e2e.sh');
+  const out = execFileSync(bin, ['--db', db, '--task', taskId, '--doc', key, '--content', content], { encoding: 'utf8' });
+  const m = out.match(/^VERSION (\d+)$/m);
+  if (!m) throw new Error(`stepsim stored no document: ${out}`);
+  return Number(m[1]);
+}
+
+/**
  * Like simulateRunSteps but emits a wake + tool steps WITHOUT a terminal
  * state step, leaving the task visually mid-run so the elapsed ticker keeps
  * ticking. Returns how many steps were persisted.

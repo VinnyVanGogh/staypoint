@@ -1,18 +1,17 @@
-import { execFileSync } from 'node:child_process';
-import { test, expect, gotoTaskPage, openTaskPanelTab } from '../fixtures';
+import { test, expect, gotoTaskPage, openTaskPanelTab, addTaskDocument } from '../fixtures';
 
 // Task documents (`staypoint task doc add`) show in the UI: the task page's
 // Artifacts tab lists every doc key, renders the latest version as Markdown,
 // switches versions and downloads; the sidebar Artifacts page lists documents
 // across tasks, filterable by org, task and kind.
 
-/** Inserts one version of a task document straight into the throwaway DB. */
+/**
+ * Stores the next version of a task document; `version` is the one the spec
+ * expects it to get, checked so the specs stay readable.
+ */
 function addDoc(taskId: string, key: string, version: number, content: string) {
-  const db = process.env.STAYPOINT_UI_DB;
-  if (!db) throw new Error('STAYPOINT_UI_DB not set: run via scripts/ui-e2e.sh');
-  const q = (s: string) => `'${s.replace(/'/g, "''")}'`;
-  execFileSync('sqlite3', [db,
-    `INSERT INTO task_documents (task_id, doc_key, version, content) VALUES (${q(taskId)}, ${q(key)}, ${version}, ${q(content)});`]);
+  const got = addTaskDocument(taskId, key, content);
+  expect(got, `${key} version`).toBe(version);
 }
 
 test('task page Artifacts tab renders documents with versions and download', async ({ page, api }) => {
