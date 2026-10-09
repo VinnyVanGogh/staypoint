@@ -863,37 +863,42 @@ func sedNamesOnly(re *regexp.Regexp, args []string) bool {
 // gitNamesOnly: a git subcommand that records or shows files, with no -c
 // config (an alias or pager can run anything) naming the script.
 func gitNamesOnly(re *regexp.Regexp, args []string) bool {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		switch {
-		case a == "-c" || a == "--config-env":
-			if i+1 < len(args) && re.MatchString(args[i+1]) {
-				return false
-			}
-			i++
-		case a == "-C" || a == "--git-dir" || a == "--work-tree" || a == "--namespace":
-			i++
-		case strings.HasPrefix(a, "-"):
-			if re.MatchString(a) {
-				return false
-			}
-		default:
-			return gitNameSubs[a] && !gitRunsProgram(a, args[i+1:])
+	sub, rest := gitSub(args)
+	for _, a := range args[:len(args)-len(rest)] {
+		if re.MatchString(a) {
+			return false
 		}
 	}
-	return false
+	return gitNameSubs[sub] && !gitRunsProgram(sub, rest)
 }
 
 // gitOrderFileSubs: builtins whose -O is a diff orderfile, not a pager.
 var gitOrderFileSubs = map[string]bool{"log": true, "show": true, "diff": true, "whatchanged": true, "format-patch": true, "diff-tree": true}
 
-// gitSub splits git's arguments into the subcommand and its arguments.
+// gitGlobalValue and gitGlobalFlag: git's options before the subcommand,
+// with and without a separate value.
+var (
+	gitGlobalValue = map[string]bool{"-c": true, "--config-env": true, "-C": true, "--git-dir": true,
+		"--work-tree": true, "--namespace": true, "--attr-source": true, "--super-prefix": true, "--list-cmds": true}
+	gitGlobalFlag = map[string]bool{"-p": true, "--paginate": true, "-P": true, "--no-pager": true, "--bare": true,
+		"--no-replace-objects": true, "--literal-pathspecs": true, "--glob-pathspecs": true,
+		"--noglob-pathspecs": true, "--icase-pathspecs": true, "--no-optional-locks": true,
+		"--no-lazy-fetch": true, "--no-advice": true, "--exec-path": true}
+)
+
+// gitSub splits git's arguments into the subcommand and its arguments. An
+// option it does not know may take the next word as a value, so the
+// subcommand is unknown: "" and every word from there on.
 func gitSub(args []string) (string, []string) {
 	for i := 0; i < len(args); i++ {
-		switch a := args[i]; {
-		case a == "-c" || a == "--config-env" || a == "-C" || a == "--git-dir" || a == "--work-tree" || a == "--namespace":
+		a := args[i]
+		name, _, hasValue := strings.Cut(a, "=")
+		switch {
+		case gitGlobalValue[a]:
 			i++
+		case gitGlobalFlag[a] || hasValue && (gitGlobalValue[name] || gitGlobalFlag[name]):
 		case strings.HasPrefix(a, "-"):
+			return "", args[i:]
 		default:
 			return a, args[i+1:]
 		}
