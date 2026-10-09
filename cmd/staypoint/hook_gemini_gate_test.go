@@ -189,6 +189,11 @@ func TestGeminiGate_UnreadOrHiddenCommandsNeverAllowed(t *testing.T) {
 		{"argv array", rawCall(t, "run_command", map[string]any{"Argv": []string{"git", "push", "--force", "origin", "main"}, "Cwd": dir})},
 		{"shell call with no command", rawCall(t, "run_command", map[string]any{"Cwd": dir})},
 		{"unreadable payload", []byte(`{"toolCall":`)},
+		{"second toolCall in another case", []byte(`{"toolCall":{"name":"view_file","args":{}},"ToolCall":{"name":"run_command","args":{"CommandLine":"` + redCmd + `"}}}`)},
+		{"duplicate name", []byte(`{"toolCall":{"name":"run_command","name":"view_file","args":{"CommandLine":"` + redCmd + `"}}}`)},
+		{"duplicate cwd in another case", []byte(`{"toolCall":{"name":"run_command","args":{"CommandLine":"ls","Cwd":"/tmp","cwd":"/"}}}`)},
+		{"long-s folded key", []byte(`{"toolCall":{"name":"view_file","args":{}},"converſationId":"x","conversationId":"y"}`)},
+		{"renamed shell tool", rawCall(t, "run_terminal_command", map[string]any{"CommandLine": redCmd, "Cwd": dir})},
 		{"no tool call", []byte(`{"conversationId":"c"}`)},
 	}
 	for _, tc := range cases {
@@ -213,7 +218,25 @@ func TestGeminiGate_SafeCommandsAndOtherToolsPass(t *testing.T) {
 	if got, _ := decision(t, gateGeminiPreTool(view)); got != "allow" {
 		t.Fatalf("view_file: %q, want allow", got)
 	}
+	// Seen in real agy transcripts: Description must not read as "script",
+	// or every file write's content would be judged as a shell command.
+	write := rawCall(t, "write_to_file", map[string]any{"TargetFile": "/tmp/x.md",
+		"CodeContent": "rm -rf / && " + redCmd, "Description": "notes"})
+	if got, _ := decision(t, gateGeminiPreTool(write)); got != "allow" {
+		t.Fatalf("write_to_file with Description: %q, want allow (not a shell call)", got)
+	}
 	if len(f.created) != 0 {
 		t.Fatalf("safe calls filed %d gate requests", len(f.created))
+	}
+}
+
+func TestKeyWords(t *testing.T) {
+	for k, want := range map[string]string{
+		"CommandLine": "command line", "Description": "description", "shell_exec": "shell exec",
+		"argv": "argv", "WaitMsBeforeAsync": "wait ms before async", "RunCMD": "run cmd",
+	} {
+		if got := strings.Join(keyWords(k), " "); got != want {
+			t.Errorf("keyWords(%q) = %q, want %q", k, got, want)
+		}
 	}
 }

@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/VinnyVanGogh/staypoint/internal/trackgate"
@@ -56,12 +58,18 @@ func parseGeminiShellCall(raw []byte) (*geminiShellCall, error) {
 		ConversationID string   `json:"conversationId"`
 		WorkspacePaths []string `json:"workspacePaths"`
 	}
+	// Go matches JSON keys case-insensitively and keeps the last duplicate;
+	// agy may read a different one. A payload where that could matter is
+	// refused rather than guessed at.
+	if dup := ambiguousJSONKey(raw); dup != "" {
+		return nil, fmt.Errorf("StayPoint refused a tool call with ambiguous key %q, so it was blocked", dup)
+	}
 	if err := json.Unmarshal(raw, &p); err != nil || p.ToolCall == nil || strings.TrimSpace(p.ToolCall.Name) == "" {
 		return nil, fmt.Errorf("StayPoint could not read this tool call, so it was blocked")
 	}
 	name := strings.ToLower(strings.TrimSpace(p.ToolCall.Name))
 	name = strings.TrimPrefix(name, "cortex_step_type_")
-	if !geminiShellToolNames[name] {
+	if !geminiShellToolNames[name] && !looksLikeShellCall(p.ToolCall.Args) {
 		return nil, nil
 	}
 	call := &geminiShellCall{sessionID: p.ConversationID}
@@ -112,6 +120,97 @@ func parseGeminiShellCall(raw []byte) (*geminiShellCall, error) {
 		call.cwd = p.WorkspacePaths[0]
 	}
 	return call, nil
+}
+
+// looksLikeShellCall catches a tool agy may add or rename that still carries a
+// command: any arg named like one makes the call judged as a shell call.
+// Whole words only: "Description" must not count as "script".
+func looksLikeShellCall(args map[string]json.RawMessage) bool {
+	for k := range args {
+		for _, w := range keyWords(k) {
+			switch w {
+			case "command", "commandline", "cmd", "script", "shell", "exec", "argv":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// keyWords splits an arg name on case changes, digits and separators:
+// "CommandLine" -> command, line; "shell_exec" -> shell, exec.
+func keyWords(k string) []string {
+	var words []string
+	var cur []rune
+	flush := func() {
+		if len(cur) > 0 {
+			words = append(words, strings.ToLower(string(cur)))
+			cur = cur[:0]
+		}
+	}
+	for i, r := range k {
+		switch {
+		case !unicode.IsLetter(r):
+			flush()
+		case unicode.IsUpper(r) && i > 0 && len(cur) > 0 && unicode.IsLower(cur[len(cur)-1]):
+			flush()
+			cur = append(cur, r)
+		default:
+			cur = append(cur, r)
+		}
+	}
+	flush()
+	return words
+}
+
+// ambiguousJSONKey returns the first key that appears twice in one JSON
+// object, compared case-insensitively, or "" when there is none (or the
+// payload does not parse; Unmarshal reports that).
+func ambiguousJSONKey(raw []byte) string {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	var walk func() (string, bool)
+	walk = func() (string, bool) {
+		tok, err := dec.Token()
+		if err != nil {
+			return "", false
+		}
+		d, ok := tok.(json.Delim)
+		if !ok {
+			return "", true
+		}
+		switch d {
+		case '{':
+			var seen []string
+			for dec.More() {
+				kt, err := dec.Token()
+				if err != nil {
+					return "", false
+				}
+				k, _ := kt.(string)
+				// EqualFold also folds ſ/s and K/k, as encoding/json does.
+				for _, s := range seen {
+					if strings.EqualFold(s, k) {
+						return k, false
+					}
+				}
+				seen = append(seen, k)
+				if dup, ok := walk(); !ok {
+					return dup, false
+				}
+			}
+			_, _ = dec.Token() // '}'
+		case '[':
+			for dec.More() {
+				if dup, ok := walk(); !ok {
+					return dup, false
+				}
+			}
+			_, _ = dec.Token() // ']'
+		}
+		return "", true
+	}
+	dup, _ := walk()
+	return dup
 }
 
 // gateGeminiPreTool runs agy's shell commands through the same Red-tier
