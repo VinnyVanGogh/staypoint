@@ -81,10 +81,29 @@ func FindPSQL(home string) (string, error) {
 
 func (o *PaperclipOptions) psql(ctx context.Context, query string) *exec.Cmd {
 	// -X: no ~/.psqlrc; -A -t: one bare value per line; FETCH_COUNT streams via a cursor.
-	cmd := exec.CommandContext(ctx, o.PSQL, "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-v", "FETCH_COUNT=2000", "-d", o.DSN, "-c", query)
+	dsn, password := splitPassword(o.DSN)
+	cmd := exec.CommandContext(ctx, o.PSQL, "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-v", "FETCH_COUNT=2000", "-d", dsn, "-c", query)
 	// Every statement runs in a read-only transaction: the export cannot write to Paperclip.
 	cmd.Env = append(security.ChildEnv("PGPASSWORD"), "PGOPTIONS=-c default_transaction_read_only=on")
+	if password != "" {
+		// Through the environment, not argv, so it never shows in ps.
+		cmd.Env = append(cmd.Env, "PGPASSWORD="+password)
+	}
 	return cmd
+}
+
+// splitPassword removes the password from a postgres:// URL.
+func splitPassword(dsn string) (string, string) {
+	u, err := url.Parse(dsn)
+	if err != nil || u.User == nil {
+		return dsn, ""
+	}
+	pw, ok := u.User.Password()
+	if !ok {
+		return dsn, ""
+	}
+	u.User = url.User(u.User.Username())
+	return u.String(), pw
 }
 
 func (o *PaperclipOptions) query(ctx context.Context, q string) ([]string, error) {

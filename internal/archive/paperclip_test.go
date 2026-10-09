@@ -115,6 +115,23 @@ func TestPaperclipExportStopsWhenDiskLow(t *testing.T) {
 	}
 }
 
+func TestPaperclipPasswordNotInArgv(t *testing.T) {
+	o := PaperclipOptions{PSQL: "/bin/true", DSN: "postgres://paperclip:s3cret@127.0.0.1:54329/paperclip"}
+	cmd := o.psql(context.Background(), "SELECT 1")
+	if strings.Contains(strings.Join(cmd.Args, " "), "s3cret") {
+		t.Fatalf("password in argv: %v", cmd.Args)
+	}
+	found := false
+	for _, kv := range cmd.Env {
+		if kv == "PGPASSWORD=s3cret" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("password not passed via PGPASSWORD")
+	}
+}
+
 func TestQuoteIdent(t *testing.T) {
 	if got := quoteIdent(`a"b; DROP TABLE x`); got != `"a""b; DROP TABLE x"` {
 		t.Fatal(got)

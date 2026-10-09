@@ -9,6 +9,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/VinnyVanGogh/staypoint/internal/archive"
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
@@ -112,8 +113,9 @@ func init() {
 }
 
 func runArchivePaperclip(cmd *cobra.Command, _ []string) error {
-	if os.Getenv("STAYPOINT_TASK_ID") != "" {
-		return fmt.Errorf("archive paperclip: refused in agent context (STAYPOINT_TASK_ID is set); this is a Board command")
+	tty := isatty.IsTerminal(os.Stdin.Fd()) && isatty.IsTerminal(os.Stdout.Fd())
+	if err := refuseBoardOnlyInAgentContext("archive paperclip", os.Getenv, tty); err != nil {
+		return err
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
