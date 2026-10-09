@@ -23,9 +23,6 @@ const geminiGateMaxWait = 15 * time.Second
 
 var geminiGateBudget = 22 * time.Second
 
-// geminiGateDaemon resolves the daemon for the Gemini gate; tests replace it.
-var geminiGateDaemon = gateDaemonConn
-
 // geminiShellCall is what the gate judges in an agy shell tool call.
 type geminiShellCall struct {
 	commands      []string // every distinct command text in the args
@@ -271,7 +268,7 @@ func gateGeminiPreTool(raw []byte) string {
 	}
 
 	reasons := strings.Join(verdict.Reasons, "; ")
-	daemonURL, token := geminiGateDaemon()
+	daemonURL, token := gateDaemonConn()
 	if daemonURL == "" {
 		return deny(fmt.Sprintf("Board gate unreachable; command blocked (%s)", reasons))
 	}

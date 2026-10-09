@@ -65,10 +65,10 @@ func geminiPayload(t *testing.T, cmd, cwd string) []byte {
 
 func withGeminiDaemon(t *testing.T, url string, budget time.Duration) {
 	t.Helper()
-	oldD, oldB := geminiGateDaemon, geminiGateBudget
-	geminiGateDaemon = func() (string, string) { return url, "tok" }
+	oldD, oldB := gateDaemonConn, geminiGateBudget
+	gateDaemonConn = func() (string, string) { return url, "tok" }
 	geminiGateBudget = budget
-	t.Cleanup(func() { geminiGateDaemon, geminiGateBudget = oldD, oldB })
+	t.Cleanup(func() { gateDaemonConn, geminiGateBudget = oldD, oldB })
 	t.Setenv("STAYPOINT_TASK_ID", "")
 }
 

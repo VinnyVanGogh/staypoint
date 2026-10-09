@@ -941,11 +941,11 @@ func waitGateDecisionWithin(daemonURL, token, id string, budget time.Duration) (
 		if left <= 0 {
 			return "expired", ""
 		}
-		poll := gatePollTimeout
-		if left < poll {
-			poll = left
+		pollTimeout := gatePollTimeout
+		if left < pollTimeout {
+			pollTimeout = left
 		}
-		status, decidedBy = pollGateRequestWithin(daemonURL, token, id, poll)
+		status, decidedBy = pollGateRequestWithin(daemonURL, token, id, pollTimeout)
 		if status != "pending" {
 			return status, decidedBy
 		}

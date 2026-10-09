@@ -267,11 +267,10 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 			trust = nil
 		}
 	}
-	// wait is how long a held request stays pending before it is skipped:
-	// the defer deadline, or the caller's MaxWait when that is shorter.
-	wait := time.Duration(deferMins) * time.Minute
-	if in.MaxWait > 0 && (wait == 0 || in.MaxWait < wait) {
-		wait = in.MaxWait
+	// MaxWait may only shorten the deadline, never extend it.
+	holdFor := time.Duration(deferMins) * time.Minute
+	if in.MaxWait > 0 && (holdFor == 0 || in.MaxWait < holdFor) {
+		holdFor = in.MaxWait
 	}
 	pending, approved := string(security.GateRequestPending), string(security.GateRequestApproved)
 	if rule == nil && trust != nil && !facts.Protected && boardRule == "" && !facts.DeleteOutside && !trust.Tev1 {
@@ -286,7 +285,7 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 		if trust != nil {
 			event, payload := "", map[string]any{"rule_id": trust.ID, "cmdline": gr.Cmdline, "task_id": gr.TaskID}
 			deferHeld := func() error {
-				at := now.Add(wait)
+				at := now.Add(holdFor)
 				if err := security.SetDeferAt(tx, gr.ID, at); err != nil {
 					return err
 				}
@@ -326,8 +325,8 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 			if err := governance.LogGateEventTx(tx, gr.ID, gates.DecidedByTrust(trust.ID), event, nil, &pending, payload); err != nil {
 				return nil, err
 			}
-		} else if wait > 0 {
-			at := now.Add(wait)
+		} else if holdFor > 0 {
+			at := now.Add(holdFor)
 			if err := security.SetDeferAt(tx, gr.ID, at); err != nil {
 				return nil, err
 			}
