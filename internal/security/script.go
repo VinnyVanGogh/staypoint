@@ -357,6 +357,10 @@ func shellNoExec(argv []string) bool {
 			}
 			i++
 		case len(a) > 1 && a[0] == '+':
+			// +ox noexec: o takes the next word, which may undo -n.
+			if strings.ContainsAny(a[1:], "oO") {
+				return false
+			}
 			if strings.ContainsRune(a[1:], 'n') {
 				noexec = false
 			}

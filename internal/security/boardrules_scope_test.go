@@ -134,6 +134,8 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"zsh -O -c 'unset STAYPOINT_TASK_ID'",
 		"zsh +O -c 'claude -p x'",
 		"zsh -no exec scripts/reinstall-daemon.sh",
+		"bash -n +ox noexec scripts/reinstall-daemon.sh",
+		"zsh -n +O scripts/reinstall-daemon.sh",
 		"cat scripts/reinstall-daemon.sh | cat > /tmp/r.sh",
 		"git show HEAD:scripts/reinstall-daemon.sh | grep . > /tmp/r.sh",
 		"git mv scripts/reinstall-daemon.sh scripts/r.sh && bash scripts/r.sh",

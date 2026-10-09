@@ -257,14 +257,9 @@ func runsAgent(code string, depth int) bool {
 		argv, viaXargs := unwrapArgv(s.argv)
 		// GIT_PAGER=claude, EDITOR='sh -c codex': a variable naming an
 		// agent may run it, set for one command, the line or exported.
-		assigns := append([]string{}, s.argv[:len(s.argv)-len(argv)]...)
-		if len(argv) > 0 && exportLike[baseCmd(argv)] {
-			assigns = append(assigns, argv[1:]...)
-		}
-		for _, a := range assigns {
-			if isAssign(a) && runsAgent(a[strings.IndexByte(a, '=')+1:], depth+1) {
-				return true
-			}
+		if assignRunsAgent(s.argv[:len(s.argv)-len(argv)], depth) ||
+			(len(argv) > 0 && exportLike[baseCmd(argv)] && assignRunsAgent(argv[1:], depth)) {
+			return true
 		}
 		if len(argv) == 0 {
 			continue
@@ -300,6 +295,15 @@ func runsAgent(code string, depth int) bool {
 			if r.heredoc && nestedAgentRe.MatchString(r.body) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func assignRunsAgent(words []string, depth int) bool {
+	for _, a := range words {
+		if isAssign(a) && runsAgent(a[strings.IndexByte(a, '=')+1:], depth+1) {
+			return true
 		}
 	}
 	return false
