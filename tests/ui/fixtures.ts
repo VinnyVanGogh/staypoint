@@ -103,6 +103,17 @@ export class StayPointAPI {
     return this.json('POST', `/api/tasks/${encodeURIComponent(id)}/stage`, { stage }, true);
   }
 
+  /** Stands in for a run (TestMode only): live=true takes a run slot and
+   * checks the task out like Harness.Claim; live=false releases both. */
+  async setLiveRun(id: string, live: boolean) {
+    return this.json('PUT', `/api/tasks/${encodeURIComponent(id)}/test/live-run`, { live });
+  }
+
+  async liveRuns(): Promise<Array<{ task_id: string; organization: string; started_at: string }>> {
+    const r = await this.json<{ runs: Array<{ task_id: string; organization: string; started_at: string }> }>('GET', '/api/runs/live');
+    return r.runs || [];
+  }
+
   async runControl(id: string, action: string) {
     return this.json('POST', `/api/tasks/${encodeURIComponent(id)}/run-control`, { action });
   }

@@ -117,6 +117,45 @@ cancelled   -> backlog, todo
 done, rejected: terminal
 ```
 
+### Stage vs Running in the web UI (task-3387cad2)
+
+Every task list (Overview, Global Task Status, Recent Tasks, All Tasks,
+Kanban cards, Projects cards, org pages, the fleet modal) and the task page
+header show two separate things:
+
+- **Stage**: Backlog, Todo, In progress, In review, Blocked, Done or
+  Cancelled (`lib/taskstate.js` `taskStageKey`). Lists never say "active":
+  `tasks.status = active` only means "not closed", and the Board read it as
+  running.
+- **Running**: a badge with the run's elapsed time, shown only while a run is
+  in flight: `checkout_run_id` is set **and** the daemon's run slot is held
+  (`orchestrator.GlobalRunSlots.LiveRuns`). Stage `in_progress` alone is not
+  running; a stopped or crashed run leaves it behind.
+
+`GET /api/runs/live` lists the runs in flight (`task_id`, `run_id`,
+`organization`, `started_at`). The UI polls it every 10 s and on run, queue
+and task events. The Running badges, the Running filter, the sidebar's
+"N running" per organization and the overview's Running KPI all read it.
+`GET /api/tasks` and `GET /api/tasks/{id}` carry the same `running` and
+`run_started_at`, and `GET /api/tasks?running=1|0` filters on it. The fleet
+overview's `task_counts.running` counts the same live runs. The CLI's
+`staypoint fleet` can't see the daemon's slots, so it counts any checkout.
+A run started by `staypoint run` in another process holds no daemon slot, so
+it doesn't show as running.
+
+Each list has a **Running** (any / running / not running) filter and a
+**Stage** multi-select next to Organization, Project and Priority. Each page
+keeps its own filter in `localStorage` (`staypoint_list_filter_<page>`).
+
+The fleet overview lists each Paperclip company under the organization the
+import mapped it to (`paperclipimport.OrganizationFor`: "RuneLite Plugins" ->
+RuneLite, "Research & Intelligence" -> Research, "Maintenance sweep across
+repos" -> Maintenance). It used to list both names. This is a display merge
+only: no task's `organization` changes. A local task wins over the frozen
+Paperclip issue that has its ID or title. Paperclip issues are legacy, so they
+are left out of the counts unless legacy is included, and none of them counts
+as running.
+
 ## Origins
 
 `tasks.origin` records where a task came from:
