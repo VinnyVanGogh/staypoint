@@ -55,7 +55,9 @@ var (
 	// or the worktree is not one, and neither is killing a test server
 	// (staypoint-apitest-server): only staypoint and staypointd themselves.
 	// Running the reinstall script is reinstallExec, launchctl runsLaunchctl.
-	selfCmdRe = regexp.MustCompile(`(?i)(\bgo\s+install\b[^;&|\n]*staypoint|\bgo\s+(install|build)\b[^;&|\n]*\.local/bin|\b(cp|mv|ln|install|rsync|ditto)\b[^;&|\n]*\.local/bin|\b(kill|pkill|killall)\b[^;&|\n]*\bstaypointd?([^\w-]|$)|\bbrew\s+(re)?install\b[^;&|\n]*staypoint)`)
+	// A cd (or -C) into ~/.local makes a relative `go build -o staypointd`
+	// or `cp x staypoint` replace the installed binary.
+	selfCmdRe = regexp.MustCompile(`(?i)(\b(cd|pushd)\b[^;&|\n]*\.local\b|\s-C\s*['"]?[^\s;&|]*\.local\b|\bgo\s+install\b[^;&|\n]*staypoint|\bgo\s+(install|build)\b[^;&|\n]*\.local/bin|\b(cp|mv|ln|install|rsync|ditto)\b[^;&|\n]*\.local/bin|\b(kill|pkill|killall)\b[^;&|\n]*\bstaypointd?([^\w-]|$)|\bbrew\s+(re)?install\b[^;&|\n]*staypoint)`)
 	// selfPathRe: paths StayPoint and the agent guards depend on. Any
 	// reference holds, reads included: they hold tokens and the guards. The
 	// one exception is reading the run's own handoff files (ownHandoffRead).
@@ -66,7 +68,7 @@ var (
 // start, then any env assignments and wrappers (env, command, exec, nohup,
 // sudo, npx, ...), then an optional backslash and directory, so `\ssh`,
 // `/usr/bin/ssh` and `command ssh` read as ssh.
-const gateVarPat = `STAYPOINT_(TASK_ID|SESSION_ID|RUN_ID|HOOK\w*|SCRATCH_ROOT|REPO_ROOT|CLI_BIN|CLAUDE_BIN|CODEX_BIN|AGY_BIN|GEMINI_BIN|LOCAL_URL|GATE\w*|TRUST\w*|SECURITY\w*)`
+const gateVarPat = `STAYPOINT_(TASK_ID|SESSION_ID|RUN_ID|HOOK\w*|SKIP\w*|SCRATCH_ROOT|REPO_ROOT|CLI_BIN|CLAUDE_BIN|CODEX_BIN|AGY_BIN|GEMINI_BIN|LOCAL_URL|GATE\w*|TRUST\w*|SECURITY\w*)`
 
 const progAt = `(^|[;&|(\n{` + "`" + `]|\$\(|\bthen\b|\bdo\b|\belse\b)\s*` +
 	`(([A-Za-z_]\w*=\S*|env|command|builtin|exec|nohup|sudo|doas|time|nice|ionice|caffeinate|timeout\s+\S+|xargs|npx|bunx|pnpm\s+dlx|yarn\s+dlx|npm\s+exec|uvx|pipx\s+run)(\s+-\S+)*\s+)*` +
@@ -192,11 +194,21 @@ func boardRuleText(code, what, taskID string) string {
 var boardWrappers = map[string]bool{"sudo": true, "doas": true, "caffeinate": true, "parallel": true,
 	"npx": true, "bunx": true, "uvx": true}
 
+// shellKeywords start a command without being one: `do unset X` runs unset.
+var shellKeywords = map[string]bool{"do": true, "then": true, "else": true, "elif": true, "!": true, "{": true, "time": true}
+
+func dropKeywords(argv []string) []string {
+	for len(argv) > 0 && shellKeywords[argv[0]] {
+		argv = argv[1:]
+	}
+	return argv
+}
+
 // unwrapArgv drops leading assignments and wrapper commands (env, nohup,
 // timeout, xargs, sudo, ...). viaXargs reports xargs or parallel: the
 // command's arguments then come from its input.
 func unwrapArgv(argv []string) (out []string, viaXargs bool) {
-	argv = stripPrefixes(argv)
+	argv = stripPrefixes(dropKeywords(argv))
 	for d := 0; len(argv) > 0 && d < maxDepth; d++ {
 		name := baseCmd(argv)
 		if !wrappers[name] && !boardWrappers[name] {
@@ -332,7 +344,8 @@ func shellCommandArg(args []string) (int, bool) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
-		case a == "-o" || a == "+o":
+		// Flags that take a value: the value is not the script.
+		case a == "-o" || a == "+o" || a == "-O" || a == "+O" || a == "--rcfile" || a == "--init-file":
 			i++
 		case a == "--" || (!strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+")):
 			return 0, false
@@ -432,7 +445,7 @@ func stayEnvChange(code string, depth int) bool {
 		}
 	}
 	for _, s := range segs {
-		if segEnvChange(s.argv, false, depth) {
+		if envChange(s.argv, &envState{other: goShadowRe.MatchString(code)}, depth) {
 			return true
 		}
 		if argv, _ := unwrapArgv(s.argv); shells[baseCmd(argv)] {
@@ -446,23 +459,39 @@ func stayEnvChange(code string, depth int) bool {
 	return false
 }
 
-// segEnvChange is stayEnvChange for one simple command. changed is true
-// once a wrapper or assignment has changed a gate variable.
-func segEnvChange(argv []string, changed bool, depth int) bool {
+// envState tracks one command's env changes. other is any change besides
+// clearing a gate variable (PATH=, GOFLAGS=, STAYPOINT_TASK_ID=other): with
+// it, `go test` may not be the go test it looks like, so the exemption is
+// off.
+type envState struct{ changed, other bool }
+
+func (st *envState) assign(a string) {
+	if !gateVarRe.MatchString(assignName(a)) {
+		st.other = true
+		return
+	}
+	st.changed = true
+	if v := a[strings.IndexByte(a, '=')+1:]; v != "" {
+		st.other = true
+	}
+}
+
+func envChange(argv []string, st *envState, depth int) bool {
+	argv = dropKeywords(argv)
 	for len(argv) > 0 && isAssign(argv[0]) {
-		if gateVarRe.MatchString(assignName(argv[0])) {
-			changed = true
-		}
+		st.assign(argv[0])
 		argv = argv[1:]
 	}
 	if len(argv) == 0 {
-		return changed // VAR=x on its own sets it for the rest of the line
+		return st.changed // VAR=x on its own sets it for the rest of the line
 	}
+	changed := st.changed
 	name, args := baseCmd(argv), argv[1:]
 	switch {
 	case name == "unset" || name == "export" || name == "declare" || name == "typeset" || name == "local" || name == "readonly":
 		for _, a := range args {
-			if gateVarRe.MatchString(assignName(a)) {
+			// unset $n, export ${n}=x: a name we cannot read.
+			if gateVarRe.MatchString(assignName(a)) || strings.ContainsAny(assignName(a), "$`") {
 				return true
 			}
 		}
@@ -475,13 +504,13 @@ func segEnvChange(argv []string, changed bool, depth int) bool {
 			switch {
 			case a == "-u" || a == "--unset":
 				if i+1 < len(args) && gateVarRe.MatchString(args[i+1]) {
-					changed = true
+					st.changed = true
 				}
 				i++
 			case strings.HasPrefix(a, "--unset="):
-				changed = changed || gateVarRe.MatchString(a[len("--unset="):])
+				st.changed = st.changed || gateVarRe.MatchString(a[len("--unset="):])
 			case strings.HasPrefix(a, "-u"):
-				changed = changed || gateVarRe.MatchString(a[2:])
+				st.changed = st.changed || gateVarRe.MatchString(a[2:])
 			case a == "-C" || a == "--chdir":
 				i++
 			case a == "--":
@@ -496,25 +525,35 @@ func segEnvChange(argv []string, changed bool, depth int) bool {
 					return true
 				}
 			case isAssign(a):
-				changed = changed || gateVarRe.MatchString(assignName(a))
+				st.assign(a)
 			default:
 				break flags
 			}
 		}
 		if i >= len(args) {
-			return changed
+			return st.changed
 		}
-		return segEnvChange(args[i:], changed, depth)
+		return envChange(args[i:], st, depth)
 	case wrappers[name] || boardWrappers[name]:
-		return segEnvChange(skipWrapper(name, args), changed, depth)
+		// skipWrapper drops a wrapper's assignments; count them first.
+		for _, a := range args {
+			if isAssign(a) {
+				st.assign(a)
+			}
+		}
+		return envChange(skipWrapper(name, args), st, depth)
 	case shells[name]:
 		if ci, ok := shellCommandArg(args); ok && stayEnvChange(args[ci], depth+1) {
 			return true
 		}
 		return changed
 	}
-	return changed && !goTestOrVet(argv)
+	return changed && (st.other || !goTestOrVet(argv))
 }
+
+// goShadowRe: a line that can make `go` something else (a function, an
+// alias, PATH or GO* settings, an overlay): no go test exemption.
+var goShadowRe = regexp.MustCompile(`\balias\b|\bfunction\b|\(\s*\)\s*\{|\bPATH=|\bGO\w*=|-overlay|\bgo\s+env\s+-w\b`)
 
 // goTestOrVet reports `go test` or `go vet` without a flag that runs
 // another program (-exec, -toolexec, -vettool).
@@ -568,7 +607,7 @@ func namedRun(code string, re *regexp.Regexp, depth int) bool {
 	for _, s := range segs {
 		argv, viaXargs := unwrapArgv(s.argv)
 		named := anyNames(re, s.argv) || redirectNames(re, s) || heredocNames(re, s)
-		if fed && (viaXargs || len(argv) == 0 || !pipeFilters[baseCmd(argv)] || argv[0] != baseCmd(argv)) {
+		if fed && (viaXargs || len(argv) == 0 || !pipeFilters[baseCmd(argv)] || argv[0] != baseCmd(argv) || writesFile(s)) {
 			return true
 		}
 		// Named in an assignment or a wrapper's args (BASH_ENV=...,
@@ -628,7 +667,7 @@ var nameReaders = map[string]bool{
 // gitNameSubs only record or show the files they are given.
 var gitNameSubs = map[string]bool{
 	"add": true, "diff": true, "log": true, "show": true, "status": true, "blame": true, "commit": true,
-	"mv": true, "rm": true, "restore": true, "checkout": true, "ls-files": true, "grep": true,
+	"rm": true, "restore": true, "checkout": true, "ls-files": true, "grep": true,
 	"cat-file": true, "check-ignore": true, "ls-tree": true, "reset": true, "stash": true,
 	"update-index": true, "hash-object": true, "shortlog": true, "annotate": true,
 }

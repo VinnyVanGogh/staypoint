@@ -366,7 +366,8 @@ func shellNoExec(argv []string) bool {
 				return false
 			}
 		case len(a) > 1 && a[0] == '-':
-			if strings.ContainsAny(a[1:], "csil") {
+			// o in a cluster (-no exec) takes the next word as its option.
+			if strings.ContainsAny(a[1:], "csilo") {
 				return false
 			}
 			if strings.ContainsRune(a[1:], 'n') {
