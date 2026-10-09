@@ -263,6 +263,8 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"kill $(lsof -t -i :41421)",
 		"ps aux | grep staypoint[d] | awk '{print $2}' | xargs kill",
 		"kill `pidof staypointd`",
+		"kill $(lsof -t -i :$((41420+1)))",
+		`python3 -c "import os; os.system('kill $(pgrep -f a.staypointd)')"`,
 		// A write that may carry what a command naming the script prints.
 		"f(){ cat scripts/reinstall-daemon.sh; }; f > /tmp/r.sh",
 		"cat <(cat scripts/reinstall-daemon.sh) > /tmp/r.sh",

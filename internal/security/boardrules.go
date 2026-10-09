@@ -614,35 +614,35 @@ var killRe = regexp.MustCompile(`(?i)\b(pkill|killall)\b`)
 // the parse will.
 var unquoter = strings.NewReplacer(`'`, "", `"`, "", `\`, "")
 
-func unquoted(code string) string { return unquoter.Replace(code) }
+// textMatch is re on code as written or unquoted: unquoting only adds
+// matches.
+func textMatch(re *regexp.Regexp, code string) bool {
+	return re.MatchString(code) || re.MatchString(unquoter.Replace(code))
+}
 
-var (
-	plainKillRe = regexp.MustCompile(`(?i)\bkill\b`)
-	// selfMentionRe: a line that may be after the daemon's or CLI's PID.
-	selfMentionRe = regexp.MustCompile(`(?i)staypoint|41421`)
-)
+var plainKillRe = regexp.MustCompile(`(?i)\bkill\b`)
 
 // killsByPID reports kill of a PID that may be StayPoint's: kill with an
 // expanding argument or fed by xargs, on a line whose PID source may name
-// it (pgrep or pidof with a pattern matching selfProcNames, or ps or lsof
-// on a line that mentions StayPoint or its port). kill 1234 is not read.
+// it: pgrep or pidof with a pattern matching selfProcNames, or any ps or
+// lsof (their filters are not read). kill 1234 is not read.
 func killsByPID(code string) bool {
-	if !plainKillRe.MatchString(unquoted(code)) {
+	if !textMatch(plainKillRe, code) {
 		return false
 	}
-	dynKill, src, psLike := pidKill(code, 0)
-	return dynKill && (src || psLike && selfMentionRe.MatchString(unquoted(code)))
+	dynKill, src := pidKill(code, 0)
+	return dynKill && src
 }
 
-func pidKill(code string, depth int) (dynKill, src, psLike bool) {
+func pidKill(code string, depth int) (dynKill, src bool) {
 	if depth > maxDepth {
-		return true, true, true
+		return true, true
 	}
 	segs, subs, err := parseShell(code)
 	if err != nil {
-		return true, true, true
+		return true, true
 	}
-	merge := func(d, s, p bool) { dynKill, src, psLike = dynKill || d, src || s, psLike || p }
+	merge := func(d, s bool) { dynKill, src = dynKill || d, src || s }
 	for _, b := range subs {
 		merge(pidKill(b, depth+1))
 	}
@@ -660,6 +660,7 @@ func pidKill(code string, depth int) (dynKill, src, psLike bool) {
 			}
 			continue
 		}
+		data := len(argv) > 0 && dataArgs(argv)
 		for i, a := range argv {
 			switch baseCmd([]string{a}) {
 			case "kill":
@@ -667,11 +668,17 @@ func pidKill(code string, depth int) (dynKill, src, psLike bool) {
 			case "pgrep", "pidof":
 				src = src || killPatternsSelf(argv[i+1:]) || anyTrue(s.dyn[off+i+1:])
 			case "ps", "lsof":
-				psLike = true
+				src = true
+			default:
+				// Code in a word (python3 -c "os.system('kill ...')") is
+				// read as shell.
+				if !data && i > 0 && textMatch(plainKillRe, a) {
+					merge(pidKill(a, depth+1))
+				}
 			}
 		}
 	}
-	return dynKill, src, psLike
+	return dynKill, src
 }
 
 // selfProcNames are what pkill -f and killall match the daemon and the CLI
@@ -690,7 +697,7 @@ func selfProcNames() []string {
 // staypoint-apitest-server does not. A pattern that does not compile, a
 // pidfile, patterns from xargs or code that does not parse hold.
 func killsSelf(code string, depth int) bool {
-	if !killRe.MatchString(unquoted(code)) {
+	if !textMatch(killRe, code) {
 		return false
 	}
 	if depth > maxDepth {
@@ -798,7 +805,7 @@ func isDaemonName(p string) bool { return daemonProgRe.MatchString(path.Base(p))
 // does cp, mv or ln of one to such a name. Building it as staypointd* or
 // naming it does not hold.
 func runsDaemon(code string, depth int) bool {
-	if !daemonRe.MatchString(unquoted(code)) {
+	if !textMatch(daemonRe, code) {
 		return false
 	}
 	if depth > maxDepth {
@@ -984,7 +991,7 @@ func reinstallExec(code string, depth int) bool { return namedRun(code, reinstal
 // holds unless it only reads or records the name (namesOnly), and so does
 // a pipe from it into anything but a filter.
 func namedRun(code string, re *regexp.Regexp, depth int) bool {
-	if !re.MatchString(unquoted(code)) {
+	if !textMatch(re, code) {
 		return false
 	}
 	if depth > maxDepth {
