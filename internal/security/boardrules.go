@@ -284,7 +284,7 @@ func runsAgent(code string, depth int) bool {
 			return true
 		}
 		// git grep -O'claude -p x #': the pager value runs, glued to its flag.
-		if baseCmd(argv) == "git" && gitRunsProgram(argv[1:]) {
+		if baseCmd(argv) == "git" && gitRunsProgram(gitSub(argv[1:])) {
 			return true
 		}
 		if !viaXargs && !writesFile(s) && dataArgs(argv) {
@@ -878,22 +878,31 @@ func gitNamesOnly(re *regexp.Regexp, args []string) bool {
 				return false
 			}
 		default:
-			return gitNameSubs[a] && !gitRunsProgram(args[i+1:])
+			return gitNameSubs[a] && !gitRunsProgram(a, args[i+1:])
 		}
 	}
 	return false
 }
 
-// gitValueShort: git short flags whose value is the rest of the word
-// (grep -e/-f/-A/-B/-C/-m, log -S/-G): an O after one is data. Any other
-// letter may be a valueless flag that a closing -O follows.
-const gitValueShort = "efABCmSG"
+// gitSub splits git's arguments into the subcommand and its arguments.
+func gitSub(args []string) (string, []string) {
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; {
+		case a == "-c" || a == "--config-env" || a == "-C" || a == "--git-dir" || a == "--work-tree" || a == "--namespace":
+			i++
+		case strings.HasPrefix(a, "-"):
+		default:
+			return a, args[i+1:]
+		}
+	}
+	return "", nil
+}
 
-// gitRunsProgram reports subcommand options that run a program (grep -O
-// opens a pager through the shell, --ext-diff an external diff) or copy
-// what they show (--output). Every word is checked, past a "--" too: "--" may be an option's value
-// (git grep -e -- -O...).
-func gitRunsProgram(args []string) bool {
+// gitRunsProgram reports options of subcommand sub that run a program (grep
+// -O opens a pager through the shell, --ext-diff an external diff) or copy
+// what they show (--output). Every word is checked, past a "--" too: "--"
+// may be an option's value (git grep -e -- -O...).
+func gitRunsProgram(sub string, args []string) bool {
 	for _, a := range args {
 		switch {
 		case strings.HasPrefix(a, "--") && len(a) > 2:
@@ -904,17 +913,10 @@ func gitRunsProgram(args []string) bool {
 					return true
 				}
 			}
-		case strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--"):
-			// -O may close a cluster of flags without values (-nO<pager>);
-			// in -S'TODO' the O is the value of -S.
-			for _, r := range a[1:] {
-				if r == 'O' {
-					return true
-				}
-				if strings.ContainsRune(gitValueShort, r) {
-					break
-				}
-			}
+		case sub == "grep" && strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 'O'):
+			// -O may close a short-flag cluster (-nO<pager>). Elsewhere
+			// (log -O<orderfile>, -S'TODO') it runs nothing.
+			return true
 		}
 	}
 	return false

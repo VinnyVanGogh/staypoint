@@ -162,6 +162,8 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"git grep --open-files-in-pager='true; claude -p hi' -e .",
 		"git -C /r grep -nO'claude -p x #' -e .",
 		"git grep -LoO'scripts/reinstall-daemon.sh #' -e .",
+		"git grep -GO'scripts/reinstall-daemon.sh #' -e .",
+		"git -c core.x=y grep -GO'claude -p x #' -e .",
 		"git diff --ext-diff -- scripts/reinstall-daemon.sh",
 		"git show HEAD:scripts/reinstall-daemon.sh --output=/tmp/r.sh",
 		"git grep --open='launchctl list #' -e .",
