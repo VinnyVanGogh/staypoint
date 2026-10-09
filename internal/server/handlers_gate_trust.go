@@ -3,12 +3,14 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
 	"time"
 
+	gctx "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/gates"
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
@@ -246,6 +248,10 @@ func (h *SecurityGateHandler) GetTaskTrust(w http.ResponseWriter, r *http.Reques
 		"defer_minutes": gates.TrustDeferMinutes(h.db), "tev1_threshold": gates.Tev1Threshold(h.db),
 		"tev1_warning": gates.Tev1Warning, "tev1_configured": h.tev1Advisor() != nil,
 	}
+	// The page offers "Move to todo and trust" on a backlog task.
+	if stage, _, err := gates.TaskStage(h.db, taskID); err == nil {
+		resp["task_stage"] = stage
+	}
 	if len(trusts) > 0 {
 		v, err := h.buildTrustView(trusts[0], now)
 		if err != nil {
@@ -280,13 +286,18 @@ func (h *SecurityGateHandler) CreateTaskTrust(w http.ResponseWriter, r *http.Req
 		return
 	}
 	now := h.clock()
-	if err := gates.CanTrust(h.db, taskID); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusConflict)
-		return
-	}
+	// Validate the spec before move_to_todo touches the task, so a bad
+	// preset never leaves it moved but untrusted.
 	draft, err := gates.NewTrust(taskID, spec, gates.Tev1Threshold(h.db), now)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusUnprocessableEntity)
+		return
+	}
+	if spec.MoveToTodo && !h.moveBacklogToTodo(w, taskID) {
+		return
+	}
+	if err := gates.CanTrust(h.db, taskID); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusConflict)
 		return
 	}
 	tx, err := h.db.Begin()
@@ -312,6 +323,36 @@ func (h *SecurityGateHandler) CreateTaskTrust(w http.ResponseWriter, r *http.Req
 	h.hub.Publish("security_gate_rules", map[string]any{"id": rule.ID, "action": "created", "task_id": taskID, "trust": true})
 	w.WriteHeader(http.StatusCreated)
 	writeJSON(w, rule)
+}
+
+// moveBacklogToTodo is Trust's "Move to todo and trust" (task-40f0a2f0). The
+// route already passed the Board gate with a fresh Touch ID, which is at
+// least what POST /stage asks to move any task, prod-targeting agent tasks
+// included, out of backlog. A task in any other stage is left alone for
+// CanTrust to judge. It reports false after writing a refusal.
+func (h *SecurityGateHandler) moveBacklogToTodo(w http.ResponseWriter, taskID string) bool {
+	stage, _, err := gates.TaskStage(h.db, taskID)
+	if err != nil {
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return false
+	}
+	if stage != governance.StageBacklog {
+		return true
+	}
+	err = gctx.SetTaskExecutionStageWithOptions(h.db, taskID, governance.StageTodo, gctx.DoneOptions{BoardStage: true})
+	switch {
+	case err == nil:
+	case errors.Is(err, gctx.ErrNoRepo):
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusConflict)
+		return false
+	default:
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, "move to todo failed: "+err.Error()), http.StatusInternalServerError)
+		return false
+	}
+	if h.hub != nil {
+		h.hub.Publish("task_stage_changed", map[string]string{"task_id": taskID, "stage": governance.StageTodo})
+	}
+	return true
 }
 
 // RevokeTaskTrust handles POST /api/tasks/{id}/trust/revoke (Board session).
