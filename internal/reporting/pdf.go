@@ -372,7 +372,7 @@ func generatePersonalHTML(data PersonalReportData) (string, error) {
       <h1>Claude Max 5x Engineering Velocity & Value</h1>
     </div>
     <div class="header-right">
-      <div class="org">Claude Max 5x Subscription ($100/mo)</div>
+      <div class="org">Subscription: {{.SubscriptionCost}}</div>
       {{if .HasEngineerName}}
         <div>Engineer: {{.EngineerName}}{{if .PersonalEmail}} (<code>{{.PersonalEmail}}</code>){{end}}</div>
       {{else if .PersonalEmail}}
@@ -396,7 +396,7 @@ func generatePersonalHTML(data PersonalReportData) (string, error) {
     <div class="kpi-card">
       <div class="kpi-label">Subscription Net ROI</div>
       <div class="kpi-val">{{.SubscriptionROI}}</div>
-      <div class="kpi-sub">Against $100/mo investment</div>
+      <div class="kpi-sub">Against {{.SubscriptionCost}} plan, prorated over the period</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Total Token Volume</div>
@@ -447,7 +447,7 @@ func generatePersonalHTML(data PersonalReportData) (string, error) {
         <div class="stat-box">
           <div class="stat-label">Net Surplus Value Created</div>
           <div class="stat-val" style="color: #4f46e5;">{{.NetSurplus}}</div>
-          <div style="font-size: 9.5px; color: #64748b; margin-top: 1px;">Value delivered after deducting $100 subscription</div>
+          <div style="font-size: 9.5px; color: #64748b; margin-top: 1px;">Value delivered after deducting the prorated subscription</div>
         </div>
         <div class="stat-box" style="margin-bottom: 0;">
           <div class="stat-label">Effective Cost Per Turn</div>
@@ -850,7 +850,7 @@ func generateCombinedHTML(data CombinedReportData) (string, error) {
         </tr>
         <tr>
           <td class="segment-name">Personal Fleet</td>
-          <td>Claude Max 5x ($100/mo)</td>
+          <td>Personal plan</td>
           <td>{{.PersonalTurns}}</td>
           <td>{{.PersonalTokens}}</td>
           <td style="font-weight: 700; color: #4f46e5;">{{.PersonalValue}}</td>
@@ -886,7 +886,7 @@ func generateCombinedHTML(data CombinedReportData) (string, error) {
     <div class="mini-card">
       <div class="mini-title">📈 Capital & Operational Efficiency</div>
       <div class="mini-desc">
-        Across 145,000+ turns, the effective cost per 1,000 turns is <strong>$0.89</strong> compared to direct API list price of <strong>$97.80</strong> (99.1% cost avoidance). Delivering $14,000+ of substantiated engineering value for $130/mo.
+        Across {{.TotalInvocations}} turns, the fleet delivered <strong>{{.TotalValue}}</strong> of API list-price equivalent value against <strong>{{.TotalSubscriptionCost}}</strong> of flat-rate plans.
       </div>
     </div>
   </div>
@@ -905,7 +905,7 @@ func generateCombinedHTML(data CombinedReportData) (string, error) {
       <div class="summary-item">
         <div class="label">Fleet Engineering Value</div>
         <div class="value">{{.TotalValue}}</div>
-        <div style="font-size: 9px; color: #94a3b8; margin-top: 1px;">109.6x cost-to-value return</div>
+        <div style="font-size: 9px; color: #94a3b8; margin-top: 1px;">{{.CombinedROI}} cost-to-value return</div>
       </div>
       <div class="summary-item">
         <div class="label">Recommended Action</div>

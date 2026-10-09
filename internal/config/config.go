@@ -12,26 +12,33 @@ import (
 )
 
 type Config struct {
-	DataDir               string  `json:"data_dir" toml:"data_dir"`
-	DBPath                string  `json:"db_path" toml:"db_path"`
-	TelemetryDBPath       string  `json:"telemetry_db_path" toml:"telemetry_db_path"`
-	CompanyName           string  `json:"company_name" toml:"company_name"`
-	EngineerName          string  `json:"engineer_name" toml:"engineer_name"`
-	HourlyRate            float64 `json:"hourly_rate" toml:"hourly_rate"`
-	WorkEmail             string  `json:"work_email" toml:"work_email"`
-	PersonalEmail         string  `json:"personal_email" toml:"personal_email"`
-	WorkRepoRoot          string  `json:"work_repo_root" toml:"work_repo_root"`
+	DataDir         string  `json:"data_dir" toml:"data_dir"`
+	DBPath          string  `json:"db_path" toml:"db_path"`
+	TelemetryDBPath string  `json:"telemetry_db_path" toml:"telemetry_db_path"`
+	CompanyName     string  `json:"company_name" toml:"company_name"`
+	EngineerName    string  `json:"engineer_name" toml:"engineer_name"`
+	HourlyRate      float64 `json:"hourly_rate" toml:"hourly_rate"`
+	// Monthly plan prices in USD, used as the denominators of report ROI
+	// figures. Zero or unset = that figure reads "not measured". Top-level
+	// keys. Upgrade is the proposed work plan the Boss Card argues for.
+	WorkSubscriptionUSD     float64 `json:"work_subscription_usd" toml:"work_subscription_usd"`
+	UpgradeSubscriptionUSD  float64 `json:"upgrade_subscription_usd" toml:"upgrade_subscription_usd"`
+	PersonalSubscriptionUSD float64 `json:"personal_subscription_usd" toml:"personal_subscription_usd"`
+	GeminiSubscriptionUSD   float64 `json:"gemini_subscription_usd" toml:"gemini_subscription_usd"`
+	WorkEmail               string  `json:"work_email" toml:"work_email"`
+	PersonalEmail           string  `json:"personal_email" toml:"personal_email"`
+	WorkRepoRoot            string  `json:"work_repo_root" toml:"work_repo_root"`
 	// HarnessRepoRoot is the git repo used for agent worktrees. Populated from
 	// STAYPOINT_REPO_ROOT env var (takes precedence) or harness_repo_root in
 	// config.toml. Never derived from work_repo_root.
-	HarnessRepoRoot string `json:"harness_repo_root" toml:"harness_repo_root"`
-	RemoteHost            string  `json:"remote_host" toml:"remote_host"`
-	RemoteRepoRoot        string  `json:"remote_repo_root" toml:"remote_repo_root"` // e.g. "~/Documents/dev/managed_solution" or "~/Documents/dev/work"
-	MachineRole           string  `json:"machine_role" toml:"machine_role"`         // "hybrid" (default), "work", or "personal"
-	GooglePlanTier        string  `json:"google_plan_tier" toml:"google_plan_tier"` // e.g. "Google AI Ultra" or "Ultra"
-	ClaudePlanTier        string  `json:"claude_plan_tier" toml:"claude_plan_tier"` // e.g. "Max 5x" or "Pro"
-	MaxHandoffsPerRepo    int     `json:"max_handoffs_per_repo" toml:"max_handoffs_per_repo"`
-	PreferredPersonalTool string  `json:"preferred_personal_tool" toml:"preferred_personal_tool"` // "auto" (default), "claude", or "agy"
+	HarnessRepoRoot       string `json:"harness_repo_root" toml:"harness_repo_root"`
+	RemoteHost            string `json:"remote_host" toml:"remote_host"`
+	RemoteRepoRoot        string `json:"remote_repo_root" toml:"remote_repo_root"` // e.g. "~/Documents/dev/managed_solution" or "~/Documents/dev/work"
+	MachineRole           string `json:"machine_role" toml:"machine_role"`         // "hybrid" (default), "work", or "personal"
+	GooglePlanTier        string `json:"google_plan_tier" toml:"google_plan_tier"` // e.g. "Google AI Ultra" or "Ultra"
+	ClaudePlanTier        string `json:"claude_plan_tier" toml:"claude_plan_tier"` // e.g. "Max 5x" or "Pro"
+	MaxHandoffsPerRepo    int    `json:"max_handoffs_per_repo" toml:"max_handoffs_per_repo"`
+	PreferredPersonalTool string `json:"preferred_personal_tool" toml:"preferred_personal_tool"` // "auto" (default), "claude", or "agy"
 	// MaxConcurrentRuns caps how many agent runs the daemon runs in parallel
 	// (STA-773). Zero or unset = 9 (3 organizations x 3 runs).
 	// Top-level key: it must appear before any [table] in config.toml.

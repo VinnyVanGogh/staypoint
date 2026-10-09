@@ -63,10 +63,12 @@ type PersonalReportData struct {
 	DeliveredValue  string
 	NetSurplus      string
 	SubscriptionROI string
-	TotalTokens     string
-	ActiveDays      string
-	Models          []ModelStat
-	HasEngineerName bool
+	// SubscriptionCost is the configured monthly plan price ("<amount>/mo").
+	SubscriptionCost string
+	TotalTokens      string
+	ActiveDays       string
+	Models           []ModelStat
+	HasEngineerName  bool
 }
 
 type GeminiReportData struct {
@@ -107,15 +109,24 @@ type CombinedReportData struct {
 	HasEngineerName       bool
 }
 
+// NotMeasured stands in for any report figure the data cannot support. A
+// report shows this rather than a placeholder number.
+const NotMeasured = "not measured"
+
+// daysPerMonth converts a day span into months for run rates and prorating
+// monthly plan prices (365.25 / 12).
+const daysPerMonth = 30.4375
+
+// countBrainSessions returns the number of Antigravity brain sessions on
+// disk, or 0 when the directory cannot be read.
 func countBrainSessions() int {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return 508
+		return 0
 	}
-	brainDir := filepath.Join(home, ".gemini", "antigravity-cli", "brain")
-	entries, err := os.ReadDir(brainDir)
+	entries, err := os.ReadDir(filepath.Join(home, ".gemini", "antigravity-cli", "brain"))
 	if err != nil {
-		return 508
+		return 0
 	}
 	count := 0
 	for _, entry := range entries {
@@ -123,10 +134,121 @@ func countBrainSessions() int {
 			count++
 		}
 	}
-	if count == 0 {
-		return 508
-	}
 	return count
+}
+
+// usage aggregates the requests rows matching one filter.
+type usage struct {
+	count                 int64
+	cost                  float64
+	tokens, input, output int64
+	activeDays            int64
+	minTs, maxTs          string
+}
+
+// months is the span between the first and last request, counted in whole
+// days inclusive, expressed in months. Zero when the span is unknown.
+func (u usage) months() float64 {
+	t1, err1 := time.Parse(time.RFC3339, u.minTs)
+	t2, err2 := time.Parse(time.RFC3339, u.maxTs)
+	if err1 != nil || err2 != nil {
+		return 0
+	}
+	d1 := time.Date(t1.Year(), t1.Month(), t1.Day(), 0, 0, 0, 0, time.UTC)
+	d2 := time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)
+	days := d2.Sub(d1).Hours()/24 + 1
+	return days / daysPerMonth
+}
+
+func (u usage) period() string {
+	if p := formatPeriod(u.minTs, u.maxTs); p != "" {
+		return p
+	}
+	return NotMeasured
+}
+
+// queryUsage sums requests rows matching filter (a SQL boolean over the
+// requests table, "1=1" for all) within the date bounds.
+func queryUsage(conn *sql.DB, filter string, filterArgs []any, since, until string) usage {
+	var u usage
+	var minTs, maxTs sql.NullString
+	args := append(append([]any{}, filterArgs...), since, since, until, until)
+	err := conn.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(cost_usd), 0), COALESCE(SUM(total_tokens), 0),
+		       COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+		       COUNT(DISTINCT substr(ts, 1, 10)), MIN(ts), MAX(ts)
+		FROM requests
+		WHERE `+filter+`
+		  AND (ts >= ? OR ? = '')
+		  AND (ts <= ? OR ? = '')`, args...).Scan(
+		&u.count, &u.cost, &u.tokens, &u.input, &u.output, &u.activeDays, &minTs, &maxTs)
+	if err != nil {
+		return usage{}
+	}
+	u.minTs, u.maxTs = minTs.String, maxTs.String
+	return u
+}
+
+// queryModels breaks the matching requests down per model, busiest first.
+func queryModels(conn *sql.DB, filter string, filterArgs []any, since, until string, total int64) []ModelStat {
+	if total == 0 {
+		return nil
+	}
+	args := append(append([]any{}, filterArgs...), since, since, until, until)
+	rows, err := conn.Query(`
+		SELECT COALESCE(NULLIF(model, ''), 'unknown'), COUNT(*), COALESCE(SUM(cost_usd), 0), COALESCE(SUM(total_tokens), 0)
+		FROM requests
+		WHERE `+filter+`
+		  AND (ts >= ? OR ? = '')
+		  AND (ts <= ? OR ? = '')
+		GROUP BY 1
+		ORDER BY 2 DESC, 1
+		LIMIT 5`, args...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []ModelStat
+	for rows.Next() {
+		var name string
+		var n, tokens int64
+		var cost float64
+		if rows.Scan(&name, &n, &cost, &tokens) != nil {
+			continue
+		}
+		out = append(out, ModelStat{
+			Name:     name,
+			Turns:    formatInt(n),
+			TurnsPct: fmt.Sprintf("%.1f%%", float64(n)*100/float64(total)),
+			Value:    formatUSD(cost),
+			Tokens:   formatTokens(tokens),
+		})
+	}
+	return out
+}
+
+// ratio formats num/den as a multiplier, or NotMeasured when den is not positive.
+func ratio(num, den float64, suffix string) string {
+	if den <= 0 {
+		return NotMeasured
+	}
+	return fmt.Sprintf("%.1fx%s", num/den, suffix)
+}
+
+func formatUSD(v float64) string {
+	sign := ""
+	if v < 0 {
+		sign, v = "-", -v
+	}
+	cents := int64(v*100 + 0.5)
+	return fmt.Sprintf("%s$%s.%02d", sign, formatInt(cents/100), cents%100)
+}
+
+func formatMonthlyUSD(v float64) string {
+	if v <= 0 {
+		return NotMeasured
+	}
+	return formatUSD(v) + "/mo"
 }
 
 // DateRangeOptions specifies optional time bounding for executive reports.
@@ -162,105 +284,117 @@ func FetchTelemetryWithRange(cfg *config.Config, rangeOpts DateRangeOptions) (
 	}
 
 	ratecardSrc := telemetry.RateCardSource()
+	hasEngineerName := strings.TrimSpace(cfg.EngineerName) != ""
 
-	// 1. Prepare robust defaults
+	brainSessions := NotMeasured
+	if n := countBrainSessions(); n > 0 {
+		brainSessions = formatInt(int64(n))
+	}
+
+	// 1. Start every figure at "not measured"; only data replaces it.
 	work = WorkReportData{
 		CompanyName:                 cfg.CompanyName,
 		EngineerName:                cfg.EngineerName,
 		WorkEmail:                   cfg.WorkEmail,
 		HourlyRate:                  cfg.HourlyRate,
-		AuditPeriod:                 "Aug 10 to Sep 19, 2026",
-		SubstantiatedValue:          "$2,881.71",
-		APIListPriceEquivalentValue: "$2,881.71",
-		ActualSpend:                 "$0.00",
+		AuditPeriod:                 NotMeasured,
+		SubstantiatedValue:          NotMeasured,
+		APIListPriceEquivalentValue: NotMeasured,
+		ActualSpend:                 formatUSD(0),
 		ActualSpendSub:              "$0 marginal for flat subscriptions",
 		RatecardSource:              ratecardSrc,
-		ROIMultiplier:               "91.4x",
-		MonthlyRunRate:              "$1,827.57/mo",
-		AcceptedTurns:               "25,814",
-		MonthlyNetCost:              "+$180.00 / mo",
-		ExpectedROI:                 "9.1x to 15.0x",
+		ROIMultiplier:               NotMeasured,
+		MonthlyRunRate:              NotMeasured,
+		AcceptedTurns:               NotMeasured,
+		MonthlyNetCost:              NotMeasured,
+		ExpectedROI:                 NotMeasured,
+		DirectCostMultiplier:        NotMeasured,
 		HasHourlyRate:               cfg.HourlyRate > 0,
 		HasCompanyName:              strings.TrimSpace(cfg.CompanyName) != "",
-		HasEngineerName:             strings.TrimSpace(cfg.EngineerName) != "",
-		DirectCostMultiplier:        "14.4x net return on upgrade",
+		HasEngineerName:             hasEngineerName,
 		DBPath:                      cfg.DBPath,
 		// Deliverables come only from audited tasks and their recorded work
 		// products (queryStaypointTasks); with none, the report shows none.
 	}
-
 	if cfg.HourlyRate > 0 {
-		work.HoursSavedBreakEven = fmt.Sprintf("~%.1f billable client hours (@ $%.0f/hr)", 180.0/cfg.HourlyRate, cfg.HourlyRate)
-		work.TotalHoursSaved = fmt.Sprintf("~%.1f client billable hours saved", 2881.71/cfg.HourlyRate)
+		work.HoursSavedBreakEven = NotMeasured
+		work.TotalHoursSaved = NotMeasured
 	}
 
-	// Query StayPoint local DB for task spend and work products
+	// The upgrade's net monthly cost needs both plan prices configured.
+	upgradeNet := 0.0
+	if cfg.UpgradeSubscriptionUSD > 0 && cfg.WorkSubscriptionUSD > 0 {
+		upgradeNet = cfg.UpgradeSubscriptionUSD - cfg.WorkSubscriptionUSD
+	}
+	if upgradeNet > 0 {
+		work.MonthlyNetCost = "+" + formatUSD(upgradeNet) + " / mo"
+		if cfg.HourlyRate > 0 {
+			work.HoursSavedBreakEven = fmt.Sprintf("~%.1f billable client hours (@ $%.0f/hr)", upgradeNet/cfg.HourlyRate, cfg.HourlyRate)
+		}
+	}
+
+	// Query StayPoint local DB for audited deliverables and work products
 	queryStaypointTasks(&work, cfg, sinceBound, untilBound)
 
 	personal = PersonalReportData{
-		EngineerName:    cfg.EngineerName,
-		PersonalEmail:   cfg.PersonalEmail,
-		AuditPeriod:     "Aug 11 to Sep 19, 2026",
-		TotalRequests:   "102,502",
-		DeliveredValue:  "$7,574.00",
-		NetSurplus:      "+$7,474.00",
-		SubscriptionROI: "75.7x",
-		TotalTokens:     "26.86 Billion",
-		ActiveDays:      "38 days",
-		HasEngineerName: strings.TrimSpace(cfg.EngineerName) != "",
-		Models: []ModelStat{
-			{Name: "Claude Sonnet 5", Turns: "51,552", TurnsPct: "50.3%", Value: "$1,822.50", Tokens: "10.0B"},
-			{Name: "Claude Opus 5", Turns: "43,892", TurnsPct: "42.8%", Value: "$5,729.33", Tokens: "16.5B"},
-			{Name: "Claude Opus 4.7", Turns: "4,251", TurnsPct: "4.1%", Value: "$0.00 (Pro Included)", Tokens: "298.8M"},
-			{Name: "Gemini Flash (Native)", Turns: "2,043", TurnsPct: "2.0%", Value: "$0.00 (Zero Cost)", Tokens: "42.9M"},
-			{Name: "Claude Haiku & Fable", Turns: "764", TurnsPct: "0.8%", Value: "$22.17", Tokens: "24.1M"},
-		},
+		EngineerName:     cfg.EngineerName,
+		PersonalEmail:    cfg.PersonalEmail,
+		AuditPeriod:      NotMeasured,
+		TotalRequests:    NotMeasured,
+		DeliveredValue:   NotMeasured,
+		NetSurplus:       NotMeasured,
+		SubscriptionROI:  NotMeasured,
+		SubscriptionCost: formatMonthlyUSD(cfg.PersonalSubscriptionUSD),
+		TotalTokens:      NotMeasured,
+		ActiveDays:       NotMeasured,
+		HasEngineerName:  hasEngineerName,
 	}
 
-	brainCount := countBrainSessions()
 	gemini = GeminiReportData{
 		EngineerName:    cfg.EngineerName,
-		AuditPeriod:     "Aug 1 to Sep 19, 2026",
-		TotalTokens:     "53.08 Million",
-		InputTokens:     "51.13 Million",
-		OutputTokens:    "1.95 Million",
-		TotalTurns:      "2,272",
-		CodeReviews:     "880",
-		UniqueRepos:     "49",
-		BrainSessions:   fmt.Sprintf("%d", brainCount),
-		SubagentRuns:    "647",
-		BugsFound:       "69",
-		HasEngineerName: strings.TrimSpace(cfg.EngineerName) != "",
-		Models: []ModelStat{
-			{Name: "Gemini 3.8 / 3.6 Flash (Low)", Turns: "1,511", TurnsPct: "66.5%", Value: "Zero Latency Ops", Tokens: "35.02M"},
-			{Name: "Gemini 3.8 / 3.6 Flash (Med)", Turns: "626", TurnsPct: "27.6%", Value: "Context Search", Tokens: "9.99M"},
-			{Name: "Gemini 3.1 Pro (High)", Turns: "135", TurnsPct: "5.9%", Value: "Deep Diff Reasoning", Tokens: "8.07M"},
-		},
+		AuditPeriod:     NotMeasured,
+		TotalTokens:     NotMeasured,
+		InputTokens:     NotMeasured,
+		OutputTokens:    NotMeasured,
+		TotalTurns:      NotMeasured,
+		CodeReviews:     NotMeasured,
+		UniqueRepos:     NotMeasured,
+		BrainSessions:   brainSessions,
+		SubagentRuns:    NotMeasured,
+		BugsFound:       NotMeasured,
+		HasEngineerName: hasEngineerName,
 	}
 
+	totalSubscription := cfg.WorkSubscriptionUSD + cfg.PersonalSubscriptionUSD + cfg.GeminiSubscriptionUSD
 	combined = CombinedReportData{
 		EngineerName:          cfg.EngineerName,
-		AuditPeriod:           "July 7 to Sep 19, 2026",
-		TotalValue:            "$14,259.29",
-		TotalInvocations:      "145,624",
-		TotalTokens:           "39.7 Billion",
-		CombinedROI:           "109.6x",
-		TotalSubscriptionCost: "$130.00 / mo",
-		WorkTurns:             "25,814",
-		WorkValue:             "$2,881.71",
-		WorkTokens:            "7.91 Billion",
-		PersonalTurns:         "102,502",
-		PersonalValue:         "$7,574.00",
-		PersonalTokens:        "26.86 Billion",
-		GeminiTurns:           "2,272 turns + 880 reviews",
-		GeminiValue:           "$3,803.58 (Equiv Value)",
-		GeminiTokens:          "53.08 Million",
-		GeminiReviews:         "880 Reviews (49 Repos)",
-		GeminiBrains:          fmt.Sprintf("%d Sessions", brainCount),
-		HasEngineerName:       strings.TrimSpace(cfg.EngineerName) != "",
+		AuditPeriod:           NotMeasured,
+		TotalValue:            NotMeasured,
+		TotalInvocations:      NotMeasured,
+		TotalTokens:           NotMeasured,
+		CombinedROI:           NotMeasured,
+		TotalSubscriptionCost: NotMeasured,
+		WorkTurns:             NotMeasured,
+		WorkValue:             NotMeasured,
+		WorkTokens:            NotMeasured,
+		PersonalTurns:         NotMeasured,
+		PersonalValue:         NotMeasured,
+		PersonalTokens:        NotMeasured,
+		GeminiTurns:           NotMeasured,
+		GeminiValue:           NotMeasured,
+		GeminiTokens:          NotMeasured,
+		GeminiReviews:         NotMeasured,
+		GeminiBrains:          NotMeasured,
+		HasEngineerName:       hasEngineerName,
+	}
+	if totalSubscription > 0 {
+		combined.TotalSubscriptionCost = formatUSD(totalSubscription) + " / mo"
+	}
+	if brainSessions != NotMeasured {
+		combined.GeminiBrains = brainSessions + " Sessions"
 	}
 
-	// 2. Attempt live query on telemetry.db
+	// 2. Query telemetry.db; cost_usd is the ratecard valuation recorded at ingest.
 	dbPath := cfg.TelemetryDBPath
 	if dbPath == "" {
 		home, _ := os.UserHomeDir()
@@ -282,7 +416,7 @@ func FetchTelemetryWithRange(cfg *config.Config, rangeOpts DateRangeOptions) (
 	if sinceBound != "" || untilBound != "" {
 		var matchedRows int64
 		_ = conn.QueryRow(`
-			SELECT COUNT(*) FROM requests 
+			SELECT COUNT(*) FROM requests
 			WHERE (ts >= ? OR ? = '') AND (ts <= ? OR ? = '')`,
 			sinceBound, sinceBound, untilBound, untilBound).Scan(&matchedRows)
 		if matchedRows == 0 {
@@ -293,120 +427,95 @@ func FetchTelemetryWithRange(cfg *config.Config, rangeOpts DateRangeOptions) (
 		}
 	}
 
-	// Query Work
-	var workCount int64
-	var workCost float64
-	var workTokens int64
-	var workMinTs, workMaxTs sql.NullString
-	err = conn.QueryRow(`
-		SELECT COUNT(*), COALESCE(SUM(cost_usd), 0), COALESCE(SUM(total_tokens), 0), MIN(ts), MAX(ts)
-		FROM requests
-		WHERE account_email = ?
-		  AND (ts >= ? OR ? = '')
-		  AND (ts <= ? OR ? = '')`,
-		cfg.WorkEmail, sinceBound, sinceBound, untilBound, untilBound).Scan(&workCount, &workCost, &workTokens, &workMinTs, &workMaxTs)
-	if err == nil && workCount > 0 {
-		work.AcceptedTurns = formatInt(workCount)
-		if workCost > 0 {
-			workVal := workCost
-			if workVal < 2881.71 && sinceBound == "" && untilBound == "" {
-				workVal = 2881.71 // preserves verified historical audit benchmark if unbounded
+	// Work
+	w := queryUsage(conn, "account_email = ?", []any{cfg.WorkEmail}, sinceBound, untilBound)
+	if w.count > 0 {
+		months := w.months()
+		work.AuditPeriod = w.period()
+		work.SubstantiatedValue = formatUSD(w.cost)
+		work.APIListPriceEquivalentValue = work.SubstantiatedValue
+		work.AcceptedTurns = formatInt(w.count)
+		work.ROIMultiplier = ratio(w.cost, cfg.WorkSubscriptionUSD*months, "")
+		if cfg.HourlyRate > 0 {
+			work.TotalHoursSaved = fmt.Sprintf("~%.1f client billable hours saved", w.cost/cfg.HourlyRate)
+		}
+		if months > 0 {
+			runRate := w.cost / months
+			work.MonthlyRunRate = formatUSD(runRate) + "/mo"
+			work.ExpectedROI = ratio(runRate, cfg.UpgradeSubscriptionUSD, "")
+			work.DirectCostMultiplier = ratio(runRate, upgradeNet, " net return on upgrade")
+		}
+		combined.WorkTurns = work.AcceptedTurns
+		combined.WorkValue = work.SubstantiatedValue
+		combined.WorkTokens = formatTokens(w.tokens)
+	}
+
+	// Personal
+	p := queryUsage(conn, "account_email = ?", []any{cfg.PersonalEmail}, sinceBound, untilBound)
+	if p.count > 0 {
+		personal.AuditPeriod = p.period()
+		personal.TotalRequests = formatInt(p.count)
+		personal.DeliveredValue = formatUSD(p.cost)
+		personal.TotalTokens = formatTokens(p.tokens)
+		personal.ActiveDays = formatInt(p.activeDays) + " days"
+		if p.activeDays == 1 {
+			personal.ActiveDays = "1 day"
+		}
+		personal.Models = queryModels(conn, "account_email = ?", []any{cfg.PersonalEmail}, sinceBound, untilBound, p.count)
+		if planCost := cfg.PersonalSubscriptionUSD * p.months(); planCost > 0 {
+			surplus := p.cost - planCost
+			personal.NetSurplus = formatUSD(surplus)
+			if surplus >= 0 {
+				personal.NetSurplus = "+" + personal.NetSurplus
 			}
-			work.SubstantiatedValue = fmt.Sprintf("$%.2f", workVal)
-			work.APIListPriceEquivalentValue = work.SubstantiatedValue
-			work.ActualSpend = "$0.00"
-			work.ActualSpendSub = "$0 marginal for flat subscriptions"
-			work.RatecardSource = ratecardSrc
-			work.ROIMultiplier = fmt.Sprintf("%.1fx", workVal/20.0)
-			work.MonthlyRunRate = fmt.Sprintf("$%.2f/mo", (workVal / 1.57))
-			if cfg.HourlyRate > 0 {
-				work.HoursSavedBreakEven = fmt.Sprintf("~%.1f billable client hours (@ $%.0f/hr)", 180.0/cfg.HourlyRate, cfg.HourlyRate)
-				work.TotalHoursSaved = fmt.Sprintf("~%.1f client billable hours saved", workVal/cfg.HourlyRate)
-			}
+			personal.SubscriptionROI = ratio(p.cost, planCost, "")
 		}
-		if workMinTs.Valid && workMaxTs.Valid {
-			work.AuditPeriod = formatPeriod(workMinTs.String, workMaxTs.String)
-		}
+		combined.PersonalTurns = personal.TotalRequests
+		combined.PersonalValue = personal.DeliveredValue
+		combined.PersonalTokens = personal.TotalTokens
 	}
 
-	// Query Personal
-	var pCount int64
-	var pCost float64
-	var pTokens int64
-	var pMinTs, pMaxTs sql.NullString
-	err = conn.QueryRow(`
-		SELECT COUNT(*), COALESCE(SUM(cost_usd), 0), COALESCE(SUM(total_tokens), 0), MIN(ts), MAX(ts)
-		FROM requests
-		WHERE account_email = ?
-		  AND (ts >= ? OR ? = '')
-		  AND (ts <= ? OR ? = '')`,
-		cfg.PersonalEmail, sinceBound, sinceBound, untilBound, untilBound).Scan(&pCount, &pCost, &pTokens, &pMinTs, &pMaxTs)
-	if err == nil && pCount > 0 {
-		personal.TotalRequests = formatInt(pCount)
-		personal.DeliveredValue = fmt.Sprintf("$%.2f", pCost)
-		personal.NetSurplus = fmt.Sprintf("+$%.2f", pCost-100.0)
-		personal.SubscriptionROI = fmt.Sprintf("%.1fx", pCost/100.0)
-		personal.TotalTokens = formatTokens(pTokens)
-		if pMinTs.Valid && pMaxTs.Valid {
-			personal.AuditPeriod = formatPeriod(pMinTs.String, pMaxTs.String)
-		}
+	// Gemini
+	g := queryUsage(conn, "model_family = 'gemini'", nil, sinceBound, untilBound)
+	if g.count > 0 {
+		gemini.AuditPeriod = g.period()
+		gemini.TotalTokens = formatTokens(g.tokens)
+		gemini.InputTokens = formatTokens(g.input)
+		gemini.OutputTokens = formatTokens(g.output)
+		gemini.TotalTurns = formatInt(g.count)
+		gemini.Models = queryModels(conn, "model_family = 'gemini'", nil, sinceBound, untilBound, g.count)
+		combined.GeminiTurns = gemini.TotalTurns
+		combined.GeminiValue = formatUSD(g.cost)
+		combined.GeminiTokens = gemini.TotalTokens
 	}
 
-	// Query Gemini
-	var geminiTokens, geminiInput, geminiOutput, geminiCount int64
-	err = conn.QueryRow(`
-		SELECT COALESCE(SUM(total_tokens), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COUNT(*)
-		FROM requests
-		WHERE model_family = 'gemini'
-		  AND (ts >= ? OR ? = '')
-		  AND (ts <= ? OR ? = '')`,
-		sinceBound, sinceBound, untilBound, untilBound).Scan(&geminiTokens, &geminiInput, &geminiOutput, &geminiCount)
-	if err == nil && geminiTokens > 0 {
-		gemini.TotalTokens = formatTokens(geminiTokens)
-		gemini.InputTokens = formatTokens(geminiInput)
-		gemini.OutputTokens = formatTokens(geminiOutput)
-		gemini.TotalTurns = formatInt(geminiCount)
-	}
-
-	// Query Reviews
+	// Reviews
 	var totalReviews, uniqueRepos, bugsFound int64
 	err = conn.QueryRow(`
-		SELECT COUNT(*), COUNT(DISTINCT repo), SUM(CASE WHEN severity > 0 THEN 1 ELSE 0 END)
+		SELECT COUNT(*), COUNT(DISTINCT repo), COALESCE(SUM(CASE WHEN severity > 0 THEN 1 ELSE 0 END), 0)
 		FROM review_outcomes`).Scan(&totalReviews, &uniqueRepos, &bugsFound)
 	if err == nil && totalReviews > 0 {
 		gemini.CodeReviews = formatInt(totalReviews)
 		gemini.UniqueRepos = formatInt(uniqueRepos)
 		gemini.BugsFound = formatInt(bugsFound)
-		combined.GeminiReviews = fmt.Sprintf("%d Reviews (%d Repos)", totalReviews, uniqueRepos)
+		combined.GeminiReviews = fmt.Sprintf("%s Reviews (%s Repos)", formatInt(totalReviews), formatInt(uniqueRepos))
 	}
 
-	// Query Subagents
+	// Subagents
 	var subagentCount int64
 	err = conn.QueryRow(`SELECT COUNT(*) FROM subagent_runs`).Scan(&subagentCount)
 	if err == nil && subagentCount > 0 {
 		gemini.SubagentRuns = formatInt(subagentCount)
 	}
 
-	// Query Total requests
-	var totCount int64
-	var totCost float64
-	var totTokens int64
-	var totMinTs, totMaxTs sql.NullString
-	err = conn.QueryRow(`
-		SELECT COUNT(*), COALESCE(SUM(cost_usd), 0), COALESCE(SUM(total_tokens), 0), MIN(ts), MAX(ts)
-		FROM requests
-		WHERE (ts >= ? OR ? = '')
-		  AND (ts <= ? OR ? = '')`,
-		sinceBound, sinceBound, untilBound, untilBound).Scan(&totCount, &totCost, &totTokens, &totMinTs, &totMaxTs)
-	if err == nil && totCount > 0 {
-		combined.TotalInvocations = formatInt(totCount)
-		combined.TotalTokens = formatTokens(totTokens)
-		totalVal := totCost + 3800.0 // + Gemini value & review deliverables
-		combined.TotalValue = fmt.Sprintf("$%.2f", totalVal)
-		combined.CombinedROI = fmt.Sprintf("%.1fx", totalVal/130.0)
-		if totMinTs.Valid && totMaxTs.Valid {
-			combined.AuditPeriod = formatPeriod(totMinTs.String, totMaxTs.String)
-		}
+	// All accounts
+	all := queryUsage(conn, "1=1", nil, sinceBound, untilBound)
+	if all.count > 0 {
+		combined.AuditPeriod = all.period()
+		combined.TotalInvocations = formatInt(all.count)
+		combined.TotalTokens = formatTokens(all.tokens)
+		combined.TotalValue = formatUSD(all.cost)
+		combined.CombinedROI = ratio(all.cost, totalSubscription*all.months(), "")
 	}
 
 	return work, personal, gemini, combined, nil
@@ -441,7 +550,7 @@ func formatPeriod(start, end string) string {
 	if err1 == nil && err2 == nil {
 		return fmt.Sprintf("%s to %s", t1.Format("Jan 2"), t2.Format("Jan 2, 2006"))
 	}
-	return "Aug 1 to Sep 19, 2026"
+	return ""
 }
 
 func formatBoundDate(s string) string {
@@ -535,7 +644,6 @@ func queryStaypointTasks(work *WorkReportData, cfg *config.Config, sinceBound, u
 
 	var deliverables []DeliverableItem
 	var totalUSD float64
-	var totalTurns int64
 	seenTasks := make(map[string]bool)
 
 	for rows.Next() {
@@ -546,7 +654,6 @@ func queryStaypointTasks(work *WorkReportData, cfg *config.Config, sinceBound, u
 			if !seenTasks[taskID] {
 				seenTasks[taskID] = true
 				totalUSD += spentUSD
-				totalTurns += spentTurns
 
 				impact := proj
 				if impact == "" {
@@ -556,10 +663,7 @@ func queryStaypointTasks(work *WorkReportData, cfg *config.Config, sinceBound, u
 						impact = "Audited engineering activity"
 					}
 				}
-				valStr := fmt.Sprintf("$%.2f value", spentUSD)
-				if spentUSD == 0 {
-					valStr = "$0.00 value"
-				}
+				valStr := formatUSD(spentUSD) + " value"
 				wpStr := ""
 				if prodType != "" && prodRef != "" {
 					wpStr = fmt.Sprintf("%s: %s", prodType, prodRef)
@@ -576,15 +680,8 @@ func queryStaypointTasks(work *WorkReportData, cfg *config.Config, sinceBound, u
 		}
 	}
 
+	// Headline figures come from telemetry alone; tasks only list deliverables.
 	if len(deliverables) > 0 && totalUSD > 0 {
 		work.Deliverables = deliverables
-		if totalUSD > 2881.71 || sinceBound != "" || untilBound != "" {
-			work.APIListPriceEquivalentValue = fmt.Sprintf("$%.2f", totalUSD)
-			work.SubstantiatedValue = work.APIListPriceEquivalentValue
-			work.ROIMultiplier = fmt.Sprintf("%.1fx", totalUSD/20.0)
-		}
-		if totalTurns > 0 && (sinceBound != "" || untilBound != "") {
-			work.AcceptedTurns = formatInt(totalTurns)
-		}
 	}
 }

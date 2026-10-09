@@ -414,8 +414,9 @@ func TestFetchTelemetryWithRange_HourlyRateBehavior(t *testing.T) {
 		if work.TotalHoursSaved != "" {
 			t.Errorf("expected TotalHoursSaved to be empty, got %q", work.TotalHoursSaved)
 		}
-		if work.DirectCostMultiplier != "14.4x net return on upgrade" {
-			t.Errorf("expected fallback DirectCostMultiplier, got %q", work.DirectCostMultiplier)
+		// No plan prices configured: the multiplier cannot be computed.
+		if work.DirectCostMultiplier != NotMeasured {
+			t.Errorf("expected DirectCostMultiplier %q, got %q", NotMeasured, work.DirectCostMultiplier)
 		}
 
 		// Verify HTML rendering omits billable hours and includes value multipliers
@@ -426,8 +427,8 @@ func TestFetchTelemetryWithRange_HourlyRateBehavior(t *testing.T) {
 		if strings.Contains(html, "billable client hours") {
 			t.Errorf("HTML should not mention billable client hours when rate is 0.0")
 		}
-		if !strings.Contains(html, "14.4x net return on upgrade") {
-			t.Errorf("HTML should contain DirectCostMultiplier fallback")
+		if !strings.Contains(html, NotMeasured) {
+			t.Errorf("HTML should show DirectCostMultiplier as %q", NotMeasured)
 		}
 		if !strings.Contains(html, "Fully unblocked velocity multiplier") {
 			t.Errorf("HTML should contain unblocked multiplier fallback")
@@ -439,6 +440,9 @@ func TestFetchTelemetryWithRange_HourlyRateBehavior(t *testing.T) {
 			TelemetryDBPath: dbPath,
 			WorkEmail:       "jane@acmework.com",
 			HourlyRate:      150.0,
+			// Break-even hours need both plan prices.
+			WorkSubscriptionUSD:    20,
+			UpgradeSubscriptionUSD: 200,
 		}
 
 		work, _, _, _, err := FetchTelemetryWithRange(cfg, DateRangeOptions{})
@@ -604,9 +608,9 @@ func TestFetchTelemetryWithRange_NonExistentDBGracefulFallback(t *testing.T) {
 		t.Fatalf("expected graceful return when db doesn't exist, got error: %v", err)
 	}
 
-	// Verify defaults are populated
-	if work.SubstantiatedValue == "" || personal.DeliveredValue == "" || gemini.TotalTokens == "" || combined.TotalValue == "" {
-		t.Errorf("expected default metrics when database file does not exist")
+	// No database: figures read "not measured", never a placeholder number.
+	if work.SubstantiatedValue != NotMeasured || personal.DeliveredValue != NotMeasured || gemini.TotalTokens != NotMeasured || combined.TotalValue != NotMeasured {
+		t.Errorf("expected %q metrics when database file does not exist", NotMeasured)
 	}
 }
 

@@ -273,10 +273,10 @@ Seamlessly bridges local workstations with enterprise hardware (e.g., `company-m
 
 Pure Go PDF rendering engine powered by Chrome DevTools Protocol (`chromedp`). Eliminates all Node, Bun, and Playwright dependencies:
 
-- **Work Report (`--type work`)**: "The Boss Card." Displays net engineering value delivered, requests processed, and cache efficiency. When `hourly_rate` is set, calculates hours saved; when `0.0`, highlights direct value-to-cost multipliers (e.g., `14.4x net return on upgrade`).
-- **Personal Audit (`--type personal`)**: Value audit covering Claude Max usage (100k+ requests, token distributions, cost benchmarks).
-- **Gemini Native Report (`--type gemini`)**: Antigravity token throughput, flash vs. pro distributions, and code review logs.
-- **Combined Fleet Memo (`--type combined`)**: Unified executive overview calculating combined impact across all platforms ($14,000+ delivered value).
+- **Work Report (`--type work`)**: "The Boss Card." Displays net engineering value delivered, requests processed, and cache efficiency. When `hourly_rate` is set, calculates hours saved; when `0.0`, highlights the direct value-to-cost multiplier of the proposed upgrade. Every figure is computed from telemetry for the selected range; anything that cannot be computed reads "not measured".
+- **Personal Audit (`--type personal`)**: Value audit of personal-account usage (requests, per-model token distribution, ratecard value).
+- **Gemini Native Report (`--type gemini`)**: Antigravity token throughput, per-model distribution, and code review logs.
+- **Combined Fleet Memo (`--type combined`)**: Unified executive overview of combined value across all accounts.
 - **Batch Generation (`--type all`)**: Renders all 4 print-ready PDFs to `~/Desktop` with a single command.
 
 ### 🌐 Multi-Machine Fleet & Air-Gapped MDM Support
@@ -396,6 +396,13 @@ engineer_name = "Staff Engineer"
 # When set to 0.0, billable client hours are completely omitted from reports,
 # and direct value-to-cost multipliers (e.g. 14.4x return) are displayed instead.
 hourly_rate = 0.0
+
+# Monthly plan prices (USD) used as ROI denominators in reports.
+# Leave at 0.0 and the matching ROI figure reads "not measured".
+work_subscription_usd = 0.0      # current work seat
+upgrade_subscription_usd = 0.0   # proposed work seat (Boss Card upgrade case)
+personal_subscription_usd = 0.0
+gemini_subscription_usd = 0.0
 
 # Account Attribution
 work_email = "user@example.com"
