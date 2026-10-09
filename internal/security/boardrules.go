@@ -611,18 +611,18 @@ func namedRun(code string, re *regexp.Regexp, depth int) bool {
 			return true
 		}
 	}
-	fed := false     // a pipe from a segment that read the script
-	execOut := false // exec >file: later output goes to that file
+	// Any file written on a line that names it may hold a copy: exec >f,
+	// { cat x; } > f and ( ... ) > f redirect segments other than their own.
+	for _, s := range segs {
+		if writesFile(s) {
+			return true
+		}
+	}
+	fed := false // a pipe from a segment that read the script
 	for _, s := range segs {
 		argv, viaXargs := unwrapArgv(s.argv)
 		named := anyNames(re, s.argv) || redirectNames(re, s) || heredocNames(re, s)
-		if len(argv) == 0 && writesFile(s) {
-			execOut = true
-		}
-		if execOut && named {
-			return true
-		}
-		if fed &&(viaXargs || len(argv) == 0 || !pipeFilters[baseCmd(argv)] || argv[0] != baseCmd(argv) || writesFile(s)) {
+		if fed && (viaXargs || len(argv) == 0 || !pipeFilters[baseCmd(argv)] || argv[0] != baseCmd(argv) || writesFile(s)) {
 			return true
 		}
 		// Named in an assignment or a wrapper's args (BASH_ENV=...,
