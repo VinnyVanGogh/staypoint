@@ -202,10 +202,12 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 			cc.baseCWD = c.CWD
 		}
 		cc.classifySegment(s, &v, depth)
-		if s.piped || i > 0 && segs[i-1].piped {
-			// A pipeline stage runs in a subshell: what it assigns does not
-			// reach the rest of the line, and the name keeps whatever value
-			// it inherited, which we do not know.
+		if s.piped {
+			// A pipeline stage before the last runs in a subshell: what it
+			// assigns does not reach the rest of the line, and the name
+			// keeps whatever value it inherited, which we do not know. The
+			// last stage runs in the shell itself in zsh (and bash with
+			// lastpipe), so its assignments are kept.
 			sub := pathVars{}
 			cc.noteAssignments(s, sub)
 			for name := range sub {

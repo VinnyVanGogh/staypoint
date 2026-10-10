@@ -102,6 +102,7 @@ func TestSensitivePathSpellings(t *testing.T) {
 		"grep -R -- -r ~",
 		"d=~/.staypoint | cat $d/auth_token",
 		"export d=/tmp | cat $d/auth_token",
+		"echo | d=~/.staypoint; cat $d/x",
 		"export {CD,X}PATH=$HOME; cd .staypoint; cat x",
 		"cdpath=(~); cd .staypoint; cat x",
 		"n=CD; : ${(P)n::=$HOME}; cd .staypoint; cat x",
