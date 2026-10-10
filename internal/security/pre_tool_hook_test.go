@@ -238,6 +238,9 @@ func TestPreToolHookPythonNodeBoardEndpoints(t *testing.T) {
 		`python3 -c "import requests; requests.post('http://127.0.0.1:41421/api/settings/ship-review')"`,
 		// ship-review/send-back with POST
 		`python3 -c "import urllib.request as u; u.urlopen(u.Request('http://127.0.0.1:41421/api/tasks/X/ship-review/send-back',method='POST'))"`,
+		// Deploy drain (task-db71fba9): an agent must not stop all new runs.
+		`python3 -c "import requests; requests.post('http://127.0.0.1:41421/api/daemon/drain', json={'mode':'now'})"`,
+		`curl -X POST http://127.0.0.1:41421/api/daemon/drain`,
 	}
 	for _, cmd := range blocked {
 		v := c.Classify(cmd)

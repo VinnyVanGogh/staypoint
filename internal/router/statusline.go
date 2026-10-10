@@ -378,6 +378,11 @@ func RenderStatuslineFor(w io.Writer, r io.Reader, decision *RouteDecision) erro
 		line2Parts = append(line2Parts, fmt.Sprintf("%s🦴 CAVEMAN%s", Yellow, Reset))
 	}
 
+	// Deploy drain (task-db71fba9): "Draining for deploy: N runs left, M queued".
+	if label := drainLabel(filepath.Join(home, ".staypoint", "drain.json"), time.Now()); label != "" {
+		line2Parts = append(line2Parts, fmt.Sprintf("%s%s🚧 %s%s", Yellow, Bold, label, Reset))
+	}
+
 	// 10. Quotas & Meters
 	var fivePct, weekPct float64
 	var fiveResetsAt, weekResetsAt time.Time
@@ -681,4 +686,28 @@ func getPendingReviewForClaude(dir string) *pendingReviewInfo {
 	}
 	pendingDir := filepath.Join(home, ".claude", "reviews", "pending")
 	return getPendingReviewFromDir(dir, pendingDir)
+}
+
+// drainStaleAfter: staypointd rewrites drain.json every 2s while it drains,
+// so an older file was left by a daemon that died and is not shown.
+const drainStaleAfter = 10 * time.Second
+
+// drainLabel returns the daemon's deploy-drain line from path, or "" when the
+// daemon is not draining (no file, unreadable, or stale).
+func drainLabel(path string, now time.Time) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var st struct {
+		Label     string    `json:"label"`
+		UpdatedAt time.Time `json:"updated_at"`
+	}
+	if json.Unmarshal(b, &st) != nil || st.Label == "" {
+		return ""
+	}
+	if now.Sub(st.UpdatedAt) > drainStaleAfter {
+		return ""
+	}
+	return st.Label
 }

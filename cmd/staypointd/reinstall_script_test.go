@@ -50,7 +50,46 @@ exit 0
 
 // Answers /api/health with the label the stub go build was given, so the
 // script's start check sees the commit it just built.
+//
+// /api/daemon/drain (task-db71fba9): POST and DELETE are logged to
+// drain_calls; each GET takes the next live-run count from the live_seq file
+// (empty: 0) and records the installed binary in binary_during_drain, so a
+// test can see the swap waited for the drain. STUB_DRAIN=old answers like a
+// daemon without drain mode, STUB_DRAIN=forbidden like a wrong board token.
+// STUB_DOWN=1: no daemon answers until the new binary is installed. argv and
+// stdin (headers sent with -H @-) are logged to curl_args and curl_stdin.
 const stubCurl = `#!/bin/sh
+case " $* " in *" @- "*) cat >> "$STUB_STATE/curl_stdin" ;; esac
+printf '%s\n' "$*" >> "$STUB_STATE/curl_args"
+bin="$HOME/.local/bin/staypointd"
+case "$*" in
+*/api/daemon/drain*)
+    case "$*" in
+    *"-X POST"*)
+        printf 'POST %s\n' "$*" >> "$STUB_STATE/drain_calls"
+        case "$STUB_DRAIN" in
+        old) printf '404 page not found\n'; exit 0 ;;
+        forbidden) printf '{"error":"board_session_required","message":"forbidden"}'; exit 0 ;;
+        esac
+        printf '{"draining":true,"mode":"finish","live":1,"queued":0,"live_tasks":["task-a"]}' ;;
+    *"-X DELETE"*)
+        printf 'DELETE\n' >> "$STUB_STATE/drain_calls"
+        printf '{"draining":false,"mode":"off","live":0,"queued":0,"live_tasks":[]}' ;;
+    *)
+        live=0
+        if [ -s "$STUB_STATE/live_seq" ]; then
+            live="$(head -1 "$STUB_STATE/live_seq")"
+            tail -n +2 "$STUB_STATE/live_seq" > "$STUB_STATE/live_seq.tmp"
+            mv "$STUB_STATE/live_seq.tmp" "$STUB_STATE/live_seq"
+        fi
+        cat "$bin" >> "$STUB_STATE/binary_during_drain" 2>/dev/null
+        printf '{"draining":true,"mode":"finish","live":%s,"queued":2,"live_tasks":["task-a","task-b"]}' "$live" ;;
+    esac
+    exit 0 ;;
+esac
+if [ -n "$STUB_DOWN" ] && [ -e "$bin.staging" ]; then
+    exit 7
+fi
 label="$(sed -n 's/.*main.GitCommit=\([^ ]*\).*/\1/p' "$STUB_STATE/ldflags" | head -1)"
 printf '{"git_commit":"%s","repo_access":{"checked":true,"inaccessible":[]}}' "$label"
 `
@@ -100,12 +139,16 @@ func newDeployFixture(t *testing.T) *deployFixture {
 	if err := os.WriteFile(filepath.Join(f.home, ".staypoint", "auth_token"), []byte("tok"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(f.home, ".staypoint", "board_token"), []byte(stubBoardToken), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	f.env = append(os.Environ(),
 		"HOME="+f.home,
 		"PATH="+stubs+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"STUB_STATE="+f.state,
 		"STAYPOINT_START_TIMEOUT=5",
+		"STAYPOINT_DRAIN_POLL=0.05",
 		"STAYPOINT_REPO_CHECK_TIMEOUT=2",
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL="+os.DevNull,

@@ -36,7 +36,7 @@ func wireRunQueue(ctx context.Context, limits orchestrator.RunLimits, srv *serve
 	if srv != nil {
 		hub := srv.Hub()
 		slots.OnChange = func(q []orchestrator.QueuedRun) {
-			hub.Publish("run.queue", map[string]any{"queue": q})
+			hub.Publish("run.queue", map[string]any{"queue": q, "drain": slots.DrainStatus()})
 		}
 	}
 	slots.SetLimits(limits)

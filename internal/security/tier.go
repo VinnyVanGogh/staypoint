@@ -12,7 +12,7 @@ import (
 
 // boardEndpointRe matches board-only API endpoint path segments that agents must not call.
 var boardEndpointRe = regexp.MustCompile(
-	`/(?:ship-review/(?:approve|send-back|reject|delete-branch|push-branch)|gate-requests/[^/\s'"]+/decide|settings/(?:security-gate|ship-review))`)
+	`/(?:ship-review/(?:approve|send-back|reject|delete-branch|push-branch)|gate-requests/[^/\s'"]+/decide|settings/(?:security-gate|ship-review)|daemon/drain)`)
 
 // boardBootstrapRe matches the board-session bootstrap URL pattern (board_nonce or board_token
 // query parameter). An agent fetching this URL (even via GET) would obtain the board cookie.

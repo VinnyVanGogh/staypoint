@@ -181,6 +181,8 @@ func (h *TasksHandler) GetTask(w http.ResponseWriter, r *http.Request) {
 		"work_kind":    task.WorkKind,
 		// Run queue position (STA-773): {queued, ahead, wait}.
 		"queue": orchestrator.GlobalRunSlots.Position(task.ID),
+		// Deploy drain (task-db71fba9): the task page's "Draining for deploy" line.
+		"drain": orchestrator.GlobalRunSlots.DrainStatus(),
 		// Turn in flight, for the task page's turn timer; null when idle.
 		"turn": orchestrator.GlobalActiveTurns.Get(task.ID),
 		// Where the task runs; git=false shows the non-git warning banner (STA-864).

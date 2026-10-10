@@ -858,6 +858,10 @@ function handleEvent(evt) {
       const pos = queuePositionIn(evt.data.queue, tid);
       if (state.tasks[tid]) state.tasks[tid].queue = pos;
       setRunQueueLine(document.getElementById(`run-queue-line-${tid}`), pos);
+      if (evt.data.drain) {
+        if (state.tasks[tid]) state.tasks[tid].drain = evt.data.drain;
+        setDrainLine(document.getElementById(`drain-line-${tid}`), evt.data.drain);
+      }
     }
     return;
   }
@@ -7654,6 +7658,7 @@ async function fetchTaskViewData(resolvedId) {
   const task = taskResp.task || taskResp;
   if (taskResp.dependencies) task.dependencies = taskResp.dependencies;
   task.queue = taskResp.queue || null;
+  task.drain = taskResp.drain || null;
   task.turn = taskResp.turn || null;
   task.workspace = taskResp.workspace || null;
   task.block_event = taskResp.block_event || null;
@@ -8381,6 +8386,14 @@ async function syncRunControlBar(taskId) {
 function setRunQueueLine(line, pos) {
   if (!line) return;
   const text = queueLabel(pos);
+  line.textContent = text;
+  line.classList.toggle('hidden', !text);
+}
+
+// Show or hide the task page "Draining for deploy" line (task-db71fba9).
+function setDrainLine(line, drain) {
+  if (!line) return;
+  const text = drainLabel(drain);
   line.textContent = text;
   line.classList.toggle('hidden', !text);
 }
@@ -10912,6 +10925,13 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   queueLine.setAttribute('role', 'status');
   setRunQueueLine(queueLine, task.queue);
   container.appendChild(queueLine);
+
+  // Deploy drain line (task-db71fba9), kept current by run.queue SSE.
+  const drainLine = el('div', 'task-page-queue-line task-page-drain-line');
+  drainLine.id = `drain-line-${task.id}`;
+  drainLine.setAttribute('role', 'status');
+  setDrainLine(drainLine, task.drain);
+  container.appendChild(drainLine);
 
   // Non-git task (STA-864): runs in place; nothing is checkpointed, and
   // there is no ship review card or Approve.

@@ -92,7 +92,22 @@
     slots: 'global limit: max_concurrent_runs reached',
     quota: 'quota: provider quota is locked',
     parent: 'parent limit: its parent already has max_running_children running',
+    drain: 'StayPoint is draining for a deploy: starts after the restart',
+    resume: 'paused for a deploy: resumes from where it stopped',
   };
+
+  // Task page line while the daemon drains for a deploy (task-db71fba9).
+  // d is GET /api/tasks/{id} .drain or a run.queue SSE payload's .drain:
+  // { draining, mode, live, queued }. '' when not draining.
+  function drainLabel(d) {
+    if (!d || !d.draining) return '';
+    const live = Math.max(0, Number(d.live) || 0);
+    const queued = Math.max(0, Number(d.queued) || 0);
+    let s = `Draining for deploy: ${live} run${live === 1 ? '' : 's'} left, ${queued} queued`;
+    if (d.mode === 'boundary') s += ' (suspending at the next turn)';
+    else if (d.mode === 'now') s += ' (suspending now)';
+    return s;
+  }
   function queueLabel(pos) {
     if (!pos || !pos.queued) return '';
     const n = Math.max(0, Number(pos.ahead) || 0);
@@ -138,7 +153,7 @@
     return `#${(turn.turn || 0) + 1} · ${elapsed}`;
   }
 
-  const api = { turnElapsedLabel, groupStepsByRun, isRealRunGroup, latestRunSteps, currentRunSteps, runElapsedMs, isStuck, routeModel, queueLabel, queuePositionIn, runStepLabel };
+  const api = { turnElapsedLabel, groupStepsByRun, isRealRunGroup, latestRunSteps, currentRunSteps, runElapsedMs, isStuck, routeModel, queueLabel, queuePositionIn, runStepLabel, drainLabel };
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;
