@@ -207,9 +207,12 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 			// value it inherited, which we do not know; zsh (and bash with
 			// lastpipe) run the last stage in the shell itself, so there it
 			// may also hold the new value. Keep both.
-			sub := pathVars{}
+			sub := vars.clone()
 			cc.noteAssignments(s, sub)
 			for name, val := range sub {
+				if old, ok := vars[name]; ok && old == val {
+					continue
+				}
 				vars[name] = unresolved
 				if !s.piped && !strings.ContainsAny(val, "{},") {
 					vars[name] = "{" + val + "," + unresolved + "}"

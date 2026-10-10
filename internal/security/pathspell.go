@@ -257,7 +257,10 @@ func (c *Classifier) noteAssignments(s segment, vars pathVars) {
 		}
 		vars[name] = val
 	}
-	rest := stripPrefixes(argv)
+	rest := argv
+	for len(rest) > 0 && (isAssign(rest[0]) || isAppendAssign(rest[0])) {
+		rest = rest[1:]
+	}
 	if len(rest) == 0 {
 		for _, a := range argv {
 			if isAssign(a) || isAppendAssign(a) {
