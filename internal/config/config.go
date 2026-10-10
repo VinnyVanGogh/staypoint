@@ -86,6 +86,24 @@ type Config struct {
 
 	// Gates holds the optional [gates] table.
 	Gates GatesConfig `json:"gates,omitempty" toml:"gates"`
+
+	// Browser holds the optional [browser] table used by
+	// 'staypoint task open' (task-63a9779d).
+	Browser BrowserConfig `json:"browser,omitempty" toml:"browser"`
+}
+
+// BrowserConfig is the [browser] table of config.toml: which browser and
+// profile 'staypoint task open' uses for task pages. All fields empty = the
+// macOS default browser via 'open'.
+type BrowserConfig struct {
+	// App is the macOS application name, e.g. "Microsoft Edge".
+	App string `json:"app,omitempty" toml:"app"`
+	// ProfileDirectory is the Chromium profile folder, e.g. "Profile 4".
+	ProfileDirectory string `json:"profile_directory,omitempty" toml:"profile_directory"`
+	// Profile is the profile's display name, e.g. "Main"; it is resolved to a
+	// folder through the browser's Local State file. ProfileDirectory wins
+	// when both are set.
+	Profile string `json:"profile,omitempty" toml:"profile"`
 }
 
 // GatesConfig holds security-gate toggles from the [gates] section of config.toml.

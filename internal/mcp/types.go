@@ -47,6 +47,8 @@ type ServerInfo struct {
 type Property struct {
 	Type        string `json:"type"`
 	Description string `json:"description,omitempty"`
+	// Items is the element schema of an "array" property.
+	Items *Property `json:"items,omitempty"`
 }
 
 // InputSchema defines JSON Schema for tool input arguments.
