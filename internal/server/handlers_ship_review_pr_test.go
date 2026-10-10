@@ -771,6 +771,41 @@ func TestShipReviewPR_MergeRechecksMigrations(t *testing.T) {
 	}
 }
 
+// task-a5c42165: "Open PR" on a direct-mode card opens a PR so CI runs on
+// the commit, and never merges; the card then follows the pr_merge flow.
+func TestShipReviewPR_OpenPRForCIOnDirectCard(t *testing.T) {
+	notWork(t)
+	state := installFakeGH(t)
+	database, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	setMergeMode(t, database, repoDir, shipreview.MergeModeDirect, "")
+	bare := gitOut(t, repoDir, "remote", "get-url", "origin")
+	mainBefore := gitOut(t, bare, "rev-parse", "main")
+	head := gitOut(t, repoDir, "rev-parse", "staypoint/"+taskID)
+
+	body, _ := json.Marshal(map[string]any{"head_sha": head, "open_pr_for_ci": true})
+	resp, rb := shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", body, boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Approve open_pr_for_ci: %d %s", resp.StatusCode, rb)
+	}
+	calls := ghCalls(t, state)
+	if !hasCall(calls, "pr create --head staypoint/"+taskID) || hasCall(calls, "pr merge") {
+		t.Fatalf("want a PR opened and nothing merged, calls: %v", calls)
+	}
+	if got := gitOut(t, bare, "rev-parse", "main"); got != mainBefore {
+		t.Errorf("origin main moved %s -> %s; Open PR must not merge", mainBefore, got)
+	}
+	c := getPRCard(t, client, baseURL, token, taskID)
+	if c.Status != "pending" || c.PRNumber != 7 || c.MergeMode != "pr_merge" || c.EffectiveMode != "pr_merge" {
+		t.Errorf("card after Open PR = %+v", c)
+	}
+
+	// The card now has a PR: open_pr_for_ci no longer applies.
+	resp, rb = shipDoReq(t, client, token, "POST", baseURL+"/api/tasks/"+taskID+"/ship-review/approve", body, boardToken, "", "mock-assertion")
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("second open_pr_for_ci: %d %s, want 409", resp.StatusCode, rb)
+	}
+}
+
 func readFile(t *testing.T, p string) string {
 	t.Helper()
 	b, err := os.ReadFile(p)
@@ -778,4 +813,61 @@ func readFile(t *testing.T, p string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// task-a5c42165: Approve on a branch whose head is already in the target
+// (merged earlier through its own PR, branch tip now the merge commit) says
+// so and closes the card, instead of a 502 from `gh pr create` ("No commits
+// between"), and never rewinds the merged branch on origin.
+func TestShipReviewPR_ApproveAlreadyMerged(t *testing.T) {
+	notWork(t)
+	state := installFakeGH(t)
+	database, baseURL, token, boardToken, taskID, repoDir, client := shipApproveServer(t)
+	setMergeMode(t, database, repoDir, shipreview.MergeModePRMerge, "")
+	bare := gitOut(t, repoDir, "remote", "get-url", "origin")
+	branch := "staypoint/" + taskID
+	head := gitOut(t, repoDir, "rev-parse", branch)
+
+	// PR #477 merged the branch into main on GitHub; the branch tip there
+	// moved on to the merge commit.
+	if out, err := exec.Command("git", "-C", repoDir, "push", "-q", "origin", head+":refs/heads/"+branch).CombinedOutput(); err != nil {
+		t.Fatalf("push branch: %v %s", err, out)
+	}
+	m := gitOut(t, bare, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", head+"^{tree}", "-p", "main", "-p", head, "-m", "Merge pull request #477")
+	gitOut(t, bare, "update-ref", "refs/heads/main", m)
+	gitOut(t, bare, "update-ref", "refs/heads/"+branch, m)
+	writeState(t, state, "pr", "477 https://github.com/o/r/pull/477 "+branch)
+	writeState(t, state, "state", "MERGED")
+	writeState(t, state, "merge_sha", m)
+
+	code, rb := prApprove(t, client, baseURL, token, boardToken, taskID)
+	if code != http.StatusOK {
+		t.Fatalf("Approve on an already merged branch: %d %s", code, rb)
+	}
+	var resp struct {
+		AlreadyMerged bool   `json:"already_merged"`
+		Target        string `json:"target"`
+		MainSHA       string `json:"main_sha"`
+		PRNumber      int    `json:"pr_number"`
+		Message       string `json:"message"`
+		NextStep      string `json:"next_step"`
+	}
+	if err := json.Unmarshal(rb, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AlreadyMerged || resp.Target != "main" || resp.MainSHA != m || resp.PRNumber != 477 ||
+		resp.Message != "Already merged into main (PR #477)" || resp.NextStep == "" {
+		t.Errorf("approve response = %+v", resp)
+	}
+	calls := ghCalls(t, state)
+	if hasCall(calls, "pr create") || hasCall(calls, "pr merge") {
+		t.Fatalf("already merged: nothing to create or merge, calls: %v", calls)
+	}
+	if got := gitOut(t, bare, "rev-parse", branch); got != m {
+		t.Errorf("origin %s = %s, want merge commit %s left alone", branch, got, m)
+	}
+	c := getPRCard(t, client, baseURL, token, taskID)
+	if c.Status != "approved" || c.MainSHA != m {
+		t.Errorf("card after already-merged approve = %+v", c)
+	}
 }

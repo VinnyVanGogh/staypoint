@@ -82,7 +82,7 @@ func (h *ShipReviewHandler) GetCard(w http.ResponseWriter, r *http.Request) {
 			if cfg, reason, cfgErr := shipreview.LiveGate(h.db, task.RepoPath); cfgErr == nil {
 				isWork := shipreview.IsWorkRepo(task.RepoPath)
 				merged["is_work_repo"] = isWork
-				merged["effective_merge_mode"] = shipreview.EffectiveMergeMode(cfg, isWork)
+				merged["effective_merge_mode"] = shipreview.CardMergeMode(cfg, isWork, card)
 				if card.TargetBranch == "" {
 					tctx, tcancel := gitRequestContext(r)
 					if target, tErr := shipreview.TaskTargetBranch(tctx, h.db, task.RepoPath, task.ID); tErr == nil {
@@ -760,6 +760,9 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 		MigrationOverrideReason string `json:"migration_override_reason"`
 		// HeadSHA, when sent, is the head the Board was shown (STA-717).
 		HeadSHA string `json:"head_sha"`
+		// OpenPRForCI: on a direct-mode card, open a PR instead of merging,
+		// so CI runs on this commit; Merge PR then lands it, gated as usual.
+		OpenPRForCI bool `json:"open_pr_for_ci"`
 		testGateBypass
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
@@ -816,7 +819,14 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "load project config: "+err.Error())
 		return
 	}
-	mode := shipreview.EffectiveMergeMode(cfg, shipreview.IsWorkRepo(task.RepoPath))
+	mode := shipreview.CardMergeMode(cfg, shipreview.IsWorkRepo(task.RepoPath), card)
+	if req.OpenPRForCI {
+		if mode != shipreview.MergeModeDirect {
+			writeError(w, http.StatusConflict, "open_pr_for_ci is for direct-mode cards; this card's Approve already opens a PR")
+			return
+		}
+		mode = shipreview.MergeModePRMerge
+	}
 
 	// STA-734: direct and open_pr Approve hand the change to main, so the
 	// test gate runs here; pr_merge only opens the PR and is gated at Merge.
