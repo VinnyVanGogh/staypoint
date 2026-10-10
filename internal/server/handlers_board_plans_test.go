@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/server"
 )
@@ -372,6 +373,33 @@ func TestBoardPlan_ApproveMergeRunsThroughShipReview(t *testing.T) {
 	// The same route called directly still demands its own passkey.
 	if status, raw, _ := f.do("POST", "/api/tasks/"+f.taskID+"/ship-review/send-back", map[string]string{"comment": "x"}, true, nil); status != http.StatusForbidden {
 		t.Fatalf("per-task route without assertion: want 403, got %d %s", status, raw)
+	}
+}
+
+// Gate rows decide held commands through the gate's own decide route.
+func TestBoardPlan_GateDecisions(t *testing.T) {
+	f := newPlanFixture(t)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, id := range []string{"gate-yes", "gate-no"} {
+		if _, err := f.db.Exec(`INSERT INTO security_gate_requests (id, cmdline, run_id, status, created_at) VALUES (?, 'rm -rf build', 'run-1', 'pending', ?)`, id, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	id := f.propose(
+		map[string]any{"gate_id": "gate-yes", "action": "gate_approve"},
+		map[string]any{"gate_id": "gate-no", "action": "gate_deny"},
+	)
+	session, assertion := f.sign(id, 0, 1)
+	status, out, raw := f.execute(id, session, assertion, 0, 1)
+	if status != http.StatusOK || len(out.Results) != 2 || out.Results[0].Status != "ok" || out.Results[1].Status != "ok" {
+		t.Fatalf("gate rows: %d %s", status, raw)
+	}
+	for id, want := range map[string]string{"gate-yes": "approved", "gate-no": "denied"} {
+		var got string
+		_ = f.db.QueryRow(`SELECT status FROM security_gate_requests WHERE id = ?`, id).Scan(&got)
+		if got != want {
+			t.Fatalf("%s: status %q, want %q", id, got, want)
+		}
 	}
 }
 
