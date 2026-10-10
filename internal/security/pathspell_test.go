@@ -99,6 +99,9 @@ func TestSensitivePathSpellings(t *testing.T) {
 		"find ~ -name auth_token > /tmp/l; xargs cat < /tmp/l",
 		"timeout 5 find ~ -name auth_token | xargs cat",
 		"fd -u auth_token ~",
+		"grep -R -- -r ~",
+		"d=~/.staypoint | cat $d/auth_token",
+		"export d=/tmp | cat $d/auth_token",
 		"export {CD,X}PATH=$HOME; cd .staypoint; cat x",
 		"cdpath=(~); cd .staypoint; cat x",
 		"n=CD; : ${(P)n::=$HOME}; cd .staypoint; cat x",
@@ -145,6 +148,7 @@ func TestSensitivePathSpellings(t *testing.T) {
 		"cat $(find internal -name '*.md')",
 		"cd internal && grep -rn x .",
 		"pushd internal && ls; popd",
+		"{ echo a; }; cd internal && grep -rn x .",
 		"ls \"$TMPDIR\"/staypoint-e2e",
 	}
 	for _, line := range notRed {

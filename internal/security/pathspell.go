@@ -36,6 +36,21 @@ var cdpathRe = regexp.MustCompile(`(?i)cdpath|\$\{\(|\b(export|declare|typeset|l
 // parameters.
 var expansionRe = regexp.MustCompile(`\$(\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])`)
 
+// braceGroupRe is an innermost brace group, read as unresolved when a word
+// has too many alternatives to expand.
+var braceGroupRe = regexp.MustCompile(`\{[^{}]*\}`)
+
+// anyBraceGroup reports a word with a { and a } after it: a brace group
+// that may build a name ({CD,X}PATH=...). A lone brace ({ cmd; }) is not.
+func anyBraceGroup(words []string) bool {
+	for _, w := range words {
+		if k := strings.IndexByte(w, '{'); k >= 0 && strings.IndexByte(w[k:], '}') > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // braceExpand expands {a,b} alternatives. A {x..y} sequence or more than
 // maxBraceAlts results reads the group as unresolved (fail closed).
 func braceExpand(w string) []string {
@@ -63,7 +78,7 @@ func braceExpand(w string) []string {
 			return out
 		}
 		if len(out) > maxBraceAlts {
-			return []string{regexp.MustCompile(`\{[^{}]*\}`).ReplaceAllString(w, unresolved)}
+			return []string{braceGroupRe.ReplaceAllString(w, unresolved)}
 		}
 	}
 	return out

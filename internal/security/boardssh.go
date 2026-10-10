@@ -105,7 +105,7 @@ func remoteShellDepth(code, taskID string, depth int) string {
 	}
 	found := false
 	for k, s := range segs {
-		argv, _ := unwrapArgv(s.argv)
+		argv, viaXargs := unwrapArgv(s.argv)
 		if len(argv) == 0 {
 			continue
 		}
@@ -139,6 +139,10 @@ func remoteShellDepth(code, taskID string, depth int) string {
 		found = true
 		if name != "ssh" {
 			return name + " " + remoteHeld
+		}
+		if viaXargs {
+			// xargs or parallel append words read at run time.
+			return "ssh run by xargs gets its remote command at run time; " + remoteHeld
 		}
 		fedInput := (k > 0 && segs[k-1].piped) || readsFile(s)
 		off := len(s.argv) - len(argv)
@@ -248,7 +252,8 @@ func sshRule(args []string, s segment, fedInput bool, taskID string, depth int) 
 		}
 	}
 	for j := range cmd {
-		if segDyn(s, i+1+j) {
+		// {} is a placeholder find -exec or xargs -I fills at run time.
+		if segDyn(s, i+1+j) || strings.Contains(cmd[j], "{}") {
 			return fmt.Sprintf("ssh to dev host %s: the remote command is built by a local expansion (%s), which cannot be checked", dest, cmd[j])
 		}
 	}

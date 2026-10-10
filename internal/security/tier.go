@@ -202,7 +202,18 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 			cc.baseCWD = c.CWD
 		}
 		cc.classifySegment(s, &v, depth)
-		cc.noteAssignments(s, vars)
+		if s.piped || i > 0 && segs[i-1].piped {
+			// A pipeline stage runs in a subshell: what it assigns does not
+			// reach the rest of the line, and the name keeps whatever value
+			// it inherited, which we do not know.
+			sub := pathVars{}
+			cc.noteAssignments(s, sub)
+			for name := range sub {
+				vars[name] = unresolved
+			}
+		} else {
+			cc.noteAssignments(s, vars)
+		}
 		if a := stripPrefixes(s.argv); baseCmd(a) == "cd" {
 			fromCd = len(a) == 2 && filepath.IsAbs(a[1]) && !segDyn(s, len(s.argv)-len(a)+1)
 		}
@@ -212,7 +223,7 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 		}
 		// A segment with an expansion or brace group may have set CDPATH
 		// under a name built at run time; later relative cds are unknown.
-		if anyTrue(s.dyn) || strings.ContainsAny(strings.Join(s.argv, " "), "{}") {
+		if anyTrue(s.dyn) || anyBraceGroup(s.argv) {
 			cdpath = true
 		}
 		// remote-shell pipe: anything | sh
@@ -1259,7 +1270,7 @@ func recursiveOver(name string, args []string) bool {
 var recursiveValueOpts = map[string]string{
 	"grep": "efmABCdD", "egrep": "efmABCdD", "fgrep": "efmABCdD", "zgrep": "efmABCdD", "ggrep": "efmABCdD",
 	"rg": "efgtTABCmMj", "ag": "GgABCm", "tar": "fCbT", "bsdtar": "fCbT", "gtar": "fCbT", "zip": "bnti",
-	"cp": "", "rsync": "efB", "diff": "xXSIF", "chmod": "", "chown": "", "chgrp": "",
+	"rsync": "efB", "diff": "xXSIF",
 }
 
 // optTakesValue reports an option of a recursive command whose value is
@@ -1304,12 +1315,14 @@ func (c *Classifier) checkRecursive(name string, args, bases []string, v *Verdic
 		}
 	} else {
 		searcher := name == "rg" || name == "ag" || name == "fd" || name == "fdfind" || strings.HasSuffix(name, "grep")
-		patGiven := false
+		patGiven, endOpts := false, false
 		for i := 0; i < len(args); i++ {
 			a := args[i]
 			switch {
-			case a == "" || a == "-" || a == "--":
-			case strings.HasPrefix(a, "-"):
+			case a == "" || a == "-":
+			case a == "--" && !endOpts:
+				endOpts = true // every word after it is an operand
+			case strings.HasPrefix(a, "-") && !endOpts:
 				// The value after an option that takes one is not a tree:
 				// a pattern, a count, a glob or the archive file.
 				if searcher && (a == "-e" || a == "-f" || a == "--regexp" || a == "--file") {
