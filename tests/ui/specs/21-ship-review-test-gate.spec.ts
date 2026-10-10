@@ -336,10 +336,12 @@ test.describe('ship review merge test gate (STA-734)', () => {
 
     // The task is real, parked in the backlog of the same project.
     const href = await link.getAttribute('href');
-    const testTaskId = (href || '').split('/').pop() || '';
+    // The link is the canonical /STA-123/slug URL; the reference is its first segment.
+    const testTaskRef = (href || '').split('/')[1] || '';
+    expect(testTaskRef).toMatch(/^[A-Z]+-\d+$/);
     const res = await request.get('/api/tasks?status=all', { headers: { Authorization: `Bearer ${TOKEN}` } });
     expect(res.ok()).toBeTruthy();
-    const t = ((await res.json()).tasks as Array<Record<string, unknown>>).find((x) => x.id === testTaskId) || {};
+    const t = ((await res.json()).tasks as Array<Record<string, unknown>>).find((x) => x.identifier === testTaskRef) || {};
     expect(t.name).toBe(want);
     expect(t.execution_stage).toBe('backlog');
     expect(t.project).toBe('ui-e2e');

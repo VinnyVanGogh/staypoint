@@ -8751,8 +8751,9 @@ function appendRunStepToTimeline(taskId, step) {
 
 // ── Full-page task view ────────────────────────────────────
 
-// Puts the open task page's canonical /tasks/<org>/<project>/<id> path in the
-// address bar. Runs when the task loads and again after loadAll: the org
+// Puts the open task page's canonical path (/STA-123/<slug>, or the legacy
+// /tasks/<org>/<project>/<id> for a task without a number) in the address bar.
+// Runs when the task loads and again after loadAll: an unnumbered task's org
 // prefix comes from the fleet overview, which a direct link can beat.
 // Set once the full page has rendered a task; a miss ("Task not found") keeps
 // the URL it was given.
