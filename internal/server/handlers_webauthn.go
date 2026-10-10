@@ -302,6 +302,7 @@ func (h *WebAuthnHandler) evictSessions() {
 	for k, v := range h.sessions {
 		if !v.Expires.IsZero() && v.Expires.Before(now) {
 			delete(h.sessions, k)
+			delete(h.planBound, k)
 		}
 	}
 }
@@ -435,12 +436,10 @@ func (h *WebAuthnHandler) RegisterFinish(w http.ResponseWriter, r *http.Request)
 	}
 
 	sessionToken := r.Header.Get("X-WebAuthn-Session")
-	h.sessionMu.Lock()
-	sessionData := h.sessions[sessionToken]
-	if sessionData != nil {
-		delete(h.sessions, sessionToken)
+	sessionData, bound := h.takeSession(sessionToken)
+	if bound != nil {
+		sessionData = nil // a plan signing challenge never registers a passkey
 	}
-	h.sessionMu.Unlock()
 	if sessionData == nil {
 		writeBoardError(w, "board_passkey_session_invalid", "missing or expired registration session")
 		return

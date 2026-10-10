@@ -60,6 +60,12 @@ type BoardPlansHandler struct {
 
 // NewBoardPlansHandler creates a BoardPlansHandler.
 func NewBoardPlansHandler(db *sql.DB, hub *EventHub, secMid *SecurityMiddleware, webAuthn *WebAuthnHandler, routes http.Handler) *BoardPlansHandler {
+	// A plan left executing by a previous daemon process was cut off.
+	if n, err := boardplan.SweepInterrupted(db); err != nil {
+		slog.Warn("board plan: sweep interrupted plans", slog.String("error", err.Error()))
+	} else if n > 0 {
+		slog.Warn("board plan: closed plans interrupted by a daemon restart", slog.Int64("plans", n))
+	}
 	return &BoardPlansHandler{db: db, hub: hub, secMid: secMid, webAuthn: webAuthn, routes: routes}
 }
 
@@ -104,8 +110,8 @@ func (h *BoardPlansHandler) Propose(w http.ResponseWriter, r *http.Request) {
 	if proposer == "" {
 		proposer = kind
 	}
-	if len(proposer) > 200 {
-		proposer = proposer[:200]
+	if r := []rune(proposer); len(r) > 200 {
+		proposer = string(r[:200])
 	}
 	plan, err := boardplan.Create(h.db, proposer, kind, req.Actions)
 	if err != nil {
@@ -333,6 +339,11 @@ func (h *BoardPlansHandler) Execute(w http.ResponseWriter, r *http.Request) {
 			"status": res.Status, "http_status": res.HTTP, "error": res.Error,
 			"ip": r.RemoteAddr, "user_agent": r.UserAgent(),
 		})
+		// Saved as each row finishes, so a daemon that dies mid-plan still
+		// shows what ran (SweepInterrupted closes the plan on restart).
+		if err := boardplan.RecordResults(h.db, plan.ID, results); err != nil {
+			slog.Warn("board plan: record row", slog.String("plan", plan.ID), slog.String("error", err.Error()))
+		}
 	}
 	if err := boardplan.Finish(h.db, plan.ID, results); err != nil {
 		slog.Warn("board plan: record results", slog.String("plan", plan.ID), slog.String("error", err.Error()))

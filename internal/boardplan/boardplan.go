@@ -299,6 +299,43 @@ func Finish(db *sql.DB, id string, results []Result) error {
 	return err
 }
 
+// RecordResults saves the results so far of a plan that is executing.
+func RecordResults(db *sql.DB, id string, results []Result) error {
+	b, _ := json.Marshal(results)
+	_, err := db.Exec(`UPDATE board_action_plans SET results_json = ? WHERE id = ? AND status = 'executing'`, string(b), id)
+	return err
+}
+
+// SweepInterrupted closes plans a previous daemon process left executing.
+// Selected rows with no recorded result get status "unknown": the row may
+// or may not have run, so the Board checks the task before retrying. Returns
+// how many plans it closed. Call once at startup, before any plan executes.
+func SweepInterrupted(db *sql.DB) (int64, error) {
+	plans, err := List(db, StatusExecuting, 1000)
+	if err != nil {
+		return 0, err
+	}
+	var n int64
+	for _, p := range plans {
+		done := map[int]bool{}
+		for _, r := range p.Results {
+			done[r.Index] = true
+		}
+		results := p.Results
+		for _, i := range p.Selected {
+			if !done[i] {
+				results = append(results, Result{Index: i, Status: "unknown",
+					Error: "interrupted: the daemon stopped before this row reported; check the task before retrying"})
+			}
+		}
+		if err := Finish(db, p.ID, results); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
+}
+
 // Discard drops a pending plan without running anything.
 func Discard(db *sql.DB, id string) error {
 	res, err := db.Exec(`UPDATE board_action_plans SET status = 'discarded' WHERE id = ? AND status = 'pending'`, id)

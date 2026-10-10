@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/VinnyVanGogh/staypoint/internal/db"
 )
 
 func TestValidate_RefusesIncompleteActions(t *testing.T) {
@@ -87,6 +89,38 @@ func TestRefuseInAgentRun(t *testing.T) {
 	}
 	if err := RefuseInAgentRun(func(string) string { return "" }); err != nil {
 		t.Fatalf("Board terminal refused: %v", err)
+	}
+}
+
+// A plan cut off mid-run is closed on restart: rows that reported keep their
+// result, the rest are "unknown", and the plan can never run again.
+func TestSweepInterrupted(t *testing.T) {
+	store, err := db.Open(t.TempDir() + "/staypoint.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	conn := store.DB()
+	p, err := Create(conn, "test", "cli", []Action{{TaskID: "a", Action: RunNow}, {TaskID: "b", Action: RunNow}, {TaskID: "c", Action: RunNow}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Claim(conn, p.ID, p.ContentHash, []int{0, 2}, "sel", "cred"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordResults(conn, p.ID, []Result{{Index: 0, Status: "ok"}}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := SweepInterrupted(conn); err != nil || n != 1 {
+		t.Fatalf("sweep: n=%d err=%v", n, err)
+	}
+	got, _ := Get(conn, p.ID)
+	if got.Status != StatusExecuted || len(got.Results) != 2 || got.Results[0].Status != "ok" ||
+		got.Results[1].Index != 2 || got.Results[1].Status != "unknown" {
+		t.Fatalf("after sweep: %+v", got)
+	}
+	if err := Claim(conn, p.ID, p.ContentHash, []int{1}, "sel", "cred"); err != ErrNotPending {
+		t.Fatalf("swept plan claimable again: %v", err)
 	}
 }
 
