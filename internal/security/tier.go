@@ -142,6 +142,8 @@ type Classifier struct {
 	dotglob    bool     // the line may make globs match leading dots
 	cdLost     bool     // a cd earlier in the line went somewhere unknown
 	ownHandoff bool     // the line only reads the task's own handoff files
+	cdpath     bool     // the line may set CDPATH, so a relative cd is unknown
+	inSubst    bool     // classifying a $(...) or <(...) body, whose output is used
 }
 
 // Classify classifies a shell command line. Unparseable input is Red (fail closed).
@@ -175,9 +177,10 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 		return v
 	}
 	lineDots := c.dotglob || dotglobRe.MatchString(line)
+	cdpath := c.cdpath || strings.Contains(line, "CDPATH")
 	for _, s := range subs {
 		sc := *c
-		sc.dotglob = lineDots
+		sc.dotglob, sc.cdpath, sc.inSubst = lineDots, cdpath, true
 		v.merge(sc.classifyLine(s, depth+1))
 	}
 	lc := c.lineContext(line, segs, subs, depth)
@@ -188,7 +191,7 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 	for i, s := range segs {
 		cc := *c
 		cc.CWD, cc.line, cc.cwdFromCd = dir, lc, fromCd
-		cc.vars, cc.dotglob, cc.cdLost = vars, lineDots, cdLost
+		cc.vars, cc.dotglob, cc.cdLost, cc.cdpath = vars, lineDots, cdLost, cdpath
 		if cc.baseCWD == "" {
 			cc.baseCWD = c.CWD
 		}
@@ -320,10 +323,17 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 		v.raise(Red, name+": filesystem format")
 	}
 	bases := c.argBases(name, args)
+	if c.cdpath && dirChangers[name] {
+		for i := range bases {
+			bases[i] = unresolved // CDPATH picks where a relative target is
+		}
+	}
 	for i, a := range args {
 		c.checkPathIn(a, bases[i], v)
 	}
-	if recursiveOver(name, args) {
+	// find's or fd's list of names, piped on or substituted into a command
+	// line, feeds whatever reads it (find ~ -name x | xargs cat).
+	if recursiveOver(name, args) || ((name == "find" || name == "fd") && (s.piped || c.inSubst)) {
 		c.checkRecursive(name, args, bases, v)
 	}
 
@@ -1179,6 +1189,8 @@ func recursiveOver(name string, args []string) bool {
 				return true
 			}
 		}
+	case "fd", "fdfind":
+		return short("xXH") || long("--exec", "--exec-batch", "--hidden")
 	}
 	return false
 }
@@ -1232,7 +1244,7 @@ func (c *Classifier) checkRecursive(name string, args, bases []string, v *Verdic
 			ops = append(ops, operand{".", ""})
 		}
 	} else {
-		searcher := name == "rg" || name == "ag" || strings.HasSuffix(name, "grep")
+		searcher := name == "rg" || name == "ag" || name == "fd" || name == "fdfind" || strings.HasSuffix(name, "grep")
 		patGiven := false
 		for i := 0; i < len(args); i++ {
 			a := args[i]

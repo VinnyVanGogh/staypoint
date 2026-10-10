@@ -268,10 +268,18 @@ func (c *Classifier) nextDir(s segment, dir string) string {
 		return dir
 	}
 	if len(argv) == 1 {
+		if baseCmd(argv) == "pushd" {
+			return "" // swaps the top two dirs
+		}
 		return c.home()
 	}
 	a := argv[1]
-	if a == "-" || strings.Contains(a, "$") || strings.HasPrefix(a, "-") {
+	if a == "-" || strings.Contains(a, "$") || strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+") {
+		return ""
+	}
+	// With CDPATH set a relative target may resolve under any of its dirs.
+	if c.cdpath && !filepath.IsAbs(a) && !strings.HasPrefix(a, "~") && a != "." && a != ".." &&
+		!strings.HasPrefix(a, "./") && !strings.HasPrefix(a, "../") {
 		return ""
 	}
 	if a == "~" || strings.HasPrefix(a, "~/") {

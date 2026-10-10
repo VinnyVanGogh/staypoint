@@ -85,6 +85,15 @@ func TestSensitivePathSpellings(t *testing.T) {
 		"diff -r ~ /tmp/h",
 		"cp -r \"$SRC\" /tmp/h",
 		"cd \"$X\" && find . -exec cat {} +",
+		// find's names fed to a reader; CDPATH and pushd moving the cwd.
+		"find ~ -name auth_token | xargs cat",
+		"cat $(find ~ -name auth_token)",
+		"while read f; do cat \"$f\"; done < <(find ~ -name auth_token)",
+		"fd -H auth_token ~ | xargs cat",
+		"CDPATH=~ cd .staypoint && cat auth_token",
+		"export CDPATH=$HOME; cd .staypoint; cat x",
+		"pushd ~ >/dev/null; pushd /tmp; pushd; cat .staypoint/x",
+		"pushd ~; pushd /tmp; pushd +1; cat .st*/x",
 		// Inline scripts that name it however split.
 		`python3 -c "import os; print(open(os.path.expanduser('~/.st'+'aypoint/auth_token')).read())"`,
 		`python3 -c "import pathlib; print((pathlib.Path.home()/'.STAYPOINT'/'x').read_text())"`,
@@ -121,6 +130,10 @@ func TestSensitivePathSpellings(t *testing.T) {
 		"for f in a b; do cat $f; done",
 		`python3 -c "print('github.com/VinnyVanGogh/staypoint')"`,
 		"cat $T/*",
+		"find . -name '*.go' | xargs grep -l x",
+		"cat $(find internal -name '*.md')",
+		"cd internal && grep -rn x .",
+		"pushd internal && ls; popd",
 		"ls \"$TMPDIR\"/staypoint-e2e",
 	}
 	for _, line := range notRed {
