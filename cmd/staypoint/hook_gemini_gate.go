@@ -235,7 +235,7 @@ func gateGeminiPreTool(raw []byte) string {
 	snap := security.NewSnapshotter()
 	c := &security.Classifier{CWD: cwd, CWDTrusted: cwdTrusted, Snap: snap,
 		ScratchDirs:   hookScratchDirs(taskID),
-		PushPolicyFor: hookPushPolicy}
+		PushPolicyFor: hookPushPolicy, TaskID: taskID}
 	// Every command text in the call is judged; the strictest verdict wins,
 	// so a second field agy might run instead cannot slip past.
 	var verdict security.Verdict

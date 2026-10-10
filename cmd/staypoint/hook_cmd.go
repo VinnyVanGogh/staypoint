@@ -579,7 +579,7 @@ func handleHookPreTool() {
 	snap := security.NewSnapshotter()
 	c := &security.Classifier{CWD: cwd, CWDTrusted: cwdTrusted, Snap: snap,
 		ScratchDirs:   hookScratchDirs(os.Getenv("STAYPOINT_TASK_ID")),
-		PushPolicyFor: hookPushPolicy}
+		PushPolicyFor: hookPushPolicy, TaskID: taskID}
 	verdict := c.Classify(bashInput.Command)
 	// A daemon-run agent (STAYPOINT_TASK_ID is in the hook's own env, which
 	// the command cannot change) asks the Board for anything that breaks an

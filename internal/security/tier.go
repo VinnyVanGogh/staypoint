@@ -30,6 +30,14 @@ var staypointTokenFileRe = regexp.MustCompile(
 var ptyForgingRe = regexp.MustCompile(
 	`(?i)\b(?:import\s+pty\b|pty\.spawn|openpty|os\.openpty|zpty|posix_openpt|forkpty)\s*(?:\(|$)`)
 
+// sensitiveScriptRe matches a sensitive dir or token file named in an
+// inline script, however case or string concatenation splits it
+// ('.st' + 'aypoint'): the script builds paths the classifier cannot see
+// (open(os.path.expanduser(...))). A dot before the name is required, so
+// the module path github.com/.../staypoint does not match.
+var sensitiveScriptRe = regexp.MustCompile(
+	`(?i)\.\W{0,6}s\W{0,6}t\W{0,6}a\W{0,6}y\W{0,6}p\W{0,6}o\W{0,6}i\W{0,6}n\W{0,6}t\b|\.(ssh|aws|gnupg)\b|auth_token|board_token`)
+
 // boardCredentialInScriptRe matches board credential names/values in inline scripts
 // that are not already covered by staypointTokenFileRe.
 var boardCredentialInScriptRe = regexp.MustCompile(`\bboard_(?:nonce|token)\b`)
@@ -121,21 +129,29 @@ type Classifier struct {
 	// runs in (after -C and cd), replacing PushPolicy. A push whose repo
 	// cannot be modelled (--git-dir, --work-tree, -c) is treated as "never".
 	PushPolicyFor func(dir string) string
+	// TaskID is the daemon run's task, if any: a plain read of its own
+	// handoff files (~/.staypoint/handoffs/<TaskID>/) is not a sensitive
+	// path, as in the Board rules (ownHandoffRead).
+	TaskID string
 
-	line      *lineCtx // facts about the whole command line being classified
-	baseCWD   string   // CWD before any `cd` in the line
-	inner     bool     // classifying a wrapper's inner command (env/xargs/find -exec ...)
-	cwdFromCd bool     // CWD was set by an absolute `cd` earlier in the line
+	line       *lineCtx // facts about the whole command line being classified
+	baseCWD    string   // CWD before any `cd` in the line
+	inner      bool     // classifying a wrapper's inner command (env/xargs/find -exec ...)
+	cwdFromCd  bool     // CWD was set by an absolute `cd` earlier in the line
+	vars       pathVars // variables assigned earlier in the line
+	dotglob    bool     // the line may make globs match leading dots
+	cdLost     bool     // a cd earlier in the line went somewhere unknown
+	ownHandoff bool     // the line only reads the task's own handoff files
 }
 
 // Classify classifies a shell command line. Unparseable input is Red (fail closed).
 func (c *Classifier) Classify(line string) Verdict {
+	cc := *c
 	if c.ReadFile != nil && c.Snap == nil {
-		cc := *c
 		cc.Snap = NewSnapshotter() // fresh reads for this command line
-		return cc.classifyLine(line, 0)
 	}
-	return c.classifyLine(line, 0)
+	cc.ownHandoff = c.TaskID != "" && ownHandoffRead(line, c.TaskID)
+	return cc.classifyLine(line, 0)
 }
 
 // ClassifyArgv classifies an already-split command (no shell involved).
@@ -158,23 +174,33 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 		v.raise(Red, "unparseable command: "+err.Error())
 		return v
 	}
+	lineDots := c.dotglob || dotglobRe.MatchString(line)
 	for _, s := range subs {
-		v.merge(c.classifyLine(s, depth+1))
+		sc := *c
+		sc.dotglob = lineDots
+		v.merge(sc.classifyLine(s, depth+1))
 	}
 	lc := c.lineContext(line, segs, subs, depth)
 	dir := c.CWD
 	fromCd := c.cwdFromCd
+	vars := c.vars.clone()
+	cdLost := c.cdLost
 	for i, s := range segs {
 		cc := *c
 		cc.CWD, cc.line, cc.cwdFromCd = dir, lc, fromCd
+		cc.vars, cc.dotglob, cc.cdLost = vars, lineDots, cdLost
 		if cc.baseCWD == "" {
 			cc.baseCWD = c.CWD
 		}
 		cc.classifySegment(s, &v, depth)
+		cc.noteAssignments(s, vars)
 		if a := stripPrefixes(s.argv); baseCmd(a) == "cd" {
 			fromCd = len(a) == 2 && filepath.IsAbs(a[1]) && !segDyn(s, len(s.argv)-len(a)+1)
 		}
-		dir = c.nextDir(s, dir)
+		dir = cc.nextDir(s, dir)
+		if dirChangers[baseCmd(stripPrefixes(dropKeywords(s.argv)))] && dir == "" {
+			cdLost = true
+		}
 		// remote-shell pipe: anything | sh
 		if i > 0 && segs[i-1].piped {
 			if name := baseCmd(stripPrefixes(s.argv)); shells[name] {
@@ -293,8 +319,12 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 	if strings.HasPrefix(name, "mkfs.") {
 		v.raise(Red, name+": filesystem format")
 	}
-	for _, a := range args {
-		c.checkPath(a, v)
+	bases := c.argBases(name, args)
+	for i, a := range args {
+		c.checkPathIn(a, bases[i], v)
+	}
+	if recursiveOver(name, args) {
+		c.checkRecursive(name, args, bases, v)
 	}
 
 	switch {
@@ -905,6 +935,10 @@ func classifyInlineScript(script string, v *Verdict) bool {
 		v.raise(Red, "inline script reads staypoint auth/board token file")
 		return true
 	}
+	if sensitiveScriptRe.MatchString(script) {
+		v.raise(Red, "inline script names a sensitive path (~/.staypoint, ~/.ssh, ~/.aws, ~/.gnupg or a token file)")
+		return true
+	}
 	if boardEndpointRe.MatchString(script) && httpMutationRe.MatchString(script) {
 		v.raise(Red, "inline script calls board-only API endpoint (agents cannot self-approve)")
 		return true
@@ -944,7 +978,11 @@ func looksLikePath(s string) bool {
 }
 
 // checkPath escalates for sensitive locations and (when a worktree is set) escapes.
-func (c *Classifier) checkPath(tok string, v *Verdict) {
+func (c *Classifier) checkPath(tok string, v *Verdict) { c.checkPathIn(tok, "", v) }
+
+// checkPathIn is checkPath for a word that a -C or --directory before it
+// makes relative to base ("" for the working directory).
+func (c *Classifier) checkPathIn(tok, base string, v *Verdict) {
 	cands := []string{tok}
 	if i := strings.IndexByte(tok, '='); i > 0 {
 		cands = append(cands, tok[i+1:])
@@ -953,20 +991,289 @@ func (c *Classifier) checkPath(tok string, v *Verdict) {
 		if cand == "" || strings.Contains(cand, "://") || harmlessPaths[cand] {
 			continue
 		}
+		c.checkSensitive(cand, base, v)
 		exp := c.expandHome(cand)
 		if !looksLikePath(cand) && exp == cand {
 			continue
 		}
-		clean := filepath.Clean(exp)
-		// The run's own scratch dir may sit under ~/.staypoint/scratch.
-		for _, d := range c.sensitiveDirs() {
-			if (clean == d || strings.HasPrefix(clean, d+string(filepath.Separator))) && !c.inScratchUnder(d, clean) {
-				v.raise(Red, "touches sensitive path "+d)
-			}
-		}
 		if c.Worktree != nil {
 			if err := c.Worktree.Check(exp); err != nil {
 				v.raise(Red, "path outside worktree: "+cand)
+			}
+		}
+	}
+}
+
+// checkSensitive raises Red when word may name a sensitive dir or
+// something in it, however it is spelled (pathspell.go). The run's own
+// scratch dir (under ~/.staypoint/scratch) and, for a line that only reads
+// them, its own handoff files are exempt when named literally.
+func (c *Classifier) checkSensitive(word, base string, v *Verdict) {
+	for _, alt := range c.pathAlts(word) {
+		abs, unknown := c.resolvePattern(alt, base)
+		if (unknown || strings.Contains(abs, unresolved)) && unknownRootTouches(abs, c.dotglob) {
+			v.raise(Red, "may touch a sensitive path: "+word+" (cannot resolve where it points)")
+			return
+		}
+		if unknown {
+			continue
+		}
+		literal := !hasWild(abs)
+		clean := filepath.Clean(abs)
+		for _, d := range c.sensitiveDirs() {
+			if under, _ := patternReach(abs, d, c.dotglob); !under {
+				continue
+			}
+			if literal && (c.inScratchUnder(d, clean) || c.ownHandoffPath(clean)) {
+				continue
+			}
+			v.raise(Red, "touches sensitive path "+d)
+		}
+	}
+}
+
+// pathAlts expands a word's ~, variables and braces into the path
+// patterns it may name.
+func (c *Classifier) pathAlts(word string) []string {
+	w, _ := c.expandWord(word, c.vars)
+	return braceExpand(w)
+}
+
+// resolvePattern returns the absolute path pattern an expanded word (one of
+// pathAlts) names. unknown is true when its root cannot be known: it starts
+// with an unresolved expansion, or is relative to a directory that is not
+// known.
+func (c *Classifier) resolvePattern(w, base string) (abs string, unknown bool) {
+	switch {
+	case strings.HasPrefix(w, "/"):
+		return w, false
+	case strings.HasPrefix(w, unresolved):
+		return w, true
+	}
+	dir := base
+	if dir == "" {
+		dir = c.CWD
+	}
+	if dir == "" || strings.HasPrefix(dir, unresolved) {
+		return w, true
+	}
+	return dir + "/" + w, false
+}
+
+// ownHandoffPath reports a literal path in the task's own handoff dir, on a
+// line that only reads such files (ownHandoffRead).
+func (c *Classifier) ownHandoffPath(clean string) bool {
+	h := c.home()
+	if !c.ownHandoff || h == "" || !taskIDRe.MatchString(c.TaskID) {
+		return false
+	}
+	own := filepath.Join(h, ".staypoint", "handoffs", c.TaskID)
+	return clean == own || strings.HasPrefix(clean, own+"/")
+}
+
+// chdirTakers take -C<dir> glued as a directory to work in.
+var chdirTakers = map[string]bool{"tar": true, "bsdtar": true, "gtar": true, "git": true, "make": true, "gmake": true, "env": true, "go": true}
+
+// argBases returns, for each argument, the directory a -C, --directory or
+// --chdir before it makes relative paths start from ("" for the working
+// directory; unresolved when it cannot be resolved).
+func (c *Classifier) argBases(name string, args []string) []string {
+	bases := make([]string, len(args))
+	base := ""
+	set := func(d string) {
+		alts := c.pathAlts(d)
+		abs, unknown := c.resolvePattern(alts[0], base)
+		if unknown || len(alts) > 1 {
+			abs = unresolved
+		}
+		base = abs
+	}
+	for i := 0; i < len(args); i++ {
+		bases[i] = base
+		a := args[i]
+		switch {
+		case a == "-C" || a == "--directory" || a == "--chdir" || a == "--cwd":
+			if i+1 < len(args) {
+				bases[i+1] = base
+				i++
+				set(args[i])
+			}
+		case strings.HasPrefix(a, "--directory=") || strings.HasPrefix(a, "--chdir=") || strings.HasPrefix(a, "--cwd="):
+			set(a[strings.IndexByte(a, '=')+1:])
+		case strings.HasPrefix(a, "-C") && len(a) > 2 && chdirTakers[name]:
+			set(strings.TrimPrefix(a[2:], "="))
+		}
+	}
+	return bases
+}
+
+// recursiveOver reports a command that reads, copies, archives or changes
+// whole trees under its path operands, hidden dirs included.
+func recursiveOver(name string, args []string) bool {
+	short := func(chars string) bool {
+		for _, a := range args {
+			if len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.ContainsAny(a[1:], chars) {
+				return true
+			}
+		}
+		return false
+	}
+	long := func(names ...string) bool {
+		for _, a := range args {
+			for _, n := range names {
+				if a == n || strings.HasPrefix(a, n+"=") {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	switch name {
+	case "cp", "rsync", "scp":
+		return short("rRa") || long("--recursive", "--archive")
+	case "tar", "bsdtar", "gtar", "ditto", "pax", "cpio", "7z", "7za", "7zz":
+		return true
+	case "zip":
+		return short("rR") || long("--recurse-paths")
+	case "diff":
+		return short("r") || long("--recursive")
+	case "chmod", "chown", "chgrp", "chflags":
+		return short("R") || long("--recursive")
+	case "grep", "egrep", "fgrep", "zgrep", "ggrep":
+		for i, a := range args {
+			switch {
+			case a == "--recursive" || a == "--dereference-recursive" || a == "--directories=recurse" || a == "--recurse":
+				return true
+			case (a == "-d" || a == "--directories") && i+1 < len(args) && args[i+1] == "recurse":
+				return true
+			case len(a) > 1 && a[0] == '-' && a[1] != '-':
+				for _, ch := range a[1:] {
+					if ch == 'r' || ch == 'R' {
+						return true
+					}
+					// A value follows: the rest of the word is data.
+					if strings.ContainsRune("efmABCdD", ch) {
+						break
+					}
+				}
+			}
+		}
+	case "rg", "ag":
+		u := 0
+		for _, a := range args {
+			if a == "--hidden" || a == "--unrestricted" || a == "--all-types" && name == "ag" {
+				return true
+			}
+			if len(a) > 1 && a[0] == '-' && a[1] != '-' {
+				if strings.ContainsRune(a[1:], '.') {
+					return true
+				}
+				u += strings.Count(a[1:], "u")
+			}
+		}
+		return u >= 2 || (name == "ag" && u >= 1)
+	case "find":
+		for _, a := range args {
+			switch a {
+			case "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// recursiveValueOpts are options of recursive commands whose value is the
+// next word; a short cluster ending in one of the letters takes it too.
+var recursiveValueOpts = map[string]string{
+	"grep": "efmABCdD", "egrep": "efmABCdD", "fgrep": "efmABCdD", "zgrep": "efmABCdD", "ggrep": "efmABCdD",
+	"rg": "efgtTABCmMj", "ag": "GgABCm", "tar": "fCbT", "bsdtar": "fCbT", "gtar": "fCbT", "zip": "bnti",
+	"cp": "", "rsync": "efB", "diff": "xXSIF", "chmod": "", "chown": "", "chgrp": "",
+}
+
+// optTakesValue reports an option of a recursive command whose value is
+// the next word. Long options take one unless written --opt=value, except
+// a few flags we know.
+func optTakesValue(name, a string) bool {
+	if strings.HasPrefix(a, "--") {
+		if strings.Contains(a, "=") {
+			return false
+		}
+		switch a {
+		case "--regexp", "--file", "--include", "--exclude", "--exclude-dir", "--glob", "--type", "--type-not",
+			"--max-count", "--context", "--after-context", "--before-context", "--directories", "--devices",
+			"--exclude-from", "--files-from", "--rsh", "--filter":
+			return true
+		}
+		return false
+	}
+	letters := recursiveValueOpts[name]
+	return letters != "" && len(a) > 1 && strings.ContainsRune(letters, rune(a[len(a)-1]))
+}
+
+// findLeadFlags are find options before its starting points.
+var findLeadFlags = map[string]bool{"-H": true, "-L": true, "-P": true, "-E": true, "-X": true, "-s": true, "-x": true, "-d": true, "-O0": true, "-O1": true, "-O2": true, "-O3": true}
+
+// checkRecursive raises Red when a recursive command's path operand may be
+// a parent of a sensitive dir (cp -r ~ /tmp/h, find ~ -exec cat {} +), or
+// cannot be resolved.
+func (c *Classifier) checkRecursive(name string, args, bases []string, v *Verdict) {
+	type operand struct{ word, base string }
+	var ops []operand
+	if name == "find" {
+		i := 0
+		for i < len(args) && findLeadFlags[args[i]] {
+			i++
+		}
+		for ; i < len(args) && !strings.HasPrefix(args[i], "-") && args[i] != "(" && args[i] != "!"; i++ {
+			ops = append(ops, operand{args[i], bases[i]})
+		}
+		if len(ops) == 0 {
+			ops = append(ops, operand{".", ""})
+		}
+	} else {
+		searcher := name == "rg" || name == "ag" || strings.HasSuffix(name, "grep")
+		patGiven := false
+		for i := 0; i < len(args); i++ {
+			a := args[i]
+			switch {
+			case a == "" || a == "-" || a == "--":
+			case strings.HasPrefix(a, "-"):
+				// The value after an option that takes one is not a tree:
+				// a pattern, a count, a glob or the archive file.
+				if searcher && (a == "-e" || a == "-f" || a == "--regexp" || a == "--file") {
+					patGiven = true
+				}
+				if optTakesValue(name, a) {
+					i++
+				}
+			case searcher && !patGiven:
+				patGiven = true // the pattern
+			default:
+				ops = append(ops, operand{a, bases[i]})
+			}
+		}
+		if len(ops) == 0 && searcher {
+			ops = append(ops, operand{".", ""})
+		}
+	}
+	for _, op := range ops {
+		for _, alt := range c.pathAlts(op.word) {
+			abs, unknown := c.resolvePattern(alt, op.base)
+			if unknown {
+				// A relative operand in a directory never known (no cwd) is
+				// left alone; one a cd or -C moved somewhere unknown is not.
+				if strings.HasPrefix(abs, unresolved) || c.cdLost || op.base != "" {
+					v.raise(Red, name+" recurses into "+op.word+", which cannot be resolved (it may hold a sensitive path)")
+					return
+				}
+				continue
+			}
+			for _, d := range c.sensitiveDirs() {
+				if _, parent := patternReach(abs, d, true); parent {
+					v.raise(Red, name+" recurses into "+op.word+", which holds sensitive path "+d)
+					return
+				}
 			}
 		}
 	}
