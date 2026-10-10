@@ -135,6 +135,9 @@ type Classifier struct {
 	// envChange is a wrapper's env edit (env VAR=x, env -u VAR, env -i)
 	// carried to the command it launches.
 	envChange []string
+	// inFuncDef: the command is in (or after) a shell function definition,
+	// so it may run later under an environment the line sets after it.
+	inFuncDef bool
 }
 
 // Classify classifies a shell command line. Unparseable input is Red (fail closed).
@@ -170,6 +173,7 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 	for _, s := range subs {
 		v.merge(c.classifyLine(s, depth+1))
 	}
+	segs, funcAt := normalizeGroups(segs)
 	lc := c.lineContext(line, segs, subs, depth)
 	dir := c.CWD
 	fromCd := c.cwdFromCd
@@ -177,6 +181,7 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 	for i, s := range segs {
 		cc := *c
 		cc.CWD, cc.line, cc.cwdFromCd = dir, lc, fromCd
+		cc.inFuncDef = c.inFuncDef || (funcAt >= 0 && i >= funcAt)
 		if cc.baseCWD == "" {
 			cc.baseCWD = c.CWD
 		}
@@ -884,6 +889,10 @@ func (c *Classifier) classifyStaypoint(args, envChange []string, v *Verdict) {
 		v.raise(Red, "xargs staypoint: the subcommand comes from input the classifier cannot see")
 		return
 	}
+	if c.inFuncDef {
+		v.raise(Red, "staypoint in a shell function: it runs when called, under an environment set later on the line")
+		return
+	}
 	if why := staypointEnvChange(envChange); why != "" {
 		v.raise(Red, "staypoint with "+why+": runs StayPoint under another config, task or PATH")
 		return
@@ -1033,8 +1042,30 @@ func classifyInlineScript(script string, v *Verdict) bool {
 		v.raise(Red, "inline script references board bootstrap credential (board_nonce/board_token)")
 		return true
 	}
+	// Board review #5 M1: the shell-level Red rules for other processes'
+	// environments and for staypoint, reached through system()/spawn().
+	if inlinePsEnvRe.MatchString(script) || inlineProcEnvironRe.MatchString(script) {
+		v.raise(Red, "inline script reads another process's environment (ps -E / e modifier / /proc/*/environ)")
+		return true
+	}
+	if inlineStaypointRe.MatchString(script) && inlineExecRe.MatchString(script) {
+		v.raise(Red, "inline script runs staypoint: its subcommand and environment cannot be checked")
+		return true
+	}
 	return false
 }
+
+var (
+	// ps then its option words, through quotes, commas and brackets
+	// (os.system('ps -Eww'), ['ps','-p','1','-E']): a dash option with E,
+	// or a leading BSD-style word with the e modifier (ps eww, ps auxe).
+	// Lower-case -e is "all processes" and stays allowed.
+	inlinePsEnvRe       = regexp.MustCompile(`\bps(?:[\s'",\[\]]+(?:-[A-Za-z]*E[A-Za-z]*\b|[A-Za-z]*e[A-Za-z]*\b)|(?:[\s'",\[\]]+[-\w,=]+)+?[\s'",\[\]]+-[A-Za-z]*E[A-Za-z]*\b)`)
+	inlineProcEnvironRe = regexp.MustCompile(`/proc/[^/\s'"]+(?:/task/[^/\s'"]+)?/environ\b`)
+	inlineStaypointRe   = regexp.MustCompile(`(?i)\bstaypoint\b`)
+	// Ways an interpreter starts a process.
+	inlineExecRe = regexp.MustCompile(`\b(?:system|popen|Popen|subprocess|spawn|spawnSync|exec|execSync|execFile|execFileSync|execv[pe]*|run|call|check_output|check_call|getoutput|getstatusoutput|IO\.popen|Open3|qx|Command)\b|` + "`" + `|%x[({\[]`)
+)
 
 func (c *Classifier) expandHome(p string) string {
 	h := c.home()

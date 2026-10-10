@@ -408,11 +408,26 @@ func isScriptCall(argv []string) bool {
 // dir (or prints) is plain data; any other body is classified as commands, as
 // the parser did before it understood heredocs. It reports whether a shell's
 // script came from a heredoc.
+// scriptInterps read a script from stdin when given no script file.
+var scriptInterps = map[string]bool{
+	"python": true, "python2": true, "python3": true, "node": true, "nodejs": true,
+	"ruby": true, "perl": true, "php": true,
+}
+
 func (c *Classifier) classifyHeredocs(s segment, name string, args []string, v *Verdict, depth int) bool {
 	var docs []*redirect
 	for _, r := range s.redirects {
 		if r.heredoc {
 			docs = append(docs, r)
+		}
+		// python3 - <<EOF / node <<< '...': the body is the script, so the
+		// inline-script rules apply to it (Board review #5 M1).
+		if scriptInterps[name] && (r.heredoc || r.op == "<<<") {
+			body := r.body
+			if r.op == "<<<" {
+				body = r.target
+			}
+			classifyInlineScript(body, v)
 		}
 	}
 	if len(docs) == 0 {

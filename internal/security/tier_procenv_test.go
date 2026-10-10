@@ -127,3 +127,51 @@ func TestBoardReview4Bypasses(t *testing.T) {
 		}
 	}
 }
+
+// Board review #5 M1 (task-7d279c9d): the review #4 Red rules reached
+// through an inline interpreter script or a shell group/function body.
+func TestBoardReview5InlineAndGroups(t *testing.T) {
+	c := &Classifier{Home: t.TempDir()}
+	red := []string{
+		`python3 -c "import os;os.system('ps -Eww')"`,
+		`perl -e 'system("ps -E")'`,
+		`ruby -e 'system("ps -E")'`,
+		`python3 -c "import subprocess;subprocess.run(['staypoint','mcp'])"`,
+		`node -e "require('child_process').spawn('staypoint',['mcp'])"`,
+		`python3 -c "import os;os.system('ps eww 12')"`,
+		`python3 -c "import subprocess;subprocess.run(['ps','-E'])"`,
+		`python3 -c "import os;os.environ['HOME']='/tmp';os.system('staypoint status')"`,
+		`node -e "process.env.STAYPOINT_TASK_ID='x';require('child_process').execSync('staypoint status')"`,
+		`python3 -c "open('/proc/1/environ').read()"`,
+		`{ staypoint mcp; }`,
+		`( staypoint mcp )`,
+		`function f { staypoint status; }; export HOME=/tmp; f`,
+		`f() { staypoint status; }; export HOME=/tmp; f`,
+		`function f() { staypoint status; }; f`,
+		`if staypoint mcp; then echo; fi`,
+		`! staypoint mcp`,
+		`{ export HOME=/tmp; staypoint status; }`,
+		"python3 - <<'EOF'\nimport os\nos.system('ps -Eww')\nEOF",
+		"node <<'EOF'\nrequire('child_process').spawn('staypoint',['mcp'])\nEOF",
+		`python3 <<< "import os;os.system('ps -E')"`,
+	}
+	for _, line := range red {
+		if v := c.Classify(line); v.Tier != Red {
+			t.Errorf("%q = %s %v, want Red", line, v.Tier, v.Reasons)
+		}
+	}
+	notRed := []string{
+		`python3 -c "print('hello')"`,
+		`python3 -c "import os;print(os.getcwd())"`,
+		`node -e "console.log(process.env.PATH)"`,
+		`python3 -c "import subprocess;subprocess.run(['ps','aux'])"`,
+		`python3 -c "print('staypoint status')"`,
+		`{ echo a; echo b; }`,
+		`f() { echo hi; }; f`,
+	}
+	for _, line := range notRed {
+		if v := c.Classify(line); v.Tier == Red {
+			t.Errorf("%q = Red %v, want below Red", line, v.Reasons)
+		}
+	}
+}
