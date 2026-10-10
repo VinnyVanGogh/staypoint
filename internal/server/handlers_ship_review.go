@@ -853,8 +853,8 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 		card.TargetBranch = target
 	}
 
-	// Always merge from the repo root, never from a task worktree which may
-	// be gone or have the target checked out elsewhere (checkout conflicts).
+	// Merge against the repo root's object store, never a task worktree
+	// which may be gone. The root checkout itself is left untouched.
 	mainSHA, err := shipreview.ApproveAndMerge(r.Context(), h.db, card, task.RepoPath, target)
 	if errors.Is(err, shipreview.ErrHeadMoved) {
 		newHead, _ := shipreview.CurrentBranchHEAD(r.Context(), task.RepoPath, card.Branch)
@@ -864,6 +864,16 @@ func (h *ShipReviewHandler) Approve(w http.ResponseWriter, r *http.Request) {
 			"error":        "head_moved",
 			"message":      err.Error(),
 			"new_head_sha": newHead,
+		})
+		return
+	}
+	var conflict *shipreview.MergeConflictError
+	if errors.As(err, &conflict) {
+		writeJSONStatus(w, http.StatusConflict, map[string]any{
+			"error":   "merge_conflict",
+			"message": err.Error(),
+			"target":  conflict.Target,
+			"files":   conflict.Files,
 		})
 		return
 	}

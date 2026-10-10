@@ -65,7 +65,7 @@ func envDuration(name string, def time.Duration) time.Duration {
 var slowCommands = map[string]bool{
 	"clone": true, "fetch": true, "pull": true, "push": true, "ls-remote": true,
 	"checkout": true, "switch": true, "restore": true, "reset": true, "clean": true,
-	"merge": true, "rebase": true, "cherry-pick": true, "revert": true, "stash": true,
+	"merge": true, "merge-tree": true, "rebase": true, "cherry-pick": true, "revert": true, "stash": true,
 	"commit": true, "gc": true, "repack": true, "submodule": true, "lfs": true,
 }
 

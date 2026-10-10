@@ -1,6 +1,7 @@
 package shipreview
 
 import (
+	"context"
 	"os"
 	"testing"
 	"time"
@@ -36,4 +37,13 @@ func clearDevConfigStatCache() {
 	devConfigStatCache.Lock()
 	clear(devConfigStatCache.m)
 	devConfigStatCache.Unlock()
+}
+
+// ForceMergeWorktreeFallbackForTest makes Approve merge in a scratch worktree,
+// as on git older than 2.38, for the rest of the test.
+func ForceMergeWorktreeFallbackForTest(t testing.TB) {
+	t.Helper()
+	old := mergeTreeSupported
+	mergeTreeSupported = func(context.Context, string) bool { return false }
+	t.Cleanup(func() { mergeTreeSupported = old })
 }

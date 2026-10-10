@@ -9839,6 +9839,12 @@ function renderShipReviewCardFromData(container, taskId, card) {
             acMerge.disabled = false;
             return;
           }
+          if (body.error === 'merge_conflict') {
+            approveConfirmForm.style.display = 'none';
+            acMerge.disabled = false;
+            showErr(`Branch conflicts with ${body.target || cardTarget(card)} in ${(body.files || []).join(', ') || 'some files'}; send back or resolve.`);
+            return;
+          }
           throw new Error(boardActionErrorText(r, body));
         }
         if (!r.ok) throw await boardActionError(r);

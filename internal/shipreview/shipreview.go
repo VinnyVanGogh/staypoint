@@ -1039,6 +1039,11 @@ func BuildAndStartCard(ctx context.Context, db *sql.DB, taskID, repoPath string,
 // ApproveAndMerge merges branch into the target branch (usually main) only if
 // the current HEAD matches card.HeadSHA. After merge, verifies the reviewed SHA
 // is an ancestor of the new main HEAD.
+//
+// The merge is built without a working tree (see merge.go): repoDir's
+// checkout, index and HEAD are never touched, so a dirty or locked root
+// checkout cannot fail it, and a conflict returns *MergeConflictError with
+// nothing left behind.
 func ApproveAndMerge(ctx context.Context, db *sql.DB, card *Card, repoDir, targetBranch string) (mainSHA string, err error) {
 	if err := ValidTargetBranch(targetBranch); err != nil || targetBranch == "" {
 		return "", fmt.Errorf("merge target: %w: %q", ErrInvalidTargetBranch, targetBranch)
@@ -1046,6 +1051,12 @@ func ApproveAndMerge(ctx context.Context, db *sql.DB, card *Card, repoDir, targe
 	if targetBranch == card.Branch {
 		return "", fmt.Errorf("%w: %q is the card's own branch", ErrInvalidTargetBranch, targetBranch)
 	}
+	unlock, err := lockApprove(ctx, repoDir)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+
 	// 1. Check that HEAD hasn't moved.
 	currentHEAD, err := CurrentBranchHEAD(ctx, repoDir, card.Branch)
 	if err != nil {
@@ -1055,37 +1066,26 @@ func ApproveAndMerge(ctx context.Context, db *sql.DB, card *Card, repoDir, targe
 		return "", ErrHeadMoved
 	}
 
-	// 2. Fetch latest and check out target branch.
-	// Tolerate repos with no remote (e.g. tests / offline).
+	// 2. Fetch latest. Tolerate repos with no remote (e.g. tests / offline).
 	_, _ = gitOutput(ctx, repoDir, "fetch", "--all", "--prune")
 
-	// 3. Merge the branch into target.
-	if _, err := gitOutput(ctx, repoDir, "checkout", targetBranch); err != nil {
-		return "", fmt.Errorf("checkout %s: %w", targetBranch, err)
+	// 3. Merge the exact pinned commit (not the branch ref) to prevent
+	// TOCTOU, onto the up-to-date target.
+	base, localTip, err := mergeTarget(ctx, repoDir, targetBranch)
+	if err != nil {
+		return "", err
 	}
-	// Pull only when a tracking branch exists; skip silently otherwise.
-	if out, err := gitOutput(ctx, repoDir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"); err == nil && out != "" {
-		if _, err := gitOutput(ctx, repoDir, "pull", "--ff-only"); err != nil {
-			return "", fmt.Errorf("pull %s: %w", targetBranch, err)
-		}
-	}
-	// Merge the exact pinned commit (not the branch ref) to prevent TOCTOU.
-	if _, err := gitOutput(ctx, repoDir, "merge", "--no-ff", "-m",
-		fmt.Sprintf("Merge branch '%s' (reviewed SHA %s)", card.Branch, card.HeadSHA),
-		card.HeadSHA); err != nil {
-		return "", fmt.Errorf("merge: %w", err)
+	mainSHA, err = buildMergeCommit(ctx, repoDir, targetBranch, base, card.HeadSHA,
+		fmt.Sprintf("Merge branch '%s' (reviewed SHA %s)", card.Branch, card.HeadSHA))
+	if err != nil {
+		return "", err
 	}
 
-	// 4. Push.
-	if _, err := gitOutput(ctx, repoDir, "push", "origin", targetBranch); err != nil {
+	// 4. Push. Not forced: if the target moved since the fetch, it fails.
+	if _, err := gitOutput(ctx, repoDir, "push", "origin", mainSHA+":refs/heads/"+targetBranch); err != nil {
 		return "", fmt.Errorf("push: %w", err)
 	}
-
-	// 5. Capture new main HEAD.
-	mainSHA, err = gitOutput(ctx, repoDir, "rev-parse", "HEAD")
-	if err != nil {
-		return "", fmt.Errorf("resolve main HEAD after merge: %w", err)
-	}
+	advanceLocalTarget(ctx, repoDir, targetBranch, localTip, mainSHA)
 
 	// 6. Verify reviewed SHA is ancestor of main.
 	if err := verifyAncestor(ctx, repoDir, card.HeadSHA, mainSHA); err != nil {
