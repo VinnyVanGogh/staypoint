@@ -211,6 +211,25 @@ func TestGenerator_HeuristicFallbackWhenOffline(t *testing.T) {
 	}
 }
 
+// Mail Router / Power Platform text stays in Managed Solution: work_orgs may not
+// list "Power Platform", and an unlisted org is personal (Board 2026-10-09).
+func TestHeuristicTask_MailRouterIsManagedSolution(t *testing.T) {
+	gen := NewGenerator(GeneratorConfig{})
+	for _, input := range []string{
+		"fix the mail router retry loop dropping messages",
+		"update the mail-router flow for the new shared inbox",
+		"add a Power Platform connector for approvals",
+	} {
+		task := gen.GenerateHeuristicTask(input)
+		if task.Organization != "Managed Solution" {
+			t.Errorf("%q: Organization = %q, want Managed Solution", input, task.Organization)
+		}
+		if task.Project != "Managed Solution Mail Router" {
+			t.Errorf("%q: Project = %q, want Managed Solution Mail Router", input, task.Project)
+		}
+	}
+}
+
 func TestComplexDictationInference_ManagedSolution(t *testing.T) {
 	input := "hey can you please um fix the azure active directory sync issue on the managed solution portal for client acme ASAP because the login is completely broken"
 	gen := NewGenerator(GeneratorConfig{})

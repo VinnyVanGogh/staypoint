@@ -277,6 +277,10 @@ func LoadConfig() (*Config, error) {
 			raw = data
 			isTOML = false
 		} else {
+			// No config file: reset to Managed Solution only, so a running
+			// daemon drops a work_orgs list that was deleted with the file.
+			workorgs.Set(nil)
+			cfg.WorkOrgs = workorgs.List()
 			return cfg, nil
 		}
 	}

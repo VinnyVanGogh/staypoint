@@ -32,4 +32,20 @@ func TestLoadConfig_WorkOrgs(t *testing.T) {
 	if !workorgs.IsWork("Power Platform") || !workorgs.IsWork("Managed Solution") || workorgs.IsWork("StayPoint") {
 		t.Fatal("LoadConfig did not publish work_orgs")
 	}
+
+	// Deleting the config file must drop the extra work orgs on the next load,
+	// not leave the running daemon with the old list.
+	if err := os.Remove(filepath.Join(stDir, "config.toml")); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig without file: %v", err)
+	}
+	if want := []string{"Managed Solution"}; !reflect.DeepEqual(cfg.WorkOrgs, want) {
+		t.Fatalf("WorkOrgs without file = %v, want %v", cfg.WorkOrgs, want)
+	}
+	if workorgs.IsWork("Power Platform") || !workorgs.IsWork("Managed Solution") {
+		t.Fatal("missing config file did not reset work orgs to Managed Solution")
+	}
 }
