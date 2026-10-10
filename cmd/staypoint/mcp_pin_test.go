@@ -49,30 +49,53 @@ func TestPinMCPConfigIgnoresFakeHome(t *testing.T) {
 // Board review #2 H1: the Read tool must not hand an agent the ops key (it
 // would mint a run token for any task), nor a Grep over the data dir.
 func TestCredentialFileAccess(t *testing.T) {
-	deny := map[string]map[string]string{
-		"Read":  {"file_path": "/Users/x/.staypoint/ops_key"},
-		"Read2": {"file_path": "/Users/x/.staypoint/auth_token"},
-		"Read3": {"file_path": "/Users/x/.staypoint/handoffs/../board_token"},
-		"Grep":  {"path": "/Users/x/.staypoint", "pattern": "."},
-		"Grep2": {"path": "~/.staypoint/"},
-		"Glob":  {"pattern": "/Users/x/.staypoint/ops_key*"},
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	oldCfg := cfg
+	t.Cleanup(func() { cfg = oldCfg })
+	cfg = nil
+	dd := filepath.Join(home, ".staypoint")
+	type call struct {
+		tool string
+		in   map[string]string
 	}
-	for tool, in := range deny {
-		raw, _ := json.Marshal(in)
-		if credentialFileAccess(tool, raw) == "" {
-			t.Errorf("%s %v allowed", tool, in)
+	deny := []call{
+		{"Read", map[string]string{"file_path": dd + "/ops_key"}},
+		{"Read", map[string]string{"file_path": dd + "/auth_token"}},
+		{"Read", map[string]string{"file_path": dd + "/handoffs/../board_token"}},
+		{"Read", map[string]string{"file_path": "~/.staypoint/ops_key"}},
+		// macOS paths ignore case.
+		{"Read", map[string]string{"file_path": filepath.Join(home, ".STAYPOINT", "OPS_KEY")}},
+		{"Read", map[string]string{"file_path": dd + "/Ops_Key"}},
+		{"Grep", map[string]string{"path": dd, "pattern": "."}},
+		{"Grep", map[string]string{"path": "~/.staypoint/"}},
+		{"Grep", map[string]string{"path": filepath.Join(home, ".StayPoint")}},
+		{"Glob", map[string]string{"pattern": dd + "/ops_key*"}},
+		{"Glob", map[string]string{"pattern": "**/.staypoint/ops_key"}},
+		{"Glob", map[string]string{"path": home, "pattern": "**/ops_key"}},
+		{"Glob", map[string]string{"path": "/", "pattern": "**/{ops_key,x}"}},
+		{"Grep", map[string]string{"path": home, "glob": "**/auth_token", "pattern": "."}},
+	}
+	for _, c := range deny {
+		raw, _ := json.Marshal(c.in)
+		if credentialFileAccess(c.tool, raw) == "" {
+			t.Errorf("%s %v allowed", c.tool, c.in)
 		}
 	}
-	allow := map[string]map[string]any{
-		"Read":  {"file_path": "/Users/x/.staypoint/handoffs/task-1/plan.md"},
-		"Grep":  {"path": "/Users/x/.staypoint/handoffs/task-1", "pattern": "x"},
-		"Edit":  {"file_path": "/repo/cmd/hook.go", "old_string": "auth_token", "new_string": "~/.staypoint/ops_key"},
-		"Read2": {"file_path": "/repo/internal/opstools/origin.go"},
+	allow := []call{
+		{"Read", map[string]string{"file_path": dd + "/handoffs/task-1/plan.md"}},
+		{"Grep", map[string]string{"path": dd + "/handoffs/task-1", "pattern": "x"}},
+		// Code that mentions the names is not a credential read.
+		{"Edit", map[string]string{"file_path": "/repo/cmd/hook.go", "old_string": "auth_token", "new_string": "~/.staypoint/ops_key"}},
+		{"Grep", map[string]string{"path": "/repo", "pattern": "auth_token"}},
+		{"Read", map[string]string{"file_path": "/repo/internal/opstools/origin.go"}},
+		{"Glob", map[string]string{"path": "/repo", "pattern": "**/*auth_token*.go"}},
+		{"Read", map[string]string{"file_path": "/repo/ops_key"}},
 	}
-	for tool, in := range allow {
-		raw, _ := json.Marshal(in)
-		if why := credentialFileAccess(tool, raw); why != "" {
-			t.Errorf("%s %v denied: %s", tool, in, why)
+	for _, c := range allow {
+		raw, _ := json.Marshal(c.in)
+		if why := credentialFileAccess(c.tool, raw); why != "" {
+			t.Errorf("%s %v denied: %s", c.tool, c.in, why)
 		}
 	}
 }

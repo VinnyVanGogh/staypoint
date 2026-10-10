@@ -57,12 +57,15 @@ type PRView struct {
 	HeadRefName string `json:"headRefName"`
 	HeadRefOid  string `json:"headRefOid"`
 	State       string `json:"state"`
+	// IsCrossRepository is a PR from a fork: its head branch name says
+	// nothing about who owns it.
+	IsCrossRepository bool `json:"isCrossRepository"`
 }
 
 // PRViewArgs are the gh arguments that fetch a PRView; ghRepo pins the
 // GitHub repo ("" lets gh resolve it from the checkout's remotes).
 func PRViewArgs(pr int, ghRepo string) []string {
-	args := []string{"pr", "view", strconv.Itoa(pr), "--json", "url,baseRefName,headRefName,headRefOid,state"}
+	args := []string{"pr", "view", strconv.Itoa(pr), "--json", "url,baseRefName,headRefName,headRefOid,state,isCrossRepository"}
 	if ghRepo != "" {
 		args = append(args, "--repo", ghRepo)
 	}
@@ -220,13 +223,14 @@ func TaskBranch(taskID string) string { return "staypoint/" + taskID }
 
 // PRBodyEffect is the effect of replacing PR body text: a dev write only
 // for the task's own PR, one whose head is the task's branch
-// (TaskBranch(taskID)) in the task's own GitHub repo (taskSlug), when that
+// (TaskBranch(taskID)), not from a fork, in the task's own GitHub repo (taskSlug), when that
 // repo is also one the Board listed (ownRepos, [gates.ops] own_repos: an
 // agent can repoint a checkout's origin but not edit the config); an
 // external write (the Board) for every other PR (Board review #2 #7/L1).
-func PRBodyEffect(ghRepo, headRef, taskSlug, taskID string, ownRepos []string) Effect {
+func PRBodyEffect(ghRepo string, v PRView, taskSlug, taskID string, ownRepos []string) Effect {
 	listed := slices.ContainsFunc(ownRepos, func(r string) bool { return strings.EqualFold(r, ghRepo) })
-	if listed && taskSlug != "" && taskID != "" && strings.EqualFold(ghRepo, taskSlug) && headRef == TaskBranch(taskID) {
+	if listed && taskSlug != "" && taskID != "" && strings.EqualFold(ghRepo, taskSlug) &&
+		!v.IsCrossRepository && v.HeadRefName == TaskBranch(taskID) {
 		return DevWrite
 	}
 	return ExternalWrite

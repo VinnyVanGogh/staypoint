@@ -690,36 +690,91 @@ func handleHookPreTool() {
 	}
 }
 
-var (
-	// credentialFileRe names the StayPoint credential files: the daemon and
-	// Board tokens, and the ops key that signs each run's ops-tool token.
-	credentialFileRe = regexp.MustCompile(`\.staypoint/(?:.*/)?(?:ops_key|auth_token|board_token)\b`)
-	// dataDirSearchRe is a search path that is the data dir itself, so a
-	// Grep or Glob would reach its credential files.
-	dataDirSearchRe = regexp.MustCompile(`/\.staypoint/*$`)
-)
+// credentialNameRe is a StayPoint credential file name: the daemon and
+// Board tokens, and the ops key that signs each run's ops-tool token.
+var credentialNameRe = regexp.MustCompile(`(?i)(^|[/*?\[{,])(ops_key|auth_token|board_token)\b`)
+
+// credentialDataDirs are the data dirs whose credential files the hook
+// guards: the real account's ~/.staypoint and the configured data dir,
+// cleaned and lowercased (macOS paths are case-insensitive).
+func credentialDataDirs() []string {
+	var dirs []string
+	if home, err := config.RealHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, ".staypoint"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, ".staypoint"))
+	}
+	if cfg != nil && cfg.DataDir != "" {
+		dirs = append(dirs, cfg.DataDir)
+	}
+	for i, d := range dirs {
+		dirs[i] = strings.ToLower(filepath.Clean(d))
+	}
+	return dirs
+}
 
 // credentialFileAccess is the denial for a non-shell tool call (Read, Grep,
-// Glob, ...) whose path names a StayPoint credential file or searches the
-// whole data dir, or "". Only path parameters are read, so editing code
-// that mentions these names is unaffected. The Bash path already holds
-// ~/.staypoint; without this the Read tool could hand an agent the ops key,
-// and with it a run token for any task (Board review #2 H1).
+// Glob, ...) that would read a StayPoint credential file, or "". Only path
+// and glob parameters are read, so editing code that mentions these names
+// is unaffected. The Bash path already holds ~/.staypoint; without this the
+// Read tool could hand an agent the ops key, and with it a run token for any
+// task (Board review #2 H1). Paths are expanded (~), cleaned and lowercased
+// before comparing, since the filesystem ignores case.
 func credentialFileAccess(tool string, input json.RawMessage) string {
 	var args map[string]any
 	if json.Unmarshal(input, &args) != nil {
 		return ""
 	}
-	for _, k := range []string{"file_path", "path", "notebook_path", "pattern", "glob"} {
-		p, _ := args[k].(string)
-		if p == "" {
+	str := func(k string) string { s, _ := args[k].(string); return s }
+	home, _ := os.UserHomeDir()
+	norm := func(p string) string {
+		if p == "~" || strings.HasPrefix(p, "~/") {
+			p = filepath.Join(home, strings.TrimPrefix(p, "~"))
+		}
+		return strings.ToLower(filepath.Clean(p))
+	}
+	under := func(p, dir string) bool { return p == dir || strings.HasPrefix(p, strings.TrimSuffix(dir, "/")+"/") }
+	dirs := credentialDataDirs()
+	const named = " names a StayPoint credential file (ops_key, auth_token, board_token)"
+
+	for _, k := range []string{"file_path", "notebook_path", "path"} {
+		raw := str(k)
+		if raw == "" {
 			continue
 		}
-		if credentialFileRe.MatchString(p) {
-			return "denied, not run: " + tool + " names a StayPoint credential file (ops_key, auth_token, board_token)"
+		p := norm(raw)
+		for _, d := range dirs {
+			if !under(p, d) {
+				continue
+			}
+			if credentialNameRe.MatchString(strings.TrimPrefix(p, d)) {
+				return "denied, not run: " + tool + named
+			}
+			if k == "path" && p == d {
+				return "denied, not run: " + tool + " searches the whole StayPoint data dir; use staypoint_query for your task's records"
+			}
 		}
-		if k == "path" && dataDirSearchRe.MatchString(p) {
-			return "denied, not run: " + tool + " searches the whole StayPoint data dir; use staypoint_query for your task's records"
+	}
+	// A glob (Glob's pattern, Grep's glob) that names a credential file is
+	// refused when it reaches into a data dir: it says .staypoint, or it is
+	// searched from the data dir or one of its parents.
+	globs := []string{str("glob")}
+	if strings.EqualFold(tool, "glob") {
+		globs = append(globs, str("pattern"))
+	}
+	root := norm(str("path"))
+	for _, g := range globs {
+		if g == "" || !credentialNameRe.MatchString(g) {
+			continue
+		}
+		if strings.Contains(strings.ToLower(g), ".staypoint") || str("path") == "" {
+			return "denied, not run: " + tool + named
+		}
+		for _, d := range dirs {
+			if under(d, root) {
+				return "denied, not run: " + tool + named
+			}
 		}
 	}
 	return ""

@@ -394,9 +394,13 @@ func TestGitHubSlugAndPRBodyEffect(t *testing.T) {
 		{"o/r", mine, "o/r", "task-1", nil, ExternalWrite},
 	}
 	for _, c := range cases {
-		if got := PRBodyEffect(c.repo, c.head, c.slug, c.task, c.own); got != c.want {
+		if got := PRBodyEffect(c.repo, PRView{HeadRefName: c.head}, c.slug, c.task, c.own); got != c.want {
 			t.Errorf("PRBodyEffect(%q, %q, %q, %q, %v) = %s, want %s", c.repo, c.head, c.slug, c.task, c.own, got, c.want)
 		}
+	}
+	// A fork can name its branch staypoint/task-1 too.
+	if got := PRBodyEffect("o/r", PRView{HeadRefName: mine, IsCrossRepository: true}, "o/r", "task-1", own); got != ExternalWrite {
+		t.Errorf("fork PR with the task's branch name: %s, want external_write", got)
 	}
 }
 

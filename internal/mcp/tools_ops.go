@@ -396,7 +396,7 @@ func (s *Server) handlePRBody(ctx context.Context, rawArgs json.RawMessage) *Too
 			return opstools.Call{}, "", toolError("pr_body refused: " + err.Error())
 		}
 		sum := sha256.Sum256([]byte(args.Text))
-		effect := opstools.PRBodyEffect(ghRepo, v.HeadRefName, s.taskRepoSlug(ctx), strings.TrimSpace(os.Getenv("STAYPOINT_TASK_ID")), s.getConfig().Gates.Ops.OwnRepos)
+		effect := opstools.PRBodyEffect(ghRepo, *v, s.taskRepoSlug(ctx), strings.TrimSpace(os.Getenv("STAYPOINT_TASK_ID")), s.getConfig().Gates.Ops.OwnRepos)
 		return opstools.Call{Tool: "pr_body", Effect: effect,
 			Summary: fmt.Sprintf("gh_repo=%s pr=%d head=%s bytes=%d text_sha256=%x", ghRepo, args.PR, v.HeadRefName, len(args.Text), sum)}, ghRepo, nil
 	}
@@ -404,7 +404,7 @@ func (s *Server) handlePRBody(ctx context.Context, rawArgs json.RawMessage) *Too
 	if errRes != nil {
 		return errRes
 	}
-	reason := fmt.Sprintf("%s: replace the body of PR #%d in GitHub repo %s, which is not this task's own PR (head %s in its repo)", c.Effect, args.PR, ghRepo,
+	reason := fmt.Sprintf("%s: replace the body of PR #%d in GitHub repo %s, which is not this task's own PR (head %s in its repo, not a fork)", c.Effect, args.PR, ghRepo,
 		opstools.TaskBranch(strings.TrimSpace(os.Getenv("STAYPOINT_TASK_ID"))))
 	if res := s.gate(ctx, c, reason, args.ApprovalGateID); res != nil {
 		return res
