@@ -9,6 +9,7 @@ import (
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/geminiapproval"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
+	"github.com/VinnyVanGogh/staypoint/internal/workorgs"
 )
 
 // Board addition (2026-10-06): provider=gemini on a code kind in a PERSONAL
@@ -30,11 +31,11 @@ type geminiCodeGateResult struct {
 // approval for one run of taskID. publish, when set, announces a newly filed
 // request to the Board UI. Swappable in tests.
 var geminiCodeGate = func(conn *sql.DB, taskID, repoRoot, runID string, publish func(string, any)) geminiCodeGateResult {
-	var repoPath, workKind, provider, model, blockReason string
+	var repoPath, workKind, provider, model, blockReason, org string
 	if err := conn.QueryRowContext(context.Background(),
-		`SELECT COALESCE(repo_path,''), COALESCE(work_kind,''), COALESCE(provider,''), COALESCE(model_override,''), COALESCE(block_reason,'')
+		`SELECT COALESCE(repo_path,''), COALESCE(work_kind,''), COALESCE(provider,''), COALESCE(model_override,''), COALESCE(block_reason,''), COALESCE(organization,'')
 		 FROM tasks WHERE id=?`, taskID,
-	).Scan(&repoPath, &workKind, &provider, &model, &blockReason); err != nil {
+	).Scan(&repoPath, &workKind, &provider, &model, &blockReason, &org); err != nil {
 		return geminiCodeGateResult{} // no task row: the run path reports it
 	}
 	if !taskDirIsGit(repoPath, taskID) {
@@ -45,7 +46,7 @@ var geminiCodeGate = func(conn *sql.DB, taskID, repoRoot, runID string, publish 
 	if repoPath == "" {
 		repoPath = repoRoot
 	}
-	isWork := isWorkRepoPath(repoPath)
+	isWork := workorgs.IsWork(org) || isWorkRepoPath(repoPath)
 	if !router.NeedsGeminiCodeApproval(workKind, isWork, router.ChoiceFromStored(provider, model)) {
 		return geminiCodeGateResult{}
 	}

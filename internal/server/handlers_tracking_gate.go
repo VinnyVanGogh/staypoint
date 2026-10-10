@@ -31,7 +31,7 @@ func (h *SecurityGateHandler) GetTrackingGateSettings(w http.ResponseWriter, r *
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
-	names := []string{trackgate.CompanyManagedSolution, trackgate.CompanyPersonal}
+	names := trackgate.Companies()
 	seen := map[string]bool{}
 	for _, n := range names {
 		seen[strings.ToLower(n)] = true

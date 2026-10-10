@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/VinnyVanGogh/staypoint/internal/workorgs"
 )
 
 // Default parallel-run caps (STA-773, STA-867), used when config.toml does
@@ -90,6 +92,16 @@ func OrgBucket(org string) string {
 	return UnassignedOrg
 }
 
+// capBucket is the bucket org's runs count against for max_runs_per_org:
+// every work org (workorgs) shares the Managed Solution bucket, because they
+// all run on the one work seat. Other orgs count against their own bucket.
+func capBucket(org string) string {
+	if workorgs.IsWork(org) {
+		return workorgs.Default
+	}
+	return OrgBucket(org)
+}
+
 // RunLimits are the parallel-run caps. Zero or negative values use the
 // defaults.
 type RunLimits struct {
@@ -160,7 +172,7 @@ func (u *usage) add(k SlotKey) {
 	if k.Dir != "" {
 		u.dirs[k.Dir]++
 	}
-	u.orgs[OrgBucket(k.Org)]++
+	u.orgs[strings.ToLower(capBucket(k.Org))]++
 }
 
 // RunSlots enforces the parallel-run caps (global, per repo, per plain
@@ -437,8 +449,8 @@ func (s *RunSlots) refusalLocked(k SlotKey, u *usage) error {
 			return ErrRepoBusy
 		}
 	}
-	bucket := OrgBucket(k.Org)
-	if u.orgs[bucket] >= s.limits.orgCap(bucket) {
+	bucket := capBucket(k.Org)
+	if u.orgs[strings.ToLower(bucket)] >= s.limits.orgCap(bucket) {
 		return ErrOrgBusy
 	}
 	if u.total >= s.limits.Global {

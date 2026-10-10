@@ -66,8 +66,11 @@ var gateTrackingCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		companies := []string{trackgate.CompanyManagedSolution, trackgate.CompanyPersonal}
-		seen := map[string]bool{strings.ToLower(companies[0]): true, strings.ToLower(companies[1]): true}
+		companies := trackgate.Companies()
+		seen := map[string]bool{}
+		for _, c := range companies {
+			seen[strings.ToLower(c)] = true
+		}
 		for k := range settings {
 			if !seen[k] {
 				companies = append(companies, k)

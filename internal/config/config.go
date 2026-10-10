@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
+
+	"github.com/VinnyVanGogh/staypoint/internal/workorgs"
 )
 
 type Config struct {
@@ -46,6 +48,11 @@ type Config struct {
 	MaxRunsPerOrg int `json:"max_runs_per_org" toml:"max_runs_per_org"`
 	// RunLimits holds the optional [run_limits] table.
 	RunLimits RunLimitsConfig `json:"run_limits,omitempty" toml:"run_limits"`
+	// WorkOrgs lists organizations whose tasks are work, alongside Managed
+	// Solution (always included): work_orgs = ["Power Platform"]. A work repo
+	// accepts a task from any work org, work orgs route to the work seat, and
+	// they share the Managed Solution run cap. Top-level key.
+	WorkOrgs []string `json:"work_orgs,omitempty" toml:"work_orgs"`
 	// TurnTimeout caps one agent turn's wall-clock time, as a Go duration
 	// ("2h"). Empty or "0" = no limit (the default). Top-level key.
 	TurnTimeout string `json:"turn_timeout" toml:"turn_timeout"`
@@ -106,7 +113,8 @@ type RunLimitsConfig struct {
 	// Orgs overrides max_runs_per_org for named organizations
 	// ([run_limits.orgs] "Managed Solution" = 3). Names match
 	// case-insensitively; "Unassigned" is the bucket for tasks with no
-	// organization. Non-positive values are ignored.
+	// organization. Non-positive values are ignored. Every work org (work_orgs)
+	// counts against the one "Managed Solution" cap (the shared work seat).
 	Orgs map[string]int `json:"orgs,omitempty" toml:"orgs"`
 }
 
@@ -282,6 +290,9 @@ func LoadConfig() (*Config, error) {
 			return nil, fmt.Errorf("failed to parse config.json: %w", err)
 		}
 	}
+
+	workorgs.Set(cfg.WorkOrgs)
+	cfg.WorkOrgs = workorgs.List()
 
 	cfg.WorkRepoRoot = expandPath(cfg.WorkRepoRoot, home)
 	cfg.DataDir = expandPath(cfg.DataDir, home)

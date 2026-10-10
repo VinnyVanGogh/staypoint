@@ -300,7 +300,7 @@ func (g *TaskGenerator) CallGemini(ctx context.Context, prompt string) (*Generat
 				"properties": map[string]interface{}{
 					"organization": map[string]interface{}{
 						"type":        "string",
-						"description": "Target Organization (e.g. StayPoint, Managed Solution, RuneLite, Maintenance, Research)",
+						"description": "Target Organization (e.g. StayPoint, Managed Solution, Power Platform, RuneLite, Maintenance, Research)",
 					},
 					"project": map[string]interface{}{
 						"type":        "string",
@@ -520,6 +520,9 @@ func (g *TaskGenerator) GenerateHeuristicTask(comment string) InferredTask {
 	// 1. Infer Organization
 	org := "StayPoint"
 	switch {
+	case strings.Contains(lowerNorm, "power platform") || strings.Contains(lowerNorm, "mail router") ||
+		strings.Contains(lowerNorm, "mail-router"):
+		org = "Power Platform"
 	case strings.Contains(lowerNorm, "managed solution") || strings.Contains(lowerNorm, "mansol") ||
 		strings.Contains(lowerNorm, "azure") || strings.Contains(lowerNorm, "m365") ||
 		strings.Contains(lowerNorm, "client portal") || strings.Contains(lowerNorm, "client acme") ||
@@ -543,6 +546,8 @@ func (g *TaskGenerator) GenerateHeuristicTask(comment string) InferredTask {
 	// 2. Infer Project
 	project := "StayPoint Core Engine & Telemetry Fleet"
 	switch org {
+	case "Power Platform":
+		project = "Managed Solution Mail Router"
 	case "Managed Solution":
 		if strings.Contains(lowerNorm, "migration") || strings.Contains(lowerNorm, "cloud") {
 			project = "Managed Solution Cloud Migration"
@@ -596,6 +601,8 @@ func (g *TaskGenerator) GenerateHeuristicTask(comment string) InferredTask {
 	// 5. Infer Labels
 	labels := []string{"cli", "task"}
 	switch org {
+	case "Power Platform":
+		labels = []string{"power-platform", "mail-router"}
 	case "Managed Solution":
 		labels = []string{"managed-solution", "client"}
 		if strings.Contains(lowerNorm, "azure") {

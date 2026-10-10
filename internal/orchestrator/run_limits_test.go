@@ -14,6 +14,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/checkpoint"
 	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
 	"github.com/VinnyVanGogh/staypoint/internal/gitgate"
+	"github.com/VinnyVanGogh/staypoint/internal/workorgs"
 	"github.com/VinnyVanGogh/staypoint/internal/workspace"
 )
 
@@ -311,6 +312,48 @@ func TestRunLimits_OrgOverridesAndUnassigned(t *testing.T) {
 	s.Enqueue("u2", SlotKey{Dir: "/u2"}, "test", WaitOrg)
 	if q := s.Queue(); q[0].Org != UnassignedOrg {
 		t.Fatalf("queued org = %q, want %q", q[0].Org, UnassignedOrg)
+	}
+}
+
+// Board 2026-10-09: every work org shares the one Managed Solution cap (the
+// work seat), whatever [run_limits.orgs] says for the other work org. Other
+// orgs keep their own bucket.
+func TestRunLimits_WorkOrgsShareOneCap(t *testing.T) {
+	t.Cleanup(func() { workorgs.Set(nil) })
+	workorgs.Set([]string{"Power Platform"})
+	s := NewRunSlotsWithLimits(RunLimits{PerOrg: 3, Orgs: map[string]int{"Managed Solution": 3, "Power Platform": 3}})
+	s.Wake = func(string, string) {}
+	for i, org := range []string{"Managed Solution", "Power Platform", "power platform"} {
+		if err := s.Acquire(fmt.Sprintf("w%d", i), SlotKey{Dir: fmt.Sprintf("/w%d", i), Org: org}); err != nil {
+			t.Fatalf("work run %d (%s): %v", i, org, err)
+		}
+	}
+	for _, org := range []string{"Power Platform", "Managed Solution", "MAN"} {
+		if err := s.Acquire("w-extra", SlotKey{Dir: "/wx", Org: org}); !errors.Is(err, ErrOrgBusy) {
+			t.Fatalf("4th work run (%s) must hit the shared work cap: %v", org, err)
+		}
+	}
+	if err := s.Acquire("sp1", SlotKey{Dir: "/sp1", Org: "StayPoint"}); err != nil {
+		t.Fatalf("StayPoint must not count against the work cap: %v", err)
+	}
+	s.Enqueue("w-extra", SlotKey{Dir: "/wx", Org: "Power Platform"}, "test", WaitOrg)
+	if q := s.Queue(); q[0].Org != "Power Platform" {
+		t.Fatalf("queued org = %q, want the task's own org", q[0].Org)
+	}
+	s.Release("w1")
+	if err := s.Acquire("w-extra", SlotKey{Dir: "/wx", Org: "Power Platform"}); err != nil {
+		t.Fatalf("freed work slot not reusable: %v", err)
+	}
+
+	// Unconfigured, Power Platform is its own org with its own cap.
+	workorgs.Set(nil)
+	s2 := NewRunSlotsWithLimits(RunLimits{PerOrg: 1})
+	s2.Wake = func(string, string) {}
+	if err := s2.Acquire("m", SlotKey{Dir: "/m", Org: "Managed Solution"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Acquire("p", SlotKey{Dir: "/p", Org: "Power Platform"}); err != nil {
+		t.Fatalf("unconfigured Power Platform shares the work cap: %v", err)
 	}
 }
 
