@@ -833,7 +833,7 @@ func TestShipReviewPR_ApproveAlreadyMerged(t *testing.T) {
 	if out, err := exec.Command("git", "-C", repoDir, "push", "-q", "origin", head+":refs/heads/"+branch).CombinedOutput(); err != nil {
 		t.Fatalf("push branch: %v %s", err, out)
 	}
-	m := gitOut(t, bare, "commit-tree", head+"^{tree}", "-p", "main", "-p", head, "-m", "Merge pull request #477")
+	m := gitOut(t, bare, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", head+"^{tree}", "-p", "main", "-p", head, "-m", "Merge pull request #477")
 	gitOut(t, bare, "update-ref", "refs/heads/main", m)
 	gitOut(t, bare, "update-ref", "refs/heads/"+branch, m)
 	writeState(t, state, "pr", "477 https://github.com/o/r/pull/477 "+branch)
