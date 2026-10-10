@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -393,6 +394,19 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	}
 	defer h.Release(taskID, runID)
 
+	// Never two agents in one worktree (task-ae1414b0): an agent CLI an
+	// earlier daemon left running keeps the task from starting until it exits.
+	if pgid, alive := previousAgentAlive(ctx, h.DB, taskID); alive {
+		refuseSecondAgent(ctx, h.DB, taskID, fmt.Sprintf("the agent (process group %d) from the previous daemon", pgid))
+		return nil, ErrAgentStillRunning
+	}
+	// A run a deploy suspended, or a daemon restart cut off, resumes from
+	// the turn it stopped at, in its own worktree (task-db71fba9).
+	resume := liveRun(ctx, h.DB, taskID)
+	if resume != nil && resume.State == liveRunning && resume.DaemonPID == os.Getpid() {
+		resume = nil
+	}
+
 	runLog := logging.WithRunContext(
 		logging.WithComponent(slog.Default(), "harness"),
 		taskID, runID, cfg.AgentID,
@@ -431,6 +445,13 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 
 	var wtPath string
 	var preCP *checkpoint.Checkpoint
+	// suspended is set when a drain suspends the run: its worktree and its
+	// live_runs row are kept for the next daemon.
+	var suspended bool
+	// reuseWorktree: a resumed run keeps the worktree it was suspended in,
+	// uncommitted work included, and skips the git pre-flight (it already
+	// passed it, and the work in progress would fail the dirty check).
+	var reuseWorktree bool
 	if nonGit {
 		wtPath = taskDir.Dir
 	} else {
@@ -442,21 +463,71 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			wm = newWorktreeManager(repoPath, h.DB)
 		}
 
-		wtPath, err = wm.CreateContext(ctx, taskID, runID)
-		if err != nil {
-			return nil, fmt.Errorf("create worktree: %w", err)
+		// CreateContext force-removes an existing worktree. An agent still
+		// working there (one no live_runs row recorded) must not lose its
+		// checkout from under it, nor get a second agent beside it.
+		if pids := agentsIn(filepath.Join(repoPath, ".worktrees", taskID), taskID); len(pids) > 0 {
+			refuseSecondAgent(ctx, h.DB, taskID, fmt.Sprintf("an agent started for this task (pid %v)", pids))
+			return nil, ErrAgentStillRunning
+		}
+
+		if resume != nil && worktreeOnBranch(ctx, resume.Worktree, "staypoint/"+taskID) {
+			wtPath = resume.Worktree
+			reuseWorktree = true
+		} else {
+			wtPath, err = wm.CreateContext(ctx, taskID, runID)
+			if err != nil {
+				return nil, fmt.Errorf("create worktree: %w", err)
+			}
 		}
 		defer func() {
+			if suspended {
+				return
+			}
 			if pruneErr := wm.PruneWorktreeDirContext(context.Background(), taskID); pruneErr != nil {
 				runLog.Warn("worktree prune failed", slog.Any("error", pruneErr))
 			}
 		}()
 
-		preCP, _ = checkpoint.CreateCheckpoint(ctx, checkpoint.CreateOptions{
-			WorkDir:   wtPath,
-			SessionID: runID,
-			Message:   "pre-run " + taskID,
-		})
+		if reuseWorktree && resume.PreCheckpointID != "" {
+			// Diff the whole run, not just the part after the restart.
+			preCP = &checkpoint.Checkpoint{ID: resume.PreCheckpointID, CommitSHA: resume.PreCheckpointSHA}
+		} else {
+			preCP, _ = checkpoint.CreateCheckpoint(ctx, checkpoint.CreateOptions{
+				WorkDir:   wtPath,
+				SessionID: runID,
+				Message:   "pre-run " + taskID,
+			})
+		}
+	}
+
+	startTurn := 0
+	if resume != nil {
+		startTurn = resume.NextTurn
+		if !reuseWorktree && !nonGit {
+			// The worktree is gone; the committed branch is all there is.
+			startTurn = 0
+		}
+	}
+	{
+		lr := LiveRun{TaskID: taskID, RunID: runID, Worktree: wtPath, NextTurn: startTurn, WakeReason: cfg.WakeReason}
+		if preCP != nil {
+			lr.PreCheckpointID, lr.PreCheckpointSHA = preCP.ID, preCP.CommitSHA
+		}
+		if resume != nil {
+			// Only restarts that cut the run off count toward the
+			// auto-resume cap; a clean deploy suspend is not a failure.
+			lr.Resumes = resume.Resumes
+			if resume.State != liveSuspended {
+				lr.Resumes++
+			}
+		}
+		liveBegin(ctx, h.DB, lr)
+		defer func() {
+			if !suspended {
+				liveEnd(h.DB, taskID, runID)
+			}
+		}()
 	}
 
 	providerEnv := security.ChildEnv(defaultProviderEnvKeys...)
@@ -546,7 +617,13 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// Git pre-flight: fetch, dirty check, fast-forward.
 	// A failure is logged as a timeline comment and blocks the run.
 	// Skipped when cfg.SkipGitPreflight is true (tests running in a non-git dir).
-	if !cfg.SkipGitPreflight && !nonGit {
+	if reuseWorktree {
+		_, _ = h.DB.ExecContext(ctx,
+			`INSERT INTO task_comments (task_id, author, message) VALUES (?, 'harness', ?)`,
+			taskID, fmt.Sprintf("git-preflight: skipped (resuming run %s at turn %d in its own worktree, which keeps its uncommitted work)", resume.RunID, startTurn+1),
+		)
+	}
+	if !cfg.SkipGitPreflight && !nonGit && !reuseWorktree {
 		gfCtx, gfCancel := context.WithTimeout(ctx, 60*time.Second)
 		gfBranch := preflightBranch(gfCtx, h.DB, repoPath, taskID)
 		gfResult, gfErr := gitgate.PreFlightMerge(gfCtx, wtPath, gfBranch, preflightMergeBase(gfCtx, h.DB, repoPath, taskID))
@@ -652,7 +729,19 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// refs the agent could move.
 	turnCP := preCP
 
-	for turn := 0; turn < maxTurns; turn++ {
+	// suspendAt, when >= 0, is the turn a drain suspended the run before.
+	suspendAt := -1
+	var suspendBoardPaused bool
+
+	for turn := startTurn; turn < maxTurns; turn++ {
+		// Turn boundary: a drain that asks runs to suspend stops this one
+		// here, before the next agent CLI starts (task-db71fba9).
+		if h.slots().SuspendRequested() {
+			suspendAt = turn
+			break
+		}
+		liveTurn(h.DB, taskID, runID, turn, lastSeenCommentID)
+
 		if ctx.Err() != nil {
 			result.Disposition = "capped"
 			if sr != nil && cfg.MaxWallclock > 0 {
@@ -707,7 +796,13 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		if len(newComments) > 0 {
 			lastSeenCommentID = newComments[len(newComments)-1].ID
 		}
-		rawArgs := buildRawArgs(taskID, turn, cfg, brief, newComments)
+		// The first turn of a run, including a resumed one, gets the whole
+		// brief: every turn is a fresh agent CLI with no memory of the last.
+		note := ""
+		if turn == startTurn && resume != nil && (startTurn > 0 || reuseWorktree) {
+			note = resumeNote(resume)
+		}
+		rawArgs := buildTurnArgs(taskID, turn, turn == startTurn, note, cfg, brief, newComments)
 
 		var stdout io.Writer = tw
 		if sr != nil && cfg.ParseDelta != nil {
@@ -721,6 +816,9 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			// Watch for stop signal during this turn: if stop is requested,
 			// cancel the adapter context so the subprocess receives SIGTERM.
 			turnCtx, turnCancel := context.WithCancel(ctx)
+			// Records the agent's process group; ends the turn on an
+			// emergency drain or when the agent exited but the turn hung.
+			turnCtx, guard := h.guardTurn(turnCtx, taskID, runID, turnCancel)
 			if cfg.RunControl != nil {
 				stopCh := cfg.RunControl.StopChan(taskID)
 				go func() {
@@ -805,6 +903,21 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 				h.stopTurnForPanic(result, turnPanic, taskID, turn, stdout, sr, runLog)
 				sawOutput = true // the stop row explains the run
 				break
+			}
+
+			if guard.drained.Load() {
+				// An emergency drain cut this turn short: the next daemon
+				// redoes it from the worktree as it is now.
+				if stw, ok := stdout.(*stepTeeWriter); ok {
+					_ = stw.Close()
+				}
+				suspendAt = turn
+				break
+			}
+			if guard.reaped.Load() && sr != nil {
+				sr.EmitMessage("Agent exited but its turn never ended",
+					fmt.Sprintf("The agent process exited, but its output stayed open for %s, so the turn was ended.", fmtWatchDuration(agentExitGrace)),
+					"error")
 			}
 
 			if watchStop != "" {
@@ -1008,7 +1121,23 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 					now, taskID,
 				)
 				runLog.Info("run paused after step", slog.Int("turn", turn))
-				stopped := rc.WaitForResume(ctx, taskID)
+				// A drain that suspends runs also ends this wait: the run is
+				// suspended still paused, and resumes only on Run Now.
+				waitCtx, waitCancel := context.WithCancel(ctx)
+				go func(ch <-chan struct{}) {
+					select {
+					case <-ch:
+						waitCancel()
+					case <-waitCtx.Done():
+					}
+				}(h.slots().DrainBoundaryChan())
+				stopped := rc.WaitForResume(waitCtx, taskID)
+				waitCancel()
+				if stopped && ctx.Err() == nil && !rc.IsStopRequested(taskID) && h.slots().SuspendRequested() {
+					suspendAt = turn + 1
+					suspendBoardPaused = true
+					break
+				}
 				if stopped {
 					result.Disposition = "stopped"
 					break
@@ -1025,6 +1154,25 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 				runLog.Info("run resumed", slog.Int("turn", turn))
 			}
 		}
+	}
+
+	if suspendAt >= 0 {
+		if h.suspendRun(taskID, runID, wtPath, nonGit, suspendAt, lastSeenCommentID, suspendBoardPaused, sr, runLog) {
+			suspended = true
+			result.Disposition = SuspendedDisposition
+			if sr != nil {
+				sr.Close()
+			}
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel2()
+			_, _ = h.DB.ExecContext(ctx2,
+				`UPDATE tasks SET spent_turns=spent_turns+?, spent_usd=spent_usd+?, updated_at=? WHERE id=?`,
+				result.Turns, result.SpentUSD, time.Now().UTC().Format(time.RFC3339Nano), taskID)
+			return result, nil
+		}
+		// Could not record the suspension: finish as a normal run would
+		// at this point rather than lose it.
+		runLog.Warn("suspend failed; ending the run normally", slog.Int("turn", suspendAt))
 	}
 
 	if sr != nil {
@@ -1401,16 +1549,26 @@ func safeField(s string) string {
 // buildRawArgs constructs CLI arguments for the adapter on the given turn.
 // These are parsed by adapter.parseRawArgs into ParsedOptions.
 func buildRawArgs(taskID string, turn int, cfg RunConfig, brief taskBrief, newComments []harnessComment) []string {
+	return buildTurnArgs(taskID, turn, turn == 0, "", cfg, brief, newComments)
+}
+
+// buildTurnArgs is buildRawArgs for a run that may start at a later turn: a
+// resumed run's first turn is a first turn (whole brief and handoff), and
+// note, when set, tells the agent where it left off.
+func buildTurnArgs(taskID string, turn int, first bool, note string, cfg RunConfig, brief taskBrief, newComments []harnessComment) []string {
 	var prompt string
-	briefBlock := buildBriefBlock(brief, newComments, turn == 0)
+	briefBlock := buildBriefBlock(brief, newComments, first)
 
 	if briefBlock != "" {
 		prompt = briefBlock + "\n"
 	}
-	if turn == 0 {
+	if first {
 		if hb := buildHandoffBlock(brief.Handoff); hb != "" {
 			prompt += hb + "\n"
 		}
+	}
+	if note != "" {
+		prompt += note + "\n"
 	}
 	prompt += fmt.Sprintf(
 		"Continue work on task %s (turn %d). When you are finished, emit %s on its own line.",

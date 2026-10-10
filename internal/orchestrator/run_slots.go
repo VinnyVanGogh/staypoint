@@ -54,11 +54,15 @@ const (
 	WaitOrg    = "org"    // the task's organization is at max_runs_per_org
 	WaitQuota  = "quota"  // every provider for this task's pool is quota-locked
 	WaitParent = "parent" // the task's parent is at tasks.max_running_children
+	WaitDrain  = "drain"  // the daemon is draining for a deploy (task-db71fba9)
+	WaitResume = "resume" // a run suspended or cut off by a daemon restart, waiting to resume
 )
 
 // WaitFor maps a capacity refusal from Claim to its queue wait reason.
 func WaitFor(err error) string {
 	switch {
+	case errors.Is(err, ErrDraining):
+		return WaitDrain
 	case errors.Is(err, ErrPlainDirBusy):
 		return WaitDir
 	case errors.Is(err, ErrRepoBusy):
@@ -179,6 +183,11 @@ type RunSlots struct {
 	// OnChange, when set, is called (outside the lock) after the queue
 	// changes, with the current queue. Used to publish SSE updates.
 	OnChange func(queue []QueuedRun)
+	// Store, when set, persists every queue change so the queue survives a
+	// daemon restart or crash (STA-846). Nil keeps the queue in memory only.
+	Store QueueStore
+
+	drain drainState
 }
 
 // GlobalRunSlots is the process-wide run limiter used by Harness when
@@ -267,6 +276,10 @@ func (s *RunSlots) Acquire(taskID string, key SlotKey) error {
 		s.mu.Unlock()
 		return ErrAlreadyClaimed
 	}
+	if s.drain.mode != DrainOff {
+		s.mu.Unlock()
+		return ErrDraining
+	}
 	var u usage
 	if s.queuedLocked(taskID) {
 		u = s.activeUsageLocked()
@@ -292,9 +305,14 @@ func (s *RunSlots) Release(taskID string) {
 	s.mu.Lock()
 	_, ok := s.active[taskID]
 	delete(s.active, taskID)
+	draining := s.drain.mode != DrainOff
+	q := s.snapshotLocked()
 	s.mu.Unlock()
 	if ok {
 		s.Pump()
+		if draining {
+			s.notify(q) // the drain line counts live runs
+		}
 	}
 }
 
@@ -303,7 +321,7 @@ func (s *RunSlots) Release(taskID string) {
 func (s *RunSlots) Enqueue(taskID string, key SlotKey, reason, wait string) QueuePosition {
 	s.mu.Lock()
 	delete(s.dispatched, taskID)
-	found := false
+	idx := -1
 	for i := range s.queue {
 		if s.queue[i].TaskID == taskID {
 			s.queue[i].Wait = wait
@@ -312,16 +330,18 @@ func (s *RunSlots) Enqueue(taskID string, key SlotKey, reason, wait string) Queu
 				s.queue[i].Plain = key.Plain
 			}
 			s.queue[i].Org = OrgBucket(key.Org)
-			found = true
+			idx = i
 			break
 		}
 	}
-	if !found {
+	if idx < 0 {
 		s.queue = append(s.queue, QueuedRun{
 			TaskID: taskID, RepoKey: key.Dir, Plain: key.Plain, Org: OrgBucket(key.Org),
 			Reason: reason, Wait: wait, QueuedAt: time.Now().UTC(),
 		})
+		idx = len(s.queue) - 1
 	}
+	s.persistLocked(s.queue[idx])
 	pos := s.positionLocked(taskID)
 	q := s.snapshotLocked()
 	s.mu.Unlock()
@@ -364,6 +384,11 @@ func (s *RunSlots) Queue() []QueuedRun {
 // locked) does not lose its position.
 func (s *RunSlots) Pump() {
 	s.mu.Lock()
+	if s.drain.mode != DrainOff {
+		// Draining for a deploy: queued runs wait for the next daemon.
+		s.mu.Unlock()
+		return
+	}
 	_, startable := s.planLocked(true)
 	var toWake []QueuedRun
 	for _, q := range startable {
@@ -460,10 +485,47 @@ func (s *RunSlots) removeLocked(taskID string) bool {
 	for i, q := range s.queue {
 		if q.TaskID == taskID {
 			s.queue = append(s.queue[:i:i], s.queue[i+1:]...)
+			if s.Store != nil {
+				if err := s.Store.DeleteQueued(taskID); err != nil {
+					slog.Warn("run queue: persist remove failed", slog.String("task", taskID), slog.Any("error", err))
+				}
+			}
 			return true
 		}
 	}
 	return false
+}
+
+// persistLocked writes q to the Store (insert, or update keeping its place).
+func (s *RunSlots) persistLocked(q QueuedRun) {
+	if s.Store == nil {
+		return
+	}
+	if err := s.Store.SaveQueued(q); err != nil {
+		slog.Warn("run queue: persist failed; this run would not survive a restart",
+			slog.String("task", q.TaskID), slog.Any("error", err))
+	}
+}
+
+// Restore loads runs persisted by an earlier daemon into the queue, in the
+// order given, without writing them back. Tasks already queued or running are
+// skipped. Call before the first Pump.
+func (s *RunSlots) Restore(qs []QueuedRun) {
+	s.mu.Lock()
+	n := 0
+	for _, q := range qs {
+		if _, running := s.active[q.TaskID]; running || s.queuedLocked(q.TaskID) {
+			continue
+		}
+		q.Org = OrgBucket(q.Org)
+		s.queue = append(s.queue, q)
+		n++
+	}
+	snap := s.snapshotLocked()
+	s.mu.Unlock()
+	if n > 0 {
+		s.notify(snap)
+	}
 }
 
 func (s *RunSlots) positionLocked(taskID string) QueuePosition {
