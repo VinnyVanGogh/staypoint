@@ -70,6 +70,7 @@ func opsConfig(t *testing.T) *config.Config {
 	cfg.Gates.Ops.DevHosts = map[string]config.DevHostConfig{
 		"mansol-dev": {HostName: "10.0.0.5", AppDir: "/var/www/mansol_apps", Services: []string{"mansol-web"}},
 	}
+	cfg.Gates.Ops.OwnRepos = []string{"o/r"}
 	return cfg
 }
 
@@ -388,13 +389,15 @@ func TestPRBodyScopedToTaskRepo(t *testing.T) {
 		}
 	})
 
-	for _, c := range []struct{ name, view string }{
-		{"another repo", prViewJSON("other/r", 9, "main", "feature", head, "OPEN")},
-		{"release PR from main", prViewJSON("o/r", 9, "prod", "main", head, "OPEN")},
+	for _, c := range []struct{ name, view, origin string }{
+		{"another repo", prViewJSON("other/r", 9, "main", "feature", head, "OPEN"), "https://github.com/o/r.git"},
+		{"release PR from main", prViewJSON("o/r", 9, "prod", "main", head, "OPEN"), "https://github.com/o/r.git"},
+		// The agent repointed the shared checkout's origin at its own repo.
+		{"repointed task origin", prViewJSON("attacker/r", 9, "main", "feature", head, "OPEN"), "https://github.com/attacker/r.git"},
 	} {
 		t.Run(c.name+" needs the Board", func(t *testing.T) {
 			for _, approve := range []bool{false, true} {
-				rec := &recorder{view: c.view, origin: "https://github.com/o/r.git"}
+				rec := &recorder{view: c.view, origin: c.origin}
 				var asked []ApprovalRequest
 				s := NewServer(WithDB(database), WithConfig(opsConfig(t)), withRunner(rec.run), WithApprover(func(_ context.Context, req ApprovalRequest) (bool, string) {
 					asked = append(asked, req)

@@ -137,6 +137,9 @@ type OpsConfig struct {
 	// dev_deploy_verify runs the dev-server copy only when its blob is one of
 	// these or main's.
 	VerifyScriptBlobs []string `json:"verify_script_blobs,omitempty" toml:"verify_script_blobs"`
+	// OwnRepos are the GitHub repos ("owner/name") StayPoint tasks work in:
+	// pr_body edits a PR there unattended when it is the task's own repo.
+	OwnRepos []string `json:"own_repos,omitempty" toml:"own_repos"`
 }
 
 // DevHostConfig is one [gates.ops.dev_hosts.<alias>] table.

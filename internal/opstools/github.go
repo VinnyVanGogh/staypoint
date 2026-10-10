@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -174,13 +175,18 @@ func GitHubSlug(remoteURL string) string {
 }
 
 // OriginSlug is the GitHub "owner/name" dir's origin points at, as git
-// resolves it (insteadOf rewrites applied), or "".
-func OriginSlug(ctx context.Context, run Runner, dir string) string {
+// resolves it (insteadOf rewrites applied), and that URL; "" when it is not
+// a github.com remote.
+func OriginSlug(ctx context.Context, run Runner, dir string) (slug, url string) {
 	res := run(ctx, Cmd{Name: "git", Args: []string{"remote", "get-url", "origin"}, Dir: dir})
 	if res.ExitCode != 0 || res.Err != nil {
-		return ""
+		return "", ""
 	}
-	return GitHubSlug(res.Stdout)
+	url = strings.TrimSpace(res.Stdout)
+	if slug = GitHubSlug(url); slug == "" {
+		return "", ""
+	}
+	return slug, url
 }
 
 // protectedHeads are head branches whose PR body pr_body never edits
@@ -188,11 +194,13 @@ func OriginSlug(ctx context.Context, run Runner, dir string) string {
 var protectedHeads = map[string]bool{"main": true, "master": true, "prod": true, "production": true}
 
 // PRBodyEffect is the effect of replacing PR body text: a dev write for a
-// PR in the task's own GitHub repo (taskSlug) from a non-release branch; an
-// external write (the Board) for any other repo, or when the task's repo is
-// unknown.
-func PRBodyEffect(ghRepo, headRef, taskSlug string) Effect {
-	if taskSlug != "" && strings.EqualFold(ghRepo, taskSlug) && !protectedHeads[headRef] {
+// PR in the task's own GitHub repo (taskSlug) from a non-release branch,
+// when that repo is also one the Board listed (ownRepos, [gates.ops]
+// own_repos: an agent can repoint a checkout's origin but not edit the
+// config); an external write (the Board) otherwise.
+func PRBodyEffect(ghRepo, headRef, taskSlug string, ownRepos []string) Effect {
+	listed := slices.ContainsFunc(ownRepos, func(r string) bool { return strings.EqualFold(r, ghRepo) })
+	if listed && taskSlug != "" && strings.EqualFold(ghRepo, taskSlug) && !protectedHeads[headRef] {
 		return DevWrite
 	}
 	return ExternalWrite

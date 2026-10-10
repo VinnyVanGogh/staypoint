@@ -329,20 +329,25 @@ func TestGitHubSlugAndPRBodyEffect(t *testing.T) {
 			t.Errorf("GitHubSlug(%q) = %q, want %q", url, got, want)
 		}
 	}
+	own := []string{"o/r"}
 	cases := []struct {
 		repo, head, task string
+		own              []string
 		want             Effect
 	}{
-		{"o/r", "feature/x", "o/r", DevWrite},
-		{"O/R", "feature/x", "o/r", DevWrite},
-		{"other/r", "feature/x", "o/r", ExternalWrite},
-		{"o/r", "main", "o/r", ExternalWrite},
-		{"o/r", "prod", "o/r", ExternalWrite},
-		{"o/r", "feature/x", "", ExternalWrite},
+		{"o/r", "feature/x", "o/r", own, DevWrite},
+		{"O/R", "feature/x", "o/r", own, DevWrite},
+		{"other/r", "feature/x", "o/r", own, ExternalWrite},
+		{"o/r", "main", "o/r", own, ExternalWrite},
+		{"o/r", "prod", "o/r", own, ExternalWrite},
+		{"o/r", "feature/x", "", own, ExternalWrite},
+		// A repointed task origin names a repo the Board never listed.
+		{"attacker/r", "feature/x", "attacker/r", own, ExternalWrite},
+		{"o/r", "feature/x", "o/r", nil, ExternalWrite},
 	}
 	for _, c := range cases {
-		if got := PRBodyEffect(c.repo, c.head, c.task); got != c.want {
-			t.Errorf("PRBodyEffect(%q, %q, %q) = %s, want %s", c.repo, c.head, c.task, got, c.want)
+		if got := PRBodyEffect(c.repo, c.head, c.task, c.own); got != c.want {
+			t.Errorf("PRBodyEffect(%q, %q, %q, %v) = %s, want %s", c.repo, c.head, c.task, c.own, got, c.want)
 		}
 	}
 }
@@ -526,6 +531,34 @@ func TestRunVerifyTrustsOnlyReviewedScript(t *testing.T) {
 		out = RunVerify(context.Background(), repointed, req, dir, nil)
 		if len(ran) != before || !strings.Contains(out, "NOT ON DEV: origin of") {
 			t.Fatalf("origin %q: ran=%d %s", origin, len(ran)-before, out)
+		}
+	}
+
+	// The fetch uses the checked URL, and a failed fetch stops the run: a
+	// stale or planted origin/dev-server must not be what the script checks.
+	for _, fail := range []bool{false, true} {
+		gh := fakeGitHub(good, good, false, &ran)
+		var fetched []string
+		fetchRunner := func(ctx context.Context, c Cmd) Result {
+			if c.Name == "git" && len(c.Args) > 0 && c.Args[0] == "fetch" {
+				fetched = c.Args
+				if fail {
+					return Result{ExitCode: 128, Output: "fatal: could not read from remote"}
+				}
+				return Result{}
+			}
+			return gh(ctx, c)
+		}
+		before := len(ran)
+		out = RunVerify(context.Background(), fetchRunner, req, dir, nil)
+		if got := strings.Join(fetched, " "); got != "fetch --no-tags git@github.com:org/mansol_apps.git +refs/heads/dev-server:refs/remotes/origin/dev-server" {
+			t.Fatalf("fetch argv %q", got)
+		}
+		if fail && (len(ran) != before || !strings.Contains(out, "NOT ON DEV: could not fetch")) {
+			t.Fatalf("failed fetch still ran the script: %s", out)
+		}
+		if !fail && len(ran) != before+1 {
+			t.Fatalf("good fetch did not run the script: %s", out)
 		}
 	}
 }

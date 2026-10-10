@@ -336,7 +336,8 @@ func (s *Server) taskRepoSlug(ctx context.Context) string {
 	if err != nil || t == nil || t.RepoPath == "" {
 		return ""
 	}
-	return opstools.OriginSlug(ctx, s.opsRunner(), t.RepoPath)
+	slug, _ := opstools.OriginSlug(ctx, s.opsRunner(), t.RepoPath)
+	return slug
 }
 
 func (s *Server) handlePRBody(ctx context.Context, rawArgs json.RawMessage) *ToolCallResult {
@@ -373,8 +374,9 @@ func (s *Server) handlePRBody(ctx context.Context, rawArgs json.RawMessage) *Too
 			return opstools.Call{}, "", toolError("pr_body refused: " + err.Error())
 		}
 		sum := sha256.Sum256([]byte(args.Text))
-		return opstools.Call{Tool: "pr_body", Effect: opstools.PRBodyEffect(ghRepo, v.HeadRefName, s.taskRepoSlug(ctx)),
-			Summary: fmt.Sprintf("gh_repo=%s pr=%d head=%s bytes=%d text_sha256=%x", ghRepo, args.PR, v.HeadRefName, len(args.Text), sum[:8])}, ghRepo, nil
+		effect := opstools.PRBodyEffect(ghRepo, v.HeadRefName, s.taskRepoSlug(ctx), s.getConfig().Gates.Ops.OwnRepos)
+		return opstools.Call{Tool: "pr_body", Effect: effect,
+			Summary: fmt.Sprintf("gh_repo=%s pr=%d head=%s bytes=%d text_sha256=%x", ghRepo, args.PR, v.HeadRefName, len(args.Text), sum)}, ghRepo, nil
 	}
 	c, ghRepo, bad := view()
 	if bad != nil {

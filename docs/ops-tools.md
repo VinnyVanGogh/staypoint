@@ -121,7 +121,11 @@ verify_repos`.
    way.
 2. It checks that the working directory's `origin` (as `git remote get-url`
    resolves it) is `github.com/<repo>`, so a repointed origin can't make a
-   fork's `dev-server` look deployed, then refreshes `origin/dev-server`.
+   fork's `dev-server` look deployed. It then fetches
+   `+refs/heads/dev-server:refs/remotes/origin/dev-server` from that exact
+   URL (not the remote's config, which could change in between) and stops
+   with `NOT ON DEV` if the fetch fails, so a stale or planted local ref is
+   never what the script checks.
 3. It runs exactly those bytes with `bash -s -- <sha> <checks>`.
 4. It returns the PASS/FAIL lines and the final `DEV DEPLOY VERIFIED` /
    `NOT ON DEV` line. If the script never prints a verdict, the tool adds a
@@ -167,11 +171,14 @@ own URL, and runs `gh pr edit <pr> --repo <owner/name> --body-file -` with the
 text on stdin. Its effect:
 
 - `dev_write` when the PR is in the task's own GitHub repo (the `origin` of
-  the task's configured checkout, not the agent's working directory) and its
-  head branch is not `main`, `master`, `prod` or `production`.
+  the task's configured checkout, not the agent's working directory), that
+  repo is listed in `[gates.ops] own_repos`, and its head branch is not
+  `main`, `master`, `prod` or `production`. Worktrees share the checkout's
+  git config, so an agent can repoint `origin`; it cannot add its repo to
+  the Board's config list.
 - `external_write` (Board) for anything else, including when the task's repo
-  is unknown. The canonical call holds the text's sha256, so the approval
-  covers exactly that text.
+  is unknown. The canonical call holds the text's full sha256, so the
+  approval covers exactly that text.
 
 The run timeline declares `pr_body` as `external_write` (the upper bound);
 the result line says which effect it ran as.
@@ -225,6 +232,8 @@ prod = ["mansol-prod"]
 verify_repos = ["<owner>/<repo>"]
 # Extra Board-reviewed blob shas of that script (beyond the one on main)
 verify_script_blobs = []
+# GitHub repos tasks work in: pr_body edits the task's own PRs there unattended
+own_repos = ["VinnyVanGogh/staypoint"]
 
 [gates.ops.dev_hosts.mansol-dev]
 host_name    = "<dev host address>"  # required: ssh connects here, whatever ~/.ssh/config says

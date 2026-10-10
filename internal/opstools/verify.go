@@ -131,12 +131,17 @@ func RunVerify(ctx context.Context, run Runner, r VerifyRequest, dir string, tru
 	// The script checks the local origin/dev-server, so origin must be the
 	// repo the script came from: an agent-repointed origin would let a fork's
 	// refs stand in for GitHub's.
-	if got := OriginSlug(ctx, run, dir); !strings.EqualFold(got, r.Repo) {
-		return fmt.Sprintf("NOT ON DEV: origin of %s is %q, not github.com/%s; verify needs a checkout of that repo", dir, got, r.Repo)
+	slug, url := OriginSlug(ctx, run, dir)
+	if !strings.EqualFold(slug, r.Repo) {
+		return fmt.Sprintf("NOT ON DEV: origin of %s is %q, not github.com/%s; verify needs a checkout of that repo", dir, slug, r.Repo)
 	}
-	// Refresh origin/dev-server as the manual form did. A failed fetch is
-	// left for the script to report.
-	_ = run(ctx, Cmd{Name: "git", Args: []string{"fetch", "origin", "dev-server"}, Dir: dir})
+	// Refresh origin/dev-server from the URL just checked (not the remote's
+	// config, which could change in between), and stop if that fails: a
+	// stale or planted local ref must not be what the script checks.
+	fetch := run(ctx, Cmd{Name: "git", Args: []string{"fetch", "--no-tags", url, "+refs/heads/dev-server:refs/remotes/origin/dev-server"}, Dir: dir})
+	if fetch.ExitCode != 0 || fetch.Err != nil {
+		return "NOT ON DEV: could not fetch dev-server from github.com/" + r.Repo + "\n" + fetch.Format()
+	}
 	args := append([]string{"-s", "--", r.SHA}, r.PageChecks...)
 	res := run(ctx, Cmd{Name: "bash", Args: args, Dir: dir, Stdin: script})
 	return summarizeVerify(res)
