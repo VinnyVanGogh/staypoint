@@ -135,6 +135,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		writeJSONUnescaped(w, s.repoAccessSnapshot())
 	})
 
+	// Deploy drain (task-db71fba9): Board-only to start or cancel.
+	mux.HandleFunc("GET /api/daemon/drain", GetDrain)
+	mux.Handle("POST /api/daemon/drain", s.secMid.WrapBoardSession(http.HandlerFunc(StartDrain)))
+	mux.Handle("DELETE /api/daemon/drain", s.secMid.WrapBoardSession(http.HandlerFunc(CancelDrain)))
+
 	// Tasks REST API
 	if s.opts.DB != nil {
 		tasksH := NewTasksHandler(s.opts.DB, s.hub)

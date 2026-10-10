@@ -218,11 +218,21 @@ func runDaemon(ctx context.Context) error {
 	// Breaker and quota alerts reach the Board through board_alerts (STA-705).
 	telemetry.SetAlertSink(telemetry.DBAlertSink(dbStore.DB()))
 	defer telemetry.SetAlertSink(nil)
+	clearDrainStatusFile(cfg.DataDir)
+	// Before any claim (task-db71fba9): stop agent CLIs the previous daemon
+	// left running and queue its unfinished runs to resume. Then the stale
+	// claim reset.
+	recoverLiveRuns(ctx, dbStore.DB(), cfg.HarnessRepoRoot)
 	_ = orchestrator.RecoveryScan(ctx, dbStore.DB())
+
+	// serveCtx outlives the shutdown signal: live runs keep their MCP
+	// tools, the HTTP API and the other services until the drain is done.
+	serveCtx, stopServing := context.WithCancel(context.Background())
+	defer stopServing()
 
 	// 1. Start Rate Limit Notifier
 	notifier := telemetry.NewNotifier()
-	go notifier.Start(ctx)
+	go notifier.Start(serveCtx)
 	slog.Info("Rate limit monitoring active")
 
 	// 2. Start IPC listener (Unix socket on POSIX, named pipe on Windows).
@@ -231,11 +241,11 @@ func runDaemon(ctx context.Context) error {
 	go func() {
 		handleConn := func(conn net.Conn) {
 			defer conn.Close()
-			if err := mcpServer.Serve(ctx, conn, conn); err != nil {
+			if err := mcpServer.Serve(serveCtx, conn, conn); err != nil {
 				slog.Debug("IPC connection closed", slog.Any("error", err))
 			}
 		}
-		if err := ipc.Listen(ctx, socketPath, handleConn); err != nil && ctx.Err() == nil {
+		if err := ipc.Listen(serveCtx, socketPath, handleConn); err != nil && serveCtx.Err() == nil {
 			slog.Warn("IPC listener exited", slog.Any("error", err))
 		}
 	}()
@@ -306,7 +316,7 @@ func runDaemon(ctx context.Context) error {
 		hub := httpServer.Hub()
 		repoChecker.Publish = func(eventType string, data any) { hub.Publish(eventType, data) }
 	}
-	go repoChecker.Run(ctx, 10*time.Minute, func() ([]repoaccess.Target, error) {
+	go repoChecker.Run(serveCtx, 10*time.Minute, func() ([]repoaccess.Target, error) {
 		return repoaccess.RepoTargets(dbStore.DB(), cfg.HarnessRepoRoot)
 	})
 
@@ -314,7 +324,9 @@ func runDaemon(ctx context.Context) error {
 	// HarnessRepoRoot comes from STAYPOINT_REPO_ROOT env or harness_repo_root config key.
 	// work_repo_root is intentionally NOT used here — it belongs to billing/bridge.
 	orchestrator.GlobalRunControl.SetDB(dbStore.DB())
-	wireRunQueue(ctx, runLimitsFrom(cfg), httpServer)
+	orchestrator.GlobalRunSlots.Store = orchestrator.SQLQueueStore{DB: dbStore.DB()}
+	wireRunQueue(serveCtx, runLimitsFrom(cfg), httpServer)
+	go writeDrainStatusFile(serveCtx, cfg.DataDir, orchestrator.GlobalRunSlots)
 	setTurnLimits(cfg)
 
 	repoRoot := cfg.HarnessRepoRoot
@@ -324,29 +336,27 @@ func runDaemon(ctx context.Context) error {
 		wireOnWake(dbStore, repoRoot, httpServer, nil)
 		slog.Info("agent wake dispatcher wired", slog.String("repo_root", repoRoot))
 	}
-
-	// Shutdown: drain in-flight harness runs before closing HTTP server and DB.
-	go func() {
-		<-ctx.Done()
-
-		drainDone := make(chan struct{})
-		go func() { orchestrator.GlobalDispatcher.Drain(); close(drainDone) }()
-		select {
-		case <-drainDone:
-		case <-time.After(30 * time.Second):
-			slog.Warn("harness drain timeout; some runs may be incomplete")
-		}
-
-		if httpServer != nil {
-			shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			_ = httpServer.Shutdown(shutCtx)
-		}
-		// dbStore closed by defer above once runDaemon returns.
-	}()
+	// The queue the previous daemon left (STA-846), including the runs it
+	// suspended for a deploy, starts once runs can be dispatched.
+	restoreRunQueue(ctx, dbStore.DB(), orchestrator.GlobalRunSlots)
 
 	slog.Info("Background daemon ready and running")
-	return watcher.Start(ctx)
+	err = watcher.Start(ctx)
+
+	// Shutdown (SIGTERM from launchd or a deploy): stop claiming, suspend
+	// live runs at their next turn boundary, and wait for them before the
+	// HTTP server, the MCP socket and the DB go away (STA-832). There is no
+	// time limit here: launchd's ExitTimeOut is the backstop, and a run it
+	// cuts off is resumed by the next daemon.
+	drainForShutdown(orchestrator.GlobalRunSlots, orchestrator.GlobalDispatcher, shutdownPoll)
+	stopServing()
+	if httpServer != nil {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutCtx)
+	}
+	clearDrainStatusFile(cfg.DataDir)
+	return err
 }
 
 // wireOnWake assigns GlobalDispatcher.OnWake so every Wake call launches a
@@ -379,6 +389,13 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 				slog.String("task", taskID), slog.Any("error", err))
 			// A queued run whose task is gone must not hold its queue place.
 			orchestrator.GlobalRunSlots.Dequeue(taskID)
+			return
+		}
+		// Draining for a deploy (task-db71fba9): queue the run, persisted,
+		// before anything is spent on it (a Gemini code approval, a route).
+		// Claim refuses it too, so a drain that starts later still queues it.
+		if orchestrator.GlobalRunSlots.Drain() != orchestrator.DrainOff {
+			queueRun(h, taskID, reason, orchestrator.WaitDrain)
 			return
 		}
 		// Respect pacer locks per pool (STA-773): a run whose whole provider
@@ -521,6 +538,13 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 				// parallel slots this no longer hits the global cap first; it must
 				// stay quiet and not post an error state over the live run.
 				slog.Info("run refused: task already running", slog.String("task", taskID))
+				return
+			}
+			if errors.Is(runErr, orchestrator.ErrAgentStillRunning) {
+				// An earlier run's agent is still in the worktree; the harness
+				// posted why. Do not queue: it would retry against the same agent.
+				orchestrator.GlobalRunSlots.Dequeue(taskID)
+				sr.EmitMessage("Run not started", runErr.Error(), "error")
 				return
 			}
 			if errors.Is(runErr, orchestrator.ErrOrgHeld) {
