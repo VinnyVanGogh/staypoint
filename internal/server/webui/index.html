@@ -67,6 +67,9 @@
       <button class="sidebar-item" data-view="gates">
         <span class="sidebar-icon">&#9874;</span>Gates<span id="gates-badge" class="sidebar-badge" style="display:none;"></span>
       </button>
+      <button class="sidebar-item" data-view="board-plans">
+        <span class="sidebar-icon">&#9998;</span>Board Plans<span id="board-plans-badge" class="sidebar-badge" style="display:none;"></span>
+      </button>
       <button class="sidebar-item" data-view="pull-requests">
         <span class="sidebar-icon">&#8645;</span>Pull Requests
       </button>
@@ -703,6 +706,16 @@
       <div id="prs-container" class="prs-container"></div>
     </section>
 
+    <section id="view-board-plans" class="view">
+      <div class="view-header">
+        <div class="view-title-group">
+          <h1 class="view-title">Board Action Plans</h1>
+          <span class="refresh-indicator">Batches of Board actions proposed by a Board session — review, untick, sign once with Touch ID</span>
+        </div>
+      </div>
+      <div id="board-plans-container" class="board-plans-container"></div>
+    </section>
+
     <section id="view-gates" class="view">
       <div class="view-header">
         <div class="view-title-group">
@@ -869,6 +882,8 @@
 <script src="/ui/lib/livestream.js"></script>
 <!-- gates.js before app.js: app.js boot() may open /gates straight away. -->
 <script src="/ui/gates.js"></script>
+<!-- boardplans.js before app.js: boot() may open /board/plans/<id> at once. -->
+<script src="/ui/boardplans.js"></script>
 <script src="/ui/app.js"></script>
 </body>
 </html>

@@ -94,6 +94,8 @@ func TestRegisterUIRoutes_SPARoutes(t *testing.T) {
 		"/tasks/RES/research/RES-42",
 		"/tasks/STA/STA-168",
 		"/tasks/6f1222f9-85c6-4155-94c4-3867c2472b2d",
+		"/board/plans",
+		"/board/plans/plan-1a2b3c4d",
 	}
 
 	for _, route := range routes {

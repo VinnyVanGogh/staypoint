@@ -374,3 +374,32 @@ func TestBoardPlan_ApproveMergeRunsThroughShipReview(t *testing.T) {
 		t.Fatalf("per-task route without assertion: want 403, got %d %s", status, raw)
 	}
 }
+
+// Discarding a plan runs nothing, clears its alert and stops it being signed.
+func TestBoardPlan_DiscardRunsNothing(t *testing.T) {
+	f := newPlanFixture(t)
+	id := f.propose(sendBack(f.taskID, "never sent"))
+	openAlerts := func() int {
+		var n int
+		_ = f.db.QueryRow(`SELECT COUNT(*) FROM board_alerts WHERE dedupe_key = ? AND acknowledged_at IS NULL`, "board_plan:"+id).Scan(&n)
+		return n
+	}
+	if n := openAlerts(); n != 1 {
+		t.Fatalf("want one open alert for the proposed plan, got %d", n)
+	}
+	if status, raw, _ := f.do("POST", "/api/board/plans/"+id+"/discard", nil, false, nil); status != http.StatusForbidden {
+		t.Fatalf("discard without Board session: want 403, got %d %s", status, raw)
+	}
+	if status, raw, _ := f.do("POST", "/api/board/plans/"+id+"/discard", nil, true, nil); status != http.StatusOK {
+		t.Fatalf("discard: %d %s", status, raw)
+	}
+	if n := openAlerts(); n != 0 {
+		t.Fatal("alert still open after discard")
+	}
+	if status, raw, _ := f.do("POST", "/api/board/plans/"+id+"/challenge", map[string]any{"selected": []int{0}}, true, nil); status != http.StatusConflict {
+		t.Fatalf("challenge on discarded plan: want 409, got %d %s", status, raw)
+	}
+	if got := f.cardStatus(); got != "pending" {
+		t.Fatalf("card %q after discard", got)
+	}
+}

@@ -172,6 +172,18 @@ func Acknowledge(db *sql.DB, id int64) error {
 	return nil
 }
 
+// AcknowledgeKey dismisses the open alert with dedupeKey, if any, once the
+// thing it asked for is dealt with.
+func AcknowledgeKey(db *sql.DB, dedupeKey string) error {
+	_, err := db.Exec(
+		`UPDATE board_alerts SET acknowledged_at = ? WHERE dedupe_key = ? AND acknowledged_at IS NULL`,
+		formatTime(time.Now()), dedupeKey)
+	if err != nil {
+		return fmt.Errorf("alerts: acknowledge key: %w", err)
+	}
+	return nil
+}
+
 func query(db *sql.DB, q string, args ...any) ([]Alert, error) {
 	rows, err := db.Query(q, args...)
 	if err != nil {

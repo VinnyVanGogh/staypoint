@@ -217,17 +217,20 @@ function arrayBufferToBase64url(buf) {
 // navigator.credentials.get(), and returns { sessionToken, assertion } ready
 // to attach as X-WebAuthn-Session / X-WebAuthn-Assertion headers.
 // Throws with { needsEnrollment: true } on 412 (no credentials registered).
-async function boardWebAuthnGetAssertion() {
-  const cr = await fetch('/api/board/webauthn/challenge', {
+// challengeUrl/body let a Board action plan ask for a challenge bound to its
+// selected rows (boardplans.js); the default is the ordinary Board challenge.
+async function boardWebAuthnGetAssertion(challengeUrl = '/api/board/webauthn/challenge', body = undefined) {
+  const cr = await fetch(challengeUrl, {
     method: 'POST',
-    headers: authHeader(),
+    headers: body ? { ...authHeader(), 'Content-Type': 'application/json' } : authHeader(),
+    body,
   });
   if (cr.status === 412) {
     const err = new Error('board_passkey_enrollment_required');
     err.needsEnrollment = true;
     throw err;
   }
-  if (!cr.ok) throw new Error(`challenge failed: ${cr.status}`);
+  if (!cr.ok) throw new Error(`challenge failed: ${(await boardActionError(cr)).message}`);
   const sessionToken = cr.headers.get('X-WebAuthn-Session');
   const opts = await cr.json();
 
@@ -896,6 +899,13 @@ function handleEvent(evt) {
     loadOrgHolds();
     return;
   }
+  if (type === 'board_plan_proposed' || type === 'board_plan_executed') {
+    updateBoardPlansBadge();
+    if (document.getElementById('view-board-plans')?.classList.contains('active') && !boardPlansState.running) {
+      renderBoardPlansPage();
+    }
+    return;
+  }
   if (type === 'security_gate_decided' && evt.data) {
     updateGatesBadge();
     if (document.getElementById('view-gates')?.classList.contains('active')) {
@@ -1047,6 +1057,10 @@ document.getElementById('sidebar-toggle')?.addEventListener('click', () => {
 function viewToPath(viewName, orgName) {
   if (orgName) return `/org/${encodeURIComponent(orgName)}`;
   if (!viewName || viewName === 'overview') return '/';
+  if (viewName === 'board-plans') {
+    const id = boardPlansState.planId;
+    return id ? `/board/plans/${encodeURIComponent(id)}` : '/board/plans';
+  }
   return `/${viewName}`;
 }
 
@@ -1256,6 +1270,12 @@ function pathToRoute(pathname) {
   if (p === '/tasks' || p === '/issues') {
     return { view: 'recent-tasks', org: null, taskId: null };
   }
+  if (p === '/board/plans' || p.startsWith('/board/plans/')) {
+    const id = decodeURIComponent(p.slice('/board/plans/'.length)) || null;
+    if (id !== boardPlansState.planId) boardPlansState.selected = null;
+    boardPlansState.planId = id;
+    return { view: 'board-plans', org: null, taskId: null };
+  }
   const clean = p.replace(/^\//, '');
   return { view: clean, org: null, taskId: null };
 }
@@ -1300,6 +1320,7 @@ function navigateTo(viewName, orgName = null, pushHistory = true) {
     if (viewName === 'logs')         renderLogsPage();
     if (viewName === 'artifacts')    renderArtifactsPage();
     if (viewName === 'gates')        renderGatesPage();
+    if (viewName === 'board-plans')  renderBoardPlansPage();
     if (viewName === 'pull-requests') renderPullRequestsPage();
     if (viewName === 'boss') {
       renderBoss();

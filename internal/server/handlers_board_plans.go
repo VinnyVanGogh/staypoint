@@ -337,6 +337,7 @@ func (h *BoardPlansHandler) Execute(w http.ResponseWriter, r *http.Request) {
 	if err := boardplan.Finish(h.db, plan.ID, results); err != nil {
 		slog.Warn("board plan: record results", slog.String("plan", plan.ID), slog.String("error", err.Error()))
 	}
+	_ = alerts.AcknowledgeKey(h.db, "board_plan:"+plan.ID)
 	done, _ := boardplan.Get(h.db, plan.ID)
 	h.hub.Publish("board_plan_executed", map[string]any{"id": plan.ID})
 	writeJSON(w, map[string]any{"plan": done, "results": results})
@@ -353,6 +354,8 @@ func (h *BoardPlansHandler) Discard(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, err.Error())
 	default:
+		_ = alerts.AcknowledgeKey(h.db, "board_plan:"+r.PathValue("id"))
+		h.hub.Publish("board_plan_executed", map[string]any{"id": r.PathValue("id")})
 		writeJSON(w, map[string]string{"status": "discarded"})
 	}
 }

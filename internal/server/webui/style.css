@@ -5084,3 +5084,25 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .prs-draft { color: var(--muted, #888); font-size: 0.8rem; }
 .prs-status { white-space: pre-wrap; padding: 8px 12px; border-radius: 6px; background: var(--surface-2, rgba(127,127,127,0.12)); margin: 0 0 12px; }
 .prs-status-error, .prs-error { color: var(--red, #dc2626); }
+
+/* Board action plans (task-e1b24d66) */
+.board-plans-container { padding: 0 4px 24px; }
+.board-plan-header { display: flex; align-items: center; gap: 12px; margin: 12px 0 4px; }
+.board-plan-title { font-size: 18px; margin: 0; }
+.board-plan-status { font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; }
+.board-plan-status-pending { color: var(--amber, #f59e0b); }
+.board-plan-status-executed { color: var(--green, #3fb950); }
+.board-plan-status-executing { color: var(--accent-light, #a78bfa); }
+.board-plan-status-discarded { color: var(--muted); }
+.board-plan-table { margin-top: 12px; }
+.board-plan-action { font-weight: 600; white-space: nowrap; }
+.board-plan-text {
+  white-space: pre-wrap; word-break: break-word; margin: 4px 0; padding: 8px;
+  background: var(--surface2, #161b22); border: 1px solid var(--border, #30363d);
+  border-radius: var(--radius, 6px); font-size: 12px; max-height: 240px; overflow: auto;
+}
+.board-plan-head { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; }
+.board-plan-problem { color: var(--amber, #f59e0b); font-size: 12px; margin-top: 4px; }
+.board-plan-actions { display: flex; align-items: center; gap: 12px; margin-top: 16px; flex-wrap: wrap; }
+.board-plan-sign-btn { padding: 8px 16px; font-size: 13px; }
+.board-plan-error { color: var(--red, #f85149); margin-top: 8px; font-size: 13px; }
