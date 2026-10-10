@@ -339,6 +339,82 @@ func (a GHAuth) findOpenPR(ctx context.Context, branch string) (*PRInfo, error) 
 	return nil, nil
 }
 
+// AlreadyMergedError is OpenOrUpdatePR finding the pinned head already in the
+// target branch: there is nothing left to open a PR for.
+type AlreadyMergedError struct {
+	Target string
+	// TargetSHA is the commit that brought the head into Target: the merged
+	// PR's merge commit when GitHub has one, else origin/<Target>'s tip.
+	TargetSHA string
+	// PR is the merged same-repo PR for the branch, nil when none was found.
+	PR *PRInfo
+}
+
+func (e *AlreadyMergedError) Error() string {
+	if e.PR != nil {
+		return fmt.Sprintf("already merged into %s (PR #%d)", e.Target, e.PR.Number)
+	}
+	return "already merged into " + e.Target
+}
+
+// alreadyMerged reports whether card.HeadSHA has already landed in base:
+// it is an ancestor of origin/<base> after a fresh fetch, or (when GitHub
+// refused the PR as empty) a merged PR for the branch had exactly this head.
+// nil means not merged, or that it could not be shown.
+func (a GHAuth) alreadyMerged(ctx context.Context, card *Card, base string, ghSaysEmpty bool) *AlreadyMergedError {
+	if validateBranch(base) != nil {
+		return nil
+	}
+	remote := "refs/remotes/origin/" + base
+	_, _ = a.git(ctx, "fetch", "--quiet", "origin", "+refs/heads/"+base+":"+remote)
+	tip, err := a.git(ctx, "rev-parse", "--verify", "--quiet", remote+"^{commit}")
+	inTarget := err == nil && tip != ""
+	if inTarget {
+		_, err = a.git(ctx, "merge-base", "--is-ancestor", card.HeadSHA, tip)
+		inTarget = err == nil
+	}
+	if !inTarget && !ghSaysEmpty {
+		return nil
+	}
+	pr := a.findMergedPR(ctx, card.Branch, base, card.HeadSHA, inTarget)
+	if !inTarget && pr == nil {
+		return nil
+	}
+	res := &AlreadyMergedError{Target: base, TargetSHA: tip, PR: pr}
+	if pr != nil && pr.MergeCommit != nil && pr.MergeCommit.Oid != "" {
+		res.TargetSHA = pr.MergeCommit.Oid
+	}
+	return res
+}
+
+// findMergedPR returns the merged same-repo PR from branch into base, or nil.
+// One whose head is exactly head wins; with anyHead a later head (the branch
+// moved on, e.g. to a merge commit, before it was merged) also counts.
+func (a GHAuth) findMergedPR(ctx context.Context, branch, base, head string, anyHead bool) *PRInfo {
+	out, err := a.gh(ctx, "pr", "list", "--head", branch, "--base", base, "--state", "merged", "--json", prViewFields, "--limit", "20")
+	if err != nil {
+		return nil
+	}
+	var prs []PRInfo
+	if json.Unmarshal([]byte(out), &prs) != nil {
+		return nil
+	}
+	var fallback *PRInfo
+	for i := range prs {
+		p := &prs[i]
+		if p.IsCrossRepository || p.HeadRefName != branch || p.BaseRefName != base || p.State != "MERGED" {
+			continue
+		}
+		if p.HeadRefOid == head {
+			return p
+		}
+		if anyHead && fallback == nil {
+			fallback = p
+		}
+	}
+	return fallback
+}
+
 var prURLNumberRe = regexp.MustCompile(`/pull/(\d+)\s*$`)
 
 // defaultBranch is the repo's default branch on GitHub.
@@ -415,6 +491,17 @@ func OpenOrUpdatePR(ctx context.Context, a GHAuth, card *Card, force bool) (*PRI
 	if cur != card.HeadSHA {
 		return nil, ErrHeadMoved
 	}
+	base := card.TargetBranch
+	if base == "" {
+		if base, err = a.defaultBranch(ctx); err != nil {
+			return nil, fmt.Errorf("default branch: %w", err)
+		}
+	}
+	// Checked before the push: a branch already merged on origin may point at
+	// the merge commit, and a force push would rewind it to the pinned head.
+	if merged := a.alreadyMerged(ctx, card, base, false); merged != nil {
+		return nil, merged
+	}
 	if err := a.pushHead(ctx, card.Branch, card.HeadSHA, force); err != nil {
 		return nil, fmt.Errorf("push %s: %w", card.Branch, err)
 	}
@@ -427,15 +514,16 @@ func OpenOrUpdatePR(ctx context.Context, a GHAuth, card *Card, force bool) (*PRI
 			pr.Number, pr.BaseRefName, card.TargetBranch)
 	}
 	if pr == nil {
-		base := card.TargetBranch
-		if base == "" {
-			if base, err = a.defaultBranch(ctx); err != nil {
-				return nil, fmt.Errorf("default branch: %w", err)
-			}
-		}
 		out, err := a.gh(ctx, "pr", "create", "--head", card.Branch, "--base", base,
 			"--title", prTitle(ctx, a, card), "--body", prBody(card))
 		if err != nil {
+			// GitHub saw nothing to merge although the ancestry check above
+			// passed (stale fetch, squash merge): report it as merged if it is.
+			if strings.Contains(err.Error(), "No commits between") {
+				if merged := a.alreadyMerged(ctx, card, base, true); merged != nil {
+					return nil, merged
+				}
+			}
 			return nil, fmt.Errorf("gh pr create: %w", err)
 		}
 		// Take the PR gh just created by its URL, not by a second branch lookup.
@@ -587,6 +675,17 @@ func MarkPRApproved(db *sql.DB, cardID, head string) error {
 		UPDATE ship_review_cards
 		SET status = 'approved', approved_sha = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 		WHERE id = ?`, head, cardID)
+	return err
+}
+
+// MarkAlreadyMerged closes a card whose head Approve found already in the
+// target: mainSHA is the commit that landed it there.
+func MarkAlreadyMerged(db *sql.DB, cardID, head, mainSHA string) error {
+	_, err := db.Exec(`
+		UPDATE ship_review_cards
+		SET status = 'approved', approved_sha = ?, main_sha = ?, pr_merge_error = '',
+		    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		WHERE id = ?`, head, mainSHA, cardID)
 	return err
 }
 

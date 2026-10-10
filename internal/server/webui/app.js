@@ -8832,6 +8832,22 @@ function renderFinalShipReviewCard(taskId, headSHA, status, mainSHA, rejectComme
     shaRow.appendChild(el('code', 'ship-review-sha ship-review-sha--main', mainSHA.slice(0, 12)));
   }
   section.appendChild(shaRow);
+  if (status === 'approved' && cleanup && cleanup.already_merged) {
+    const am = cleanup.already_merged;
+    const amRow = el('div', 'ship-review-row ship-review-already-merged');
+    amRow.appendChild(el('span', 'ship-review-row-label', 'Already merged'));
+    if (am.pr_url) {
+      const a = el('a', 'ship-review-already-merged-text', am.message);
+      a.href = am.pr_url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      amRow.appendChild(a);
+    } else {
+      amRow.appendChild(el('span', 'ship-review-already-merged-text', am.message));
+    }
+    if (am.next_step) amRow.appendChild(el('span', 'ship-review-already-merged-next', ` Next: ${am.next_step}`));
+    section.appendChild(amRow);
+  }
   if (status === 'approved' && cleanup && cleanup.pr_number > 0) {
     section.appendChild(renderPRStatusSection(taskId, cleanup));
   }
@@ -9812,6 +9828,16 @@ function renderShipReviewCardFromData(container, taskId, card) {
         }
         if (!r.ok) throw await boardActionError(r);
         const result = await r.json();
+        if (result.already_merged) {
+          clearShipReviewHeaderActions(taskId);
+          section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', result.main_sha || '', '', {
+            branch: card.branch,
+            target_branch: result.target || card.target_branch,
+            already_merged: { message: result.message || '', next_step: result.next_step || '', pr_url: result.pr_url || '' },
+            test_task: result.test_task,
+          }));
+          return;
+        }
         if (result.merge_mode === 'open_pr' || result.merge_mode === 'pr_merge') {
           clearShipReviewHeaderActions(taskId);
           if (result.merge_mode === 'open_pr') {
