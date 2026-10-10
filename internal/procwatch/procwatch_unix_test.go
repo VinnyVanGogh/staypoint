@@ -79,3 +79,49 @@ func TestVerifyAndStopGroup(t *testing.T) {
 		t.Fatal("stopped group still verifies as alive")
 	}
 }
+
+// Board review item 7: ps failing for a live leader (it printed nothing) is
+// not "no such process". Taking it as gone would let StopGroup signal
+// whatever app now leads that group.
+func TestVerify_LeaderAliveButUnreadableIsUnverified(t *testing.T) {
+	cmd, at := startIn(t, t.TempDir(), true)
+	prev := procStart
+	procStart = func(int) (time.Time, bool, error) { return time.Time{}, false, nil }
+	t.Cleanup(func() { procStart = prev })
+	if ours, err := Verify(cmd.Process.Pid, at); err != ErrUnverified || ours {
+		t.Fatalf("Verify = %v, %v; want false, ErrUnverified", ours, err)
+	}
+}
+
+// Board review item 1: an exited but unreaped leader (a zombie) is not running.
+func TestPidRunning_ZombieIsDead(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	t.Cleanup(func() { _ = cmd.Wait() })
+	deadline := time.Now().Add(10 * time.Second)
+	for PidRunning(pid) {
+		if time.Now().After(deadline) {
+			t.Fatal("zombie still reported running")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !PidAlive(pid) {
+		t.Skip("zombie already reaped; kill(pid, 0) check not exercised")
+	}
+}
+
+// Board review item 3: a pid reused later is not ours; an earlier start
+// (ps rounds down to the second, the daemon records just after spawn) is.
+func TestVerify_OneSidedStartTime(t *testing.T) {
+	cmd, at := startIn(t, t.TempDir(), true)
+	pid := cmd.Process.Pid
+	if ours, err := Verify(pid, at.Add(10*time.Minute)); err != nil || !ours {
+		t.Fatalf("Verify(recorded after the real start) = %v, %v; want true", ours, err)
+	}
+	if ours, err := Verify(pid, at.Add(-10*time.Minute)); err != nil || ours {
+		t.Fatalf("Verify(process started after the record) = %v, %v; want false", ours, err)
+	}
+}

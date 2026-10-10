@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -127,5 +128,44 @@ func TestDrainStatusFile_WrittenWhileDrainingRemovedAfter(t *testing.T) {
 			t.Fatal("drain.json left after the drain ended")
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// Board review item 8: a run refused for a live agent in its worktree is
+// woken again once that agent exits, not dropped for good.
+func TestWakeWhenAgentExits_WakesAfterExit(t *testing.T) {
+	prev := orchestrator.GlobalDispatcher
+	t.Cleanup(func() { orchestrator.GlobalDispatcher = prev })
+	orchestrator.GlobalDispatcher = orchestrator.NewDispatcher()
+	woke := make(chan string, 1)
+	orchestrator.GlobalDispatcher.OnWake = func(id, _ string) { woke <- id }
+
+	var alive atomic.Bool
+	alive.Store(true)
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	go func() { _ = cmd.Wait(); alive.Store(false) }()
+	still := &orchestrator.AgentStillRunningError{PIDs: []int{pid}}
+	go wakeWhenAgentExits("task-w", "run_now", still, 20*time.Millisecond, time.Minute)
+
+	select {
+	case <-woke:
+		t.Fatal("woken while the agent still runs")
+	case <-time.After(200 * time.Millisecond):
+	}
+	_ = cmd.Process.Kill()
+	select {
+	case id := <-woke:
+		if id != "task-w" {
+			t.Fatalf("woke %q", id)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("not woken after the agent exited")
+	}
+	if !refusedBeforeStart(still) || refusedBeforeStart(os.ErrClosed) {
+		t.Fatal("refusedBeforeStart misclassifies")
 	}
 }

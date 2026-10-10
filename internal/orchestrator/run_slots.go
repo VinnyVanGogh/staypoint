@@ -188,6 +188,8 @@ type RunSlots struct {
 	Store QueueStore
 
 	drain drainState
+	// shutdown: the daemon is stopping; the drain cannot be cancelled.
+	shutdown bool
 }
 
 // GlobalRunSlots is the process-wide run limiter used by Harness when
@@ -291,13 +293,28 @@ func (s *RunSlots) Acquire(taskID string, key SlotKey) error {
 		return err
 	}
 	s.active[taskID] = key
-	changed := s.removeLocked(taskID)
+	// The persisted row stays until the run is live (Started): a daemon
+	// killed in between must still find the run.
+	changed := s.removeMemLocked(taskID)
 	q := s.snapshotLocked()
 	s.mu.Unlock()
 	if changed {
 		s.notify(q)
 	}
 	return nil
+}
+
+// Started drops taskID's persisted queue row once its run is recorded as
+// live (or was refused): unless the task was queued again meanwhile.
+func (s *RunSlots) Started(taskID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Store == nil || s.queuedLocked(taskID) {
+		return
+	}
+	if err := s.Store.DeleteQueued(taskID); err != nil {
+		slog.Warn("run queue: persist remove failed", slog.String("task", taskID), slog.Any("error", err))
+	}
 }
 
 // Release frees taskID's slot (no-op when it holds none) and pumps the queue.
@@ -354,6 +371,13 @@ func (s *RunSlots) Dequeue(taskID string) {
 	s.mu.Lock()
 	delete(s.dispatched, taskID)
 	changed := s.removeLocked(taskID)
+	if !changed && s.Store != nil {
+		// Acquire already took it off the in-memory queue; the row stays
+		// until the run is live, so drop it here too.
+		if err := s.Store.DeleteQueued(taskID); err != nil {
+			slog.Warn("run queue: persist remove failed", slog.String("task", taskID), slog.Any("error", err))
+		}
+	}
 	q := s.snapshotLocked()
 	s.mu.Unlock()
 	if changed {
@@ -482,14 +506,22 @@ func (s *RunSlots) queuedLocked(taskID string) bool {
 }
 
 func (s *RunSlots) removeLocked(taskID string) bool {
+	if !s.removeMemLocked(taskID) {
+		return false
+	}
+	if s.Store != nil {
+		if err := s.Store.DeleteQueued(taskID); err != nil {
+			slog.Warn("run queue: persist remove failed", slog.String("task", taskID), slog.Any("error", err))
+		}
+	}
+	return true
+}
+
+// removeMemLocked drops taskID from the in-memory queue only.
+func (s *RunSlots) removeMemLocked(taskID string) bool {
 	for i, q := range s.queue {
 		if q.TaskID == taskID {
 			s.queue = append(s.queue[:i:i], s.queue[i+1:]...)
-			if s.Store != nil {
-				if err := s.Store.DeleteQueued(taskID); err != nil {
-					slog.Warn("run queue: persist remove failed", slog.String("task", taskID), slog.Any("error", err))
-				}
-			}
 			return true
 		}
 	}

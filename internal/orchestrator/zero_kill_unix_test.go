@@ -83,7 +83,7 @@ func TestZeroKill_OrphanedAgentBlocksDuplicateThenIsStopped(t *testing.T) {
 	pid, started := startGroup(t, repo, `trap "" TERM; sleep 300`)
 	liveBegin(ctx, d, LiveRun{TaskID: "zk-o", RunID: "old-run", NextTurn: 3})
 	liveAgent(d, "zk-o", "old-run", pid, started)
-	_, _ = d.Exec(`UPDATE live_runs SET daemon_pid=1`) // the previous daemon's row
+	_, _ = d.Exec(`UPDATE live_runs SET daemon_pid=1, daemon_id='previous-daemon'`) // the previous daemon's row
 
 	s := useSlots(t, 9)
 	h := zkHarness(t, d, repo)
@@ -126,7 +126,7 @@ func TestZeroKill_ReusedPidIsNotKilled(t *testing.T) {
 	pid, _ := startGroup(t, t.TempDir(), "sleep 300")
 	liveBegin(ctx, d, LiveRun{TaskID: "zk-u", RunID: "old-run"})
 	liveAgent(d, "zk-u", "old-run", pid, time.Now().Add(-time.Hour)) // recorded start: an hour ago
-	_, _ = d.Exec(`UPDATE live_runs SET daemon_pid=1`)
+	_, _ = d.Exec(`UPDATE live_runs SET daemon_pid=1, daemon_id='previous-daemon'`)
 
 	rep := RecoverLiveRuns(ctx, d, nil)
 	if len(rep.Stopped) != 0 || len(rep.Unstopped) != 0 {
@@ -147,6 +147,11 @@ func TestZeroKill_UnrecordedAgentInWorktreeBlocksRun(t *testing.T) {
 	initGitRepo(t, repo)
 	d := zkDB(t)
 	zkTask(t, d, "zk-h", repo)
+	// The database began recording agents after these agents started.
+	if _, err := d.Exec(`UPDATE schema_migrations SET applied_at=? WHERE version=47`,
+		time.Now().Add(time.Hour).UTC().Format("2006-01-02T15:04:05.000Z")); err != nil {
+		t.Fatal(err)
+	}
 	wt := filepath.Join(repo, ".worktrees", "zk-h")
 	if err := os.MkdirAll(wt, 0o755); err != nil {
 		t.Fatal(err)
@@ -154,13 +159,13 @@ func TestZeroKill_UnrecordedAgentInWorktreeBlocksRun(t *testing.T) {
 	// Not an agent: headless, in the worktree, but no task marker.
 	startAgent(t, wt, "STAYPOINT_TASK_ID=zk-other")
 	time.Sleep(300 * time.Millisecond)
-	if got := agentsIn(wt, "zk-h"); len(got) != 0 {
+	if got := agentsIn(context.Background(), d, wt, "zk-h"); len(got) != 0 {
 		t.Fatalf("a process without the task's marker counted as its agent: %v", got)
 	}
 	startAgent(t, wt, "STAYPOINT_TASK_ID=zk-h") // the orphaned agent
 	useSlots(t, 9)
 	h := zkHarness(t, d, repo)
-	waitFor(t, "lsof to see the agent", func() bool { return len(agentsIn(wt, "zk-h")) > 0 })
+	waitFor(t, "lsof to see the agent", func() bool { return len(agentsIn(context.Background(), d, wt, "zk-h")) > 0 })
 
 	ran := false
 	_, err := h.Run(context.Background(), "zk-h", zkRunCfg(1, func(context.Context, string, string, []string, []string, io.Writer, io.Writer) error {
@@ -178,6 +183,10 @@ func TestZeroKill_UnrecordedAgentInWorktreeBlocksRun(t *testing.T) {
 // task-0e2d556c: the agent CLI exited but its turn never ended (its output
 // stayed open), which left the task "running" and Run Now refused. The turn
 // is ended after agentExitGrace and the slot is freed.
+//
+// This is the real shape (local-e478f754, Board review of 4136a01): a
+// grandchild holds the stdout pipe, so the adapter never reaches Wait and the
+// exited CLI stays an unreaped zombie, which kill(pid, 0) still reports alive.
 func TestZeroKill_DeadAgentTurnIsReaped(t *testing.T) {
 	prevGrace, prevPoll := agentExitGrace, agentExitPoll
 	agentExitGrace, agentExitPoll = 200*time.Millisecond, 50*time.Millisecond
@@ -190,21 +199,35 @@ func TestZeroKill_DeadAgentTurnIsReaped(t *testing.T) {
 	s := useSlots(t, 9)
 	h := zkHarness(t, d, repo)
 
-	dead := exec.Command("true")
-	if err := dead.Run(); err != nil {
-		t.Fatal(err)
-	}
 	var reaped bool
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		_, _ = h.Run(context.Background(), "zk-d", zkRunCfg(1, func(ctx context.Context, _, _ string, _, _ []string, _, _ io.Writer) error {
-			procwatch.Spawned(ctx, dead.Process.Pid) // an agent that already exited
+			// The CLI exits at once; its background child keeps stdout open.
+			cli := exec.Command("sh", "-c", "sleep 20 & exit 0")
+			cli.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			out, err := cli.StdoutPipe()
+			if err != nil {
+				return err
+			}
+			if err := cli.Start(); err != nil {
+				return err
+			}
+			pid := cli.Process.Pid
+			defer func() {
+				_ = syscall.Kill(-pid, syscall.SIGKILL)
+				_ = cli.Wait()
+			}()
+			procwatch.Spawned(ctx, pid)
+			read := make(chan struct{})
+			go func() { _, _ = io.Copy(io.Discard, out); close(read) }()
+			// No Wait until stdout closes, as the adapter does.
 			select {
 			case <-ctx.Done():
 				reaped = true
 				return ctx.Err()
-			case <-time.After(20 * time.Second):
+			case <-read:
 				return nil
 			}
 		}))

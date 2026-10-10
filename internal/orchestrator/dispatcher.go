@@ -14,6 +14,10 @@ type Dispatcher struct {
 	seenKeys map[string]time.Time
 	OnWake   func(taskID string, reason string)
 	wg       sync.WaitGroup // tracks in-flight OnWake goroutines
+	// closed is set by Close: later wakes run OnWake inline in the caller
+	// (the daemon is draining, so OnWake only queues the run) instead of
+	// in a goroutine nobody waits for.
+	closed bool
 }
 
 var GlobalDispatcher *Dispatcher
@@ -53,18 +57,38 @@ func (d *Dispatcher) Wake(taskID, reason, idempotencyKey string) {
 	}
 
 	slog.Info("wake dispatcher: waking agent", slog.String("task", taskID), slog.String("reason", reason))
-	if d.OnWake != nil {
-		d.wg.Add(1)
-		go func() {
-			defer d.wg.Done()
-			d.OnWake(taskID, reason)
-		}()
+	if d.OnWake == nil {
+		return
 	}
+	d.mu.Lock()
+	closed := d.closed
+	if !closed {
+		d.wg.Add(1) // under mu, so never after Drain's Wait began
+	}
+	d.mu.Unlock()
+	if closed {
+		d.OnWake(taskID, reason)
+		return
+	}
+	go func() {
+		defer d.wg.Done()
+		d.OnWake(taskID, reason)
+	}()
 }
 
 // Drain blocks until all in-flight OnWake goroutines have returned.
-// Call during daemon shutdown to avoid killing in-progress harness runs.
 func (d *Dispatcher) Drain() {
+	d.wg.Wait()
+}
+
+// Close is Drain for daemon shutdown: from now on a wake runs OnWake inline
+// in its caller (an HTTP handler httpServer.Shutdown waits for) rather than
+// in a goroutine started after the wait, which would write SQLite while the
+// database closes.
+func (d *Dispatcher) Close() {
+	d.mu.Lock()
+	d.closed = true
+	d.mu.Unlock()
 	d.wg.Wait()
 }
 

@@ -2,11 +2,15 @@ package orchestrator
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
@@ -100,12 +104,45 @@ const maxAutoResumes = 3
 // before SIGKILL.
 var orphanStopGrace = 10 * time.Second
 
+// daemonID identifies this daemon process start in live_runs. A pid does
+// not: the next daemon can get the old daemon's pid, and after a reboot the
+// old pid can belong to anything.
+var daemonID = newDaemonID()
+
+func newDaemonID() string {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("d%d-%d", os.Getpid(), time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+var (
+	selfStartOnce sync.Once
+	selfStart     time.Time
+)
+
+// daemonStartedAt is when this process started, as ps reports it (so a later
+// procwatch.SameProcess compares ps with ps), or now if ps cannot say.
+func daemonStartedAt() time.Time {
+	selfStartOnce.Do(func() {
+		if t, ok := procwatch.StartTime(os.Getpid()); ok {
+			selfStart = t
+		} else {
+			selfStart = time.Now()
+		}
+	})
+	return selfStart
+}
+
 // LiveRun is a live_runs row: a run the daemon is driving, or one its
 // previous daemon left behind.
 type LiveRun struct {
 	TaskID            string
 	RunID             string
 	DaemonPID         int
+	DaemonID          string
+	DaemonStartedAt   time.Time
 	AgentPID          int
 	AgentStartedAt    time.Time
 	Worktree          string
@@ -123,17 +160,20 @@ type LiveRun struct {
 
 const liveRunCols = `task_id, run_id, daemon_pid, agent_pid, agent_started_at, worktree, next_turn,
 	last_seen_comment_id, wake_reason, pre_checkpoint_id, pre_checkpoint_sha, checkpoint_sha,
-	state, board_paused, resumes, started_at`
+	state, board_paused, resumes, started_at, daemon_id, daemon_started_at`
 
 func scanLiveRun(sc interface{ Scan(...any) error }) (LiveRun, error) {
 	var r LiveRun
-	var agentAt, startedAt string
+	var agentAt, startedAt, daemonAt string
 	var paused int
 	err := sc.Scan(&r.TaskID, &r.RunID, &r.DaemonPID, &r.AgentPID, &agentAt, &r.Worktree, &r.NextTurn,
 		&r.LastSeenCommentID, &r.WakeReason, &r.PreCheckpointID, &r.PreCheckpointSHA, &r.CheckpointSHA,
-		&r.State, &paused, &r.Resumes, &startedAt)
+		&r.State, &paused, &r.Resumes, &startedAt, &r.DaemonID, &daemonAt)
 	if agentAt != "" {
 		r.AgentStartedAt = parseTS(agentAt)
+	}
+	if daemonAt != "" {
+		r.DaemonStartedAt = parseTS(daemonAt)
 	}
 	r.StartedAt = parseTS(startedAt)
 	r.BoardPaused = paused != 0
@@ -165,16 +205,18 @@ func liveBegin(ctx context.Context, db *sql.DB, r LiveRun) {
 	}
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO live_runs (`+liveRunCols+`, updated_at)
-		 VALUES (?, ?, ?, 0, '', ?, ?, ?, ?, ?, ?, '', 'running', ?, ?, ?, ?)
+		 VALUES (?, ?, ?, 0, '', ?, ?, ?, ?, ?, ?, '', 'running', ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(task_id) DO UPDATE SET
-		   run_id=excluded.run_id, daemon_pid=excluded.daemon_pid, agent_pid=0, agent_started_at='',
+		   run_id=excluded.run_id, daemon_pid=excluded.daemon_pid,
+		   daemon_id=excluded.daemon_id, daemon_started_at=excluded.daemon_started_at,
+		   agent_pid=0, agent_started_at='',
 		   worktree=excluded.worktree, next_turn=excluded.next_turn,
 		   last_seen_comment_id=excluded.last_seen_comment_id, wake_reason=excluded.wake_reason,
 		   pre_checkpoint_id=excluded.pre_checkpoint_id, pre_checkpoint_sha=excluded.pre_checkpoint_sha,
 		   checkpoint_sha='', state='running', board_paused=excluded.board_paused,
 		   resumes=excluded.resumes, started_at=excluded.started_at, updated_at=excluded.updated_at`,
 		r.TaskID, r.RunID, os.Getpid(), r.Worktree, r.NextTurn, r.LastSeenCommentID, r.WakeReason,
-		r.PreCheckpointID, r.PreCheckpointSHA, paused, r.Resumes, now, now,
+		r.PreCheckpointID, r.PreCheckpointSHA, paused, r.Resumes, now, daemonID, fmtTS(daemonStartedAt()), now,
 	); err != nil {
 		slog.Warn("live run: record failed; a restart could not find this run's agent",
 			slog.String("task", r.TaskID), slog.Any("error", err))
@@ -205,6 +247,23 @@ func liveAgent(db *sql.DB, taskID, runID string, pid int, startedAt time.Time) {
 	_, _ = db.ExecContext(ctx,
 		`UPDATE live_runs SET agent_pid=?, agent_started_at=?, updated_at=? WHERE task_id=? AND run_id=?`,
 		pid, fmtTS(startedAt), fmtTS(time.Now()), taskID, runID)
+}
+
+// livePaused records whether the Board has the run paused, so a daemon that
+// dies while the run waits for Resume does not restart it on its own.
+func livePaused(db *sql.DB, taskID, runID string, paused bool) {
+	if db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	v := 0
+	if paused {
+		v = 1
+	}
+	_, _ = db.ExecContext(ctx,
+		`UPDATE live_runs SET board_paused=?, updated_at=? WHERE task_id=? AND run_id=?`,
+		v, fmtTS(time.Now()), taskID, runID)
 }
 
 // liveSuspend marks a run suspended at a turn boundary: the next daemon
@@ -248,16 +307,76 @@ func liveEnd(db *sql.DB, taskID, runID string) {
 // would have two agents editing one checkout (task-ae1414b0).
 var ErrAgentStillRunning = errors.New("an agent from an earlier run is still running in this task's worktree")
 
+// AgentStillRunningError is the ErrAgentStillRunning a refused Run returns.
+// It names what to wait for: the recorded process group, or the pids found
+// in the worktree. The caller starts the run again once they are gone.
+type AgentStillRunningError struct {
+	PGID int   // recorded agent process group, or 0
+	PIDs []int // agent processes found in the worktree
+}
+
+func (e *AgentStillRunningError) Error() string { return ErrAgentStillRunning.Error() }
+func (e *AgentStillRunningError) Is(target error) bool {
+	return target == ErrAgentStillRunning
+}
+
+// Gone reports whether everything e waits for has exited.
+func (e *AgentStillRunningError) Gone() bool {
+	if e.PGID > 0 && procwatch.GroupAlive(e.PGID) {
+		return false
+	}
+	for _, p := range e.PIDs {
+		if procwatch.PidRunning(p) {
+			return false
+		}
+	}
+	return true
+}
+
+// ownedByLiveProcess reports whether r is driven by a process still running:
+// this daemon, or another one (a `staypoint run` CLI). A live pid that
+// started after the row's owner did is a reused pid, not the owner.
+func ownedByLiveProcess(r *LiveRun) bool {
+	if r.DaemonID != "" && r.DaemonID == daemonID {
+		return true
+	}
+	if r.DaemonID == "" && r.DaemonPID == os.Getpid() {
+		return true // row from a build before daemon_id: the old rule
+	}
+	return r.DaemonPID > 1 && r.DaemonPID != os.Getpid() && procwatch.SameProcess(r.DaemonPID, r.DaemonStartedAt)
+}
+
 // previousAgentAlive reports whether taskID's live_runs row, left by an
 // earlier daemon, names an agent process group that is still running (or
 // alive and unverifiable, which counts as running).
 func previousAgentAlive(ctx context.Context, db *sql.DB, taskID string) (int, bool) {
 	r := liveRun(ctx, db, taskID)
-	if r == nil || r.AgentPID <= 0 || r.DaemonPID == os.Getpid() {
+	if r == nil || r.AgentPID <= 0 || r.DaemonID == daemonID {
 		return 0, false
 	}
 	ours, err := procwatch.Verify(r.AgentPID, r.AgentStartedAt)
 	return r.AgentPID, ours || err != nil
+}
+
+// recordingSince is when this database started recording agent processes in
+// live_runs (migration 47). An agent started since then is recorded, so the
+// worktree scan (agentsIn) only counts processes older than that: anything
+// newer that is still in a worktree is a leftover of a finished run (an MCP
+// or dev server), not an unrecorded agent. ok is false if it is unknown.
+func recordingSince(ctx context.Context, db *sql.DB) (time.Time, bool) {
+	if db == nil {
+		return time.Time{}, false
+	}
+	var at string
+	if err := db.QueryRowContext(ctx, `SELECT applied_at FROM schema_migrations WHERE version=47`).Scan(&at); err != nil || at == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{"2006-01-02T15:04:05.999Z", time.RFC3339Nano, "2006-01-02 15:04:05"} {
+		if t, err := time.Parse(layout, at); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // RecoveryReport says what RecoverLiveRuns did.
@@ -277,7 +396,7 @@ type RecoveryReport struct {
 // one).
 func RecoverLiveRuns(ctx context.Context, db *sql.DB, keyFor func(taskID string) SlotKey) RecoveryReport {
 	var rep RecoveryReport
-	rows, err := db.QueryContext(ctx, `SELECT `+liveRunCols+` FROM live_runs WHERE daemon_pid<>? ORDER BY started_at`, os.Getpid())
+	rows, err := db.QueryContext(ctx, `SELECT `+liveRunCols+` FROM live_runs WHERE daemon_id<>? ORDER BY started_at`, daemonID)
 	if err != nil {
 		slog.Error("live run recovery: read failed", slog.Any("error", err))
 		return rep
@@ -294,25 +413,28 @@ func RecoverLiveRuns(ctx context.Context, db *sql.DB, keyFor func(taskID string)
 	rows.Close()
 
 	for _, r := range runs {
-		if r.DaemonPID > 1 && procwatch.PidAlive(r.DaemonPID) {
+		if ownedByLiveProcess(&r) {
 			// Still driven by a live process (a `staypoint run` CLI, say):
 			// not left behind, not ours to stop or resume.
 			continue
 		}
 		note := ""
+		agentLeft := false
 		if r.AgentPID > 0 {
 			ours, verr := procwatch.Verify(r.AgentPID, r.AgentStartedAt)
 			switch {
 			case verr != nil:
 				rep.Unstopped = append(rep.Unstopped, r.TaskID)
-				note = fmt.Sprintf("An agent process group (pgid %d) from the previous daemon is still alive but could not be verified, so it was left running; this task will not start again until it exits.", r.AgentPID)
+				agentLeft = true
+				note = fmt.Sprintf("An agent process group (pgid %d) from the previous daemon is still alive but could not be verified, so it was left running. The run starts again on its own once that group exits.", r.AgentPID)
 			case ours:
 				if procwatch.StopGroup(r.AgentPID, orphanStopGrace) {
 					rep.Stopped = append(rep.Stopped, r.TaskID)
 					note = fmt.Sprintf("Stopped the agent (process group %d) the previous daemon left running in this task's worktree.", r.AgentPID)
 				} else {
 					rep.Unstopped = append(rep.Unstopped, r.TaskID)
-					note = fmt.Sprintf("The agent (process group %d) the previous daemon left running would not stop; this task will not start again until it exits.", r.AgentPID)
+					agentLeft = true
+					note = fmt.Sprintf("The agent (process group %d) the previous daemon left running would not stop. The run starts again on its own once it exits.", r.AgentPID)
 				}
 			}
 			slog.Warn("live run recovery: orphaned agent", slog.String("task", r.TaskID),
@@ -322,7 +444,11 @@ func RecoverLiveRuns(ctx context.Context, db *sql.DB, keyFor func(taskID string)
 		var stage string
 		_ = db.QueryRowContext(ctx, `SELECT execution_stage FROM tasks WHERE id=?`, r.TaskID).Scan(&stage)
 		if stage == "" || !governance.IsRunnableStage(stage) {
-			// Closed or parked while it ran: nothing to resume.
+			// Closed or parked while it ran: nothing to resume. Its kept
+			// worktree goes too, unless an agent is still in it.
+			if !agentLeft {
+				pruneLeftWorktree(ctx, db, r)
+			}
 			_, _ = db.ExecContext(ctx, `DELETE FROM live_runs WHERE task_id=?`, r.TaskID)
 			if note != "" {
 				postHarnessComment(ctx, db, r.TaskID, note)
@@ -368,6 +494,45 @@ func RecoverLiveRuns(ctx context.Context, db *sql.DB, keyFor func(taskID string)
 			slog.Any("resumed", rep.Resumed), slog.Any("held", rep.Held))
 	}
 	return rep
+}
+
+// pruneLeftWorktree removes the worktree a suspended or cut-off run kept,
+// once its task closed. Only a daemon-made worktree (<repo>/.worktrees/<task>)
+// is removed; a non-git task runs in its own folder, which is never touched.
+// The suspend checkpoint still holds the uncommitted work.
+func pruneLeftWorktree(ctx context.Context, db *sql.DB, r LiveRun) {
+	wt := filepath.Clean(r.Worktree)
+	if r.Worktree == "" || filepath.Base(wt) != r.TaskID || filepath.Base(filepath.Dir(wt)) != ".worktrees" {
+		return
+	}
+	if _, err := os.Stat(wt); err != nil {
+		return
+	}
+	repo := filepath.Dir(filepath.Dir(wt))
+	if err := newWorktreeManager(repo, db).PruneWorktreeDirContext(ctx, r.TaskID); err != nil {
+		slog.Warn("live run: could not remove a closed task's kept worktree",
+			slog.String("task", r.TaskID), slog.String("worktree", wt), slog.Any("error", err))
+		return
+	}
+	slog.Info("live run: removed a closed task's kept worktree", slog.String("task", r.TaskID), slog.String("worktree", wt))
+}
+
+// DropLeftRun forgets a run an earlier daemon left (suspended or cut off)
+// for a task that can no longer run (closed or parked): it removes the kept
+// worktree, unless that run's agent is still alive, and the live_runs row.
+// A run of a live process is left alone.
+func DropLeftRun(ctx context.Context, db *sql.DB, taskID string) {
+	r := liveRun(ctx, db, taskID)
+	if r == nil || ownedByLiveProcess(r) {
+		return
+	}
+	if r.AgentPID > 0 {
+		if ours, err := procwatch.Verify(r.AgentPID, r.AgentStartedAt); ours || err != nil {
+			return // recovery has not stopped it; keep the row so it is not forgotten
+		}
+	}
+	pruneLeftWorktree(ctx, db, *r)
+	_, _ = db.ExecContext(ctx, `DELETE FROM live_runs WHERE task_id=? AND run_id=?`, taskID, r.RunID)
 }
 
 // enqueueResume puts r first in line among later arrivals: it keeps the

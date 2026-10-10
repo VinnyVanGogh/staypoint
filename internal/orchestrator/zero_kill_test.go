@@ -335,7 +335,7 @@ func TestZeroKill_BoundarySuspendsAndNextDaemonResumes(t *testing.T) {
 	}
 
 	// The next daemon.
-	if _, err := d.Exec(`UPDATE live_runs SET daemon_pid=1`); err != nil {
+	if _, err := d.Exec(`UPDATE live_runs SET daemon_pid=1, daemon_id='previous-daemon'`); err != nil {
 		t.Fatal(err)
 	}
 	s2 := useSlots(t, 9)
@@ -428,7 +428,7 @@ func TestZeroKill_RecoveryHoldsPausedAndLoopingRuns(t *testing.T) {
 	}
 	_, _ = d.Exec(`UPDATE live_runs SET resumes=? WHERE task_id='zk-l'`, maxAutoResumes)
 	_, _ = d.Exec(`UPDATE tasks SET execution_stage='done' WHERE id='zk-c'`)
-	_, _ = d.Exec(`UPDATE live_runs SET daemon_pid=1`)
+	_, _ = d.Exec(`UPDATE live_runs SET daemon_pid=1, daemon_id='previous-daemon'`)
 
 	rep := RecoverLiveRuns(ctx, d, nil)
 	if len(rep.Resumed) != 0 || strings.Join(rep.Held, ",") != "zk-p,zk-l" && strings.Join(rep.Held, ",") != "zk-l,zk-p" {

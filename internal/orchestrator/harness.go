@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -393,17 +392,27 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		return nil, err
 	}
 	defer h.Release(taskID, runID)
+	// A queued run's persisted queue row outlives Acquire until the run's
+	// live_runs row exists (liveBegin), so a kill -9 in between loses
+	// neither. A run refused before that drops the row here; a caller that
+	// queues it again writes a new one.
+	live := false
+	defer func() {
+		if !live {
+			h.slots().Started(taskID)
+		}
+	}()
 
 	// Never two agents in one worktree (task-ae1414b0): an agent CLI an
 	// earlier daemon left running keeps the task from starting until it exits.
 	if pgid, alive := previousAgentAlive(ctx, h.DB, taskID); alive {
 		refuseSecondAgent(ctx, h.DB, taskID, fmt.Sprintf("the agent (process group %d) from the previous daemon", pgid))
-		return nil, ErrAgentStillRunning
+		return nil, &AgentStillRunningError{PGID: pgid}
 	}
 	// A run a deploy suspended, or a daemon restart cut off, resumes from
 	// the turn it stopped at, in its own worktree (task-db71fba9).
 	resume := liveRun(ctx, h.DB, taskID)
-	if resume != nil && resume.State == liveRunning && resume.DaemonPID == os.Getpid() {
+	if resume != nil && ownedByLiveProcess(resume) {
 		resume = nil
 	}
 
@@ -466,9 +475,9 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		// CreateContext force-removes an existing worktree. An agent still
 		// working there (one no live_runs row recorded) must not lose its
 		// checkout from under it, nor get a second agent beside it.
-		if pids := agentsIn(filepath.Join(repoPath, ".worktrees", taskID), taskID); len(pids) > 0 {
+		if pids := agentsIn(ctx, h.DB, filepath.Join(repoPath, ".worktrees", taskID), taskID); len(pids) > 0 {
 			refuseSecondAgent(ctx, h.DB, taskID, fmt.Sprintf("an agent started for this task (pid %v)", pids))
-			return nil, ErrAgentStillRunning
+			return nil, &AgentStillRunningError{PIDs: pids}
 		}
 
 		if resume != nil && worktreeOnBranch(ctx, resume.Worktree, "staypoint/"+taskID) {
@@ -523,6 +532,8 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			}
 		}
 		liveBegin(ctx, h.DB, lr)
+		live = true
+		h.slots().Started(taskID)
 		defer func() {
 			if !suspended {
 				liveEnd(h.DB, taskID, runID)
@@ -905,9 +916,10 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 				break
 			}
 
-			if guard.drained.Load() {
+			if guard.drained.Load() && turnErr != nil {
 				// An emergency drain cut this turn short: the next daemon
-				// redoes it from the worktree as it is now.
+				// redoes it from the worktree as it is now. A turn that
+				// finished anyway is kept; the run suspends before the next.
 				if stw, ok := stdout.(*stepTeeWriter); ok {
 					_ = stw.Close()
 				}
@@ -1120,6 +1132,9 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 					`UPDATE tasks SET execution_stage='paused', updated_at=? WHERE id=?`+closedStageGuard,
 					now, taskID,
 				)
+				// Recorded now, not only on suspend: a daemon that dies
+				// while the run waits must not resume it on its own.
+				livePaused(h.DB, taskID, runID, true)
 				runLog.Info("run paused after step", slog.Int("turn", turn))
 				// A drain that suspends runs also ends this wait: the run is
 				// suspended still paused, and resumes only on Run Now.
@@ -1143,6 +1158,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 					break
 				}
 				// Resumed — update execution_stage back to in_progress.
+				livePaused(h.DB, taskID, runID, false)
 				now = time.Now().UTC().Format(time.RFC3339Nano)
 				_, _ = h.DB.ExecContext(ctx,
 					`UPDATE tasks SET execution_stage='in_progress', updated_at=? WHERE id=?`+closedStageGuard,

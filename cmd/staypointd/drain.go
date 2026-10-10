@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -47,11 +48,12 @@ func restoreRunQueue(ctx context.Context, dbConn *sql.DB, slots *orchestrator.Ru
 	slots.Pump()
 }
 
-// drainForShutdown stops new claims, asks live runs to suspend at their next
-// turn boundary, and waits until none are left and every wake goroutine
-// has returned.
+// drainForShutdown stops new claims for good (the drain cannot be
+// cancelled), asks live runs to suspend at their next turn boundary, and
+// waits until none are left and every wake goroutine has returned. Wakes
+// after that only queue their run, inline in the caller.
 func drainForShutdown(slots *orchestrator.RunSlots, d *orchestrator.Dispatcher, poll time.Duration) {
-	st := slots.StartDrain(orchestrator.DrainBoundary)
+	st := slots.StartShutdownDrain(orchestrator.DrainBoundary)
 	if st.Live > 0 {
 		slog.Warn("shutdown: waiting for live runs to reach a turn boundary",
 			slog.Int("live", st.Live), slog.Any("tasks", st.LiveTasks))
@@ -68,8 +70,47 @@ func drainForShutdown(slots *orchestrator.RunSlots, d *orchestrator.Dispatcher, 
 		}
 		time.Sleep(poll)
 	}
-	d.Drain()
+	d.Close()
 	slog.Info("shutdown: no live runs", slog.Duration("waited", time.Since(start).Round(time.Millisecond)))
+}
+
+// refusedBeforeStart reports whether a Run error means the run was refused
+// before any agent started (capacity, drain, already running, a live agent
+// in the worktree, an org hold, or a stage that cannot run).
+func refusedBeforeStart(err error) bool {
+	for _, e := range []error{
+		orchestrator.ErrConcurrencyCap, orchestrator.ErrAlreadyClaimed, orchestrator.ErrAgentStillRunning,
+		orchestrator.ErrOrgHeld, orchestrator.ErrNotRunnable,
+	} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// How often, and for how long, a run refused for a live agent in its
+// worktree waits for that agent to exit before it is woken again.
+var (
+	agentExitWatchPoll = 5 * time.Second
+	agentExitWatchMax  = 24 * time.Hour
+)
+
+// wakeWhenAgentExits wakes taskID again once the agent that refused its run
+// (still) has exited, so a run refused for an orphan (one recovery could not
+// verify or stop, say) is not dropped for good. It gives up after max.
+func wakeWhenAgentExits(taskID, reason string, still *orchestrator.AgentStillRunningError, poll, max time.Duration) {
+	deadline := time.Now().Add(max)
+	for !still.Gone() {
+		if time.Now().After(deadline) {
+			slog.Warn("run refused for a live agent: gave up waiting for it to exit; press Run Now",
+				slog.String("task", taskID))
+			return
+		}
+		time.Sleep(poll)
+	}
+	slog.Info("agent in the worktree exited; starting the refused run", slog.String("task", taskID))
+	orchestrator.GlobalDispatcher.Wake(taskID, reason, "")
 }
 
 // drainStatusFileName is read by `staypoint statusline` (router.drainLine).

@@ -13,6 +13,12 @@ func GroupAlive(int) bool { return false }
 
 func PidAlive(int) bool { return false }
 
+// Supported is false: the harness must not act on these stubs (a turn guard
+// would read every agent as exited and cut its turn).
+const Supported = false
+
+func PidRunning(int) bool { return false }
+
 func signalGroup(int, bool) {}
 
 func leaderStart(int) (time.Time, bool, error) {

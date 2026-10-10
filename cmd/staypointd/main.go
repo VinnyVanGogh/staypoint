@@ -22,6 +22,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/db"
 	"github.com/VinnyVanGogh/staypoint/internal/decision"
 	"github.com/VinnyVanGogh/staypoint/internal/gates"
+	"github.com/VinnyVanGogh/staypoint/internal/geminiapproval"
 	"github.com/VinnyVanGogh/staypoint/internal/ipc"
 	"github.com/VinnyVanGogh/staypoint/internal/logging"
 	"github.com/VinnyVanGogh/staypoint/internal/mcp"
@@ -526,6 +527,14 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			StallTimeout:       turnLimits.stall,
 		})
 		if runErr != nil {
+			if codeGate.ApprovalID != "" && refusedBeforeStart(runErr) {
+				// No agent ran: the Board's one-run approval still covers
+				// the run that starts later (a drain queued this one).
+				if err := geminiapproval.Unconsume(dbStore.DB(), codeGate.ApprovalID, taskID, runID); err != nil {
+					slog.Warn("gemini-code gate: could not return an unused approval",
+						slog.String("task", taskID), slog.Any("error", err))
+				}
+			}
 			if errors.Is(runErr, orchestrator.ErrConcurrencyCap) {
 				// Refused for capacity (global cap or repo busy). No steps were
 				// emitted (wake/route come after Claim). Queue it so it starts on
@@ -542,9 +551,14 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			}
 			if errors.Is(runErr, orchestrator.ErrAgentStillRunning) {
 				// An earlier run's agent is still in the worktree; the harness
-				// posted why. Do not queue: it would retry against the same agent.
+				// posted why. Do not queue now (it would retry against the
+				// same agent); wake the task again once that agent exits.
 				orchestrator.GlobalRunSlots.Dequeue(taskID)
 				sr.EmitMessage("Run not started", runErr.Error(), "error")
+				var still *orchestrator.AgentStillRunningError
+				if errors.As(runErr, &still) {
+					go wakeWhenAgentExits(taskID, reason, still, agentExitWatchPoll, agentExitWatchMax)
+				}
 				return
 			}
 			if errors.Is(runErr, orchestrator.ErrOrgHeld) {
@@ -557,6 +571,9 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 				// Drop any queue place so it does not hold a slot.
 				slog.Info("run refused: task not runnable in its stage", slog.String("task", taskID))
 				orchestrator.GlobalRunSlots.Dequeue(taskID)
+				// A run suspended for a deploy whose task closed meanwhile:
+				// drop its kept worktree and record.
+				orchestrator.DropLeftRun(context.Background(), dbStore.DB(), taskID)
 				return
 			}
 			slog.Error("harness run failed", slog.String("task", taskID), slog.Any("error", runErr))

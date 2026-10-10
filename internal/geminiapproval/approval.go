@@ -180,6 +180,17 @@ func Consume(conn *sql.DB, gateID, taskID, runID string) error {
 	return nil
 }
 
+// Unconsume returns an approval runID consumed but never used: the run was
+// refused before any agent started (queued for a deploy drain, say), so the
+// approval still covers the run that starts later. Only runID's own use is
+// removed.
+func Unconsume(conn *sql.DB, gateID, taskID, runID string) error {
+	_, err := conn.Exec(
+		`DELETE FROM gemini_code_grant_uses WHERE gate_request_id=? AND task_id=? AND run_id=?`,
+		gateID, taskID, runID)
+	return err
+}
+
 // SessionApproved reports whether the Board approved Gemini code for an
 // interactive agy session in repo within the last MaxSessionHours. Work
 // repos are never approved.

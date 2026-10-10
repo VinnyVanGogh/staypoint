@@ -157,9 +157,24 @@ func (s *RunSlots) StartDrain(mode DrainMode) DrainStatus {
 	return st
 }
 
-// CancelDrain leaves drain mode and starts the queued runs that fit.
+// StartShutdownDrain is StartDrain(mode) for daemon shutdown: the drain can
+// no longer be cancelled, so every later wake only queues its run.
+func (s *RunSlots) StartShutdownDrain(mode DrainMode) DrainStatus {
+	s.mu.Lock()
+	s.shutdown = true
+	s.mu.Unlock()
+	return s.StartDrain(mode)
+}
+
+// CancelDrain leaves drain mode and starts the queued runs that fit. It does
+// nothing once the daemon is shutting down (StartShutdownDrain).
 func (s *RunSlots) CancelDrain() DrainStatus {
 	s.mu.Lock()
+	if s.shutdown {
+		st := s.drainStatusLocked()
+		s.mu.Unlock()
+		return st
+	}
 	old := s.drain
 	s.drain = drainState{}
 	if !isClosed(old.boundary) {

@@ -49,7 +49,12 @@ func (h *Harness) guardTurn(ctx context.Context, taskID, runID string, cancel co
 	g := &turnGuard{}
 	ctx = procwatch.WithSpawnHook(ctx, func(pid int) {
 		g.pid.Store(int64(pid))
-		liveAgent(h.DB, taskID, runID, pid, time.Now())
+		// The start time ps reports, so a later Verify compares ps with ps.
+		at, ok := procwatch.StartTime(pid)
+		if !ok {
+			at = time.Now()
+		}
+		liveAgent(h.DB, taskID, runID, pid, at)
 	})
 	nowCh := h.slots().DrainNowChan()
 	go func() {
@@ -61,12 +66,22 @@ func (h *Harness) guardTurn(ctx context.Context, taskID, runID string, cancel co
 			case <-ctx.Done():
 				return
 			case <-nowCh:
+				if ctx.Err() != nil {
+					return // the turn had already ended
+				}
 				g.drained.Store(true)
 				cancel()
 				return
 			case <-t.C:
+				if !procwatch.Supported {
+					// No process checks here (Windows): the stubs would
+					// read every agent as exited and cut its turn.
+					continue
+				}
 				pid := int(g.pid.Load())
-				if pid <= 0 || procwatch.PidAlive(pid) {
+				// A zombie (exited, not yet reaped because a grandchild
+				// holds its output open) counts as exited.
+				if pid <= 0 || procwatch.PidRunning(pid) {
 					goneSince = time.Time{}
 					continue
 				}
@@ -102,9 +117,13 @@ func worktreeOnBranch(ctx context.Context, dir, branch string) bool {
 }
 
 // agentsIn lists the agents for taskID still working in dir (see
-// procwatch.AgentsInDir). A failed check is logged and treated as none: the
-// recorded process groups in live_runs are the primary guard.
-func agentsIn(dir, taskID string) []int {
+// procwatch.AgentsInDir) that no live_runs row could have recorded: those
+// started before this database began recording agents (recordingSince).
+// Anything newer is either recorded (previousAgentAlive covers it) or a
+// leftover of a finished run, such as an MCP or dev server, which must not
+// block the task. A failed check is logged and treated as none: the recorded
+// process groups in live_runs are the primary guard.
+func agentsIn(ctx context.Context, db *sql.DB, dir, taskID string) []int {
 	if _, err := os.Stat(dir); err != nil {
 		return nil
 	}
@@ -114,14 +133,26 @@ func agentsIn(dir, taskID string) []int {
 			slog.String("dir", dir), slog.Any("error", err))
 		return nil
 	}
-	return pids
+	since, ok := recordingSince(ctx, db)
+	if !ok {
+		return pids
+	}
+	var old []int
+	for _, p := range pids {
+		// ps rounds start times down to the second.
+		if at, ok := procwatch.StartTime(p); !ok || at.Before(since.Truncate(time.Second)) {
+			old = append(old, p)
+		}
+	}
+	return old
 }
 
 // refuseSecondAgent records why a run did not start: an agent is still
-// running in the task's worktree.
+// running in the task's worktree. The wake path starts the run again once
+// it exits (AgentStillRunningError).
 func refuseSecondAgent(ctx context.Context, db *sql.DB, taskID, who string) {
 	msg := fmt.Sprintf("Run not started: %s is still running in this task's worktree, and two agents in one worktree overwrite each other's work. "+
-		"It is a leftover from an earlier run. Stop it (or wait for it to exit), then press Run Now.", who)
+		"It is a leftover from an earlier run. The run starts on its own once it exits; stop it to start sooner.", who)
 	slog.Warn("run refused: agent still running in worktree", slog.String("task", taskID), slog.String("agent", who))
 	// Claim moved the task to in_progress; with no run it must not stay there.
 	_, _ = db.ExecContext(ctx, `UPDATE tasks SET execution_stage='todo', updated_at=? WHERE id=? AND execution_stage='in_progress'`,

@@ -1604,6 +1604,27 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version: 48,
+		Name:    "live_runs_daemon_instance",
+		Up: func(conn *sql.DB) error {
+			// task-db71fba9 (Board review of 4136a01): a bare daemon pid
+			// does not identify a daemon. After a reboot the old pid can
+			// belong to anything, and the new daemon can get the old pid.
+			// daemon_id is random per daemon start; daemon_started_at is the
+			// process start time ps reported, to tell a live owner (a
+			// `staypoint run` CLI) from a reused pid.
+			for _, stmt := range []string{
+				`ALTER TABLE live_runs ADD COLUMN daemon_id TEXT NOT NULL DEFAULT ''`,
+				`ALTER TABLE live_runs ADD COLUMN daemon_started_at TEXT NOT NULL DEFAULT ''`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+					return err
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {

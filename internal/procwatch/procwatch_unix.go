@@ -32,6 +32,27 @@ func PidAlive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
+// Supported reports whether this platform can watch agent processes.
+const Supported = true
+
+// PidRunning reports whether process pid exists and has not exited. An
+// exited child its parent has not reaped yet (a zombie, ps stat "Z") counts
+// as exited: kill(pid, 0) still succeeds for it. If ps cannot say, pid
+// counts as running.
+func PidRunning(pid int) bool {
+	if !PidAlive(pid) {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+	stat := strings.TrimSpace(string(out))
+	if err != nil && stat == "" {
+		return PidAlive(pid)
+	}
+	return !strings.HasPrefix(stat, "Z")
+}
+
 func signalGroup(pgid int, kill bool) {
 	sig := syscall.SIGTERM
 	if kill {
@@ -124,21 +145,25 @@ func AgentsInDir(dir, envMarker string) ([]int, error) {
 const psStartLayout = "Mon Jan _2 15:04:05 2006"
 
 // leaderStart returns when process pid started. found is false when ps ran
-// and there is no such process.
+// and there is no such process; ps printing nothing for a pid that exists is
+// an error, not "not found".
 func leaderStart(pid int) (start time.Time, found bool, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "ps", "-o", "lstart=", "-p", strconv.Itoa(pid)).Output()
 	line := strings.TrimSpace(string(out))
-	if err != nil {
+	if line == "" {
 		var ee *exec.ExitError
-		if errors.As(err, &ee) && line == "" {
+		if (err == nil || errors.As(err, &ee)) && !PidAlive(pid) {
 			return time.Time{}, false, nil // ps ran: no such process
+		}
+		if err == nil {
+			err = errors.New("ps printed no start time for a live process")
 		}
 		return time.Time{}, false, err
 	}
-	if line == "" {
-		return time.Time{}, false, nil
+	if err != nil {
+		return time.Time{}, false, err
 	}
 	t, perr := time.ParseInLocation(psStartLayout, strings.Join(strings.Fields(line), " "), time.Local)
 	if perr != nil {
