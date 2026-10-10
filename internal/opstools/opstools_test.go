@@ -483,6 +483,8 @@ func fakeGitHub(dev, main string, lie bool, ranBash *[]string) Runner {
 			return Result{Stdout: "git@github.com:org/mansol_apps.git\n"}
 		case c.Name == "git" && strings.HasPrefix(args, "rev-parse "):
 			return Result{Stdout: devCommit + "\n"}
+		case c.Name == "gh" && strings.Contains(args, "/compare/abc1234..."+devCommit+" --jq .status"):
+			return Result{Stdout: "ahead\n"}
 		case c.Name == "git":
 			return Result{}
 		case c.Name == "bash":
@@ -576,6 +578,20 @@ func TestRunVerifyTrustsOnlyReviewedScript(t *testing.T) {
 	before := len(ran)
 	if out = RunVerify(context.Background(), redirected, req, dir, nil); len(ran) != before || !strings.Contains(out, "GitHub's API reports") {
 		t.Fatalf("redirected fetch ran the script: %s", out)
+	}
+
+	// GitHub, not local objects, decides whether sha is on dev-server.
+	for _, status := range []string{"behind", "diverged", ""} {
+		notOn := func(ctx context.Context, c Cmd) Result {
+			if c.Name == "gh" && strings.Contains(strings.Join(c.Args, " "), "/compare/") {
+				return Result{Stdout: status + "\n"}
+			}
+			return gh(ctx, c)
+		}
+		before := len(ran)
+		if out = RunVerify(context.Background(), notOn, req, dir, nil); len(ran) != before || !strings.Contains(out, "GitHub does not show abc1234 on dev-server") {
+			t.Fatalf("compare %q ran the script: %s", status, out)
+		}
 	}
 }
 

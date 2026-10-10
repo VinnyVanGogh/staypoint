@@ -128,7 +128,10 @@ verify_repos`.
    config an agent can edit (`url.*.insteadOf`, `core.sshCommand`), so the
    anchor is GitHub's API: after the fetch, local `origin/dev-server` must be
    the commit the API reported for `refs/heads/dev-server`, or the script
-   does not run.
+   does not run. Local objects can still lie (`refs/replace`), so GitHub
+   also decides ancestry: `compare/<sha>...<dev-server commit>` must be
+   `identical` or `ahead`. The script and the rev-parse run with
+   `GIT_NO_REPLACE_OBJECTS=1`.
 3. It runs exactly those bytes with `bash -s -- <sha> <checks>`.
 4. It returns the PASS/FAIL lines and the final `DEV DEPLOY VERIFIED` /
    `NOT ON DEV` line. If the script never prints a verdict, the tool adds a

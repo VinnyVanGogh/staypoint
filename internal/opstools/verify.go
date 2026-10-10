@@ -145,12 +145,19 @@ func RunVerify(ctx context.Context, run Runner, r VerifyRequest, dir string, tru
 	// The fetch went through local git config (url.*.insteadOf,
 	// core.sshCommand) an agent can edit, so the anchor is GitHub's API:
 	// the ref the script checks must be the commit the API reported.
-	local := run(ctx, Cmd{Name: "git", Args: []string{"rev-parse", "--verify", "--quiet", "refs/remotes/origin/dev-server^{commit}"}, Dir: dir})
+	local := run(ctx, Cmd{Name: "git", Args: []string{"rev-parse", "--verify", "--quiet", "refs/remotes/origin/dev-server^{commit}"}, Dir: dir, Env: []string{"GIT_NO_REPLACE_OBJECTS=1"}})
 	if got := strings.TrimSpace(local.Stdout); local.ExitCode != 0 || local.Err != nil || got != devCommit {
 		return fmt.Sprintf("NOT ON DEV: local origin/dev-server is %q after the fetch, but GitHub's API reports %s; local git config may redirect the fetch", got, devCommit)
 	}
+	// Local objects can still lie (refs/replace), so GitHub decides whether
+	// sha is on dev-server: compare sha...dev-server is "identical" or
+	// "ahead" exactly when sha is an ancestor of the dev-server commit.
+	cmp := run(ctx, Cmd{Name: "gh", Args: []string{"api", "repos/" + r.Repo + "/compare/" + r.SHA + "..." + devCommit, "--jq", ".status"}})
+	if st := strings.TrimSpace(cmp.Stdout); cmp.ExitCode != 0 || cmp.Err != nil || (st != "identical" && st != "ahead") {
+		return fmt.Sprintf("NOT ON DEV: GitHub does not show %s on dev-server (%s, compare status %q)", r.SHA, devCommit, st)
+	}
 	args := append([]string{"-s", "--", r.SHA}, r.PageChecks...)
-	res := run(ctx, Cmd{Name: "bash", Args: args, Dir: dir, Stdin: script})
+	res := run(ctx, Cmd{Name: "bash", Args: args, Dir: dir, Stdin: script, Env: []string{"GIT_NO_REPLACE_OBJECTS=1"}})
 	return summarizeVerify(res)
 }
 

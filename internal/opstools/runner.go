@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -16,6 +17,8 @@ type Cmd struct {
 	Args  []string
 	Dir   string
 	Stdin []byte
+	// Env is added to the inherited environment.
+	Env []string
 }
 
 // Result is a finished Cmd. Err is set when the process could not run or
@@ -48,6 +51,9 @@ type Runner func(ctx context.Context, c Cmd) Result
 func ExecRunner(ctx context.Context, c Cmd) Result {
 	cmd := exec.CommandContext(ctx, c.Name, c.Args...)
 	cmd.Dir = c.Dir
+	if len(c.Env) > 0 {
+		cmd.Env = append(os.Environ(), c.Env...)
+	}
 	if c.Stdin != nil {
 		cmd.Stdin = bytes.NewReader(c.Stdin)
 	}
