@@ -434,6 +434,9 @@ func runTaskCreate(cmd *cobra.Command, args []string) error {
 				ExecutionStage: stage,
 				Origin:         cliTaskOrigin(os.Getenv),
 			})
+			if createErr == nil && created.Identifier != "" {
+				fmt.Fprintf(out, "Created %s (%s): %s\n", created.Identifier, created.ID, created.URL)
+			}
 			if createErr == nil && stage != "" {
 				if session, client, _, err := attachFlags(cmd); err == nil {
 					if err := attachSession(out, store.DB(), created.ID, session, client, created.RepoPath); err != nil {

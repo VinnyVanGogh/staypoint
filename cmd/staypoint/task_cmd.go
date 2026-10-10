@@ -109,8 +109,8 @@ var taskListCmd = &cobra.Command{
 			if t.SourceRef != "" {
 				originInfo += " (imported from " + t.SourceRef + ")"
 			}
-			fmt.Printf("  • %s[%s/%s]\033[0m \033[1m%s\033[0m%s%s (branch: %s, role: %s)%s\n",
-				statusColor, t.Status, t.ExecutionStage, t.Name, orgProjInfo, originInfo, t.GitBranch, t.AccountRole, budgetInfo)
+			fmt.Printf("  • \033[1m%s\033[0m %s[%s/%s]\033[0m \033[1m%s\033[0m%s%s (branch: %s, role: %s)%s\n",
+				t.Ref(), statusColor, t.Status, t.ExecutionStage, t.Name, orgProjInfo, originInfo, t.GitBranch, t.AccountRole, budgetInfo)
 		}
 	},
 }
@@ -181,7 +181,14 @@ var taskShowCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
+		if task.Identifier != "" {
+			fmt.Printf("Task: %s\n", task.Identifier)
+			fmt.Printf("URL: %s\n", task.URL)
+		}
 		fmt.Printf("Task ID: %s\n", task.ID)
+		if task.SourceRef != "" && task.SourceRef != task.Identifier {
+			fmt.Printf("Legacy label: %s\n", task.SourceRef)
+		}
 		fmt.Printf("Name: %s\n", task.Name)
 		fmt.Printf("Status: %s\n", task.Status)
 		if task.IsBlocked {

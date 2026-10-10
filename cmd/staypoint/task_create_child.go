@@ -99,5 +99,8 @@ func runTaskCreateChild(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Created child task %s (%s) under %s: %s\n", child.ID, child.WorkKind, child.ParentID, child.Name)
+	if child.Identifier != "" {
+		fmt.Fprintf(cmd.OutOrStdout(), "  %s %s\n", child.Identifier, child.URL)
+	}
 	return nil
 }

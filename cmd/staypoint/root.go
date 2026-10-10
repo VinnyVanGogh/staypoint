@@ -33,6 +33,9 @@ var (
 			if err != nil {
 				return fmt.Errorf("failed to load config: %w", err)
 			}
+			// args is the slice the command's Run receives: references
+			// (STA-123) become task ids before it runs.
+			resolveTaskRefArgs(cmd, args, cfg.DBPath)
 			return nil
 		},
 		FParseErrWhitelist: cobra.FParseErrWhitelist{

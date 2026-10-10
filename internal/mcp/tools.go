@@ -16,6 +16,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
+	"github.com/VinnyVanGogh/staypoint/internal/taskref"
 	"github.com/VinnyVanGogh/staypoint/internal/wire"
 )
 
@@ -276,7 +277,47 @@ func (s *Server) getToolsList() []Tool {
 	}
 }
 
+// taskRefArgs are the tool arguments that name a task.
+var taskRefArgs = []string{"task_id", "parent_id"}
+
+// resolveTaskRefArgs swaps a task reference (STA-123) in a task argument for
+// the task id, so every tool takes a reference where it takes an id. Anything
+// that is not a known reference passes through untouched.
+func (s *Server) resolveTaskRefArgs(raw json.RawMessage) json.RawMessage {
+	var m map[string]json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &m) != nil {
+		return raw
+	}
+	changed := false
+	for _, k := range taskRefArgs {
+		var v string
+		if json.Unmarshal(m[k], &v) != nil {
+			continue
+		}
+		if _, _, ok := taskref.Parse(v); !ok {
+			continue
+		}
+		dbConn, err := s.getDB()
+		if err != nil {
+			return raw
+		}
+		if id := meshContext.ResolveTaskID(dbConn, v); id != v {
+			m[k], _ = json.Marshal(id)
+			changed = true
+		}
+	}
+	if !changed {
+		return raw
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
 func (s *Server) handleCallTool(ctx context.Context, params CallToolParams) *ToolCallResult {
+	params.Arguments = s.resolveTaskRefArgs(params.Arguments)
 	switch params.Name {
 	case "staypoint_checkpoint":
 		return s.handleCheckpoint(ctx, params.Arguments)
@@ -678,6 +719,8 @@ func (s *Server) handleTaskGet(ctx context.Context, rawArgs json.RawMessage) *To
 
 	result := map[string]any{
 		"id":          task.ID,
+		"identifier":  task.Identifier,
+		"url":         task.URL,
 		"name":        task.Name,
 		"org":         task.Organization,
 		"project":     task.Project,

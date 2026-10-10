@@ -720,18 +720,19 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 			SELECT id, name, COALESCE(organization, ''), COALESCE(project, ''),
 			       status, execution_stage, is_blocked, COALESCE(block_reason, ''),
 			       spent_usd, spent_tokens, updated_at, COALESCE(parent_id, ''),
-			       COALESCE(checkout_agent_id, ''), COALESCE(origin, 'native')
+			       COALESCE(checkout_agent_id, ''), COALESCE(origin, 'native'),
+			       COALESCE(org_key || '-' || number, ''), slug
 			FROM tasks
 			WHERE status != 'soft_deleted' AND ` + meshContext.VisibleTasksSQL("", includeHidden) + `;
 		`)
 		if err == nil {
 			defer tRows.Close()
 			for tRows.Next() {
-				var id, name, org, proj, st, stage, bReason, upAt, parentID, checkoutAgentID, origin string
+				var id, name, org, proj, st, stage, bReason, upAt, parentID, checkoutAgentID, origin, ref, slug string
 				var isBlockedInt int
 				var spentUSD float64
 				var spentTokens int64
-				if err := tRows.Scan(&id, &name, &org, &proj, &st, &stage, &isBlockedInt, &bReason, &spentUSD, &spentTokens, &upAt, &parentID, &checkoutAgentID, &origin); err == nil {
+				if err := tRows.Scan(&id, &name, &org, &proj, &st, &stage, &isBlockedInt, &bReason, &spentUSD, &spentTokens, &upAt, &parentID, &checkoutAgentID, &origin, &ref, &slug); err == nil {
 					if org == "" {
 						org = "StayPoint"
 					}
@@ -808,9 +809,14 @@ func (a *Aggregator) gatherOrgsAndTasks(ctx context.Context, overview *FleetOver
 						desc = cmts[0]
 					}
 
+					// An unnumbered task (written by an older binary) shows its id.
+					if ref == "" {
+						ref = id
+					}
 					item := TaskItem{
 						ID:              id,
-						Identifier:      fmt.Sprintf("%s-%s", orgSummary.IssuePrefix, shortID(id)),
+						Identifier:      ref,
+						Slug:            slug,
 						Title:           name,
 						Description:     desc,
 						Comments:        cmts,
