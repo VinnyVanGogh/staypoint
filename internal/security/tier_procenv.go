@@ -259,7 +259,8 @@ func lineEnvEdits(s segment) []string {
 		for _, a := range argv[1:] {
 			// printf "$opt" NAME x, printf {-v,x} HOME y, printf -[v] ...:
 			// expansion could produce -v, so the options are unknown.
-			if strings.ContainsAny(a, "$`{*?[") {
+			if strings.ContainsAny(a, "$`{*?[~") { // ~- is $OLDPWD
+
 				return []string{"-opaque:printf"}
 			}
 			if a == "--" || !strings.HasPrefix(a, "-") {
