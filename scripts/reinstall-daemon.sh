@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 # Rebuild staypointd from source and restart the LaunchAgent.
 # Run this after any git pull or code change.
+#
+# Zero-kill deploys (task-db71fba9). By default (--when-idle) the running
+# daemon is put in drain first: it stops starting runs (Run Now, wakes and
+# routines that arrive are queued, persisted, and started by the new daemon)
+# and the script waits until no run is live before it swaps the binary and
+# restarts. There is no time limit unless --max-wait is given; after it, live
+# runs are suspended at their next turn boundary (never mid-tool-call) and the
+# new daemon resumes them from that turn.
+#
+#   --when-idle        default, as above
+#   --max-wait <dur>   e.g. 900, 15m, 2h: then suspend at the next turn boundary
+#   --now              emergency: cut the current turns short, suspend the runs
+#                      (the new daemon redoes those turns), deploy right away
+#   --allow-dev-build  deploy a tree that is not origin/main's tip (see below)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,13 +34,15 @@ DIRTY=false
 IN_MAIN=false
 AT_MAIN=false
 DEV_BUILD=false
+DRAIN_RESULT=none
+DRAIN_WAIT=0
 log_deploy() {
     local parent
     parent="$(ps -o command= -p "$PPID" 2>/dev/null | tr '\t\n' '  ' | cut -c1-200 || true)"
     mkdir -p "$(dirname "$DEPLOY_LOG")"
-    printf '%s\tresult=%s\tuser=%s\thost=%s\tsha=%s\tdirty=%s\tin_main=%s\tat_main=%s\tdev_build=%s\trepo=%s\tparent=%s\n' \
+    printf '%s\tresult=%s\tuser=%s\thost=%s\tsha=%s\tdirty=%s\tin_main=%s\tat_main=%s\tdev_build=%s\tdrain=%s\tdrain_wait=%ss\trepo=%s\tparent=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "${USER:-$(id -un)}" "$(hostname)" \
-        "${FULL_SHA:-none}" "$DIRTY" "$IN_MAIN" "$AT_MAIN" "$DEV_BUILD" "$REPO" "$parent" >> "$DEPLOY_LOG"
+        "${FULL_SHA:-none}" "$DIRTY" "$IN_MAIN" "$AT_MAIN" "$DEV_BUILD" "$DRAIN_RESULT" "$DRAIN_WAIT" "$REPO" "$parent" >> "$DEPLOY_LOG"
 }
 
 # refuse <log-reason> <headline> [detail lines...]
@@ -38,19 +54,48 @@ refuse() {
     exit 1
 }
 
+bad_arg() {
+    # Exit 2 (usage error), but still leave a trace in the deploy log.
+    log_deploy "refused:bad-arg"
+    echo "✗ $1 (flags: --when-idle, --max-wait <dur>, --now, --allow-dev-build)" >&2
+    exit 2
+}
+
+# to_seconds 90 | 15m | 2h | 30s -> seconds, or empty if malformed.
+to_seconds() {
+    [[ "$1" =~ ^([0-9]+)([smh]?)$ ]] || return 0
+    local n=$((10#${BASH_REMATCH[1]}))
+    case "${BASH_REMATCH[2]}" in
+        h) echo $((n * 3600)) ;;
+        m) echo $((n * 60)) ;;
+        *) echo "$n" ;;
+    esac
+}
+
 ALLOW_DEV_BUILD=0
-for arg in "$@"; do
-    case "$arg" in
+DEPLOY_MODE=when-idle
+MAX_WAIT=""
+while [ $# -gt 0 ]; do
+    case "$1" in
         --allow-dev-build) ALLOW_DEV_BUILD=1 ;;
         --allow-unmerged)
             echo "  ! --allow-unmerged is now --allow-dev-build; treating it as that."
             ALLOW_DEV_BUILD=1 ;;
-        *)
-            # Exit 2 (usage error), but still leave a trace in the deploy log.
-            log_deploy "refused:bad-arg"
-            echo "✗ Unknown argument: $arg (the only flag is --allow-dev-build)" >&2
-            exit 2 ;;
+        --when-idle) DEPLOY_MODE=when-idle ;;
+        --now) DEPLOY_MODE=now ;;
+        --max-wait|--max-wait=*)
+            if [ "$1" = --max-wait ]; then
+                [ $# -ge 2 ] || bad_arg "--max-wait needs a duration (e.g. 900, 15m, 2h)"
+                shift
+                raw="$1"
+            else
+                raw="${1#--max-wait=}"
+            fi
+            MAX_WAIT="$(to_seconds "$raw")"
+            [ -n "$MAX_WAIT" ] || bad_arg "Bad --max-wait duration: $raw (e.g. 900, 15m, 2h)" ;;
+        *) bad_arg "Unknown argument: $1" ;;
     esac
+    shift
 done
 
 # Deploy guards (STA-805). The live daemon must be a reviewed build: a clean
@@ -206,8 +251,120 @@ echo "→ Building staypoint CLI at $FULL_SHA (label: $BUILD_LABEL) ..."
     -o "$CLI_STAGED" ./cmd/staypoint)
 sign com.staypoint.cli "$CLI_STAGED"
 
+# ── Drain the running daemon before the swap (task-db71fba9) ────────────────
+# The drain endpoint is Board-only: the request carries the Board session
+# cookie (board_token), so an agent cannot put the daemon in drain. Tokens go
+# to curl as headers on stdin, never in argv where `ps` would show them.
+DAEMON_URL="http://127.0.0.1:41421"
+DRAIN_URL="$DAEMON_URL/api/daemon/drain"
+DRAIN_POLL="${STAYPOINT_DRAIN_POLL:-2}"
+NOW_TIMEOUT="${STAYPOINT_NOW_TIMEOUT:-120}"
+DRAINING=false
+
+# daemon_req <method> <url> [json-body]: prints the response body ("" on failure).
+daemon_req() {
+    local token board
+    token="$(cat "$HOME/.staypoint/auth_token" 2>/dev/null || true)"
+    board="$(cat "$HOME/.staypoint/board_token" 2>/dev/null || true)"
+    if [ -n "${3:-}" ]; then
+        printf 'Authorization: Bearer %s\nCookie: staypoint_board=%s\nContent-Type: application/json\n' "$token" "$board" \
+            | curl -s -m 10 -H @- -X "$1" -d "$3" "$2" 2>/dev/null || true
+    else
+        printf 'Authorization: Bearer %s\nCookie: staypoint_board=%s\n' "$token" "$board" \
+            | curl -s -m 10 -H @- -X "$1" "$2" 2>/dev/null || true
+    fi
+}
+json_num() { printf '%s' "$2" | sed -n "s/.*\"$1\":\([0-9][0-9]*\).*/\1/p" | head -1; }
+json_tasks() { printf '%s' "$1" | sed -n 's/.*"live_tasks":\[\([^]]*\)\].*/\1/p' | tr -d '"' | sed 's/,/, /g'; }
+
+# A deploy that stops before the swap (error, Ctrl-C) hands the daemon back
+# to normal work instead of leaving it queuing everything.
+cancel_drain() {
+    if [ "$DRAINING" = true ]; then
+        DRAINING=false
+        echo "  ↩ Deploy stopped before the swap: cancelling the drain, so the running daemon starts runs again." >&2
+        daemon_req DELETE "$DRAIN_URL" >/dev/null
+    fi
+}
+trap 'cancel_drain; cleanup' EXIT
+trap 'exit 130' INT TERM
+
+if [ -n "$(daemon_req GET "$DAEMON_URL/api/health")" ]; then
+    DRAIN_MODE=finish
+    [ "$DEPLOY_MODE" = now ] && DRAIN_MODE=now
+    RESP="$(daemon_req POST "$DRAIN_URL" "{\"mode\":\"$DRAIN_MODE\"}")"
+    case "$RESP" in
+        *'"draining":true'*) DRAINING=true ;;
+        *board_session_required*)
+            refuse drain-forbidden "the running daemon refused the drain request: ~/.staypoint/board_token is not the Board credential it expects." \
+                "Nothing was swapped; the old daemon keeps running." ;;
+        *)
+            if [ "$DEPLOY_MODE" = now ]; then
+                DRAIN_RESULT=unsupported
+                echo "  ! The running daemon has no drain mode (an older build). --now: deploying without a drain; its live runs are cut."
+            else
+                refuse drain-unsupported "the running daemon has no drain mode (it predates zero-kill deploys), so restarting it would cut its live runs." \
+                    "Deploy this once with --now when no run is live (check the Board); every deploy after that drains." \
+                    "Nothing was swapped; the old daemon keeps running."
+            fi ;;
+    esac
+else
+    DRAIN_RESULT=not-running
+fi
+
+if [ "$DRAINING" = true ]; then
+    case "$DEPLOY_MODE" in
+        now) echo "→ Draining (--now): cutting live turns short and suspending their runs ..." ;;
+        *) echo "→ Draining: no new runs start (they are queued for the new daemon); waiting for live runs to finish${MAX_WAIT:+ (at most ${MAX_WAIT}s, then suspend at the next turn)} ..." ;;
+    esac
+    DRAIN_RESULT=ok
+    [ "$DEPLOY_MODE" = now ] && DRAIN_RESULT=now
+    drain_start=$SECONDS
+    last_msg=""
+    last_print=$SECONDS
+    misses=0
+    while :; do
+        STATUS="$(daemon_req GET "$DRAIN_URL")"
+        LIVE="$(json_num live "$STATUS")"
+        if [ -z "$LIVE" ]; then
+            misses=$((misses + 1))
+            if [ "$misses" -ge 5 ]; then
+                echo "  ! The daemon stopped answering during the drain; going ahead (the new daemon resumes any run it cut off)."
+                DRAIN_RESULT=daemon-gone
+                break
+            fi
+            sleep "$DRAIN_POLL"
+            continue
+        fi
+        misses=0
+        [ "$LIVE" = 0 ] && break
+        elapsed=$((SECONDS - drain_start))
+        msg="Draining for deploy: $LIVE run(s) left ($(json_tasks "$STATUS")), $(json_num queued "$STATUS") queued"
+        if [ "$msg" != "$last_msg" ] || [ $((SECONDS - last_print)) -ge 60 ]; then
+            echo "  … $msg (${elapsed}s)"
+            last_msg="$msg"
+            last_print=$SECONDS
+        fi
+        if [ -n "$MAX_WAIT" ] && [ "$DRAIN_RESULT" = ok ] && [ "$elapsed" -ge "$MAX_WAIT" ]; then
+            echo "  → --max-wait (${MAX_WAIT}s) reached: suspending live runs at their next turn boundary; the new daemon resumes them."
+            daemon_req POST "$DRAIN_URL" '{"mode":"boundary"}' >/dev/null
+            DRAIN_RESULT=suspended
+        fi
+        if [ "$DEPLOY_MODE" = now ] && [ "$elapsed" -ge "$NOW_TIMEOUT" ]; then
+            echo "  ! --now: runs still live after ${NOW_TIMEOUT}s; restarting anyway (the new daemon stops leftover agents and resumes their runs)."
+            DRAIN_RESULT=now-timeout
+            break
+        fi
+        sleep "$DRAIN_POLL"
+    done
+    DRAIN_WAIT=$((SECONDS - drain_start))
+    echo "✓ Drained in ${DRAIN_WAIT}s: no run is live; queued runs start on the new daemon."
+fi
+
 mv -f "$STAGED" "$BINARY"
 mv -f "$CLI_STAGED" "$CLI_BINARY"
+# Swapped: from here the restart is the way forward, so the drain stays on.
+DRAINING=false
 log_deploy installed
 echo "  Built: $BINARY ($(staypointd -version 2>/dev/null || echo 'ok'))"
 echo "  Built: $CLI_BINARY"
@@ -239,6 +396,12 @@ else
     echo "  Build manifest: $MANIFEST (in main: $IN_MAIN, dirty: $DIRTY)"
 fi
 
+# On SIGTERM the daemon stops claiming and waits for every live run to reach
+# its next turn boundary before it exits (STA-832). launchd SIGKILLs a job
+# ExitTimeOut seconds after SIGTERM (its default is 20s, which cut runs off),
+# so give it a day: in practice only a turn hung on a Board pause takes that
+# long, and a run cut off anyway is resumed by the next daemon.
+EXIT_TIMEOUT="${STAYPOINT_EXIT_TIMEOUT:-86400}"
 cat <<EOF > "$PLIST"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -265,6 +428,8 @@ cat <<EOF > "$PLIST"
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ExitTimeOut</key>
+    <integer>$EXIT_TIMEOUT</integer>
     <key>StandardOutPath</key>
     <string>/tmp/staypointd.log</string>
     <key>StandardErrorPath</key>
@@ -330,6 +495,12 @@ fi
 # SIGPIPE, and under pipefail the pipeline fails even though the job is there.
 DOMAIN="gui/$(id -u)"
 if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    if [ "$DRAIN_RESULT" = now-timeout ]; then
+        # Emergency: do not sit out ExitTimeOut. The new daemon stops any
+        # agent left behind and resumes the runs from their turn.
+        echo "→ Killing $LABEL (--now) ..."
+        launchctl kill SIGKILL "$DOMAIN/$LABEL" 2>/dev/null || true
+    fi
     echo "→ Stopping $LABEL ..."
     launchctl unload "$PLIST" 2>/dev/null || true
 fi
@@ -420,8 +591,7 @@ else
     fi
 fi
 
-if [ -n "$TOKEN" ]; then
-    PORT=$(grep "HTTP and SSE server active" /tmp/staypointd.err 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | tail -1 | cut -d: -f2 || echo "41421")
-    echo ""
-    echo "  Web UI: http://127.0.0.1:${PORT}/?token=${TOKEN}"
-fi
+# Never print a tokenized URL: deploy output lands in logs and agent
+# transcripts. The Board opens the UI with its own session.
+echo ""
+echo "  Web UI: http://localhost:41421/"
