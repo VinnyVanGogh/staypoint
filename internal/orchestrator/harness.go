@@ -477,6 +477,9 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 		if tok, revoke, err := cfg.OpsTokens.Issue(taskID, runID); err == nil {
 			defer revoke()
 			providerEnv = append(providerEnv, opstools.RunTokenEnv+"="+tok)
+			if cfg.StepRecorder != nil {
+				cfg.StepRecorder.AddSecret(tok)
+			}
 		} else {
 			runLog.Warn("ops run token not issued; ops tools will refuse this run", slog.Any("error", err))
 		}

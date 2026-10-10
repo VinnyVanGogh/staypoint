@@ -135,3 +135,21 @@ func TestWriterLongLineWithoutNewline(t *testing.T) {
 		t.Fatal("secret survived long line")
 	}
 }
+
+// Board review #5 M2: the ops run ticket as env/printenv/export -p print it.
+func TestRedactRunTicket(t *testing.T) {
+	tok := strings.Repeat("0123456789abcdef", 4)
+	for _, in := range []string{
+		"STAYPOINT_RUN_TICKET=" + tok,
+		"PATH=/bin\nSTAYPOINT_RUN_TICKET=" + tok + "\nHOME=/x",
+		`declare -x STAYPOINT_RUN_TICKET="` + tok + `"`,
+		"STAYPOINT_RUN_TICKET=" + strings.ToUpper(tok),
+	} {
+		if out := Redact(in); strings.Contains(strings.ToLower(out), tok[:16]) || !strings.Contains(out, "[REDACTED:run-ticket]") {
+			t.Errorf("ticket survived: %q", out)
+		}
+	}
+	if out := Redact("STAYPOINT_TASK_ID=task-7d279c9d"); out != "STAYPOINT_TASK_ID=task-7d279c9d" {
+		t.Errorf("over-redacted task id: %q", out)
+	}
+}

@@ -24,6 +24,8 @@ var redactRules = []redactRule{
 	{name: "google-api-key", re: regexp.MustCompile(`\bAIza[0-9A-Za-z_\-]{35}`)},
 	{name: "github-token", re: regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})`)},
 	{name: "aws-access-key", re: regexp.MustCompile(`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`)},
+	// The ops run ticket (opstools.RunTokenEnv) as printed by env/printenv/export -p.
+	{name: "run-ticket", re: regexp.MustCompile(`(?i)\b(STAYPOINT_RUN_TICKET\s*[=:]\s*["']?)[0-9a-f]{16,}`), repl: "${1}[REDACTED:run-ticket]"},
 	{name: "bearer-token", re: regexp.MustCompile(`(?i)\b(bearer\s+)[A-Za-z0-9._~+/=\-]{8,}`), repl: "${1}[REDACTED:bearer]"},
 }
 

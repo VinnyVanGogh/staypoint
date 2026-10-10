@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/VinnyVanGogh/staypoint/internal/opstools"
+	"github.com/VinnyVanGogh/staypoint/internal/security"
 )
 
 // StepKind classifies a run timeline step for the board UI.
@@ -134,6 +136,10 @@ type StepRecorder struct {
 	// contentSeen is set once the agent produced any thinking, text or tool
 	// call, so the harness can tell a silent run from a quiet one (STA-775).
 	contentSeen bool
+	// secrets are this run's own credentials (the ops run ticket), masked in
+	// every step before it is stored or published: the timeline is shown on
+	// the task page, and an agent can print its env into a tool result.
+	secrets []*regexp.Regexp
 }
 
 // openStep is a step that has been started but not yet closed.
@@ -157,6 +163,39 @@ func NewStepRecorder(db *sql.DB, publish PublishFunc, runID, taskID string) *Ste
 		taskID:    taskID,
 		startedAt: time.Now().UTC(),
 	}
+}
+
+// AddSecret masks s (case-insensitively) in every step recorded from now on.
+func (r *StepRecorder) AddSecret(s string) {
+	if strings.TrimSpace(s) == "" {
+		return
+	}
+	re := regexp.MustCompile(`(?i)` + regexp.QuoteMeta(s))
+	r.mu.Lock()
+	r.secrets = append(r.secrets, re)
+	r.mu.Unlock()
+}
+
+// scrubLocked redacts known secret shapes and this run's own secrets.
+func (r *StepRecorder) scrubLocked(s string) string {
+	if s == "" {
+		return s
+	}
+	s = security.Redact(s)
+	for _, re := range r.secrets {
+		s = re.ReplaceAllLiteralString(s, "[REDACTED:run-secret]")
+	}
+	return s
+}
+
+// record scrubs step, then stores and publishes it. Every step goes through
+// here so nothing reaches run_steps or the SSE stream unredacted.
+func (r *StepRecorder) record(step RunStep) {
+	step.Title = r.scrubLocked(step.Title)
+	step.Command = r.scrubLocked(step.Command)
+	step.Body = r.scrubLocked(step.Body)
+	r.persist(step)
+	r.publish("run.step", step)
 }
 
 // SetWorktreeRoot sets the absolute path of the task's git worktree.
@@ -186,8 +225,7 @@ func (r *StepRecorder) EmitWake(reason string) {
 		StartedAt: now,
 		EndedAt:   &now,
 	}
-	r.persist(step)
-	r.publish("run.step", step)
+	r.record(step)
 }
 
 // EmitRoute emits a route step as the first substantive row of each run.
@@ -210,8 +248,7 @@ func (r *StepRecorder) EmitRoute(title, body string) {
 		StartedAt: now,
 		EndedAt:   &now,
 	}
-	r.persist(step)
-	r.publish("run.step", step)
+	r.record(step)
 }
 
 // EmitCheckpoint emits a checkpoint step.
@@ -232,8 +269,7 @@ func (r *StepRecorder) EmitCheckpoint(sha, msg string) {
 		StartedAt: now,
 		EndedAt:   &now,
 	}
-	r.persist(step)
-	r.publish("run.step", step)
+	r.record(step)
 }
 
 // EmitMessage records a message row in the timeline (status "done" or
@@ -255,8 +291,7 @@ func (r *StepRecorder) EmitMessage(title, body, status string) {
 		StartedAt: now,
 		EndedAt:   &now,
 	}
-	r.persist(step)
-	r.publish("run.step", step)
+	r.record(step)
 }
 
 // SawContent reports whether the agent produced any thinking, text or tool
@@ -299,8 +334,7 @@ func (r *StepRecorder) EmitState(disposition string) {
 		StartedAt: now,
 		EndedAt:   &now,
 	}
-	r.persist(step)
-	r.publish("run.step", step)
+	r.record(step)
 	r.publish("run.state", map[string]any{
 		"run_id":      r.runID,
 		"task_id":     r.taskID,
@@ -313,6 +347,11 @@ func (r *StepRecorder) EmitState(disposition string) {
 func (r *StepRecorder) Feed(d StepDelta) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// Scrub before a tool result is truncated, so a cut cannot leave half a
+	// secret that no longer matches; record scrubs the assembled step again.
+	d.Text = r.scrubLocked(d.Text)
+	d.ToolInput = r.scrubLocked(d.ToolInput)
 
 	switch d.Kind {
 	case StepDeltaThinking, StepDeltaText:
@@ -368,8 +407,7 @@ func (r *StepRecorder) Feed(d StepDelta) {
 			Status:    "running",
 			StartedAt: p.startedAt.Format(time.RFC3339Nano),
 		}
-		r.persist(liveStep)
-		r.publish("run.step", liveStep)
+		r.record(liveStep)
 
 	case StepDeltaToolResult:
 		// Fast path: match by tool_use_id in the parallel map.
@@ -545,8 +583,7 @@ func (r *StepRecorder) closePendingWithStatusLocked(p *openStep, status string) 
 		StartedAt: p.startedAt.Format(time.RFC3339Nano),
 		EndedAt:   &now,
 	}
-	r.persist(step)
-	r.publish("run.step", step)
+	r.record(step)
 }
 
 func (r *StepRecorder) closeCurrentLocked() {
@@ -573,8 +610,7 @@ func (r *StepRecorder) closeToolStepLocked(p *openStep, status string) {
 		StartedAt: p.startedAt.Format(time.RFC3339Nano),
 		EndedAt:   &now,
 	}
-	r.persist(step)
-	r.publish("run.step", step)
+	r.record(step)
 }
 
 // closeAllPendingToolsLocked drains every in-flight parallel tool step as "done".
