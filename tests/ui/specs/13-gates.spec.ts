@@ -80,8 +80,9 @@ test.describe('Gates page', () => {
     // A real href, so "Open in New Tab" and cmd-click work.
     await expect(link).toHaveAttribute('href', `/tasks/${task.id}`);
 
+    // The task page settles on its canonical /STA-123/<slug> URL.
     await link.click();
-    await expect(page).toHaveURL(new RegExp(`/${task.id}$`));
+    await expect(page).toHaveURL(new RegExp(`/${task.identifier}/${task.slug}$`));
   });
 
   test('Deny button records decision and actor in security_gate_audit_log', async ({ api, boardPage }) => {

@@ -1054,17 +1054,22 @@ function projectSlug(task) {
   return p.urlKey || p.slug || p.name || p.id || 'default';
 }
 
-// Local daemon tasks ("task-…") only resolve by id. Any identifier they carry is
-// the fleet aggregator's display label (issue prefix + first 6 chars of the id,
-// e.g. "RHI-task-e"), which no endpoint can look up (STA-693).
+// Local daemon tasks ("task-…") resolve by their reference (STA-123) or id.
+// An identifier that is not a reference is a display label from before
+// numbering (prefix + first 6 chars of the id, e.g. "RHI-task-e"), which no
+// endpoint can look up (STA-693), so the id is used.
 function taskRouteIdent(task) {
   const id = task.id || '';
-  if (id.startsWith('task-')) return id;
+  if (id.startsWith('task-')) return isTaskRef(task.identifier) ? task.identifier : id;
   return task.identifier || id;
 }
 
 function taskToPath(task) {
   if (!task) return '/';
+  // Numbered local task: /STA-123/<slug>. The project is shown on the page,
+  // never in the URL.
+  const refPath = taskRefPath(task);
+  if (refPath) return refPath;
   const ident = taskRouteIdent(task);
   let org = '';
   if (ident && ident.includes('-') && !ident.startsWith('task-')) {
@@ -1224,6 +1229,11 @@ async function filterByLabelOrg(pool, prefix) {
 function pathToRoute(pathname) {
   const p = (pathname || window.location.pathname).replace(/\/+$/, '') || '/';
   if (p === '/' || p === '/overview') return { view: 'overview', org: null, taskId: null };
+  const ref = taskRefFromPath(p);
+  if (ref) {
+    // /STA-123[/slug]: the slug is decoration; lookup is by number alone.
+    return { view: 'overview', org: null, project: null, identifier: ref, taskId: ref };
+  }
   if (p.startsWith('/org/')) {
     const org = decodeURIComponent(p.slice(5));
     return { view: 'org-detail', org, taskId: null };
@@ -4030,7 +4040,7 @@ function renderAllTasksPage() {
   for (const t of rows.slice(0, ALL_TASKS_ROW_LIMIT)) {
     const tr = document.createElement('tr');
     tr.dataset.id = t.id;
-    const tdId = el('td', null, t.source_ref || t.identifier || `#${t.id.slice(0, 8)}`);
+    const tdId = el('td', null, t.identifier || t.source_ref || `#${t.id.slice(0, 8)}`);
     tdId.style.cssText = 'font-family:monospace;font-weight:600;';
     const tdTitle = el('td');
     tdTitle.appendChild(el('span', 'task-table-title', t.title || t.name || '(untitled)'));
@@ -6432,7 +6442,7 @@ function makeTaskCard(task) {
   card.appendChild(el('div', 'card-title', task.title || task.name || '(untitled)'));
   const meta = el('div', 'card-meta');
   meta.appendChild(el('span', `card-status-dot dot-${boardColumnFor(task) || task.status}`));
-  meta.appendChild(el('span', 'card-id', task.source_ref || task.identifier || (task.id ? `#${task.id.slice(0, 8)}` : '')));
+  meta.appendChild(el('span', 'card-id', task.identifier || task.source_ref || (task.id ? `#${task.id.slice(0, 8)}` : '')));
   if (isLegacy(task)) meta.appendChild(el('span', 'card-origin-badge', 'legacy'));
   else if (isArchived(task)) meta.appendChild(el('span', 'card-origin-badge', 'archive'));
   card.appendChild(meta);
@@ -7593,7 +7603,15 @@ function isFleetTaskId(id) {
   if (!id) return false;
   if (id.startsWith('task-')) return false;
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) return true;
-  if (/^[A-Za-z]+-\d+$/i.test(id)) return true;
+  // STA-123 is a daemon task reference (the daemon also resolves imported
+  // Paperclip labels). It is a fleet (Paperclip) issue only when the fleet
+  // lists it and no daemon task carries it.
+  if (isTaskRef(id)) {
+    const ref = id.toUpperCase();
+    const local = Object.values(state.tasks || {}).some(t => (t.id || '').startsWith('task-') && (t.identifier || '').toUpperCase() === ref);
+    if (local) return false;
+    return (state.fleet?.tasks || []).some(t => !(t.id || '').startsWith('task-') && (t.identifier || '').toUpperCase() === ref);
+  }
   return false;
 }
 
@@ -7616,6 +7634,14 @@ let taskViewSeq = 0;
 // { diffData, checkpoints } (STA-775). The ship review card stays in the first
 // batch: it decides whether Run Now and Mark done are offered at all.
 async function fetchTaskViewData(resolvedId) {
+  // A pasted /STA-123 link before the task list has loaded: learn the task id
+  // first, so every per-task request and everything keyed by id uses the id.
+  // An unknown reference 404s here, as an unknown id does below.
+  if (isTaskRef(resolvedId) && !isFleetTaskId(resolvedId)) {
+    const first = await apiFetch(`/api/tasks/${encodeURIComponent(resolvedId)}`);
+    const t = first?.task || first;
+    if (t?.id) resolvedId = t.id;
+  }
   const isFleet = isFleetTaskId(resolvedId);
   const apiBase = isFleet ? '/api/fleet/tasks' : '/api/tasks';
   const diff = isFleet
@@ -7748,11 +7774,11 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
   // Determine canonical hierarchical path
   const canonicalPath = matchedTask
     ? taskToPath(matchedTask)
-    : `/tasks/${encodeURIComponent(orgHint || 'STA')}/${encodeURIComponent(projectHint || 'default')}/${encodeURIComponent(targetId)}`;
+    : isTaskRef(targetId) ? `/${String(targetId).toUpperCase()}` : `/tasks/${encodeURIComponent(orgHint || 'STA')}/${encodeURIComponent(projectHint || 'default')}/${encodeURIComponent(targetId)}`;
 
   if (pushHistory && window.location.pathname !== canonicalPath) {
     history.pushState({ taskId: resolvedId, canonicalPath, taskPage: false }, '', canonicalPath);
-  } else if (!pushHistory && (window.location.pathname.startsWith('/tasks/') || window.location.pathname.startsWith('/issues/')) && window.location.pathname !== canonicalPath) {
+  } else if (!pushHistory && isTaskPagePath(window.location.pathname) && window.location.pathname !== canonicalPath) {
     history.replaceState({ taskId: resolvedId, canonicalPath, taskPage: false }, '', canonicalPath);
   }
 
@@ -7768,7 +7794,7 @@ async function openDetail(target, pushHistory = true, orgHint = null, projectHin
 
     // Ensure browser URL displays the fully resolved canonical hierarchical path
     const finalCanonicalPath = taskToPath(task);
-    if (window.location.pathname !== finalCanonicalPath && (window.location.pathname.startsWith('/tasks/') || window.location.pathname.startsWith('/issues/'))) {
+    if (window.location.pathname !== finalCanonicalPath && isTaskPagePath(window.location.pathname)) {
       history.replaceState({ taskId: task.id, canonicalPath: finalCanonicalPath, taskPage: false }, '', finalCanonicalPath);
     }
 
@@ -7855,7 +7881,7 @@ function closeDetailPanel() {
   stopChatPoll();
   stopElapsedTicker();
   state.openDetailTaskId = null;
-  if (window.location.pathname.startsWith('/tasks/') || window.location.pathname.startsWith('/issues/')) {
+  if (isTaskPagePath(window.location.pathname)) {
     const activeBtn = document.querySelector('.sidebar-item.active');
     const viewName = activeBtn?.dataset?.view || 'overview';
     navigateTo(viewName, state.currentOrgDetail, true);
@@ -8717,7 +8743,7 @@ let taskPageRenderedId = null;
 function canonicalizeTaskPageURL(taskId) {
   if (!taskId || taskId !== taskPageRenderedId || state.openDetailTaskId !== taskId || !isTaskPageShowing()) return;
   const path = window.location.pathname;
-  if (!path.startsWith('/tasks/') && !path.startsWith('/issues/')) return;
+  if (!isTaskPagePath(path)) return;
   const finalPath = taskToPath(state.tasks[taskId] || { id: taskId });
   if (path !== finalPath) {
     history.replaceState({ taskId, canonicalPath: finalPath, taskPage: true }, '', finalPath);
@@ -8756,7 +8782,7 @@ async function openTaskPage(target, pushHistory = true, fromRouteMiss = false) {
 
   const canonicalPath = matchedTask
     ? taskToPath(matchedTask)
-    : `/tasks/${encodeURIComponent(orgHint || 'STA')}/${encodeURIComponent(projectHint || 'default')}/${encodeURIComponent(targetId || '')}`;
+    : isTaskRef(targetId) ? `/${String(targetId).toUpperCase()}` : `/tasks/${encodeURIComponent(orgHint || 'STA')}/${encodeURIComponent(projectHint || 'default')}/${encodeURIComponent(targetId || '')}`;
 
   if (pushHistory && window.location.pathname !== canonicalPath) {
     history.pushState({ taskId: resolvedId, canonicalPath, taskPage: true }, '', canonicalPath);
@@ -10674,6 +10700,14 @@ function renderInteractionCards(container, task, interactions, opts = {}) {
 function taskPageHeaderMeta(task, ident) {
   const parts = [];
   if (ident) parts.push(ident);
+  // The Paperclip label an imported task had before renumbering; the old
+  // label still resolves here unless a new task now holds that number.
+  if (task.source_ref && isTaskRef(task.source_ref) && task.source_ref.toUpperCase() !== String(ident).toUpperCase()) {
+    parts.push(`formerly ${task.source_ref}`);
+  }
+  // The project is not in the URL; it is shown here.
+  const project = typeof task.project === 'object' && task.project ? (task.project.name || '') : (task.project || '');
+  if (project) parts.push(project);
   const assignee = task.assignee_name || task.checkout_agent_id || '';
   // Latest route step that names a model; fallback reasons are not a model.
   let model = '';
