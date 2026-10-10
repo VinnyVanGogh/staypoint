@@ -78,6 +78,12 @@ tasks from starting without the Board:
   task (name says prod/production, or its repo is a `live_credentials`
   project) also needs the passkey (Touch ID), so it can only leave backlog
   from the Board UI. Closing (`done`, `cancelled`) needs no Board.
+- **The task page's "Move to…" menu** is the Board's stage control: it
+  offers every Board-settable stage but the current one (plus Blocked, which
+  asks for a reason). In progress is Run Now, Done is Mark done; a closed task
+  can only be reopened to Backlog or Todo. A refusal shows the server's
+  message under the header. Trust on a backlog task is "Move to todo and
+  trust": the trust request (`move_to_todo`) moves it under the same Touch ID.
 
 **Org hold** is a Board-only switch per organization (`settings_kv`
 `org_hold.<lower(org)>`). While it is on, `Harness.Claim` refuses every

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -245,6 +246,75 @@ func TestTrust_CreateNeedsTouchIDAndServerOwnsLimits(t *testing.T) {
 	_ = e.db.QueryRow(`SELECT COUNT(*) FROM board_audit_log WHERE payload LIKE '%create_task_trust%'`).Scan(&n)
 	if n != 1 {
 		t.Fatalf("board audit rows for trust creation: %d", n)
+	}
+}
+
+// task-40f0a2f0: Trust on a backlog task offers "Move to todo and trust".
+// move_to_todo moves an agent-created backlog task to todo under the same
+// Touch ID, then trusts it; it never moves a task from any other stage.
+func TestTrust_MoveToTodoLeavesBacklogUnderOneTouchID(t *testing.T) {
+	e := startGateServer(t, nil, nil)
+	seedTask(t, e.db, "T1", t.TempDir(), "StayPoint")
+	if _, err := e.db.Exec(`UPDATE tasks SET execution_stage = 'backlog', status = 'active', origin = 'agent', git_branch = '' WHERE id = 'T1'`); err != nil {
+		t.Fatal(err)
+	}
+	stage := func(id string) string {
+		var s string
+		_ = e.db.QueryRow(`SELECT execution_stage FROM tasks WHERE id = ?`, id).Scan(&s)
+		return s
+	}
+
+	// Without the flag a backlog task still cannot be trusted.
+	if st, out, _ := e.do(t, "POST", "/api/tasks/T1/trust", `{"preset":"1h"}`, true, "good"); st != http.StatusConflict {
+		t.Fatalf("trusting a backlog task without move_to_todo: %d %v", st, out)
+	}
+	// The flag does not get past the Board gate: no session, no Touch ID.
+	if st, _, _ := e.do(t, "POST", "/api/tasks/T1/trust", `{"preset":"1h","move_to_todo":true}`, false, ""); st != http.StatusForbidden {
+		t.Fatalf("move_to_todo with no Board session: %d", st)
+	}
+	if st, _, _ := e.do(t, "POST", "/api/tasks/T1/trust", `{"preset":"1h","move_to_todo":true}`, true, ""); st != http.StatusForbidden {
+		t.Fatalf("move_to_todo with no Touch ID: %d", st)
+	}
+	if got := stage("T1"); got != "backlog" {
+		t.Fatalf("refused requests moved the task: stage %q", got)
+	}
+
+	rule := e.trust(t, "T1", `{"preset":"1h","move_to_todo":true}`)
+	if rule["scope_value"] != "T1" {
+		t.Fatalf("trust rule: %v", rule)
+	}
+	if got := stage("T1"); got != "todo" {
+		t.Fatalf("stage after move_to_todo: %q, want todo", got)
+	}
+
+	// A done task is not reopened by move_to_todo.
+	seedTask(t, e.db, "T2", t.TempDir(), "StayPoint")
+	if _, err := e.db.Exec(`UPDATE tasks SET execution_stage = 'done', status = 'done' WHERE id = 'T2'`); err != nil {
+		t.Fatal(err)
+	}
+	if st, _, _ := e.do(t, "POST", "/api/tasks/T2/trust", `{"preset":"1h","move_to_todo":true}`, true, "good"); st != http.StatusConflict {
+		t.Fatalf("move_to_todo on a done task: %d", st)
+	}
+	if got := stage("T2"); got != "done" {
+		t.Fatalf("move_to_todo reopened a done task: stage %q", got)
+	}
+
+	// A backlog task with no repo stays in backlog and gets the server's reason.
+	seedTask(t, e.db, "T3", "", "StayPoint")
+	if _, err := e.db.Exec(`UPDATE tasks SET execution_stage = 'backlog', status = 'active', git_branch = '' WHERE id = 'T3'`); err != nil {
+		t.Fatal(err)
+	}
+	st, out, _ := e.do(t, "POST", "/api/tasks/T3/trust", `{"preset":"1h","move_to_todo":true}`, true, "good")
+	if st != http.StatusConflict || !strings.Contains(fmt.Sprint(out["error"]), "set-repo") {
+		t.Fatalf("move_to_todo with no repo: %d %v", st, out)
+	}
+	if got := stage("T3"); got != "backlog" {
+		t.Fatalf("no-repo task left backlog: stage %q", got)
+	}
+
+	// GET reports the stage so the page can offer the move.
+	if _, view, _ := e.do(t, "GET", "/api/tasks/T3/trust", "", false, ""); view["task_stage"] != "backlog" {
+		t.Fatalf("GET trust task_stage: %v", view["task_stage"])
 	}
 }
 

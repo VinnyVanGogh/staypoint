@@ -61,3 +61,45 @@ test('kind changes: known kinds only, never mid-run, no gemini code kind in a wo
   assert.equal(kindChangeRefusal(gem, 'planning', true), '');
   assert.equal(kindChangeRefusal(gem, 'coding', false), '', 'personal repo: server gates per run');
 });
+
+// ── Stage control (task-40f0a2f0) ──
+const { BOARD_STAGES, stageMenuOptions, stageChangeConfirmText } = require('../../internal/server/webui/lib/taskactions.js');
+const stagesOf = (t, opts) => stageMenuOptions(t, opts).map(o => o.stage);
+
+test('stage menu offers every Board stage but the current one', () => {
+  assert.deepEqual(BOARD_STAGES, ['backlog', 'todo', 'in_progress', 'in_review', 'done', 'cancelled']);
+  assert.deepEqual(stagesOf(task('backlog'), { canRun: true }), ['todo', 'in_progress', 'in_review', 'blocked', 'done']);
+  assert.deepEqual(stagesOf(task('in_review'), { canRun: true }), ['backlog', 'todo', 'in_progress', 'blocked', 'done']);
+  assert.deepEqual(stagesOf(task('blocked'), { canRun: true }), ['backlog', 'todo', 'in_progress', 'in_review', 'done']);
+  assert.deepEqual(stageMenuOptions({ status: 'active', execution_stage: 'todo' }), [], 'no id');
+});
+
+test('stage menu routes done, in progress and blocked through their own flows', () => {
+  const via = Object.fromEntries(stageMenuOptions(task('todo'), { canRun: true }).map(o => [o.stage, o.via]));
+  assert.deepEqual(via, { backlog: 'stage', in_progress: 'run', in_review: 'stage', blocked: 'block', done: 'done' });
+  for (const o of stageMenuOptions(task('todo'), { canRun: true })) assert.ok(o.label, `${o.stage} has a label`);
+});
+
+test('in progress is offered only when Run Now is', () => {
+  assert.ok(!stagesOf(task('todo'), { canRun: false }).includes('in_progress'));
+  assert.ok(!stagesOf(task('todo')).includes('in_progress'));
+});
+
+test('an agent task parked in backlog is not offered blocked: the server would keep it in backlog', () => {
+  assert.ok(!stagesOf(task('backlog', { origin: 'agent' })).includes('blocked'));
+  assert.ok(stagesOf(task('todo', { origin: 'agent' })).includes('blocked'));
+  assert.ok(stagesOf(task('backlog', { origin: 'native' })).includes('blocked'));
+});
+
+test('a closed task can be reopened but not closed again', () => {
+  const done = stagesOf(task('done', { status: 'done' }), { canRun: true });
+  assert.deepEqual(done, ['backlog', 'todo']);
+  const cancelled = stagesOf(task('cancelled', { status: 'soft_deleted' }), { canRun: true });
+  assert.deepEqual(cancelled, ['backlog', 'todo']);
+});
+
+test('moving a task off a live run confirms that the run stops first', () => {
+  assert.equal(stageChangeConfirmText(task('todo'), 'in_review'), '');
+  assert.match(stageChangeConfirmText(task('in_progress'), 'in_review'), /run is in progress[\s\S]*In review/);
+  assert.equal(stageChangeConfirmText(task('in_progress'), 'done'), '', 'Mark done asks its own confirm');
+});

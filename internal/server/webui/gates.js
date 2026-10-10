@@ -760,14 +760,15 @@ function trustCreateForm(taskId, info, onDone) {
   tev1.type = 'checkbox';
   tev1Label.append(tev1, document.createTextNode(' tev1 decides overnight (off by default)'));
   if (!info.tev1_configured) { tev1.disabled = true; tev1Label.title = 'No local tev1 advisor configured'; }
-  const go = el('button', 'gate-btn gate-approve-btn trust-create-btn', 'Trust (Touch ID)');
+  const fromBacklog = info.task_stage === 'backlog';
+  const go = el('button', 'gate-btn gate-approve-btn trust-create-btn', trustButtonLabel(info.task_stage));
   go.addEventListener('click', async () => {
     let ack = false;
     if (tev1.checked) {
       ack = confirm(`Enable tev1 overnight mode?\n\n${info.tev1_warning || ''}\n\nOn a deny, low confidence or error the request is not run and the whole task is parked until you review it.`);
       if (!ack) return;
     }
-    const { spec, error } = trustSpec(preset.value, mins.value, tev1.checked, ack);
+    const { spec, error } = trustSpec(preset.value, mins.value, tev1.checked, ack, fromBacklog);
     if (error) { alert(error); return; }
     go.disabled = true;
     const ok = await trustCreate(taskId, spec);
@@ -786,7 +787,8 @@ function trustCreateForm(taskId, info, onDone) {
 // renderTaskTrust draws the trust section at the top of a task page: the
 // banner and auto-approved list when trusted, the create form otherwise, and
 // the latest trust's tev1 summary.
-async function renderTaskTrust(container, taskId) {
+// onStageChange reopens the page after "Move to todo and trust" moved the task.
+async function renderTaskTrust(container, taskId, onStageChange) {
   if (!taskId) return;
   let info;
   try {
@@ -795,7 +797,8 @@ async function renderTaskTrust(container, taskId) {
   const sec = el('div', 'task-page-section task-trust-section');
   sec.dataset.taskId = taskId;
   const now = Date.now();
-  const rerender = () => { sec.remove(); renderTaskTrust(container, taskId); };
+  const rerender = () => { sec.remove(); renderTaskTrust(container, taskId, onStageChange); };
+  const afterCreate = info.task_stage === 'backlog' && onStageChange ? onStageChange : rerender;
   const active = info.active;
   if (active) {
     if (active.tev1) sec.appendChild(trustTev1Banner('this task'));
@@ -809,7 +812,7 @@ async function renderTaskTrust(container, taskId) {
       .sort((a, b) => String(b.decided_at || '').localeCompare(String(a.decided_at || '')));
     if (approved.length) sec.appendChild(trustRequestList('Auto-approved, newest first', approved, now));
   } else {
-    sec.appendChild(trustCreateForm(taskId, info, rerender));
+    sec.appendChild(trustCreateForm(taskId, info, afterCreate));
     const last = info.latest;
     if (last) {
       sec.appendChild(el('div', 'muted-text trust-ended',
