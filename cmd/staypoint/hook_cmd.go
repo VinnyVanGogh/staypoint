@@ -579,7 +579,7 @@ func handleHookPreTool() {
 	snap := security.NewSnapshotter()
 	c := &security.Classifier{CWD: cwd, CWDTrusted: cwdTrusted, Snap: snap,
 		ScratchDirs:   hookScratchDirs(os.Getenv("STAYPOINT_TASK_ID")),
-		PushPolicyFor: hookPushPolicy}
+		PushPolicyFor: hookPushPolicy, TaskID: taskID}
 	verdict := c.Classify(bashInput.Command)
 	// A daemon-run agent (STAYPOINT_TASK_ID is in the hook's own env, which
 	// the command cannot change) asks the Board for anything that breaks an
@@ -688,7 +688,7 @@ func raiseForBoardRules(cmd, cwd string, snap *security.Snapshotter, v *security
 	for _, r := range security.ScriptRefs(cmd, cwd, snap, 0) {
 		hashes = append(hashes, security.ScriptHash{Path: r.Path, Content: string(r.Full)})
 	}
-	if why := security.AnalyzeBoardRulesForTask(taskID, cmd, hashes); why != "" {
+	if why := security.AnalyzeBoardRulesForTaskIn(taskID, cwd, cmd, hashes); why != "" {
 		v.Tier = security.Red
 		v.Reasons = append(v.Reasons, "board rule: "+why)
 	}

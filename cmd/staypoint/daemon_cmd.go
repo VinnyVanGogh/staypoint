@@ -157,6 +157,7 @@ var daemonServeCmd = &cobra.Command{
 				os.Exit(1)
 			}
 		}
+		setGateHosts(cfg)
 
 		dbStore, err := db.Open(cfg.DBPath)
 		if err != nil {

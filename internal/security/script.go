@@ -259,19 +259,39 @@ func absIn(dir, p string) string {
 // nextDir returns the working directory after segment s ran in dir: `cd x`
 // moves it, anything unresolvable makes it unknown ("").
 func (c *Classifier) nextDir(s segment, dir string) string {
-	argv := stripPrefixes(s.argv)
-	if baseCmd(argv) != "cd" {
+	argv := stripPrefixes(dropKeywords(s.argv))
+	switch baseCmd(argv) {
+	case "cd", "pushd":
+	case "popd":
+		return ""
+	default:
 		return dir
 	}
 	if len(argv) == 1 {
+		if baseCmd(argv) == "pushd" {
+			return "" // swaps the top two dirs
+		}
 		return c.home()
 	}
 	a := argv[1]
-	if a == "-" || strings.Contains(a, "$") || strings.HasPrefix(a, "-") {
+	if a == "-" || strings.Contains(a, "$") || strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+") {
 		return ""
+	}
+	// With CDPATH set a relative target may resolve under any of its dirs.
+	if c.cdpath && !filepath.IsAbs(a) && !strings.HasPrefix(a, "~") && a != "." && a != ".." &&
+		!strings.HasPrefix(a, "./") && !strings.HasPrefix(a, "../") {
+		return ""
+	}
+	if a == "~" || strings.HasPrefix(a, "~/") {
+		if h := c.home(); h != "" {
+			a = h + a[1:]
+		}
 	}
 	return absIn(dir, a)
 }
+
+// dirChangers move the shell's working directory.
+var dirChangers = map[string]bool{"cd": true, "pushd": true, "popd": true}
 
 // shellScriptArg returns the script a shell is asked to run, skipping its
 // option flags. ok is false for -c, -s, -i and for no script at all.
@@ -428,10 +448,18 @@ func (c *Classifier) classifyHeredocs(s segment, name string, args []string, v *
 	default:
 		for _, d := range docs {
 			v.merge(c.classifyLine(d.body, depth+1))
+			if scriptInterps[name] {
+				classifyInlineScript(d.body, v)
+			}
 		}
 		return false
 	}
 }
+
+// scriptInterps run code they are fed; a heredoc to one is read as an
+// inline script too.
+var scriptInterps = map[string]bool{"python": true, "python2": true, "python3": true, "node": true, "nodejs": true,
+	"ruby": true, "perl": true, "php": true, "osascript": true, "deno": true, "bun": true}
 
 // dataSink reports whether a cat/tee segment only prints its input or writes
 // it under a scratch dir.
@@ -684,6 +712,11 @@ type scriptState struct {
 	vars    map[string]scriptVar
 	content string
 	depth   int
+	// forVals collects every literal for-loop word list per variable and
+	// forBinds counts those loops (-1 after a non-literal one): when every
+	// binding of a name is such a loop, it is one of forVals.
+	forVals  map[string][]string
+	forBinds map[string]int
 }
 
 // scriptReadOnly reports whether content runs only read-only commands and
@@ -707,7 +740,7 @@ func (c *Classifier) scriptReadOnly(content, confine string, depth int) (bool, s
 		}
 	}
 	st := &scriptState{c: c, confine: confine, funcs: map[string]bool{}, vars: map[string]scriptVar{},
-		content: content, depth: depth}
+		content: content, depth: depth, forVals: map[string][]string{}, forBinds: map[string]int{}}
 	for _, m := range funcDefRe.FindAllStringSubmatch(content, -1) {
 		st.funcs[m[1]] = true
 	}
@@ -870,6 +903,37 @@ func (st *scriptState) concrete(tok string, dyn bool) (string, bool) {
 		return "", false
 	}
 	return out, true
+}
+
+// pathVars is what the walker knows of the script's variables, for the
+// sensitive-path check: a literal, or a for-loop's words as a brace group.
+func (st *scriptState) pathVars() pathVars {
+	pv := pathVars{}
+	vars := map[string]scriptVar{}
+	for name, n := range st.forBinds {
+		if n > 0 && n == st.bareCount(name) {
+			vars[name] = scriptVar{values: st.forVals[name]}
+		}
+	}
+	for name, v := range st.vars {
+		vars[name] = v
+	}
+	for name, v := range vars {
+		switch {
+		case v.known:
+			pv[name] = v.literal
+		case len(v.values) == 1:
+			pv[name] = v.values[0]
+		case len(v.values) > 1:
+			pv[name] = "{" + strings.Join(v.values, ",") + "}"
+			for _, x := range v.values {
+				if strings.ContainsAny(x, "{},") {
+					pv[name] = unresolved
+				}
+			}
+		}
+	}
+	return pv
 }
 
 // writable reports whether the script may write tok: an absolute path,
@@ -1038,8 +1102,10 @@ func (st *scriptState) command(s segment) (bool, string) {
 
 	// Sensitive paths are never read or written.
 	var fv Verdict
+	pc := *st.c
+	pc.vars = st.pathVars()
 	for _, a := range args.argv {
-		st.c.checkPath(a, &fv)
+		pc.checkPath(a, &fv)
 	}
 	if fv.Tier == Red {
 		return false, line + ": " + strings.Join(fv.Reasons, "; ")
@@ -1229,6 +1295,18 @@ func (st *scriptState) forLoop(args segment) (bool, string) {
 	name := args.argv[0]
 	if dangerVarRe.MatchString(name) {
 		return false, "for loop assigns " + name
+	}
+	// Literal words (quoted ones with spaces included) are what the
+	// variable may hold, for the sensitive-path check.
+	literal := true
+	for i := 2; i < len(args.argv); i++ {
+		literal = literal && !segDyn(args, i) && !segMeta(args, i)
+	}
+	if literal && st.forBinds[name] >= 0 {
+		st.forBinds[name]++
+		st.forVals[name] = append(st.forVals[name], args.argv[2:]...)
+	} else {
+		st.forBinds[name] = -1
 	}
 	var vals []string
 	for i := 2; i < len(args.argv); i++ {

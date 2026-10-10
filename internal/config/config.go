@@ -100,6 +100,26 @@ type GatesConfig struct {
 	// branch is merged. Default true. When off, tasks finish the way they do
 	// today — no card, no dev server.
 	ShipReview *bool `json:"ship_review,omitempty" toml:"ship_review"`
+
+	// Hosts classes ssh destinations for the unattended-run Board rules
+	// ([gates.hosts]). A host in neither list is unknown and held as prod.
+	Hosts GateHostsConfig `json:"hosts,omitempty" toml:"hosts"`
+}
+
+// GateHostsConfig is the [gates.hosts] table:
+//
+//	[gates.hosts]
+//	dev = ["mansol-dev"]
+//	prod = ["mansol-prod"]
+//	dev_services = ["mansol_apps"]
+//
+// ssh to a dev host may run reads and dev deploy steps (git pull, systemctl
+// restart of a dev_services unit, verify_dev_deploy.sh) unattended; ssh to
+// any other host waits for the Board.
+type GateHostsConfig struct {
+	Dev         []string `json:"dev,omitempty" toml:"dev"`
+	Prod        []string `json:"prod,omitempty" toml:"prod"`
+	DevServices []string `json:"dev_services,omitempty" toml:"dev_services"`
 }
 
 // Parallel-run caps used when config.toml does not set them (STA-773,

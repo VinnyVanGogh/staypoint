@@ -122,25 +122,26 @@ func SelfProtectedPath(path string) string {
 	return ""
 }
 
-// AnalyzeBoardRulesForTask returns why line (or a script it runs) breaks a
+// AnalyzeBoardRulesForTaskIn returns why line (or a script it runs) breaks a
 // Board rule for unattended runs of taskID, or "" when it does not. The run
 // may read its own handoff files (~/.staypoint/handoffs/<taskID>/); pass ""
-// when there is no task.
-func AnalyzeBoardRulesForTask(taskID, line string, scripts []ScriptHash) string {
-	if why := boardRuleText(line, "command", taskID); why != "" {
+// when there is no task. cwd lets a relative path in line resolve ("" when
+// unknown: a relative path that may spell a protected name then holds).
+func AnalyzeBoardRulesForTaskIn(taskID, cwd, line string, scripts []ScriptHash) string {
+	if why := boardRuleText(line, "command", taskID, cwd); why != "" {
 		return why
 	}
 	for _, s := range scripts {
 		// Comments are read too: a script can run its own comments
 		// (bash -c "$(sed 's/^#//' "$0")").
-		if why := boardRuleText(s.Content, "script "+s.Path, ""); why != "" {
+		if why := boardRuleText(s.Content, "script "+s.Path, "", cwd); why != "" {
 			return why
 		}
 	}
 	return ""
 }
 
-func boardRuleText(code, what, taskID string) string {
+func boardRuleText(code, what, taskID, cwd string) string {
 	if strings.TrimSpace(code) == "" {
 		return ""
 	}
@@ -152,11 +153,16 @@ func boardRuleText(code, what, taskID string) string {
 		return what + " runs an indirect command ($VAR, $(...), eval) that cannot be checked"
 	case inputShell(code, 0):
 		return what + " runs shell commands it reads from input or a file, which cannot be checked"
-	case remoteShellRe.MatchString(code):
-		return what + " opens a remote shell or tunnel, which may write prod or delete data (Board rule: no prod writes or deletes)"
-	case selfCmdRe.MatchString(code) || runsLaunchctl(code, 0) || reinstallExec(code, 0) || killsSelf(code, 0) || killsByPID(code) || runsDaemon(code, 0):
+	case gitRunsConfig(code, 0):
+		return what + " sets git config or a GIT_* variable that runs a program (core.fsmonitor, core.sshCommand, diff.external, a filter or helper, GIT_SSH_COMMAND ...), which cannot be checked"
+	}
+	if why := remoteShellRule(code, taskID); why != "" {
+		return what + " " + why
+	}
+	switch {
+	case textMatch(selfCmdRe, code) || runsLaunchctl(code, 0) || reinstallExec(code, 0) || killsSelf(code, 0) || killsByPID(code) || runsDaemon(code, 0):
 		return what + " rebuilds, restarts or replaces StayPoint or its guards (Board rule: self-protection)"
-	case selfPathRe.MatchString(code) && !ownHandoffRead(code, taskID):
+	case textMatch(selfPathRe, code) && !ownHandoffRead(code, taskID), selfPathSpelled(code, cwd, taskID):
 		return what + " touches StayPoint state or agent guard config (Board rule: self-protection)"
 	case localAPIWrite(code):
 		return what + " writes to the local StayPoint API (Board rule: self-protection)"
@@ -236,7 +242,8 @@ var pkgRunners = map[string]bool{"pnpm dlx": true, "yarn dlx": true, "npm exec":
 // parse confirms it is not only data, such as a grep pattern 'a|claude' or
 // a commit message.
 func runsAgent(code string, depth int) bool {
-	if !agentWordRe.MatchString(code) {
+	// cl""aude and c\laude are claude once the shell drops the quotes.
+	if !textMatch(agentWordRe, code) && !globSpells(nestedAgentRe, code, 0) {
 		return false
 	}
 	if depth > maxDepth {
@@ -262,7 +269,7 @@ func runsAgent(code string, depth int) bool {
 		if len(argv) == 0 {
 			continue
 		}
-		if nestedAgentRe.MatchString(argv[0]) {
+		if nestedAgentRe.MatchString(argv[0]) || globNames(nestedAgentRe, argv[0]) {
 			return true
 		}
 		if shells[baseCmd(argv)] {
@@ -441,7 +448,7 @@ var envWordRe = regexp.MustCompile(`\b(env|unset|export|declare|typeset|local|re
 // StayPoint env the gate relies on (gateVarRe) for anything but go test or
 // go vet: tests clear STAYPOINT_TASK_ID to isolate themselves.
 func stayEnvChange(code string, depth int) bool {
-	if !strings.Contains(code, "STAYPOINT_") && !envWordRe.MatchString(code) {
+	if uq := unquoter.Replace(code); !strings.Contains(uq, "STAYPOINT_") && !envWordRe.MatchString(uq) {
 		return false
 	}
 	if depth > maxDepth {
@@ -829,7 +836,15 @@ func grepPatternsOther(pats []string) bool {
 		names = append(names, path.Base(home))
 	}
 	for _, p := range pats {
-		if !psPatternRe.MatchString(p) || statOnlyRe.MatchString(p) || patternMatches(p, names) {
+		// "[n]ode server": words split by single spaces, each of which
+		// passes alone, cannot match the daemon's line either: no word of
+		// it does, and one cannot reach across a column.
+		for _, w := range strings.Split(p, " ") {
+			if !psPatternRe.MatchString(w) || statOnlyRe.MatchString(w) || patternMatches(w, names) {
+				return false
+			}
+		}
+		if patternMatches(p, names) {
 			return false
 		}
 	}
@@ -935,7 +950,7 @@ func selfProcNames() []string {
 // staypoint-apitest-server does not. A pattern that does not compile, a
 // pidfile, patterns from xargs or code that does not parse hold.
 func killsSelf(code string, depth int) bool {
-	if !textMatch(killRe, code) {
+	if !textMatch(killRe, code) && !globSpells(killRe, code, 0) {
 		return false
 	}
 	if depth > maxDepth {
@@ -969,7 +984,7 @@ func killsSelf(code string, depth int) bool {
 		data, off := dataArgs(argv), len(s.argv)-len(argv)
 		for i, a := range argv {
 			switch n := baseCmd([]string{a}); {
-			case n == "pkill" || n == "killall":
+			case n == "pkill" || n == "killall" || i == 0 && globNames(killRe, a):
 				// find -exec pkill, sudo pkill: its patterns follow it. A
 				// pattern that expands ("$P") cannot be read.
 				if i == 0 && viaXargs || killPatternsSelf(argv[i+1:]) || anyTrue(s.dyn[off+i:]) {
@@ -1037,7 +1052,7 @@ func isDaemonName(p string) bool { return daemonProgRe.MatchString(path.Base(p))
 // does cp, mv or ln of one to such a name. Building it as staypointd* or
 // naming it does not hold.
 func runsDaemon(code string, depth int) bool {
-	if !textMatch(daemonRe, code) {
+	if !textMatch(daemonRe, code) && !globSpells(daemonRe, code, 0) {
 		return false
 	}
 	if depth > maxDepth {
@@ -1079,7 +1094,7 @@ func runsDaemon(code string, depth int) bool {
 		name := baseCmd(argv)
 		runner := viaXargs || name == "watch"
 		switch {
-		case isDaemonName(argv[0]):
+		case isDaemonName(argv[0]) || globNames(daemonRe, argv[0]):
 			return true
 		case name == "go":
 			// go -C dir build: -C (or --C) is the one flag before the
@@ -1223,7 +1238,7 @@ func reinstallExec(code string, depth int) bool { return namedRun(code, reinstal
 // holds unless it only reads or records the name (namesOnly), and so does
 // a pipe from it into anything but a filter.
 func namedRun(code string, re *regexp.Regexp, depth int) bool {
-	if !textMatch(re, code) {
+	if !textMatch(re, code) && !globSpells(re, code, 0) {
 		return false
 	}
 	if depth > maxDepth {
@@ -1256,7 +1271,8 @@ func namedRun(code string, re *regexp.Regexp, depth int) bool {
 	fed := false // a pipe from a segment that read the script
 	for _, s := range segs {
 		argv, viaXargs := unwrapArgv(s.argv)
-		named := anyNames(re, s.argv) || redirectNames(re, s) || heredocNames(re, s)
+		named := anyNames(re, s.argv) || redirectNames(re, s) || heredocNames(re, s) ||
+			len(argv) > 0 && nameMatch(re, argv[0])
 		if fed && (viaXargs || len(argv) == 0 || !pipeFilters[baseCmd(argv)] || argv[0] != baseCmd(argv) || writesFile(s) || filterWrites(argv)) {
 			return true
 		}
@@ -1275,16 +1291,23 @@ func namedRun(code string, re *regexp.Regexp, depth int) bool {
 
 func anyNames(re *regexp.Regexp, args []string) bool {
 	for _, a := range args {
-		if re.MatchString(a) {
+		if argNames(re, a) {
 			return true
 		}
 	}
 	return false
 }
 
+// argNames is re on an argument, or a glob argument that may spell the
+// reinstall script. A glob spelling a program name (launch*ctl) only runs
+// it at a program position, which namesOnly and the callers check.
+func argNames(re *regexp.Regexp, a string) bool {
+	return re.MatchString(a) || re == reinstallRe && globNames(re, a)
+}
+
 func redirectNames(re *regexp.Regexp, s segment) bool {
 	for _, r := range s.redirects {
-		if !r.heredoc && re.MatchString(r.target) {
+		if !r.heredoc && argNames(re, r.target) {
 			return true
 		}
 	}
@@ -1368,7 +1391,7 @@ var gitNameSubs = map[string]bool{
 // namesOnly reports whether segment s (argv unwrapped) only names what re
 // matches without running or copying it.
 func namesOnly(re *regexp.Regexp, s segment, argv []string, viaXargs bool, depth int) bool {
-	if viaXargs || len(argv) == 0 || writesFile(s) || re.MatchString(argv[0]) {
+	if viaXargs || len(argv) == 0 || writesFile(s) || nameMatch(re, argv[0]) {
 		return false
 	}
 	// A bare program name: ./cat is whatever the agent put there.
