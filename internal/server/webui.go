@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"embed"
 	"html/template"
 	"io/fs"
@@ -53,6 +54,9 @@ func isSPARoute(p string) bool {
 	if strings.HasPrefix(clean, "org/") || strings.HasPrefix(clean, "tasks/") || strings.HasPrefix(clean, "issues/") || clean == "tasks" || clean == "issues" {
 		return true
 	}
+	if isTaskRefPath(p) {
+		return true
+	}
 	return validSPARoutes[clean]
 }
 
@@ -64,7 +68,11 @@ func isSPARoute(p string) bool {
 //
 // The board token is NOT injected here; it is delivered only as an HttpOnly cookie
 // during the ?token= bootstrap redirect handled by SecurityMiddleware.Wrap.
-func RegisterUIRoutes(mux *http.ServeMux, authToken string) {
+//
+// With a db, task page URLs are canonicalised server-side (see taskPageRoute):
+// old /tasks/... links and wrong slugs 301 to /STA-123/slug, and an unknown
+// reference serves the page with status 404.
+func RegisterUIRoutes(mux *http.ServeMux, authToken string, db *sql.DB) {
 	fileServer := http.FileServer(http.FS(webuiFS))
 
 	// Serve static assets under /ui/
@@ -81,7 +89,22 @@ func RegisterUIRoutes(mux *http.ServeMux, authToken string) {
 			http.NotFound(w, r)
 			return
 		}
+		status := http.StatusOK
+		if db != nil {
+			redirect, notFound := taskPageRoute(db, r.URL.Path)
+			if redirect != "" {
+				if r.URL.RawQuery != "" {
+					redirect += "?" + r.URL.RawQuery
+				}
+				http.Redirect(w, r, redirect, http.StatusMovedPermanently)
+				return
+			}
+			if notFound {
+				status = http.StatusNotFound
+			}
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(status)
 		_ = indexTmpl.Execute(w, map[string]string{
 			"Token": authToken,
 		})

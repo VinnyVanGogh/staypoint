@@ -18,6 +18,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
+	"github.com/VinnyVanGogh/staypoint/internal/taskref"
 	"github.com/VinnyVanGogh/staypoint/internal/testgate"
 )
 
@@ -87,6 +88,9 @@ func (h *ShipReviewHandler) taskOrgProject(t *context.Task) (string, string) {
 }
 
 func (h *ShipReviewHandler) taskPagePath(t *context.Task) string {
+	if t.Identifier != "" {
+		return taskref.Path(t.Identifier, t.Slug)
+	}
 	org, project := h.taskOrgProject(t)
 	if org == "" {
 		org = "STA"

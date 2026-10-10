@@ -79,7 +79,7 @@ func New(opts Options) (*Server, error) {
 	s.registerRoutes(mux)
 
 	// Wrap entire mux with security middleware (DNS rebinding, Origin, CORS, Auth)
-	secureHandler := secMid.Wrap(mux)
+	secureHandler := secMid.Wrap(resolveTaskRefPaths(opts.DB, mux))
 
 	s.httpServer = &http.Server{
 		Handler:      secureHandler,
@@ -338,7 +338,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	}
 
 	// Embedded web UI (must be registered last so /api/* patterns take precedence)
-	RegisterUIRoutes(mux, s.opts.AuthToken)
+	RegisterUIRoutes(mux, s.opts.AuthToken, s.opts.DB)
 }
 
 // Start binds to 127.0.0.1 and starts serving requests in the background.

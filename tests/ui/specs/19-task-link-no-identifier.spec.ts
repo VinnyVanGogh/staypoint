@@ -54,24 +54,26 @@ async function seedFleetLabel(page: Page, task: Task, project: string) {
 }
 
 test.describe('task link without identifier (STA-693)', () => {
-  test('peek view expand opens the full page for a non-STA task with identifier null', async ({ page, api }) => {
+  // task-eb38c245: every local task now carries its own reference (RHI-12), so
+  // the fleet label never stands in for it and the URL is /RHI-12/<slug>.
+  test('peek view expand opens the full page for a non-STA task', async ({ page, api }) => {
     const project = `rhizome-site-${Date.now().toString(36)}`;
     const task = await api.createTask('NoIdent', { organization: ORG, project });
-    const label = fleetLabel(task);
+    expect(task.identifier).toMatch(new RegExp(`^${PREFIX}-\\d+$`));
+    const canonical = new RegExp(`/${task.identifier}/${task.slug}$`);
     await seedFleetLabel(page, task, project);
 
     await page.goto('/task-status');
-    // Precondition: the fleet label reached the UI's task state, as in production.
+    // The task's own reference wins over the fleet label.
     await expect
       .poll(() => page.evaluate((id) => (state.tasks[id] || {}).identifier, task.id), { timeout: 20_000 })
-      .toBe(label);
+      .toBe(task.identifier);
 
     await page.locator('#ts-task-table').getByText(task.name).click();
     const panel = page.locator('#detail-panel');
     await expect(panel).toBeVisible();
     await expect(panel).toContainText(task.name);
-    // The peek URL carries the task's own org and project, not STA/default.
-    await expect(page).toHaveURL(new RegExp(`/tasks/${PREFIX}/${project}/${task.id}$`));
+    await expect(page).toHaveURL(canonical);
 
     // Hold the task fetch: on a loaded daemon the page sits on its first URL for
     // many seconds, and a reload or copied link in that window must still resolve.
@@ -82,22 +84,22 @@ test.describe('task link without identifier (STA-693)', () => {
       await route.continue();
     });
     await page.locator('#panel-open').click();
-    await expect(page).toHaveURL(new RegExp(`/tasks/${PREFIX}/${project}/${task.id}$`));
+    await expect(page).toHaveURL(canonical);
     release();
     await page.unroute(`**/api/tasks/${task.id}`);
 
     const title = page.locator('#task-page-content .task-page-title');
     await expect(title).toHaveText(task.name, { timeout: 20_000 });
-    await expect(page).toHaveURL(new RegExp(`/tasks/${PREFIX}/${project}/${task.id}$`));
+    await expect(page).toHaveURL(canonical);
     await expect(page.locator('#task-page-content')).not.toContainText('Task not found');
 
     // The link must survive a reload, which resolves it before fleet data loads.
     await page.reload();
     await expect(title).toHaveText(task.name, { timeout: 20_000 });
-    await expect(page).toHaveURL(new RegExp(`/tasks/${PREFIX}/${project}/${task.id}$`));
+    await expect(page).toHaveURL(canonical);
   });
 
-  test('legacy URL with the fleet label in the ident slot resolves by id', async ({ page, api }) => {
+  test('legacy URL with the fleet label in the ident slot lands on the canonical URL', async ({ page, api }) => {
     const project = `rhizome-site-${Date.now().toString(36)}`;
     const task = await api.createTask('LegacyLabel', { organization: ORG, project });
     // The label was minted by the fleet overview, which maps Rhizome to RHI. The
@@ -106,8 +108,8 @@ test.describe('task link without identifier (STA-693)', () => {
 
     await page.goto(`/tasks/${PREFIX}/${project}/${fleetLabel(task)}`);
     await expect(page.locator('#task-page-content .task-page-title')).toHaveText(task.name, { timeout: 20_000 });
-    // The URL is rewritten to the resolvable task id.
-    await expect(page).toHaveURL(new RegExp(`/${task.id}$`));
+    // The URL is rewritten to the task's own reference.
+    await expect(page).toHaveURL(new RegExp(`/${task.identifier}/${task.slug}$`));
   });
 
   // STA-722: the label prefix is the task's own org, so a legacy RHI label must
@@ -130,7 +132,7 @@ test.describe('task link without identifier (STA-693)', () => {
 
     await page.goto(`/tasks/${PREFIX}/default/${fleetLabel(task)}`);
     await expect(page.locator('#task-page-content .task-page-title')).toHaveText(task.name, { timeout: 20_000 });
-    await expect(page).toHaveURL(new RegExp(`/${task.id}$`));
+    await expect(page).toHaveURL(new RegExp(`/${task.identifier}/${task.slug}$`));
   });
 
   test('legacy label URL stays a miss when the org prefix cannot be loaded', async ({ page, api }) => {

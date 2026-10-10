@@ -288,12 +288,19 @@ func TestTestGate_BypassAuditsAndFilesBacklogTask(t *testing.T) {
 	if stage != "backlog" || status != "active" || project != "ship-review-test" {
 		t.Errorf("task stage/status/project = %s/%s/%s, want backlog/active/ship-review-test", stage, status, project)
 	}
-	if !strings.Contains(g.TestTask.URL, "/tasks/STA/ship-review-test/"+g.TestTask.ID) {
-		t.Errorf("task url = %q", g.TestTask.URL)
+	taskPath := func(id string) string {
+		var ref, slug string
+		if err := database.QueryRow(`SELECT org_key || '-' || number, slug FROM tasks WHERE id = ?`, id).Scan(&ref, &slug); err != nil {
+			t.Fatalf("task %s reference: %v", id, err)
+		}
+		return "/" + ref + "/" + slug
+	}
+	if want := taskPath(g.TestTask.ID); g.TestTask.URL != want {
+		t.Errorf("task url = %q, want %q", g.TestTask.URL, want)
 	}
 	var desc string
 	_ = database.QueryRow(`SELECT content FROM task_documents WHERE task_id = ? AND doc_key = 'description' ORDER BY version DESC LIMIT 1`, g.TestTask.ID).Scan(&desc)
-	for _, want := range []string{"Merge without tests", head, "task `" + taskID + "`", "/tasks/STA/ship-review-test/" + taskID,
+	for _, want := range []string{"Merge without tests", head, "task `" + taskID + "`", "(" + taskPath(taskID) + ")",
 		"Board's reason: hotfix", "This repo has no CI.", "- `calc/calc.go`", "No coverage data"} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("description missing %q:\n%s", want, desc)

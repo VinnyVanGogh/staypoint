@@ -153,6 +153,10 @@ type LinkedTask struct {
 	ID    string `json:"id"`
 	Name  string `json:"name"`
 	Stage string `json:"stage"`
+	// Identifier (STA-123) and Slug make the task page link /STA-123/slug;
+	// empty for a task with no number.
+	Identifier string `json:"identifier,omitempty"`
+	Slug       string `json:"slug,omitempty"`
 }
 
 // prLinks maps PR URLs and branch names to tasks in repo.
@@ -174,7 +178,8 @@ func normPRURL(u string) string {
 func (h *PullRequestsHandler) links(repo string) prLinks {
 	l := prLinks{byURL: map[string]LinkedTask{}, byBranch: map[string]LinkedTask{}}
 	rows, err := h.db.Query(`
-		SELECT wp.reference, t.id, t.name, COALESCE(t.execution_stage, '')
+		SELECT wp.reference, t.id, t.name, COALESCE(t.execution_stage, ''),
+		       COALESCE(t.org_key || '-' || t.number, ''), t.slug
 		FROM task_work_products wp JOIN tasks t ON t.id = wp.task_id
 		WHERE wp.product_type IN ('pr', 'pull_request') AND t.status != 'soft_deleted'
 		ORDER BY wp.id`)
@@ -182,20 +187,20 @@ func (h *PullRequestsHandler) links(repo string) prLinks {
 		for rows.Next() {
 			var ref string
 			var lt LinkedTask
-			if rows.Scan(&ref, &lt.ID, &lt.Name, &lt.Stage) == nil && prRefNumberRe.MatchString(ref) {
+			if rows.Scan(&ref, &lt.ID, &lt.Name, &lt.Stage, &lt.Identifier, &lt.Slug) == nil && prRefNumberRe.MatchString(ref) {
 				l.byURL[normPRURL(ref)] = lt
 			}
 		}
 		rows.Close()
 	}
 	rows, err = h.db.Query(`
-		SELECT id, name, COALESCE(execution_stage, '')
+		SELECT id, name, COALESCE(execution_stage, ''), COALESCE(org_key || '-' || number, ''), slug
 		FROM tasks WHERE repo_path = ? AND status != 'soft_deleted'`, repo)
 	if err == nil {
 		// Task runs work on staypoint/<task id> (ship review's branch).
 		for rows.Next() {
 			var lt LinkedTask
-			if rows.Scan(&lt.ID, &lt.Name, &lt.Stage) == nil {
+			if rows.Scan(&lt.ID, &lt.Name, &lt.Stage, &lt.Identifier, &lt.Slug) == nil {
 				l.byBranch["staypoint/"+lt.ID] = lt
 			}
 		}

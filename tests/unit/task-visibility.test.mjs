@@ -113,9 +113,10 @@ test('taskVisibility labels badges', () => {
 
 test('list surfaces in app.js read tasks through the visibility helpers', () => {
   // Raw Object.values(state.tasks) is allowed only in the helpers, the hidden
-  // count, the direct-link resolver (findTask) and the Kanban board (which
-  // filters through buildBoard's showLegacy).
-  const allowed = ['function taskValues', 'function updateShowHiddenCounts', 'function findTask', 'function renderKanban'];
+  // count, the direct-link resolvers (findTask, isFleetTaskId: a pasted
+  // STA-123 link to an archived task still opens it) and the Kanban board
+  // (which filters through buildBoard's showLegacy).
+  const allowed = ['function taskValues', 'function updateShowHiddenCounts', 'function findTask', 'function isFleetTaskId', 'function renderKanban'];
   const fnStarts = [...app.matchAll(/^(?:async )?function ([A-Za-z_]+)\(/gm)].map(m => ({ name: m[1], at: m.index }));
   const owner = at => (fnStarts.filter(f => f.at <= at).pop() || { name: '<top>' }).name;
   const offenders = [];

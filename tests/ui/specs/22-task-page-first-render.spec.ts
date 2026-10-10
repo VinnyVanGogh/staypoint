@@ -6,8 +6,8 @@
  * each, seconds on a loaded machine) before drawing anything. It now renders
  * from the DB-backed calls and fills the Diff tab and the Lines stat later.
  *
- * A pasted /tasks/task-… link kept that URL: only in-app navigation replaced
- * it with /tasks/<org>/<project>/<id>.
+ * A pasted /tasks/task-… link kept that URL. The server now 301s it to the
+ * canonical /STA-123/<slug> URL (task-eb38c245).
  */
 
 import type { Page, Route } from '@playwright/test';
@@ -79,40 +79,17 @@ test('a stale diff for the previous task does not paint over the next one', asyn
   await expect(linesVal(page, b.id)).toHaveText('+0 −0');
 });
 
-/** Lists the task's org in /api/fleet/overview with an issue prefix. */
-async function seedFleetOrg(page: Page, org: string, prefix: string) {
-  await page.route('**/api/fleet/overview', async (route) => {
-    const res = await route.fetch();
-    const body = await res.json();
-    body.organizations = [
-      ...(body.organizations || []),
-      {
-        id: `org-${prefix.toLowerCase()}`,
-        name: org,
-        issue_prefix: prefix,
-        task_counts: { total: 1, running: 0, active: 1, stopped: 0, blocked: 0, errored: 0, done: 0 },
-        active_agents: 0,
-        active_agents_by_provider: {},
-        spent_usd: 0,
-        spent_tokens: 0,
-        tasks: [],
-      },
-    ];
-    await route.fulfill({ response: res, json: body });
-  });
-}
-
-test('a bare /tasks/<id> link is replaced with /tasks/<org>/<project>/<id>', async ({ page, api, baseURL }) => {
-  const org = 'Canon Org';
+test('a bare /tasks/<id> link is redirected to /<ORG>-<n>/<slug> (task-eb38c245)', async ({ page, api, baseURL }) => {
   const project = `canon-${Date.now().toString(36)}`;
-  const task = await api.createTask('Canonical URL', { organization: org, project });
-  await seedFleetOrg(page, org, 'CAN');
+  const task = await api.createTask('Canonical URL', { organization: 'Canon Org', project });
+  // The org key comes from the server, not the fleet overview: an unknown org
+  // takes its first three letters.
+  expect(task.identifier).toMatch(/^CAN-\d+$/);
 
-  await page.goto(`${baseURL}/tasks/${encodeURIComponent(task.id)}`);
+  const res = await page.goto(`${baseURL}/tasks/${encodeURIComponent(task.id)}`);
   await expect(page.locator('#task-page-content .task-page-title')).toHaveText(task.name, { timeout: 20_000 });
-  await expect(page).toHaveURL(`${baseURL}/tasks/CAN/${project}/${task.id}`, { timeout: 20_000 });
-
-  // replaceState, not pushState: Back leaves the page instead of returning to
-  // the bare link.
-  expect(await page.evaluate(() => history.state && history.state.canonicalPath)).toBe(`/tasks/CAN/${project}/${task.id}`);
+  await expect(page).toHaveURL(`${baseURL}/${task.identifier}/${task.slug}`);
+  // A server redirect, so the bare link never enters history and Back leaves
+  // the page instead of returning to it.
+  expect(res?.request().redirectedFrom()?.url()).toBe(`${baseURL}/tasks/${task.id}`);
 });

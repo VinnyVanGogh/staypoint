@@ -38,6 +38,9 @@ type TaskItem struct {
 	// Origin is the local task origin (native, paperclip_import, legacy, agent);
 	// live Paperclip issues are "legacy" (Paperclip is frozen).
 	Origin string `json:"origin,omitempty"`
+	// Slug is a local task's URL slug (/STA-123/<slug>); Identifier is then
+	// its reference (STA-123).
+	Slug string `json:"slug,omitempty"`
 }
 
 // AgentItem represents an active or registered agent in an organization.

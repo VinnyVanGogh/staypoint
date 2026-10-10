@@ -1555,6 +1555,16 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		Version: 46,
+		Name:    "task_numbers",
+		Up: func(conn *sql.DB) error {
+			// task-eb38c245: per-organization references (STA-123) and URL
+			// slugs; every existing task renumbered in created order. See
+			// migrate_task_numbers.go.
+			return migrateTaskNumbers(conn)
+		},
+	},
 }
 
 func copyFile(src, dst string) error {

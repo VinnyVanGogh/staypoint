@@ -66,7 +66,7 @@ func ListDocumentSummaries(db *sql.DB, f DocumentFilter) ([]DocumentSummary, err
 		args = append(args, org)
 	}
 	query := `
-		SELECT d.task_id, t.name, COALESCE(t.source_ref, ''), COALESCE(t.organization, ''),
+		SELECT d.task_id, t.name, COALESCE(t.org_key || '-' || t.number, t.source_ref, ''), COALESCE(t.organization, ''),
 		       COALESCE(t.project, ''), COALESCE(t.work_kind, 'coding'), d.doc_key,
 		       MAX(d.version), COUNT(*), MIN(d.created_at), MAX(d.created_at),
 		       (SELECT LENGTH(CAST(x.content AS BLOB)) FROM task_documents x

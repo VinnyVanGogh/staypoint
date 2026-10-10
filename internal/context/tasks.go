@@ -15,6 +15,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
+	"github.com/VinnyVanGogh/staypoint/internal/taskref"
 	"github.com/google/uuid"
 )
 
@@ -69,6 +70,16 @@ type Task struct {
 	// ModelOverride pins the model for Provider ("opus", "sonnet",
 	// "gemini-3.1-pro-high", "gemini-3.8-flash-high"); "" = the default.
 	ModelOverride string `json:"model_override"`
+	// Identifier is the task's reference: its organization key and number
+	// (STA-123), unique and never reused. OrgKey and Number are its parts;
+	// Slug is the URL decoration stored at create; URL is the canonical link
+	// (http://localhost:41421/STA-123/slug). All empty for a task with no
+	// number. ID stays the key everything else references.
+	Identifier string `json:"identifier,omitempty"`
+	OrgKey     string `json:"org_key,omitempty"`
+	Number     int    `json:"number,omitempty"`
+	Slug       string `json:"slug,omitempty"`
+	URL        string `json:"url,omitempty"`
 }
 
 // TaskBlockerInfo contains summarized info about an upstream or downstream related task.
@@ -247,10 +258,11 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 			id, name, repo_path, git_branch, status, account_role,
 			max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 			organization, project, parent_id, assignee_agent_id, work_kind,
-			execution_stage, origin, priority, source_ref, source_id, provider, model_override, created_at, updated_at, deleted_at
+			execution_stage, origin, priority, source_ref, source_id, provider, model_override, created_at, updated_at, deleted_at,
+			org_key, number, slug
 		)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-		        COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?)
+		        COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?, ?, ?, ?)
 	`
 	// status follows the stage, as in writeStage: a task created closed
 	// (an imported done/cancelled issue) is never active.
@@ -281,7 +293,22 @@ func CreateTaskWithOptions(db *sql.DB, opts TaskCreateOptions) (*Task, error) {
 		assigneeAgentID = opts.AssigneeAgentID
 	}
 
-	if _, err := db.Exec(query, taskID, name, repoPath, gitBranch, status, role, opts.MaxBudgetUSD, opts.MaxTurns, opts.Organization, opts.Project, parentID, assigneeAgentID, workKind, stage, origin, priority, opts.SourceRef, opts.SourceID, opts.Provider, opts.ModelOverride, closedAt, deletedAt); err != nil {
+	// The number is reserved and the row inserted in one transaction: a failed
+	// insert gives the number back, a committed one owns it.
+	orgKey := taskref.OrgKey(opts.Organization)
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert task: %w", err)
+	}
+	defer tx.Rollback()
+	number, err := nextTaskNumber(tx, orgKey)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(query, taskID, name, repoPath, gitBranch, status, role, opts.MaxBudgetUSD, opts.MaxTurns, opts.Organization, opts.Project, parentID, assigneeAgentID, workKind, stage, origin, priority, opts.SourceRef, opts.SourceID, opts.Provider, opts.ModelOverride, closedAt, deletedAt, orgKey, number, taskref.Slugify(name)); err != nil {
+		return nil, fmt.Errorf("failed to insert task: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to insert task: %w", err)
 	}
 
@@ -415,7 +442,8 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 			       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
 			       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
 			       COALESCE(origin, 'native'), COALESCE(priority, 'medium'), source_ref, source_id,
-			       COALESCE(provider, ''), COALESCE(model_override, '')
+			       COALESCE(provider, ''), COALESCE(model_override, ''),
+			       COALESCE(org_key, ''), COALESCE(number, 0), slug
 			FROM tasks
 			WHERE status != 'soft_deleted'
 			ORDER BY created_at DESC
@@ -427,7 +455,8 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 			       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
 			       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
 			       COALESCE(origin, 'native'), COALESCE(priority, 'medium'), source_ref, source_id,
-			       COALESCE(provider, ''), COALESCE(model_override, '')
+			       COALESCE(provider, ''), COALESCE(model_override, ''),
+			       COALESCE(org_key, ''), COALESCE(number, 0), slug
 			FROM tasks
 			WHERE status = 'active'
 			ORDER BY created_at DESC
@@ -444,6 +473,8 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 	for rows.Next() {
 		var t Task
 		var deletedAt, org, proj, blockReason, parentID, checkoutRunID, checkoutAgentID, assigneeAgentID sql.NullString
+		var refKey, refSlug string
+		var refNumber int
 		if err := rows.Scan(
 			&t.ID,
 			&t.Name,
@@ -474,6 +505,7 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 			&t.SourceID,
 			&t.Provider,
 			&t.ModelOverride,
+			&refKey, &refNumber, &refSlug,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan task row: %w", err)
 		}
@@ -501,6 +533,7 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 		if proj.Valid {
 			t.Project = proj.String
 		}
+		t.fillRef(refKey, refNumber, refSlug)
 		tasks = append(tasks, t)
 	}
 
@@ -544,16 +577,19 @@ func ListTasks(db *sql.DB, includeAll bool) ([]Task, error) {
 	return tasks, nil
 }
 
-// GetTask fetches a single task by exact ID or ID prefix.
+// GetTask fetches a single task by exact ID, ID prefix or reference (STA-123,
+// or a legacy label; see ResolveTaskRef).
 func GetTask(db *sql.DB, id string) (*Task, error) {
 	id = strings.TrimSpace(id)
+	id = ResolveTaskID(db, id)
 	query := `
 		SELECT id, name, repo_path, git_branch, status, account_role,
 		       max_budget_usd, max_turns, spent_tokens, spent_usd, spent_turns,
 		       organization, project, parent_id, execution_stage, checkout_run_id, checkout_agent_id,
 		       assignee_agent_id, is_blocked, block_reason, created_at, updated_at, deleted_at,
 		       COALESCE(work_kind, 'coding'), COALESCE(origin, 'native'), COALESCE(priority, 'medium'), source_ref, source_id,
-			       COALESCE(provider, ''), COALESCE(model_override, '')
+			       COALESCE(provider, ''), COALESCE(model_override, ''),
+			       COALESCE(org_key, ''), COALESCE(number, 0), slug
 		FROM tasks
 		WHERE id = ? OR id = ? OR id LIKE ?
 		ORDER BY created_at DESC
@@ -568,6 +604,8 @@ func GetTask(db *sql.DB, id string) (*Task, error) {
 	row := db.QueryRow(query, id, fullID, prefixMatch)
 	var t Task
 	var deletedAt, org, proj, blockReason, parentID, checkoutRunID, checkoutAgentID, assigneeAgentID sql.NullString
+	var refKey, refSlug string
+	var refNumber int
 	if err := row.Scan(
 		&t.ID,
 		&t.Name,
@@ -599,6 +637,7 @@ func GetTask(db *sql.DB, id string) (*Task, error) {
 		&t.SourceID,
 		&t.Provider,
 		&t.ModelOverride,
+		&refKey, &refNumber, &refSlug,
 	); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("task not found: %s", id)
@@ -629,6 +668,7 @@ func GetTask(db *sql.DB, id string) (*Task, error) {
 	if proj.Valid {
 		t.Project = proj.String
 	}
+	t.fillRef(refKey, refNumber, refSlug)
 	t.BlockedBy, _ = GetTaskBlockedBy(db, t.ID)
 	t.Blocks, _ = GetTaskBlocks(db, t.ID)
 	if cRows, err := db.Query(`SELECT id, task_id, author, message, created_at FROM task_comments WHERE task_id = ? ORDER BY created_at ASC`, t.ID); err == nil {
@@ -651,7 +691,8 @@ func GetTask(db *sql.DB, id string) (*Task, error) {
 func GetTaskBlockedBy(db *sql.DB, taskID string) ([]TaskBlockerInfo, error) {
 	query := `
 		SELECT tr.task_id, COALESCE(t.name, tr.task_id), COALESCE(t.status, 'active'), COALESCE(t.execution_stage, 'todo'),
-		       COALESCE(t.is_blocked, 0), COALESCE(t.block_reason, ''), COALESCE(tr.rationale, '')
+		       COALESCE(t.is_blocked, 0), COALESCE(t.block_reason, ''), COALESCE(tr.rationale, ''),
+		       COALESCE(t.org_key || '-' || t.number, tr.task_id)
 		FROM task_relations tr
 		LEFT JOIN tasks t ON tr.task_id = t.id
 		WHERE tr.blocks_id = ?
@@ -667,10 +708,9 @@ func GetTaskBlockedBy(db *sql.DB, taskID string) ([]TaskBlockerInfo, error) {
 	for rows.Next() {
 		var info TaskBlockerInfo
 		var isBlockedInt int
-		if err := rows.Scan(&info.ID, &info.Name, &info.Status, &info.ExecutionStage, &isBlockedInt, &info.BlockReason, &info.Rationale); err != nil {
+		if err := rows.Scan(&info.ID, &info.Name, &info.Status, &info.ExecutionStage, &isBlockedInt, &info.BlockReason, &info.Rationale, &info.Identifier); err != nil {
 			return nil, err
 		}
-		info.Identifier = info.ID
 		info.Title = info.Name
 		info.IsBlocked = isBlockedInt == 1
 		if info.Rationale == "" && info.BlockReason != "" {
@@ -685,7 +725,8 @@ func GetTaskBlockedBy(db *sql.DB, taskID string) ([]TaskBlockerInfo, error) {
 func GetTaskBlocks(db *sql.DB, taskID string) ([]TaskBlockerInfo, error) {
 	query := `
 		SELECT tr.blocks_id, COALESCE(t.name, tr.blocks_id), COALESCE(t.status, 'active'), COALESCE(t.execution_stage, 'todo'),
-		       COALESCE(t.is_blocked, 0), COALESCE(t.block_reason, ''), COALESCE(tr.rationale, '')
+		       COALESCE(t.is_blocked, 0), COALESCE(t.block_reason, ''), COALESCE(tr.rationale, ''),
+		       COALESCE(t.org_key || '-' || t.number, tr.blocks_id)
 		FROM task_relations tr
 		LEFT JOIN tasks t ON tr.blocks_id = t.id
 		WHERE tr.task_id = ?
@@ -701,10 +742,9 @@ func GetTaskBlocks(db *sql.DB, taskID string) ([]TaskBlockerInfo, error) {
 	for rows.Next() {
 		var info TaskBlockerInfo
 		var isBlockedInt int
-		if err := rows.Scan(&info.ID, &info.Name, &info.Status, &info.ExecutionStage, &isBlockedInt, &info.BlockReason, &info.Rationale); err != nil {
+		if err := rows.Scan(&info.ID, &info.Name, &info.Status, &info.ExecutionStage, &isBlockedInt, &info.BlockReason, &info.Rationale, &info.Identifier); err != nil {
 			return nil, err
 		}
-		info.Identifier = info.ID
 		info.Title = info.Name
 		info.IsBlocked = isBlockedInt == 1
 		if info.Rationale == "" && info.BlockReason != "" {
@@ -724,7 +764,7 @@ func GetTaskDependencyGraph(db *sql.DB, taskID string) (*TaskDependencyGraph, er
 
 	taskInfo := &TaskBlockerInfo{
 		ID:             task.ID,
-		Identifier:     task.ID,
+		Identifier:     task.Ref(),
 		Name:           task.Name,
 		Title:          task.Name,
 		Status:         task.Status,
@@ -745,7 +785,7 @@ func GetTaskDependencyGraph(db *sql.DB, taskID string) (*TaskDependencyGraph, er
 		if parentTask, err := GetTask(db, task.ParentID); err == nil {
 			graph.Parent = &TaskBlockerInfo{
 				ID:             parentTask.ID,
-				Identifier:     parentTask.ID,
+				Identifier:     parentTask.Ref(),
 				Name:           parentTask.Name,
 				Title:          parentTask.Name,
 				Status:         parentTask.Status,
@@ -758,7 +798,8 @@ func GetTaskDependencyGraph(db *sql.DB, taskID string) (*TaskDependencyGraph, er
 
 	// Fetch subtasks (where parent_id = task.ID)
 	subRows, err := db.Query(`
-		SELECT id, name, status, execution_stage, is_blocked, COALESCE(block_reason, '')
+		SELECT id, name, status, execution_stage, is_blocked, COALESCE(block_reason, ''),
+		       COALESCE(org_key || '-' || number, id)
 		FROM tasks
 		WHERE parent_id = ? AND status != 'soft_deleted'
 		ORDER BY created_at ASC
@@ -768,8 +809,7 @@ func GetTaskDependencyGraph(db *sql.DB, taskID string) (*TaskDependencyGraph, er
 		for subRows.Next() {
 			var st TaskBlockerInfo
 			var isBlockedInt int
-			if err := subRows.Scan(&st.ID, &st.Name, &st.Status, &st.ExecutionStage, &isBlockedInt, &st.BlockReason); err == nil {
-				st.Identifier = st.ID
+			if err := subRows.Scan(&st.ID, &st.Name, &st.Status, &st.ExecutionStage, &isBlockedInt, &st.BlockReason, &st.Identifier); err == nil {
 				st.Title = st.Name
 				st.IsBlocked = isBlockedInt == 1
 				graph.Subtasks = append(graph.Subtasks, st)

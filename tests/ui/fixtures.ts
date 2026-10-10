@@ -22,6 +22,9 @@ export type Task = {
   repo_path?: string;
   organization?: string;
   project?: string;
+  /** Reference (STA-123) and URL slug: the page lives at /STA-123/<slug>. */
+  identifier?: string;
+  slug?: string;
 };
 
 export type Interaction = {
@@ -198,6 +201,9 @@ export async function recordTaskBase(request: APIRequestContext, taskId: string,
 
 /** URL of the full task page, matching taskToPath() in app.js for local tasks. */
 export function taskPagePath(task: Task): string {
+  if (task.identifier) {
+    return task.slug ? `/${task.identifier}/${encodeURIComponent(task.slug)}` : `/${task.identifier}`;
+  }
   return `/tasks/${encodeURIComponent(task.organization || 'STA')}/${encodeURIComponent(
     task.project || 'default',
   )}/${encodeURIComponent(task.id)}`;
