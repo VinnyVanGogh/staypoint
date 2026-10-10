@@ -116,7 +116,7 @@ func opsRun(t *testing.T, cfg *config.Config) Option {
 // /api/ops/run-token/check does.
 func registryCheck(r *opstools.RunTokens) RunChecker {
 	return func(_ context.Context, taskID, token string) error {
-		_, err := r.Check(taskID, token)
+		_, _, err := r.CheckHash(taskID, opstools.TokenHash(token), "")
 		return err
 	}
 }
@@ -230,6 +230,22 @@ func TestPRMergeGatesOnRealBase(t *testing.T) {
 		res := callOps(t, s, "pr_merge", map[string]any{"repo": repo, "pr": 5, "base": "dev-server"})
 		if res.IsError || called || !rec.ran("gh", "merge") || !strings.Contains(resultText(res), "effect=dev_write") {
 			t.Fatalf("dev merge: err=%v called=%v %s", res.IsError, called, resultText(res))
+		}
+	})
+
+	// Board review #5 LOW a: a dev-base merge is a dev write only in a repo
+	// [gates.ops] lists; elsewhere it goes to the Board as external_write.
+	t.Run("dev-server merge in an unlisted repo asks the Board", func(t *testing.T) {
+		rec := &recorder{views: []string{prViewJSON("x/y", 5, "dev-server", "feature", head, "OPEN")}}
+		var asked []ApprovalRequest
+		s := NewServer(opsRun(t, opsConfig(t)), withRunner(rec.run), WithApprover(func(_ context.Context, req ApprovalRequest) (bool, string) {
+			asked = append(asked, req)
+			return false, "Board denied"
+		}))
+		defer s.Close()
+		res := callOps(t, s, "pr_merge", map[string]any{"repo": repo, "pr": 5, "base": "dev-server"})
+		if len(asked) != 1 || asked[0].Call.Effect != opstools.ExternalWrite || !res.IsError || rec.ran("gh", "merge") {
+			t.Fatalf("unlisted dev merge: asked=%+v err=%v %s", asked, res.IsError, resultText(res))
 		}
 	})
 

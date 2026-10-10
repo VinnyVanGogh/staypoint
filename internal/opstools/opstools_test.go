@@ -301,28 +301,43 @@ func TestMergeEffectAndPlan(t *testing.T) {
 			t.Errorf("MergeEffect(%q) = %s, want %s", base, got, want)
 		}
 	}
+	listed := []string{"Owner/Repo"}
+	for _, c := range []struct {
+		base, repo string
+		want       Effect
+	}{
+		{"dev-server", "owner/repo", DevWrite},
+		{"dev-server", "other/repo", ExternalWrite},
+		{"dev", "", ExternalWrite},
+		{"main", "owner/repo", ProdWrite},
+		{"main", "other/repo", ProdWrite},
+	} {
+		if got := RepoMergeEffect(c.base, c.repo, listed); got != c.want {
+			t.Errorf("RepoMergeEffect(%q, %q) = %s, want %s", c.base, c.repo, got, c.want)
+		}
+	}
 	head := strings.Repeat("a", 40)
 	view := func(url, base, state string) []byte {
 		return []byte(`{"url":"` + url + `","baseRefName":"` + base + `","headRefName":"feature","headRefOid":"` + head + `","state":"` + state + `"}`)
 	}
 	const prURL = "https://github.com/Owner/repo/pull/7"
 	req := PRMergeRequest{Repo: "/r", PR: 7, Base: "main", Method: "merge"}
-	if _, err := PlanPRMerge(req, view(prURL, "dev-server", "OPEN")); err == nil || !strings.Contains(err.Error(), "not the declared base") {
+	if _, err := PlanPRMerge(req, view(prURL, "dev-server", "OPEN"), nil); err == nil || !strings.Contains(err.Error(), "not the declared base") {
 		t.Fatalf("declared base lie not refused: %v", err)
 	}
 	devReq := PRMergeRequest{Repo: "/r", PR: 7, Base: "dev-server", Method: "merge"}
-	if _, err := PlanPRMerge(devReq, view(prURL, "main", "OPEN")); err == nil {
+	if _, err := PlanPRMerge(devReq, view(prURL, "main", "OPEN"), nil); err == nil {
 		t.Fatal("main PR declared as dev-server was not refused")
 	}
-	if _, err := PlanPRMerge(req, view(prURL, "main", "MERGED")); err == nil {
+	if _, err := PlanPRMerge(req, view(prURL, "main", "MERGED"), nil); err == nil {
 		t.Fatal("merged PR not refused")
 	}
 	for _, bad := range []string{"", "https://github.example.com/o/r/pull/7", "https://github.com/o/r/pull/8", "https://github.com/o/../pull/7", "https://github.com/o/r/pull/7/files"} {
-		if _, err := PlanPRMerge(req, view(bad, "main", "OPEN")); err == nil {
+		if _, err := PlanPRMerge(req, view(bad, "main", "OPEN"), nil); err == nil {
 			t.Errorf("PR URL %q accepted", bad)
 		}
 	}
-	p, err := PlanPRMerge(req, view(prURL, "main", "OPEN"))
+	p, err := PlanPRMerge(req, view(prURL, "main", "OPEN"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -16,12 +16,25 @@ import (
 // main and prod included, is a prod write (fail closed).
 var devBases = map[string]bool{"dev-server": true, "dev": true}
 
-// MergeEffect is the effect of merging a PR into base.
+// MergeEffect is the effect of merging a PR into base, as the parameters
+// alone show it. The server decides on RepoMergeEffect.
 func MergeEffect(base string) Effect {
 	if devBases[base] {
 		return DevWrite
 	}
 	return ProdWrite
+}
+
+// RepoMergeEffect is MergeEffect scoped to the GitHub repo the PR is in: a
+// dev-base merge is a dev write only in a repo the Board listed in
+// [gates.ops] own_repos or verify_repos; in any other repo it is an
+// external write (Board review #5 LOW a).
+func RepoMergeEffect(base, ghRepo string, listed []string) Effect {
+	e := MergeEffect(base)
+	if e == DevWrite && !slices.ContainsFunc(listed, func(r string) bool { return strings.EqualFold(r, ghRepo) }) {
+		return ExternalWrite
+	}
+	return e
 }
 
 var (
@@ -117,8 +130,10 @@ func ValidatePRMerge(r *PRMergeRequest, defaultRepo string) error {
 
 // PlanPRMerge binds r to the PR GitHub reported: the declared base must be
 // the real base (so the effect is decided from the truth), the PR must be
-// open, and the merge is pinned to the head commit the Board saw.
-func PlanPRMerge(r PRMergeRequest, viewJSON []byte) (*PRMergePlan, error) {
+// open, and the merge is pinned to the head commit the Board saw. listed
+// are the GitHub repos a dev-base merge may run in unattended
+// (RepoMergeEffect).
+func PlanPRMerge(r PRMergeRequest, viewJSON []byte, listed []string) (*PRMergePlan, error) {
 	v, ghRepo, err := ParsePRView(r.PR, viewJSON)
 	if err != nil {
 		return nil, err
@@ -134,7 +149,7 @@ func PlanPRMerge(r PRMergeRequest, viewJSON []byte) (*PRMergePlan, error) {
 	}
 	p := &PRMergePlan{Repo: r.Repo, GHRepo: ghRepo, PR: r.PR, Method: r.Method, Base: r.Base, HeadSHA: v.HeadRefOid}
 	p.Tool = "pr_merge"
-	p.Effect = MergeEffect(r.Base)
+	p.Effect = RepoMergeEffect(r.Base, ghRepo, listed)
 	p.Summary = fmt.Sprintf("gh_repo=%s pr=%d base=%s method=%s head=%s", ghRepo, r.PR, r.Base, r.Method, v.HeadRefOid)
 	return p, nil
 }

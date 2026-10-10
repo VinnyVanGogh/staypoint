@@ -90,7 +90,23 @@ was no activity row. Four things close that:
   or unsets `HOME`, `PATH`, `USER`, `TMPDIR`, `XDG_*`, `GH_*`, `GITHUB_*`,
   `GIT_*`, `STAYPOINT_*`, `DYLD_*` or `LD_*` (as a prefix or through `env`,
   including any `env` flag), is Red. The harness starts the MCP server
-  itself; an agent never needs to.
+  itself; an agent never needs to. The same holds behind shell keywords
+  and groups (`{ staypoint mcp; }`, `if staypoint mcp`, `! staypoint mcp`),
+  and any `staypoint` call inside a shell function definition is Red, since
+  the body runs when called, after env edits later on the line. Inline
+  interpreter scripts (`python3 -c`, `node -e`, `perl -e`, `ruby -e`, and
+  the same interpreters fed a here-document or here-string) are Red when
+  they read another process's environment (`ps -E`, `ps` with the `e`
+  modifier, `/proc/*/environ`) or start `staypoint` at all (Board review #5).
+- **Ticket kept off the timeline.** Run steps are stored and shown on the
+  task page, and an agent can print its env (`env`, `printenv`). Every step
+  title, command and body is redacted (`security.Redact`, which masks
+  `STAYPOINT_RUN_TICKET=<hex>`) and the run's own ticket value is masked
+  wherever it appears, before the step is stored or published.
+
+Effect enforcement runs in the MCP server process, which runs as the
+agent's uid; the daemon only confirms that the ticket is live and belongs
+to the task and run.
 
 A renamed copy of the binary (`go build -o /tmp/x ./cmd/staypoint && /tmp/x
 mcp`) is not caught by name. It gets the same pinned config and the same
@@ -278,9 +294,15 @@ the result line says which effect it ran as.
 
 The effect depends on the base:
 
-- `dev_write` when the base is `dev-server` or `dev`.
+- `dev_write` when the base is `dev-server` or `dev` and the PR's GitHub repo
+  is listed in `[gates.ops]` `own_repos` or `verify_repos`.
+- `external_write` (the Board) for a `dev-server` / `dev` merge in any other
+  repo (Board review #5).
 - `prod_write` for `main`, `prod`, or any other base (fail closed). The
   Board's night rule applies: prod merges run only at night unless urgent.
+
+The timeline title shows the base-only effect (`pr_merge [dev_write]
+base=dev-server`); the server decides on the repo-scoped one.
 
 The tool reads the PR with `gh pr view` in `repo`. The GitHub `owner/name`
 comes from the PR's URL and goes into the canonical call and the Board's

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -455,7 +456,8 @@ func (s *Server) handlePRMerge(ctx context.Context, rawArgs json.RawMessage) *To
 		if res.ExitCode != 0 || res.Err != nil {
 			return nil, toolError("pr_merge: gh pr view failed\n" + res.Format())
 		}
-		plan, err := opstools.PlanPRMerge(req, []byte(res.Stdout))
+		ops := s.getConfig().Gates.Ops
+		plan, err := opstools.PlanPRMerge(req, []byte(res.Stdout), slices.Concat(ops.OwnRepos, ops.VerifyRepos))
 		if err != nil {
 			return nil, toolError("pr_merge refused: " + err.Error())
 		}
