@@ -3059,7 +3059,8 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 }
 .task-page-action-tray .ship-review-actions-wrap { margin-top: 8px; }
 .task-page-action-tray .ship-review-inline-form { margin-top: 0; }
-.task-page-action-tray .mark-done-error:not([style*="display: none"]) { margin-top: 8px; }
+.task-page-action-tray .mark-done-error:not([style*="display: none"]),
+.task-page-action-tray .task-stage-error:not([style*="display: none"]) { margin-top: 8px; }
 .task-page-stats {
   flex-shrink: 0;
   margin: 0;
@@ -3355,7 +3356,9 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 }
 .cancel-task-btn:hover { opacity: .88; }
 .cancel-task-btn:disabled { opacity: .45; cursor: not-allowed; }
-.mark-done-error {
+.task-stage-select { max-width: 11rem; }
+.task-stage-select:disabled { opacity: .45; cursor: wait; }
+.mark-done-error, .task-stage-error {
   margin-top: 8px; padding: 7px 10px;
   background: rgba(220,38,38,.15); border: 1px solid var(--red, #dc2626);
   border-radius: 5px; color: var(--red, #dc2626);

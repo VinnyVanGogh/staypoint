@@ -169,3 +169,67 @@ func TestRenderStatuslineWithReviewBadge(t *testing.T) {
 		t.Fatalf("expected review badge in statusline output, got:\n%s", out)
 	}
 }
+
+// The launch banner and the launch are one routing answer: the plan line and
+// model badge show the decision's tool, never a hard-coded Gemini route.
+func TestRenderStatuslineFor_PlanLineIsTheDecision(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+
+	cases := []struct {
+		name     string
+		decision *RouteDecision
+		want     []string
+	}{
+		{"routed claude", &RouteDecision{Tool: "claude", Model: "claude-opus-5", AccountRole: "personal"},
+			[]string{"claude-opus-5 (claude)", "seat: personal"}},
+		{"forced agy", &RouteDecision{Tool: "agy", Model: "gemini-3.8-flash-high"},
+			[]string{"gemini-3.8-flash-high (agy)"}},
+		{"waiting", &RouteDecision{Tool: "claude", Model: "claude-opus-5", AccountRole: "personal", Waiting: true},
+			[]string{"claude-opus-5 (claude)", "waiting for a Claude seat"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := RenderStatuslineFor(&buf, nil, tc.decision); err != nil {
+				t.Fatal(err)
+			}
+			out := buf.String()
+			for _, w := range tc.want {
+				if !strings.Contains(out, w) {
+					t.Errorf("banner missing %q:\n%s", w, out)
+				}
+			}
+			if tc.decision.Tool == "claude" && strings.Contains(strings.ToLower(out), "gemini") {
+				t.Errorf("claude route but banner mentions gemini:\n%s", out)
+			}
+		})
+	}
+}
+
+// With no decision the statusline routes the directory itself, so the plan
+// line still matches what Route would launch (Claude, GeminiCodeForbidden).
+func TestRenderStatusline_PlanLineRoutesWhenNoDecision(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+
+	var buf bytes.Buffer
+	if err := RenderStatusline(&buf, nil); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "(claude)") || strings.Contains(out, "(agy)") {
+		t.Fatalf("plan line should be the routed claude launch:\n%s", out)
+	}
+}
+
+func TestPlanLine_NilOrEmptyDecision(t *testing.T) {
+	if got := planLine(nil); got != "" {
+		t.Errorf("planLine(nil) = %q", got)
+	}
+	if got := planLine(&RouteDecision{}); got != "" {
+		t.Errorf("planLine(empty) = %q", got)
+	}
+}
