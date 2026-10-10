@@ -273,6 +273,7 @@ func (s *Server) getToolsList() []Tool {
 			},
 		},
 		taskCreateChildTool(),
+		taskOpenTool(),
 	}
 }
 
@@ -302,6 +303,8 @@ func (s *Server) handleCallTool(ctx context.Context, params CallToolParams) *Too
 		return s.handleShipReview(ctx, params.Arguments)
 	case "staypoint_task_create_child":
 		return s.handleTaskCreateChild(ctx, params.Arguments)
+	case "staypoint_task_open":
+		return s.handleTaskOpen(ctx, params.Arguments)
 	default:
 		return toolError(fmt.Sprintf("unknown tool: %s", params.Name))
 	}

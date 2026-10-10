@@ -23,6 +23,12 @@ type Server struct {
 	workDir string
 	mu      sync.Mutex
 	outMu   sync.Mutex
+
+	// taskOpenCalls counts staypoint_task_open calls that opened tabs, so a
+	// looping agent cannot spam the Board's browser (see tools_task_open.go).
+	taskOpenCalls int
+	// launch runs the browser command; tests replace it.
+	launch func(name string, args []string) error
 }
 
 // Option configures Server behavior.
