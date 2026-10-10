@@ -67,23 +67,33 @@ type ghContent struct {
 	Encoding string `json:"encoding"`
 }
 
-// fetchScript reads the verify script at ref from GitHub and checks that
-// the bytes hash to the blob id GitHub reported.
-func fetchScript(ctx context.Context, run Runner, repo, ref string) (blob string, body []byte, err error) {
-	res := run(ctx, Cmd{Name: "gh", Args: []string{"api", "repos/" + repo + "/contents/" + verifyScript + "?ref=" + ref}})
+// commitRe is a full commit id.
+var commitRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// fetchScript reads the verify script at the head of branch on GitHub and
+// checks that the bytes hash to the blob id GitHub reported. The branch is
+// resolved through refs/heads to a commit first, so a tag or other ref an
+// agent pushed under the same name cannot stand in for it.
+func fetchScript(ctx context.Context, run Runner, repo, branch string) (blob string, body []byte, err error) {
+	ref := run(ctx, Cmd{Name: "gh", Args: []string{"api", "repos/" + repo + "/git/ref/heads/" + branch, "--jq", ".object.sha"}})
+	commit := strings.TrimSpace(ref.Stdout)
+	if ref.ExitCode != 0 || ref.Err != nil || !commitRe.MatchString(commit) {
+		return "", nil, fmt.Errorf("branch %s not found on GitHub", branch)
+	}
+	res := run(ctx, Cmd{Name: "gh", Args: []string{"api", "repos/" + repo + "/contents/" + verifyScript + "?ref=" + commit}})
 	if res.ExitCode != 0 || res.Err != nil {
-		return "", nil, fmt.Errorf("%s has no %s on GitHub", ref, verifyScript)
+		return "", nil, fmt.Errorf("%s has no %s on GitHub", branch, verifyScript)
 	}
 	var c ghContent
 	if err := json.Unmarshal([]byte(res.Stdout), &c); err != nil || c.Encoding != "base64" || !blobRe.MatchString(c.SHA) {
-		return "", nil, fmt.Errorf("unexpected GitHub contents answer for %s", ref)
+		return "", nil, fmt.Errorf("unexpected GitHub contents answer for %s", branch)
 	}
 	body, err = base64.StdEncoding.DecodeString(strings.ReplaceAll(c.Content, "\n", ""))
 	if err != nil {
-		return "", nil, fmt.Errorf("decode %s: %w", ref, err)
+		return "", nil, fmt.Errorf("decode %s: %w", branch, err)
 	}
 	if gitBlobID(body) != c.SHA {
-		return "", nil, fmt.Errorf("%s content does not hash to blob %s", ref, c.SHA)
+		return "", nil, fmt.Errorf("%s content does not hash to blob %s", branch, c.SHA)
 	}
 	return c.SHA, body, nil
 }

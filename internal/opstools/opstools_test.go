@@ -333,12 +333,17 @@ func fakeGitHub(dev, main string, lie bool, ranBash *[]string) Runner {
 		js := `{"sha":"` + sha + `","encoding":"base64","content":"` + base64.StdEncoding.EncodeToString([]byte(body)) + `\n"}`
 		return Result{Stdout: js, Output: js}
 	}
+	devCommit, mainCommit := strings.Repeat("d", 40), strings.Repeat("e", 40)
 	return func(ctx context.Context, c Cmd) Result {
 		args := strings.Join(c.Args, " ")
 		switch {
-		case c.Name == "gh" && strings.HasSuffix(args, "?ref=dev-server"):
+		case c.Name == "gh" && strings.Contains(args, "/git/ref/heads/dev-server --jq .object.sha"):
+			return Result{Stdout: devCommit + "\n"}
+		case c.Name == "gh" && strings.Contains(args, "/git/ref/heads/main --jq .object.sha"):
+			return Result{Stdout: mainCommit + "\n"}
+		case c.Name == "gh" && strings.HasSuffix(args, "?ref="+devCommit):
 			return answer(dev)
-		case c.Name == "gh" && strings.HasSuffix(args, "?ref=main"):
+		case c.Name == "gh" && strings.HasSuffix(args, "?ref="+mainCommit):
 			return answer(main)
 		case c.Name == "git":
 			return Result{}

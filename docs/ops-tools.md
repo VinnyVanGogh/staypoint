@@ -88,9 +88,12 @@ This replaces `git show origin/dev-server:scripts/verify_dev_deploy.sh | bash
 `repo` is a GitHub `owner/name`, and it must be listed in `[gates.ops]
 verify_repos`.
 
-1. The tool reads the script from the repo's `dev-server` branch on GitHub
-   (`gh api .../contents/...?ref=dev-server`). It hashes the bytes locally
-   and checks they match the blob sha GitHub reports.
+1. The tool resolves `refs/heads/dev-server` on GitHub to a commit (`gh api
+   repos/<repo>/git/ref/heads/dev-server`), so a tag an agent pushed under
+   the same name can't stand in for the branch. It reads the script at that
+   commit (`.../contents/...?ref=<commit>`), hashes the bytes locally, and
+   checks they match the blob sha GitHub reports. It resolves `main` the same
+   way.
 2. It refreshes `origin/dev-server` in the working directory.
 3. It runs exactly those bytes with `bash -s -- <sha> <checks>`.
 4. It returns the PASS/FAIL lines and the final `DEV DEPLOY VERIFIED` /
