@@ -59,7 +59,58 @@
     return { cls: 'pill-green', text: '✔ On Track' };
   }
 
-  const api = { quotaWindowMeasured, quotaWindowView, quotaStatusPill };
+  // formatCountdown renders the time left until targetTs as of nowMs. Every
+  // quota countdown goes through this one formatter so two places showing the
+  // same reset at the same tick cannot disagree.
+  function formatCountdown(targetTs, nowMs) {
+    if (!targetTs) return '';
+    const now = nowMs == null ? Date.now() : nowMs;
+    const diffMs = new Date(targetTs).getTime() - now;
+    if (diffMs <= 0) return 'resets soon';
+    const mins = Math.floor(diffMs / 60000);
+    const hrs = Math.floor(mins / 60);
+    const remMins = mins % 60;
+    if (hrs >= 24) {
+      const days = Math.floor(hrs / 24);
+      const remHrs = hrs % 24;
+      return `in ${days}d ${remHrs}h`;
+    }
+    if (hrs > 0) return `in ${hrs}h ${remMins}m`;
+    return `in ${remMins}m`;
+  }
+
+  // quotaLockoutResetAt is the one reset time a locked gauge counts down to.
+  function quotaLockoutResetAt(q) {
+    return (q && (q.lockout_until || q.five_hour_resets_at)) || null;
+  }
+
+  // quotaProjectionText is the gauge's pacing line as of nowMs. The server's
+  // "Locked out: resets in Xm" text is frozen at gather time, so a locked
+  // gauge recomputes it from the same reset the banner counts down to.
+  function quotaProjectionText(q, nowMs, fallback) {
+    if (!q) return fallback || '';
+    const locked = q.is_locked || q.projection_status === 'locked_out';
+    const resetAt = quotaLockoutResetAt(q);
+    if (locked && resetAt) {
+      const now = nowMs == null ? Date.now() : nowMs;
+      if (new Date(resetAt).getTime() > now) {
+        return `Locked out: resets ${formatCountdown(resetAt, now)}`;
+      }
+    }
+    return q.projection_message || fallback || '';
+  }
+
+  // quotaFiveHourResetText is the 5-hour reset countdown shown in both the
+  // overview gauge card and the Settings provider card.
+  function quotaFiveHourResetText(q, nowMs) {
+    if (!quotaWindowMeasured(q, 'five_hour')) return '';
+    return formatCountdown(q.five_hour_resets_at, nowMs);
+  }
+
+  const api = {
+    quotaWindowMeasured, quotaWindowView, quotaStatusPill,
+    formatCountdown, quotaLockoutResetAt, quotaProjectionText, quotaFiveHourResetText,
+  };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   Object.assign(root, api);
 })(typeof globalThis !== 'undefined' ? globalThis : this);
