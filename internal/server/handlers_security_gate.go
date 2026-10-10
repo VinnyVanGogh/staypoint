@@ -205,7 +205,7 @@ type gateCreateOutcome struct {
 // transaction), or pending. Under trust, merges/pushes to protected
 // branches stay pending, deletes outside the worktree stay pending with a
 // deferral deadline, and tev1 mode leaves the request to runTev1. Under any
-// trust the Board's unattended-run rules (AnalyzeBoardRulesForTask) also stay
+// trust the Board's unattended-run rules (AnalyzeBoardRulesForTaskIn) also stay
 // pending. Every held request gets the deferral deadline, so the run moves on
 // and the Board decides it in the morning (task-9d94997c). A trust lookup
 // error fails the request (fail closed).

@@ -122,17 +122,11 @@ func SelfProtectedPath(path string) string {
 	return ""
 }
 
-// AnalyzeBoardRulesForTask returns why line (or a script it runs) breaks a
+// AnalyzeBoardRulesForTaskIn returns why line (or a script it runs) breaks a
 // Board rule for unattended runs of taskID, or "" when it does not. The run
 // may read its own handoff files (~/.staypoint/handoffs/<taskID>/); pass ""
-// when there is no task.
-func AnalyzeBoardRulesForTask(taskID, line string, scripts []ScriptHash) string {
-	return AnalyzeBoardRulesForTaskIn(taskID, "", line, scripts)
-}
-
-// AnalyzeBoardRulesForTaskIn is AnalyzeBoardRulesForTask for a command run
-// in cwd, so a relative path in it resolves ("" when unknown: a relative
-// path that may spell a protected name then holds).
+// when there is no task. cwd lets a relative path in line resolve ("" when
+// unknown: a relative path that may spell a protected name then holds).
 func AnalyzeBoardRulesForTaskIn(taskID, cwd, line string, scripts []ScriptHash) string {
 	if why := boardRuleText(line, "command", taskID, cwd); why != "" {
 		return why

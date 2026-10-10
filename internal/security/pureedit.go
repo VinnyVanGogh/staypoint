@@ -364,4 +364,4 @@ func isIdentRune(r rune) bool {
 
 // No heredoc body (Python or cat/tee data) is stripped before the Board-rule
 // text check: with auto-allow off nothing is relaxed, so stripping could only
-// hide text from the Board rules. AnalyzeBoardRulesForTask sees the full command.
+// hide text from the Board rules. AnalyzeBoardRulesForTaskIn sees the full command.

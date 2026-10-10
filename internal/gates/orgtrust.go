@@ -17,7 +17,7 @@ import (
 // them: the same exclusions wait for the Board (protected merges/pushes,
 // deferred deletes outside the worktree, Board policy requests), the same
 // tev1 mode applies, and on top of them the Board's unattended-run rules
-// (security.AnalyzeBoardRulesForTask: prod writes, external API writes, data
+// (security.AnalyzeBoardRulesForTaskIn: prod writes, external API writes, data
 // deletes, sending PII) always wait.
 //
 // A task's own trust, when it has one, wins over its organization's.

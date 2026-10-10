@@ -10,6 +10,11 @@ func AnalyzeBoardRules(line string, scripts []ScriptHash) string {
 	return AnalyzeBoardRulesForTask("", line, scripts)
 }
 
+// AnalyzeBoardRulesForTask is AnalyzeBoardRulesForTaskIn with no cwd.
+func AnalyzeBoardRulesForTask(taskID, line string, scripts []ScriptHash) string {
+	return AnalyzeBoardRulesForTaskIn(taskID, "", line, scripts)
+}
+
 // task-33692ffb: the Board's unattended-run rules.
 func TestAnalyzeBoardRules(t *testing.T) {
 	held := map[string][]string{
