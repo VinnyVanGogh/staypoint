@@ -31,7 +31,7 @@ type RouteOptions struct {
 	CheckSSH              bool
 	RemoteHost            string
 	PreferredPersonalTool string // "auto", "claude", or "agy"
-	LastUsedTool          string // "claude", "agy", "gemini"
+	LastUsedTool          string // "claude", "agy", "gemini"; ignored: repo continuity never picks agy (GeminiCodeForbidden)
 	PreferredModel        string // e.g. "opus", "sonnet", "claude-opus-5", "claude-sonnet-4-6"
 	PreferredEffort       string // e.g. "high", "medium", "low"
 	HighPriority          bool   // task is high priority: UIOLI routing selects the top-tier Claude model

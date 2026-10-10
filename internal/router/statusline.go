@@ -1,6 +1,7 @@
 package router
 
 import (
+	stdcontext "context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -211,7 +212,15 @@ func fastGitInfo(dir string) (branch, dirty, sync string) {
 }
 
 // RenderStatusline produces the Tokyo Night multi-line statusline in <5ms.
+// Its plan line routes the current directory without the SSH probe.
 func RenderStatusline(w io.Writer, r io.Reader) error {
+	return RenderStatuslineFor(w, r, nil)
+}
+
+// RenderStatuslineFor is RenderStatusline with the plan line taken from a
+// route decision the caller already made (the smart launch), so the banner and
+// the launched tool are one answer. A nil decision routes here.
+func RenderStatuslineFor(w io.Writer, r io.Reader, decision *RouteDecision) error {
 	// 1. Read input payload if piped (e.g. from Claude Code) with 25ms timeout
 	var payload StatuslinePayload
 	hasPipedInput := false
@@ -246,6 +255,16 @@ func RenderStatusline(w io.Writer, r io.Reader) error {
 		seatIsWork = claudeSessionIsWorkSeat(os.Getenv("CLAUDE_CONFIG_DIR"), home, isWork)
 	}
 
+	// The route this directory takes. Without a session payload (a launch
+	// banner) it also names the model and seat, so every line of the banner
+	// is the same answer as the launch.
+	if decision == nil && pacerState != nil {
+		decision, _ = Route(stdcontext.Background(), dir, pacerState, RouteOptions{})
+	}
+	if !hasPipedInput && decision != nil && decision.AccountRole != "" {
+		seatIsWork = decision.AccountRole == "work"
+	}
+
 	// 5. Build Model badge
 	modelName := payload.Model.DisplayName
 	if modelName == "" {
@@ -254,10 +273,12 @@ func RenderStatusline(w io.Writer, r io.Reader) error {
 	if modelName == "" {
 		if hasPipedInput {
 			modelName = "Claude"
+		} else if decision != nil && decision.Model != "" {
+			modelName = decision.Model
 		} else if isWork {
 			modelName = "Claude (Work)"
 		} else {
-			modelName = "Gemini (Native)"
+			modelName = "Claude"
 		}
 	}
 
@@ -462,34 +483,42 @@ func RenderStatusline(w io.Writer, r io.Reader) error {
 	fmt.Fprintf(w, "%s %sweekly:%d%%%s %s~%.0f%% left%s%s\n",
 		barW, Magenta, weekInt, Reset, Dim, remW, Reset, resetWStr)
 
-	// Line 6: Plan / Dynamic Route line
-	if pacerState != nil {
-		var planParts []string
-		if isWork {
-			planParts = append(planParts, fmt.Sprintf("route ▸ %sremote-claude%s", Green, Reset))
-			planParts = append(planParts, fmt.Sprintf("fallback: %slocal-work%s", Yellow, Reset))
-			if pacerState.Pools[PoolWorkClaude] != nil {
-				planParts = append(planParts, fmt.Sprintf("runway: %d turns", pacerState.Pools[PoolWorkClaude].TurnsRunway))
-			}
-		} else {
-			geminiPool := pacerState.Pools[PoolGeminiNative]
-			if geminiPool != nil && !geminiPool.IsLocked && geminiPool.Weekly.RemainingPct > 0 {
-				planParts = append(planParts, fmt.Sprintf("route ▸ %sgemini-3.8-flash-high (agy)%s", Green, Reset))
-				planParts = append(planParts, fmt.Sprintf("fallback: %sclaude-sonnet-4-6%s", Yellow, Reset))
-				planParts = append(planParts, fmt.Sprintf("runway: %d turns", geminiPool.TurnsRunway))
-			} else {
-				planParts = append(planParts, fmt.Sprintf("route ▸ %sclaude-sonnet-4-6 (agy 3P)%s", Orange, Reset))
-				planParts = append(planParts, fmt.Sprintf("gemini locked (%s)", formatResetTime(geminiPool.LockoutUntil, false)))
-			}
-		}
-
-		if len(planParts) > 0 {
-			bullet := fmt.Sprintf(" %s·%s ", Gray, Reset)
-			fmt.Fprintf(w, "%splan:%s %s\n", Green, Reset, strings.Join(planParts, bullet))
-		}
+	// Line 6: Plan / Dynamic Route line. It is the router's own decision, so
+	// the banner never names a tool the launch will not run.
+	if line := planLine(decision); line != "" {
+		fmt.Fprintln(w, line)
 	}
 
 	return nil
+}
+
+// planLine renders the statusline "plan:" row for a route decision: the
+// tool and model the launch runs, the seat, and whether it waits for a lock.
+func planLine(d *RouteDecision) string {
+	if d == nil || d.Tool == "" {
+		return ""
+	}
+	color := Green
+	if d.Waiting {
+		color = Yellow
+	}
+	parts := []string{fmt.Sprintf("route ▸ %s%s (%s)%s", color, d.Model, d.Tool, Reset)}
+	if d.AccountRole != "" {
+		parts = append(parts, "seat: "+d.AccountRole)
+	}
+	if d.Waiting {
+		parts = append(parts, fmt.Sprintf("%swaiting for a Claude seat%s", Yellow, Reset))
+	} else if d.PacerState != nil {
+		pool := PoolPersonalClaude
+		if d.AccountRole == "work" {
+			pool = PoolWorkClaude
+		}
+		if p := d.PacerState.Pools[pool]; p != nil {
+			parts = append(parts, fmt.Sprintf("runway: %d turns", p.TurnsRunway))
+		}
+	}
+	bullet := fmt.Sprintf(" %s·%s ", Gray, Reset)
+	return fmt.Sprintf("%splan:%s %s", Green, Reset, strings.Join(parts, bullet))
 }
 
 // claudeSessionIsWorkSeat reports whether a Claude Code session runs on the
