@@ -6,9 +6,11 @@
 // or its session id (Claude session_id, agy conversationId) has a row in
 // task_session_attachments for an active task (`staypoint task attach`).
 //
-// The gate is per company: on by default for Managed Solution, off by default
-// for everyone else, toggled through settings_kv key "gates.tracking.<company>"
-// (written only by the Board-only /api/settings/tracking-gate endpoint).
+// The gate is per company: on by default for work orgs (Managed Solution and
+// config work_orgs), off by default for everyone else, toggled through
+// settings_kv key "gates.tracking.<company>" (written only by the Board-only
+// /api/settings/tracking-gate endpoint). Work-repo writes are gated under the
+// Managed Solution toggle and override, and accept a task from any work org.
 //
 // A Board override is an approved security gate request whose run_id is
 // OverrideRunID. Approval goes through WrapBoardAction (Board session cookie +
@@ -30,6 +32,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/geminiapproval"
 	"github.com/VinnyVanGogh/staypoint/internal/geminiguard"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
+	"github.com/VinnyVanGogh/staypoint/internal/workorgs"
 )
 
 const (
@@ -211,10 +214,16 @@ func (g *Gate) Evaluate(req Request) Decision {
 		}
 		if taskID != "" {
 			// The attached task must belong to the company being gated, so
-			// work in a Managed Solution repo is tracked under Managed Solution
-			// and not under whatever task happened to be handy.
+			// work is tracked under that company and not under whatever task
+			// happened to be handy. A work repo accepts a task from any work
+			// org (work_orgs: Managed Solution, Power Platform, ...).
 			org := taskOrganization(conn, taskID)
-			if !sameCompany(org, company) {
+			if work && !workorgs.IsWork(org) {
+				return g.block(req, hit, hitPath, company,
+					fmt.Sprintf("this session is attached to task %s, which belongs to %q, not a work org (%s); attach a work-org task",
+						taskID, org, strings.Join(workorgs.List(), ", ")))
+			}
+			if !work && !sameCompany(org, company) {
 				return g.block(req, hit, hitPath, company,
 					fmt.Sprintf("this session is attached to task %s, which belongs to %q, not %q; attach a %s task", taskID, org, company, company))
 			}
@@ -423,9 +432,16 @@ func BlockMessage(req Request, what, path, company, why string) string {
 	return b.String()
 }
 
-// DefaultEnabled is the gate's state for a company with no explicit setting.
+// DefaultEnabled is the gate's state for a company with no explicit setting:
+// on for every work org (Managed Solution and work_orgs), off otherwise.
 func DefaultEnabled(company string) bool {
-	return strings.EqualFold(strings.TrimSpace(company), CompanyManagedSolution)
+	return workorgs.IsWork(company)
+}
+
+// Companies lists the companies the gate always reports: every work org,
+// then Personal.
+func Companies() []string {
+	return append(workorgs.List(), CompanyPersonal)
 }
 
 // SettingKey is the settings_kv key holding a company's toggle.

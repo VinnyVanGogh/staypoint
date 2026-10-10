@@ -18,6 +18,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry/quota"
+	"github.com/VinnyVanGogh/staypoint/internal/workorgs"
 	_ "modernc.org/sqlite"
 )
 
@@ -1175,7 +1176,7 @@ func getProviderQuotaGauge(quotas map[string]*ProviderQuotaGauge, provider strin
 	if len(orgName) > 0 {
 		org = strings.ToLower(orgName[0])
 	}
-	isWorkOrg := strings.Contains(org, "managed") || strings.Contains(org, "mansol")
+	isWorkOrg := workorgs.IsWork(org) || strings.Contains(org, "managed") || strings.Contains(org, "mansol")
 
 	if strings.Contains(p, "claude") || strings.Contains(p, "anthropic") || strings.Contains(p, "fable") {
 		if p == "claude_personal" {
@@ -1286,7 +1287,7 @@ func (a *Aggregator) populateOrgQuotas(overview *FleetOverview, now time.Time) {
 	for i := range overview.Organizations {
 		org := &overview.Organizations[i]
 		org.ProviderQuotas = make(map[string]*ProviderQuotaGauge)
-		isManagedSol := strings.Contains(strings.ToLower(org.Name), "managed")
+		isManagedSol := workorgs.IsWork(org.Name) || strings.Contains(strings.ToLower(org.Name), "managed")
 
 		for key, fleetGauge := range overview.ProviderQuotas {
 			if fleetGauge == nil {

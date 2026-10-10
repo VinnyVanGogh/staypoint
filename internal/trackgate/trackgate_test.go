@@ -12,6 +12,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/db"
 	"github.com/VinnyVanGogh/staypoint/internal/geminiapproval"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
+	"github.com/VinnyVanGogh/staypoint/internal/workorgs"
 )
 
 const (
@@ -165,9 +166,59 @@ func TestAttachedToOtherCompanyTaskBlocked(t *testing.T) {
 		if d.Block != tc.block {
 			t.Errorf("org %q: block = %v, want %v (%s)", tc.org, d.Block, tc.block, d.Reason)
 		}
-		if tc.block && !strings.Contains(d.Reason, "attach a Managed Solution task") {
+		if tc.block && !strings.Contains(d.Reason, "attach a work-org task") {
 			t.Errorf("org %q: reason missing guidance:\n%s", tc.org, d.Reason)
 		}
+	}
+}
+
+// Board 2026-10-09: a work repo accepts a task from any configured work org
+// (work_orgs), and still refuses personal-org tasks. Unconfigured, Power
+// Platform is not work and is refused (fail closed).
+func TestWorkRepoAcceptsAnyWorkOrgTask(t *testing.T) {
+	t.Cleanup(func() { workorgs.Set(nil) })
+	for _, tc := range []struct {
+		configured []string
+		org        string
+		block      bool
+	}{
+		{nil, "Power Platform", true},
+		{[]string{"Power Platform"}, "Power Platform", false},
+		{[]string{"Power Platform"}, "power platform", false},
+		{[]string{"Power Platform"}, CompanyManagedSolution, false},
+		{[]string{"Power Platform"}, "StayPoint", true},
+		{[]string{"Power Platform"}, "", true},
+		{[]string{"Power Platform"}, "Pоwer Platform", true}, // Cyrillic о
+	} {
+		workorgs.Set(tc.configured)
+		conn := openStore(t)
+		insertTask(t, conn, "task-1", workRepo, tc.org, "active")
+		if err := Attach(conn, "sess-1", "task-1", ClientClaude, workRepo); err != nil {
+			t.Fatalf("attach: %v", err)
+		}
+		g := gateFor(conn, time.Now())
+		for _, req := range []Request{editReq(workRepo + "/mail-router/main.go"), bashReq("git commit -m x", workRepo)} {
+			d := g.Evaluate(req)
+			if d.Block != tc.block {
+				t.Errorf("work_orgs %v, org %q: block = %v, want %v (%s)", tc.configured, tc.org, d.Block, tc.block, d.Reason)
+			}
+		}
+	}
+}
+
+// A work org's gate is on by default; a personal-repo path whose tasks belong
+// to Power Platform is gated like Managed Solution.
+func TestWorkOrgsDefaultEnabled(t *testing.T) {
+	t.Cleanup(func() { workorgs.Set(nil) })
+	if DefaultEnabled("Power Platform") {
+		t.Fatal("unconfigured org gated by default")
+	}
+	workorgs.Set([]string{"Power Platform"})
+	if !DefaultEnabled("Power Platform") || !DefaultEnabled(CompanyManagedSolution) || DefaultEnabled(CompanyPersonal) {
+		t.Fatal("DefaultEnabled wrong for work orgs")
+	}
+	if got := Companies(); len(got) != 3 || got[0] != CompanyManagedSolution || got[1] != "Power Platform" || got[2] != CompanyPersonal {
+		t.Fatalf("Companies = %v", got)
 	}
 }
 

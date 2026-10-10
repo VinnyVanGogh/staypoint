@@ -501,6 +501,14 @@ func (g *TaskGenerator) CallClaude(ctx context.Context, prompt string) (*Generat
 	}, nil
 }
 
+// isMailRouter reports whether lowercased text names the Mail Router or Power
+// Platform work. It maps to org Managed Solution: emitting any org the work-org
+// list may not hold would land work in a personal org.
+func isMailRouter(lower string) bool {
+	return strings.Contains(lower, "power platform") || strings.Contains(lower, "mail router") ||
+		strings.Contains(lower, "mail-router")
+}
+
 // GenerateHeuristicTask provides a deterministic fallback task synthesis when remote AI APIs are offline.
 func (g *TaskGenerator) GenerateHeuristicTask(comment string) InferredTask {
 	cleanComment := strings.TrimSpace(comment)
@@ -520,7 +528,7 @@ func (g *TaskGenerator) GenerateHeuristicTask(comment string) InferredTask {
 	// 1. Infer Organization
 	org := "StayPoint"
 	switch {
-	case strings.Contains(lowerNorm, "managed solution") || strings.Contains(lowerNorm, "mansol") ||
+	case strings.Contains(lowerNorm, "managed solution") || isMailRouter(lowerNorm) || strings.Contains(lowerNorm, "mansol") ||
 		strings.Contains(lowerNorm, "azure") || strings.Contains(lowerNorm, "m365") ||
 		strings.Contains(lowerNorm, "client portal") || strings.Contains(lowerNorm, "client acme") ||
 		strings.Contains(lowerNorm, "msp"):
@@ -544,7 +552,9 @@ func (g *TaskGenerator) GenerateHeuristicTask(comment string) InferredTask {
 	project := "StayPoint Core Engine & Telemetry Fleet"
 	switch org {
 	case "Managed Solution":
-		if strings.Contains(lowerNorm, "migration") || strings.Contains(lowerNorm, "cloud") {
+		if isMailRouter(lowerNorm) {
+			project = "Managed Solution Mail Router"
+		} else if strings.Contains(lowerNorm, "migration") || strings.Contains(lowerNorm, "cloud") {
 			project = "Managed Solution Cloud Migration"
 		} else {
 			project = "Managed Solution Client Services"
@@ -598,6 +608,9 @@ func (g *TaskGenerator) GenerateHeuristicTask(comment string) InferredTask {
 	switch org {
 	case "Managed Solution":
 		labels = []string{"managed-solution", "client"}
+		if isMailRouter(lowerNorm) {
+			labels = append(labels, "mail-router")
+		}
 		if strings.Contains(lowerNorm, "azure") {
 			labels = append(labels, "azure")
 		}

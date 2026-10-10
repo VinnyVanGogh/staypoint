@@ -11,6 +11,7 @@ import (
 
 	"github.com/VinnyVanGogh/staypoint/internal/adapter"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
+	"github.com/VinnyVanGogh/staypoint/internal/workorgs"
 )
 
 // loadPacer and runRoute are package vars so tests can inject quota state and
@@ -54,10 +55,10 @@ func resolveTaskRoute(db *sql.DB, taskID, repoRoot string, pacer *router.PacerSt
 // resolveTaskRouteApproved is resolveTaskRoute for a run that consumed the
 // Board Touch ID approval approvalID (geminiCodeGate); "" for none.
 func resolveTaskRouteApproved(db *sql.DB, taskID, repoRoot string, pacer *router.PacerState, now time.Time, approvalID string) router.KindRoute {
-	var repoPath, workKind, provider, model, priority string
+	var repoPath, workKind, provider, model, org, priority string
 	if err := db.QueryRowContext(context.Background(),
-		"SELECT COALESCE(repo_path,''), COALESCE(work_kind,''), COALESCE(provider,''), COALESCE(model_override,''), COALESCE(priority,'') FROM tasks WHERE id=?", taskID,
-	).Scan(&repoPath, &workKind, &provider, &model, &priority); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		"SELECT COALESCE(repo_path,''), COALESCE(work_kind,''), COALESCE(provider,''), COALESCE(model_override,''), COALESCE(organization,''), COALESCE(priority,'') FROM tasks WHERE id=?", taskID,
+	).Scan(&repoPath, &workKind, &provider, &model, &org, &priority); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		slog.Warn("route: task lookup failed; routing as coding on the personal seat",
 			slog.String("task", taskID), slog.Any("error", err))
 	}
@@ -65,8 +66,10 @@ func resolveTaskRouteApproved(db *sql.DB, taskID, repoRoot string, pacer *router
 	if repoPath == "" {
 		repoPath = repoRoot
 	}
-	isWork := false
-	if repoPath != "" {
+	// A work-org task (work_orgs) routes as work wherever its repo lives:
+	// work seat, no Gemini code.
+	isWork := workorgs.IsWork(org)
+	if repoPath != "" && !isWork {
 		isWork, _, _ = router.IsWorkRepo(repoPath)
 	}
 	// Non-git dir (STA-864): no checkpoint to revert, so a Board Touch ID
