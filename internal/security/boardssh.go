@@ -411,6 +411,10 @@ var gitPullFlags = map[string]bool{"--ff-only": true, "--ff": true, "-q": true, 
 // verify_dev_deploy.sh.
 func devDeployStep(argv []string) bool {
 	name := baseCmd(argv)
+	// A bare name resolved through PATH: ./git is whatever is there.
+	if argv[0] != name && name != "verify_dev_deploy.sh" {
+		return false
+	}
 	switch {
 	case name == "git":
 		sub, rest := gitSub(argv[1:])

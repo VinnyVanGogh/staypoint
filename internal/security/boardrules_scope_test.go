@@ -577,6 +577,8 @@ func TestBoardRulesGateGaps(t *testing.T) {
 		"git -c sendemail.toCmd=./x send-email x",
 		"git -c submodule.x.update='!./x' submodule update",
 		"git -c remote.origin.vcs=x fetch",
+		"git -c remote.origin.url=ext::sh fetch",
+		"GIT_ALLOW_PROTOCOL=ext git fetch ext::x",
 		"HOME=/tmp/h git status",
 		"GIT_DIR=/tmp/x/.git git status",
 		"XDG_CONFIG_HOME=/tmp/c git log",

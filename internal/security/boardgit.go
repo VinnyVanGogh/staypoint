@@ -17,7 +17,7 @@ import (
 var gitRunKeyRe = regexp.MustCompile(`^(alias\.|pager\.|include\.|includeif\.|` +
 	`core\.(fsmonitor|hookspath|sshcommand|pager|editor|askpass|gitproxy|alternaterefscommand|worktree)$|` +
 	`sequence\.editor$|diff\.external$|protocol\.|uploadpack\.|receivepack\.|init\.templatedir$|ssh\.variant$|` +
-	`url\.|interactive\.|sendemail\.|submodule\.|remote\.[^.]*\.vcs$|.*cmd$|` +
+	`url\.|interactive\.|sendemail\.|submodule\.|remote\.|.*cmd$|` +
 	`.*\.(command|program|helper|cmd|driver|textconv|clean|smudge|process|path|editor|pager|proxy|` +
 	`sshcommand|askpass|uploadpack|receivepack|packobjectshook|external|browser|viewer|insteadof|pushinsteadof|hookspath|fsmonitor)$)`)
 
@@ -27,6 +27,7 @@ var gitRunVars = map[string]bool{
 	"GIT_SEQUENCE_EDITOR": true, "GIT_ASKPASS": true, "SSH_ASKPASS": true, "GIT_PROXY_COMMAND": true,
 	"GIT_CONFIG": true, "GIT_CONFIG_PARAMETERS": true, "GIT_CONFIG_COUNT": true, "GIT_CONFIG_GLOBAL": true,
 	"GIT_CONFIG_SYSTEM": true, "GIT_EXEC_PATH": true, "GIT_TEMPLATE_DIR": true,
+	"GIT_ALLOW_PROTOCOL": true, "GIT_PROTOCOL_FROM_USER": true,
 }
 
 // gitConfigSourceVars move where git reads config (and so hooks, filters
