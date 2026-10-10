@@ -114,6 +114,12 @@ type stageChangedMsg struct {
 	err    error
 }
 
+type blockToggledMsg struct {
+	taskID  string
+	blocked bool
+	err     error
+}
+
 type statusMessageMsg struct {
 	message string
 	isError bool

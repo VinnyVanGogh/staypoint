@@ -72,7 +72,48 @@
     return '';
   }
 
-  const api = { WORK_KINDS, taskIsTerminal, taskRunActive, taskCloseActions, markDoneConfirmText, cancelConfirmText, markDoneBody, kindChangeRefusal };
+  // Stages POST /api/tasks/{id}/stage accepts; mirrors
+  // governance.BoardSettableStages (checked by stage_mirror_test.go).
+  const BOARD_STAGES = ['backlog', 'todo', 'in_progress', 'in_review', 'done', 'cancelled'];
+  // Stages that are never run; mirrors governance.nonRunnableStages. An
+  // agent task parked in one keeps it when blocked (context.blockedStageSQL).
+  const PARKED_STAGES = new Set(['backlog', 'done', 'cancelled', 'rejected', 'stopped', 'error']);
+  const STAGE_LABELS = {
+    backlog: 'Backlog', todo: 'Todo', in_progress: 'In progress (Run Now)',
+    in_review: 'In review', blocked: 'Blocked…', done: 'Done…',
+  };
+
+  // The task page's "Move to…" choices (task-40f0a2f0): {stage, label, via}.
+  // via picks the request: 'stage' posts /stage, 'run' is Run Now, 'done' is
+  // Mark done (its confirm and gate), 'block' asks for a reason and posts
+  // /block. The server still decides; this only leaves out moves it would
+  // refuse or ignore. cancelled is the Cancel task button's.
+  function stageMenuOptions(task, opts) {
+    if (!task || !task.id) return [];
+    const canRun = !!(opts && opts.canRun);
+    const current = taskStage(task);
+    const terminal = taskIsTerminal(task);
+    const out = [];
+    const add = (stage, via) => { if (stage !== current) out.push({ stage, label: STAGE_LABELS[stage], via }); };
+    add('backlog', 'stage');
+    add('todo', 'stage');
+    if (terminal) return out; // a closed task can only be reopened
+    if (canRun) add('in_progress', 'run');
+    add('in_review', 'stage');
+    if (!(task.origin === 'agent' && PARKED_STAGES.has(current))) add('blocked', 'block');
+    add('done', 'done');
+    return out;
+  }
+
+  // The confirm shown before moving task to stage, or '' when none is needed.
+  // Done and Run Now have their own.
+  function stageChangeConfirmText(task, stage) {
+    if (stage === 'done' || stage === 'in_progress' || !taskRunActive(task)) return '';
+    const label = (STAGE_LABELS[stage] || stage).replace(/…$/, '');
+    return `A run is in progress. It will be stopped first.\n\nMove this task to ${label}?`;
+  }
+
+  const api = { WORK_KINDS, BOARD_STAGES, stageMenuOptions, stageChangeConfirmText, taskIsTerminal, taskRunActive, taskCloseActions, markDoneConfirmText, cancelConfirmText, markDoneBody, kindChangeRefusal };
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;

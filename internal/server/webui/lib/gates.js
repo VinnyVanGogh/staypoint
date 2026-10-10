@@ -98,7 +98,8 @@
 
   // trustSpec builds the POST body for "Trust this task until…", or an error.
   // It never carries an expiry or exclusions: the server derives those.
-  function trustSpec(preset, customMinutes, tev1, tev1Ack) {
+  // moveToTodo asks the server to move a backlog task to todo first.
+  function trustSpec(preset, customMinutes, tev1, tev1Ack, moveToTodo) {
     if (!TRUST_PRESETS.some(([v]) => v === preset)) return { error: 'Pick how long to trust the task' };
     const spec = { preset };
     if (preset === 'custom') {
@@ -111,7 +112,14 @@
       spec.tev1 = true;
       spec.tev1_ack = true;
     }
+    if (moveToTodo) spec.move_to_todo = true;
     return { spec };
+  }
+
+  // Only a todo or running task can be trusted. A backlog task (where agent
+  // tasks land) is moved to todo by the same request (task-40f0a2f0).
+  function trustButtonLabel(stage) {
+    return stage === 'backlog' ? 'Move to todo and trust (Touch ID)' : 'Trust (Touch ID)';
   }
 
   // tev1SummaryLines is the morning summary of what tev1 decided.
@@ -174,7 +182,7 @@
   const api = {
     gateAdviceView, graceLabel, reviewSelection, agreementLabel,
     ruleScopeLabel, ruleExpiryLabel, batchSummary, rememberSpec,
-    TRUST_PRESETS, clockLabel, trustBannerText, trustSpec, tev1SummaryLines, gateStatusLabel,
+    TRUST_PRESETS, clockLabel, trustBannerText, trustSpec, trustButtonLabel, tev1SummaryLines, gateStatusLabel,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   Object.assign(root, api);

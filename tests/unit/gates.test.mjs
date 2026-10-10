@@ -80,6 +80,13 @@ test('trust spec: never carries an expiry or exclusions', () => {
   assert.deepEqual(Object.keys(s).sort(), ['preset', 'tev1', 'tev1_ack']);
 });
 
+test('trust on a backlog task moves it to todo under the same Touch ID (task-40f0a2f0)', () => {
+  assert.deepEqual(g.trustSpec('overnight', '', false, false, true), { spec: { preset: 'overnight', move_to_todo: true } });
+  assert.deepEqual(g.trustSpec('overnight', '', false, false, false), { spec: { preset: 'overnight' } });
+  assert.equal(g.trustButtonLabel('backlog'), 'Move to todo and trust (Touch ID)');
+  for (const s of ['todo', 'in_progress', undefined]) assert.equal(g.trustButtonLabel(s), 'Trust (Touch ID)');
+});
+
 test('trust spec: rejects bad windows and unconfirmed tev1', () => {
   assert.match(g.trustSpec('forever', '', false, false).error, /Pick/);
   assert.match(g.trustSpec('custom', '5', false, false).error, /15 to 1440/);
