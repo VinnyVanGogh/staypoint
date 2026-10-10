@@ -17,9 +17,11 @@ import (
 
 	"github.com/VinnyVanGogh/staypoint/internal/adapter"
 	"github.com/VinnyVanGogh/staypoint/internal/bridge"
+	"github.com/VinnyVanGogh/staypoint/internal/config"
 	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
 	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
+	"github.com/VinnyVanGogh/staypoint/internal/opstools"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
@@ -556,6 +558,13 @@ func handleHookPreTool() {
 		return
 	}
 
+	// A command an ops MCP tool replaces is denied with a pointer to the tool,
+	// not held for the Board (task-7d279c9d).
+	if why := opsRedirect(bashInput.Command); why != "" {
+		preToolBlock(why)
+		return
+	}
+
 	// Resolve effective working directory for bare-push detection. Only a
 	// cwd from the payload is the shell's real one; the hook's own Getwd is a
 	// guess, so relative script paths are not resolved against it (STA-868).
@@ -671,6 +680,19 @@ func handleHookPreTool() {
 			// still pending — loop
 		}
 	}
+}
+
+// opsRedirect is the denial for a shell command an ops MCP tool replaces, or
+// "" when no tool covers it.
+func opsRedirect(cmd string) string {
+	var hosts config.HostClasses
+	if cfg != nil {
+		hosts = cfg.Gates.Hosts
+	}
+	if r := opstools.BashRedirect(cmd, hosts); r != "" {
+		return "denied, not run: " + r
+	}
+	return ""
 }
 
 // deferredMessage is what the agent is told when a held request's deadline

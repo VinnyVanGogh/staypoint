@@ -91,6 +91,73 @@ type GatesConfig struct {
 	// branch is merged. Default true. When off, tasks finish the way they do
 	// today — no card, no dev server.
 	ShipReview *bool `json:"ship_review,omitempty" toml:"ship_review"`
+
+	// Hosts classifies ssh destinations ([gates.hosts] dev = ["mansol-dev"]).
+	// A host not listed as dev is treated as prod (task-97b4fa02).
+	Hosts HostClasses `json:"hosts,omitempty" toml:"hosts"`
+
+	// Ops configures the typed ops MCP tools ([gates.ops]).
+	Ops OpsConfig `json:"ops,omitempty" toml:"ops"`
+}
+
+// HostClasses is the [gates.hosts] table.
+type HostClasses struct {
+	Dev  []string `json:"dev,omitempty" toml:"dev"`
+	Prod []string `json:"prod,omitempty" toml:"prod"`
+}
+
+// IsDevHost reports whether host is listed in [gates.hosts] dev and not also
+// in prod (a host in both is prod: fail closed).
+func (h HostClasses) IsDevHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	for _, p := range h.Prod {
+		if strings.EqualFold(p, host) {
+			return false
+		}
+	}
+	for _, d := range h.Dev {
+		if strings.EqualFold(d, host) {
+			return true
+		}
+	}
+	return false
+}
+
+// OpsConfig is the [gates.ops] table: what the ops MCP tools may touch.
+type OpsConfig struct {
+	// DevHosts maps a [gates.hosts] dev alias to what dev_host_run may do there.
+	DevHosts map[string]DevHostConfig `json:"dev_hosts,omitempty" toml:"dev_hosts"`
+	// VerifyScriptBlobs are git blob ids of scripts/verify_dev_deploy.sh the
+	// Board trusts besides the one on origin/main: dev_deploy_verify runs
+	// the dev-server copy only when its blob is one of these or main's.
+	VerifyScriptBlobs []string `json:"verify_script_blobs,omitempty" toml:"verify_script_blobs"`
+}
+
+// DevHostConfig is one [gates.ops.dev_hosts.<alias>] table.
+type DevHostConfig struct {
+	// AppDir is the absolute app checkout; read actions stay under it.
+	AppDir string `json:"app_dir" toml:"app_dir"`
+	// Services are the systemd units journal_tail, systemctl_status and
+	// restart may name.
+	Services []string `json:"services,omitempty" toml:"services"`
+	// Branches git_ff_pull may pull. Empty = dev-server and dev.
+	Branches []string `json:"branches,omitempty" toml:"branches"`
+	// SudoRestart runs restart as `sudo -n systemctl restart`.
+	SudoRestart bool `json:"sudo_restart,omitempty" toml:"sudo_restart"`
+	// Apps are the Django apps collectstatic and pip_sync may name.
+	Apps map[string]DevAppConfig `json:"apps,omitempty" toml:"apps"`
+}
+
+// DevAppConfig is one [gates.ops.dev_hosts.<alias>.apps.<name>] table.
+type DevAppConfig struct {
+	// Dir is the absolute directory holding manage.py.
+	Dir string `json:"dir" toml:"dir"`
+	// Python is the absolute interpreter (usually the app's venv).
+	Python string `json:"python" toml:"python"`
+	// Requirements is pip_sync's file, relative to Dir. Empty = requirements.txt.
+	Requirements string `json:"requirements,omitempty" toml:"requirements"`
 }
 
 // Parallel-run caps used when config.toml does not set them (STA-773,

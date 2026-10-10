@@ -13,6 +13,7 @@ import (
 
 	"github.com/VinnyVanGogh/staypoint/internal/config"
 	"github.com/VinnyVanGogh/staypoint/internal/db"
+	"github.com/VinnyVanGogh/staypoint/internal/opstools"
 )
 
 // Server implements a pure Go Model Context Protocol stdio server.
@@ -23,6 +24,20 @@ type Server struct {
 	workDir string
 	mu      sync.Mutex
 	outMu   sync.Mutex
+
+	// runner runs the ops tools' processes; nil = opstools.ExecRunner.
+	// Tests set it.
+	runner opstools.Runner
+	// approver asks the Board about prod and external writes; nil refuses
+	// them (fail closed).
+	approver Approver
+}
+
+// WithApprover lets prod and external writes ask the Board.
+func WithApprover(a Approver) Option {
+	return func(s *Server) {
+		s.approver = a
+	}
 }
 
 // Option configures Server behavior.
@@ -76,14 +91,7 @@ func (s *Server) getDB() (*sql.DB, error) {
 		return s.db, nil
 	}
 
-	if s.cfg == nil {
-		loaded, err := config.LoadConfig()
-		if err == nil {
-			s.cfg = loaded
-		} else {
-			s.cfg = config.DefaultConfig()
-		}
-	}
+	s.loadConfigLocked()
 
 	dbPath := s.cfg.DBPath
 	if dbPath == "" {
@@ -98,6 +106,25 @@ func (s *Server) getDB() (*sql.DB, error) {
 	s.store = store
 	s.db = store.DB()
 	return s.db, nil
+}
+
+func (s *Server) loadConfigLocked() {
+	if s.cfg == nil {
+		loaded, err := config.LoadConfig()
+		if err == nil {
+			s.cfg = loaded
+		} else {
+			s.cfg = config.DefaultConfig()
+		}
+	}
+}
+
+// getConfig returns the server's config, loading it on first use.
+func (s *Server) getConfig() *config.Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadConfigLocked()
+	return s.cfg
 }
 
 func (s *Server) getWorkDir() string {

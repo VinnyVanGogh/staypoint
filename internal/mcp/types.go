@@ -45,8 +45,10 @@ type ServerInfo struct {
 
 // Property defines a JSON schema property.
 type Property struct {
-	Type        string `json:"type"`
-	Description string `json:"description,omitempty"`
+	Type        string    `json:"type"`
+	Description string    `json:"description,omitempty"`
+	Enum        []string  `json:"enum,omitempty"`
+	Items       *Property `json:"items,omitempty"`
 }
 
 // InputSchema defines JSON Schema for tool input arguments.

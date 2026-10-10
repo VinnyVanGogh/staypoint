@@ -240,6 +240,11 @@ func gateGeminiPreTool(raw []byte) string {
 	// so a second field agy might run instead cannot slip past.
 	var verdict security.Verdict
 	for _, text := range call.commands {
+		if why := opsRedirect(text); why != "" {
+			return deny(why)
+		}
+	}
+	for _, text := range call.commands {
 		v := c.Classify(text)
 		if taskID != "" {
 			raiseForBoardRules(text, cwd, snap, &v, taskID)

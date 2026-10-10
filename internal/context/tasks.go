@@ -1103,6 +1103,17 @@ type TaskComment struct {
 }
 
 func AddTaskComment(db *sql.DB, taskID, author, message string) error {
+	return addTaskComment(db, taskID, author, message, true)
+}
+
+// AddAgentComment is AddTaskComment for a comment the task's own agent
+// posts: it never wakes the task, so an agent cannot re-run itself by
+// commenting (task-7d279c9d).
+func AddAgentComment(db *sql.DB, taskID, author, message string) error {
+	return addTaskComment(db, taskID, author, message, false)
+}
+
+func addTaskComment(db *sql.DB, taskID, author, message string, wake bool) error {
 	task, err := GetTask(db, taskID)
 	if err != nil {
 		return err
@@ -1117,7 +1128,7 @@ func AddTaskComment(db *sql.DB, taskID, author, message string) error {
 	_, _ = SupersedeInteractionsOnComment(db, task.ID)
 	// Watchdog: re-evaluate criteria on every comment (update-triggered, no polling).
 	_ = governance.TriggerWatchdogEval(db, task.ID, "comment")
-	if commentWakes(db, task.ID) {
+	if wake && commentWakes(db, task.ID) {
 		_ = orchestrator.NotifyDaemon(task.ID, "comment", "")
 	}
 	return nil

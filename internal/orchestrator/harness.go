@@ -1328,6 +1328,11 @@ func fetchUserComments(ctx context.Context, db *sql.DB, taskID string, afterID i
 // buildBriefBlock constructs the task brief block for the agent prompt.
 // It is treated as user-provided data: wrapped in clear delimiters.
 // Content is truncated at briefMaxBytes with a note.
+//
+// opsToolsNote points agents at the typed ops MCP tools; the pre-tool hook
+// denies the shell commands they replace (task-7d279c9d).
+const opsToolsNote = "Ops-Tools: use the staypoint MCP tools instead of shell for these: dev_host_run (not ssh to a dev host), dev_deploy_verify (not verify_dev_deploy.sh), staypoint_query (not reading ~/.staypoint), task_comment / task_doc / pr_body (text passed directly, no /tmp heredoc files), pr_merge (not gh pr merge). Each declares its effect: reads and dev writes run unattended; prod writes wait for the Board. The shell forms are denied.\n"
+
 func buildBriefBlock(brief taskBrief, comments []harnessComment, isFirstTurn bool) string {
 	var b strings.Builder
 	if isFirstTurn {
@@ -1352,6 +1357,7 @@ func buildBriefBlock(brief taskBrief, comments []harnessComment, isFirstTurn boo
 		if policy == shipreview.PushPolicyNever {
 			b.WriteString("Push-Note: DO NOT run git push. The Board pushes the branch after Ship Review. git push is a Red-tier action and will be blocked by the pre-tool gate.\n")
 		}
+		b.WriteString(opsToolsNote)
 		if brief.Description != "" {
 			b.WriteString("---\nDescription:\n" + safeField(brief.Description) + "\n")
 		}

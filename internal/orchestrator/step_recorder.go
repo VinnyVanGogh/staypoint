@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/VinnyVanGogh/staypoint/internal/opstools"
 )
 
 // StepKind classifies a run timeline step for the board UI.
@@ -645,6 +647,9 @@ func toolUseKind(name string) StepKind {
 // Returns (title, command) where command is the verbatim shell command (non-empty only for
 // Bash/run steps). root is the absolute task worktree path used to relativize file paths.
 func extractToolMeta(name, inputJSON, root string) (title, command string) {
+	if t, ok := opsToolTitle(name, inputJSON); ok {
+		return t, ""
+	}
 	if inputJSON != "" {
 		var m map[string]json.RawMessage
 		if json.Unmarshal([]byte(inputJSON), &m) == nil {
@@ -673,6 +678,39 @@ func extractToolMeta(name, inputJSON, root string) (title, command string) {
 		}
 	}
 	return toolUseTitle(name), ""
+}
+
+// opsTitleKeys are the ops tool parameters a timeline title shows, in order.
+var opsTitleKeys = []string{"host", "action", "app", "service", "branch", "path", "port", "query", "key", "pr", "base", "sha"}
+
+// opsToolTitle titles a staypoint ops tool call with its declared effect,
+// e.g. "dev_host_run [dev_write] host=mansol-dev action=restart service=web"
+// (task-7d279c9d).
+func opsToolTitle(name, inputJSON string) (string, bool) {
+	if !strings.HasPrefix(name, "mcp__staypoint__") {
+		return "", false
+	}
+	effect, ok := opstools.Declared(name, []byte(inputJSON))
+	if !ok {
+		return "", false
+	}
+	parts := []string{strings.TrimPrefix(name, "mcp__staypoint__"), "[" + string(effect) + "]"}
+	var m map[string]json.RawMessage
+	_ = json.Unmarshal([]byte(inputJSON), &m)
+	for _, k := range opsTitleKeys {
+		v, ok := m[k]
+		if !ok {
+			continue
+		}
+		var s string
+		if json.Unmarshal(v, &s) != nil {
+			s = string(v)
+		}
+		if s != "" {
+			parts = append(parts, k+"="+s)
+		}
+	}
+	return strings.Join(parts, " "), true
 }
 
 // extractToolTitle is a compatibility shim used by tests and callers that only need the title.

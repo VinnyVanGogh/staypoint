@@ -44,7 +44,7 @@ func toolError(msg string) *ToolCallResult {
 }
 
 func (s *Server) getToolsList() []Tool {
-	return []Tool{
+	return append([]Tool{
 		{
 			Name:        "staypoint_checkpoint",
 			Description: "take ephemeral git micro-checkpoint",
@@ -273,7 +273,7 @@ func (s *Server) getToolsList() []Tool {
 			},
 		},
 		taskCreateChildTool(),
-	}
+	}, opsTools()...)
 }
 
 func (s *Server) handleCallTool(ctx context.Context, params CallToolParams) *ToolCallResult {
@@ -302,6 +302,20 @@ func (s *Server) handleCallTool(ctx context.Context, params CallToolParams) *Too
 		return s.handleShipReview(ctx, params.Arguments)
 	case "staypoint_task_create_child":
 		return s.handleTaskCreateChild(ctx, params.Arguments)
+	case "dev_host_run":
+		return s.handleDevHostRun(ctx, params.Arguments)
+	case "dev_deploy_verify":
+		return s.handleDevDeployVerify(ctx, params.Arguments)
+	case "staypoint_query":
+		return s.handleStaypointQuery(ctx, params.Arguments)
+	case "task_comment":
+		return s.handleTaskComment(ctx, params.Arguments)
+	case "task_doc":
+		return s.handleTaskDoc(ctx, params.Arguments)
+	case "pr_body":
+		return s.handlePRBody(ctx, params.Arguments)
+	case "pr_merge":
+		return s.handlePRMerge(ctx, params.Arguments)
 	default:
 		return toolError(fmt.Sprintf("unknown tool: %s", params.Name))
 	}
