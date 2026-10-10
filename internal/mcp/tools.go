@@ -302,6 +302,13 @@ func (s *Server) handleCallTool(ctx context.Context, params CallToolParams) *Too
 		return s.handleShipReview(ctx, params.Arguments)
 	case "staypoint_task_create_child":
 		return s.handleTaskCreateChild(ctx, params.Arguments)
+	}
+	if opsToolNames[params.Name] {
+		if res := s.requireRun(); res != nil {
+			return res
+		}
+	}
+	switch params.Name {
 	case "dev_host_run":
 		return s.handleDevHostRun(ctx, params.Arguments)
 	case "dev_deploy_verify":

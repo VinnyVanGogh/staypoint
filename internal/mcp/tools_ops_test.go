@@ -25,6 +25,10 @@ type recorder struct {
 	views []string
 	// origin answers git remote get-url origin.
 	origin string
+	// live answers pr_merge's gh api read ("base head state"); "" derives
+	// it from the last gh pr view served.
+	live     string
+	lastView string
 }
 
 func (r *recorder) run(ctx context.Context, c opstools.Cmd) opstools.Result {
@@ -39,7 +43,17 @@ func (r *recorder) run(ctx context.Context, c opstools.Cmd) opstools.Result {
 				r.views = r.views[1:]
 			}
 		}
+		r.lastView = v
 		return opstools.Result{Stdout: v, Output: v}
+	}
+	if c.Name == "gh" && len(c.Args) > 1 && c.Args[0] == "api" && strings.Contains(c.Args[1], "/pulls/") {
+		out := r.live
+		if out == "" {
+			var v opstools.PRView
+			_ = json.Unmarshal([]byte(r.lastView), &v)
+			out = v.BaseRefName + " " + v.HeadRefOid + " " + strings.ToLower(v.State)
+		}
+		return opstools.Result{Stdout: out + "\n", Output: out + "\n"}
 	}
 	if c.Name == "git" && strings.Join(c.Args, " ") == "remote get-url origin" {
 		return opstools.Result{Stdout: r.origin + "\n", Output: r.origin + "\n"}
@@ -68,10 +82,31 @@ func opsConfig(t *testing.T) *config.Config {
 	cfg.DataDir = t.TempDir()
 	cfg.Gates.Hosts = config.HostClasses{Dev: []string{"mansol-dev"}}
 	cfg.Gates.Ops.DevHosts = map[string]config.DevHostConfig{
-		"mansol-dev": {HostName: "10.0.0.5", AppDir: "/var/www/mansol_apps", Services: []string{"mansol-web"}},
+		"mansol-dev": {HostName: "10.0.0.5", SSHConfig: filepath.Join(cfg.DataDir, "ssh_config"), AppDir: "/var/www/mansol_apps", Services: []string{"mansol-web"}},
 	}
 	cfg.Gates.Ops.OwnRepos = []string{"o/r"}
 	return cfg
+}
+
+// opsRun configures the server with cfg and makes this test a harness run
+// of STAYPOINT_TASK_ID (task-ops-test when unset): it issues the run token
+// the ops tools check (Board review #2 H1).
+func opsRun(t *testing.T, cfg *config.Config) Option {
+	t.Helper()
+	taskID := os.Getenv("STAYPOINT_TASK_ID")
+	if taskID == "" {
+		taskID = "task-ops-test"
+		t.Setenv("STAYPOINT_TASK_ID", taskID)
+	}
+	tok, err := opstools.RunToken(cfg.DataDir, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(opstools.RunTokenEnv, tok)
+	return func(s *Server) {
+		WithConfig(cfg)(s)
+		WithOpsDataDir(cfg.DataDir)(s)
+	}
 }
 
 func callOps(t *testing.T, s *Server, name string, args any) ToolCallResult {
@@ -105,7 +140,7 @@ func TestOpsToolsListed(t *testing.T) {
 
 func TestDevHostRunValidatesAndRedacts(t *testing.T) {
 	rec := &recorder{}
-	s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run))
+	s := NewServer(opsRun(t, opsConfig(t)), withRunner(rec.run))
 	defer s.Close()
 
 	for _, bad := range []map[string]any{
@@ -127,7 +162,7 @@ func TestDevHostRunValidatesAndRedacts(t *testing.T) {
 	if res.IsError || !strings.Contains(text, "effect=dev_write") || strings.Contains(text, "fixture-leak") {
 		t.Fatalf("restart result: %s", text)
 	}
-	if !rec.ran("ssh", "-o") {
+	if !rec.ran("ssh", "-F") {
 		t.Fatalf("restart did not run ssh: %+v", rec.cmds)
 	}
 }
@@ -141,7 +176,7 @@ func TestPRMergeGatesOnRealBase(t *testing.T) {
 
 	t.Run("main without approver is refused", func(t *testing.T) {
 		rec := &recorder{view: view("main")}
-		s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run))
+		s := NewServer(opsRun(t, opsConfig(t)), withRunner(rec.run))
 		defer s.Close()
 		res := callOps(t, s, "pr_merge", map[string]any{"repo": repo, "pr": 5, "base": "main"})
 		if !res.IsError || !strings.Contains(resultText(res), "prod_write") || rec.ran("gh", "merge") {
@@ -157,7 +192,7 @@ func TestPRMergeGatesOnRealBase(t *testing.T) {
 				asked = append(asked, req)
 				return approve, "Board denied"
 			}
-			s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run), WithApprover(approver))
+			s := NewServer(opsRun(t, opsConfig(t)), withRunner(rec.run), WithApprover(approver))
 			res := callOps(t, s, "pr_merge", map[string]any{"repo": repo, "pr": 5, "base": "main"})
 			s.Close()
 			if len(asked) != 1 || asked[0].Call.Effect != opstools.ProdWrite || !strings.Contains(asked[0].Reason, "night rule") || !strings.Contains(asked[0].Reason, "GitHub repo o/r") {
@@ -175,7 +210,7 @@ func TestPRMergeGatesOnRealBase(t *testing.T) {
 	t.Run("dev-server merges unattended", func(t *testing.T) {
 		rec := &recorder{views: []string{view("dev-server"), view("dev-server"), prViewJSON("o/r", 5, "dev-server", "feature", head, "MERGED")}}
 		called := false
-		s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run), WithApprover(func(context.Context, ApprovalRequest) (bool, string) {
+		s := NewServer(opsRun(t, opsConfig(t)), withRunner(rec.run), WithApprover(func(context.Context, ApprovalRequest) (bool, string) {
 			called = true
 			return false, "no"
 		}))
@@ -188,7 +223,7 @@ func TestPRMergeGatesOnRealBase(t *testing.T) {
 
 	t.Run("declaring dev-server for a main PR is refused", func(t *testing.T) {
 		rec := &recorder{view: view("main")}
-		s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run))
+		s := NewServer(opsRun(t, opsConfig(t)), withRunner(rec.run))
 		defer s.Close()
 		res := callOps(t, s, "pr_merge", map[string]any{"repo": repo, "pr": 5, "base": "dev-server"})
 		if !res.IsError || rec.ran("gh", "merge") {
@@ -200,7 +235,7 @@ func TestPRMergeGatesOnRealBase(t *testing.T) {
 		// The Board approved o/r#5; by merge time the checkout's remote
 		// resolves PR #5 in another repo.
 		rec := &recorder{views: []string{view("main"), prViewJSON("attacker/r", 5, "main", "feature", head, "OPEN")}}
-		s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run), WithApprover(func(context.Context, ApprovalRequest) (bool, string) { return true, "" }))
+		s := NewServer(opsRun(t, opsConfig(t)), withRunner(rec.run), WithApprover(func(context.Context, ApprovalRequest) (bool, string) { return true, "" }))
 		defer s.Close()
 		res := callOps(t, s, "pr_merge", map[string]any{"repo": repo, "pr": 5, "base": "main"})
 		if !res.IsError || rec.ran("gh", "merge") || !strings.Contains(resultText(res), "changed while held") {
@@ -210,7 +245,7 @@ func TestPRMergeGatesOnRealBase(t *testing.T) {
 
 	t.Run("merge targets the approved GitHub repo explicitly", func(t *testing.T) {
 		rec := &recorder{views: []string{view("dev-server"), view("dev-server"), prViewJSON("o/r", 5, "dev-server", "feature", head, "MERGED")}}
-		s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run))
+		s := NewServer(opsRun(t, opsConfig(t)), withRunner(rec.run))
 		defer s.Close()
 		if res := callOps(t, s, "pr_merge", map[string]any{"repo": repo, "pr": 5, "base": "dev-server"}); res.IsError {
 			t.Fatalf("dev merge: %s", resultText(res))
@@ -228,7 +263,7 @@ func TestPRMergeGatesOnRealBase(t *testing.T) {
 
 	t.Run("base swapped during the merge is reported", func(t *testing.T) {
 		rec := &recorder{views: []string{view("dev-server"), view("dev-server"), prViewJSON("o/r", 5, "main", "feature", head, "MERGED")}}
-		s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run))
+		s := NewServer(opsRun(t, opsConfig(t)), withRunner(rec.run))
 		defer s.Close()
 		res := callOps(t, s, "pr_merge", map[string]any{"repo": repo, "pr": 5, "base": "dev-server"})
 		if !res.IsError || !strings.Contains(resultText(res), "base changed") {
@@ -263,7 +298,7 @@ func TestStaypointQueryOwnTaskOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("STAYPOINT_TASK_ID", own.ID)
-	s := NewServer(WithDB(database), WithConfig(cfg))
+	s := NewServer(WithDB(database), opsRun(t, cfg))
 	defer s.Close()
 
 	if res := callOps(t, s, "staypoint_query", map[string]any{"query": "task", "task_id": other.ID}); !res.IsError {
@@ -301,7 +336,7 @@ func TestTaskCommentAndDoc(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("STAYPOINT_TASK_ID", own.ID)
-	s := NewServer(WithDB(database), WithConfig(opsConfig(t)))
+	s := NewServer(WithDB(database), opsRun(t, opsConfig(t)))
 	defer s.Close()
 
 	// A card waiting for the Board that a Board comment would supersede.
@@ -361,10 +396,10 @@ func TestPRBodyScopedToTaskRepo(t *testing.T) {
 		return out
 	}
 
-	t.Run("own repo feature PR runs unattended, text on stdin", func(t *testing.T) {
-		rec := &recorder{view: prViewJSON("o/r", 9, "main", "staypoint/task-x", head, "OPEN"), origin: "git@github.com:o/r.git"}
+	t.Run("own PR runs unattended, text on stdin", func(t *testing.T) {
+		rec := &recorder{view: prViewJSON("o/r", 9, "main", opstools.TaskBranch(own.ID), head, "OPEN"), origin: "git@github.com:o/r.git"}
 		asked := false
-		s := NewServer(WithDB(database), WithConfig(opsConfig(t)), withRunner(rec.run), WithApprover(func(context.Context, ApprovalRequest) (bool, string) {
+		s := NewServer(WithDB(database), opsRun(t, opsConfig(t)), withRunner(rec.run), WithApprover(func(context.Context, ApprovalRequest) (bool, string) {
 			asked = true
 			return false, "no"
 		}))
@@ -392,6 +427,9 @@ func TestPRBodyScopedToTaskRepo(t *testing.T) {
 	for _, c := range []struct{ name, view, origin string }{
 		{"another repo", prViewJSON("other/r", 9, "main", "feature", head, "OPEN"), "https://github.com/o/r.git"},
 		{"release PR from main", prViewJSON("o/r", 9, "prod", "main", head, "OPEN"), "https://github.com/o/r.git"},
+		// Board review #2 #7/L1: only this task's own PR is a dev write.
+		{"another task's PR in the task repo", prViewJSON("o/r", 9, "main", "staypoint/task-other", head, "OPEN"), "https://github.com/o/r.git"},
+		{"feature PR in the task repo", prViewJSON("o/r", 9, "main", "feature", head, "OPEN"), "https://github.com/o/r.git"},
 		// The agent repointed the shared checkout's origin at its own repo.
 		{"repointed task origin", prViewJSON("attacker/r", 9, "main", "feature", head, "OPEN"), "https://github.com/attacker/r.git"},
 	} {
@@ -399,7 +437,7 @@ func TestPRBodyScopedToTaskRepo(t *testing.T) {
 			for _, approve := range []bool{false, true} {
 				rec := &recorder{view: c.view, origin: c.origin}
 				var asked []ApprovalRequest
-				s := NewServer(WithDB(database), WithConfig(opsConfig(t)), withRunner(rec.run), WithApprover(func(_ context.Context, req ApprovalRequest) (bool, string) {
+				s := NewServer(WithDB(database), opsRun(t, opsConfig(t)), withRunner(rec.run), WithApprover(func(_ context.Context, req ApprovalRequest) (bool, string) {
 					asked = append(asked, req)
 					return approve, "Board denied"
 				}))
@@ -418,7 +456,7 @@ func TestPRBodyScopedToTaskRepo(t *testing.T) {
 	t.Run("no task repo is external", func(t *testing.T) {
 		t.Setenv("STAYPOINT_TASK_ID", "")
 		rec := &recorder{view: prViewJSON("o/r", 9, "main", "feature", head, "OPEN")}
-		s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run))
+		s := NewServer(opsRun(t, opsConfig(t)), withRunner(rec.run))
 		defer s.Close()
 		if res := callOps(t, s, "pr_body", map[string]any{"repo": repo, "pr": 9, "text": body}); !res.IsError || len(edits(rec)) != 0 {
 			t.Fatalf("pr_body without a task ran: %s", resultText(res))

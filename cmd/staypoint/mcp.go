@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/config"
 	"github.com/VinnyVanGogh/staypoint/internal/mcp"
 	"github.com/spf13/cobra"
 )
@@ -24,6 +26,13 @@ var mcpCmd = &cobra.Command{
 		}
 
 		opts := []mcp.Option{mcp.WithApprover(boardApprover)}
+		if pinned, err := pinMCPConfig(); err != nil {
+			// Ops tools stay off (no ops data dir); the rest still serve.
+			fmt.Fprintf(os.Stderr, "staypoint mcp: ops tools disabled: %v\n", err)
+		} else {
+			cfg = pinned
+			opts = append(opts, mcp.WithOpsDataDir(pinned.DataDir))
+		}
 		if cfg != nil {
 			opts = append(opts, mcp.WithConfig(cfg))
 		}
@@ -40,6 +49,33 @@ var mcpCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(mcpCmd)
+}
+
+// mcpRealHome is config.RealHomeDir; tests replace it.
+var mcpRealHome = config.RealHomeDir
+
+// pinMCPConfig loads the config the ops tools trust: the real account's
+// config.toml, whatever HOME the server was started with (Board review #2
+// H1). HOME is reset too, so gh, git and ssh children read the real
+// account's files and the Board gate token comes from the real data dir.
+func pinMCPConfig() (*config.Config, error) {
+	home, err := mcpRealHome()
+	if err != nil {
+		return nil, fmt.Errorf("resolve the real home directory: %w", err)
+	}
+	if os.Getenv("HOME") != home {
+		if err := os.Setenv("HOME", home); err != nil {
+			return nil, err
+		}
+	}
+	c, err := config.LoadConfig()
+	if err != nil {
+		return nil, err
+	}
+	if !filepath.IsAbs(c.DataDir) {
+		return nil, fmt.Errorf("data dir %q is not absolute", c.DataDir)
+	}
+	return c, nil
 }
 
 // boardApprover holds an ops tool's prod or external write for the Board,

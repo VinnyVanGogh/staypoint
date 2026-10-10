@@ -18,6 +18,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/gitgate"
 	"github.com/VinnyVanGogh/staypoint/internal/governance"
 	"github.com/VinnyVanGogh/staypoint/internal/logging"
+	"github.com/VinnyVanGogh/staypoint/internal/opstools"
 	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/VinnyVanGogh/staypoint/internal/shipreview"
 	"github.com/VinnyVanGogh/staypoint/internal/workspace"
@@ -130,6 +131,10 @@ type RunConfig struct {
 	// per-run --settings file (STA-525).  Should point to the staypoint CLI binary
 	// built from the same commit as the daemon.
 	HookBin string
+	// OpsDataDir, when set, is the data dir whose ops key signs this run's
+	// STAYPOINT_RUN_MAC, which the staypoint MCP server checks before any
+	// ops tool runs (task-7d279c9d).
+	OpsDataDir string
 	// GeminiDocsOnly applies the Board rule router.GeminiCodeForbidden to this
 	// run (every repo, STA-856 revised 2026-10-06): after any turn that
 	// spawned Gemini, changes outside the non-code allowlist are reverted to
@@ -466,6 +471,15 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// Expose task ID so the PreToolUse hook can check the pause flag before
 	// each tool call, enabling step-boundary pause rather than turn-boundary.
 	providerEnv = append(providerEnv, "STAYPOINT_TASK_ID="+taskID)
+	// The run token lets the MCP server the agent CLI starts use the ops
+	// tools for this task, and only this task.
+	if cfg.OpsDataDir != "" {
+		if tok, err := opstools.RunToken(cfg.OpsDataDir, taskID); err == nil {
+			providerEnv = append(providerEnv, opstools.RunTokenEnv+"="+tok)
+		} else {
+			runLog.Warn("ops run token not issued; ops tools will refuse this run", slog.Any("error", err))
+		}
+	}
 	// Expose the staypoint CLI path so the Claude adapter can register it as a
 	// PreToolUse hook in a per-run --settings file (STA-525).
 	if cfg.HookBin != "" {

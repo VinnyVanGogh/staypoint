@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/VinnyVanGogh/staypoint/internal/gitexec"
@@ -24,7 +25,7 @@ var httpMutationRe = regexp.MustCompile(
 
 // staypointTokenFileRe matches reads of the staypoint auth/board token files in inline scripts.
 var staypointTokenFileRe = regexp.MustCompile(
-	`/\.staypoint/(?:auth_token|board_token)\b|['"](auth_token|board_token)['"]`)
+	`/\.staypoint/(?:auth_token|board_token|ops_key)\b|['"](auth_token|board_token|ops_key)['"]`)
 
 // ptyForgingRe matches PTY-creation calls or pty module imports in inline scripts.
 var ptyForgingRe = regexp.MustCompile(
@@ -126,6 +127,9 @@ type Classifier struct {
 	baseCWD   string   // CWD before any `cd` in the line
 	inner     bool     // classifying a wrapper's inner command (env/xargs/find -exec ...)
 	cwdFromCd bool     // CWD was set by an absolute `cd` earlier in the line
+	// envChange is a wrapper's env edit (env VAR=x, env -u VAR, env -i)
+	// carried to the command it launches.
+	envChange []string
 }
 
 // Classify classifies a shell command line. Unparseable input is Red (fail closed).
@@ -301,7 +305,12 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 	case wrappers[name]:
 		v.raise(Yellow, "")
 		if inner := skipWrapper(name, args); len(inner) > 0 {
-			c.classifyInner(inner, v, depth)
+			ic := *c
+			if name == "env" {
+				ic.envChange = append(slices.Clone(c.envChange), args[:len(args)-len(inner)]...)
+			}
+			ic.envChange = append(ic.envChange, s.argv[:len(s.argv)-len(argv)]...)
+			ic.classifyInner(inner, v, depth)
 		}
 		return
 	case shells[name]:
@@ -345,7 +354,7 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 	case name == "gh":
 		c.classifyGh(args, v)
 	case name == "staypoint":
-		c.classifyStaypoint(args, v)
+		c.classifyStaypoint(args, append(slices.Clone(c.envChange), s.argv[:len(s.argv)-len(argv)]...), v)
 	case name == "curl" || name == "wget":
 		c.classifyFetch(name, args, v)
 	case name == "python" || name == "python2" || name == "python3":
@@ -432,7 +441,8 @@ func skipWrapper(name string, args []string) []string {
 		case strings.HasPrefix(a, "-"):
 			i++
 			for _, f := range wrapperValueFlags[name] {
-				if a == f {
+				// -u VAR, or a short-flag cluster ending in one (-iu VAR).
+				if a == f || (len(f) == 2 && !strings.HasPrefix(a, "--") && len(a) > 2 && a[len(a)-1] == f[1]) {
 					i++
 					break
 				}
@@ -712,6 +722,17 @@ func (c *Classifier) classifyGh(args []string, v *Verdict) {
 				return
 			}
 		}
+		// Retargeting a PR's base can turn a dev merge into a main merge
+		// while pr_merge is between its check and the merge (Board review
+		// #2 M1).
+		if slices.Contains(rest, "edit") {
+			for _, a := range rest {
+				if a == "-B" || a == "--base" || strings.HasPrefix(a, "--base=") || (strings.HasPrefix(a, "-B") && len(a) > 2) {
+					v.raise(Red, "gh pr edit --base retargets a PR; Board approval required")
+					return
+				}
+			}
+		}
 		v.raise(Yellow, "")
 	case "api":
 		// Any body-submitting flag means the call mutates state — Red immediately.
@@ -794,12 +815,56 @@ func (c *Classifier) classifyScriptInterp(name string, args []string, inlineFlag
 // classifyStaypoint classifies `staypoint <sub> …` calls.
 // `staypoint board …` is always Red: even with TTY-gating the board subcommand
 // contains credentials that agents must never access.
-func (c *Classifier) classifyStaypoint(args []string, v *Verdict) {
-	if len(args) > 0 && args[0] == "board" {
+//
+// `staypoint mcp` is Red too, and so is any staypoint call that changes its
+// environment in a way that changes which config, data dir, task or
+// binaries it uses (Board review #2 H1: `env -u STAYPOINT_TASK_ID
+// HOME=/tmp/fake staypoint mcp` ran the ops tools from a fake config.toml).
+// The harness starts the MCP server itself; an agent never needs to.
+func (c *Classifier) classifyStaypoint(args, envChange []string, v *Verdict) {
+	sub := ""
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			sub = a
+			break
+		}
+	}
+	switch sub {
+	case "board":
 		v.raise(Red, "staypoint board: accesses board credentials; agents cannot self-approve (use the Board UI)")
+		return
+	case "mcp":
+		v.raise(Red, "staypoint mcp: starts the ops-tool MCP server outside the harness")
+		return
+	}
+	if why := staypointEnvChange(envChange); why != "" {
+		v.raise(Red, "staypoint with "+why+": runs StayPoint under another config, task or PATH")
 		return
 	}
 	v.raise(Yellow, "")
+}
+
+// staypointEnvVarRe names the variables that change what a staypoint
+// process loads or acts for.
+var staypointEnvVarRe = regexp.MustCompile(`^(HOME|PATH|USER|LOGNAME|TMPDIR|XDG_[A-Z_]*|GH_[A-Z_]*|GITHUB_[A-Z_]*|GIT_[A-Z_]*|STAYPOINT_[A-Z_]*|DYLD_[A-Z_]*|LD_[A-Z_]*)$`)
+
+// staypointEnvChange reports an env edit in edits (VAR=x prefixes and env
+// wrapper arguments) that staypoint must not run under, or "".
+func staypointEnvChange(edits []string) string {
+	for _, e := range edits {
+		switch {
+		// Any env flag (-i, -u VAR, -S, -C, combined -iu ...) edits the
+		// environment or how the rest is parsed; fail closed on all of them.
+		case strings.HasPrefix(e, "-") && e != "--":
+			return "env " + e
+		case isAssign(e):
+			name := e[:strings.IndexByte(e, '=')]
+			if staypointEnvVarRe.MatchString(name) {
+				return name + " overridden"
+			}
+		}
+	}
+	return ""
 }
 
 // isMutatingMethod reports whether a HTTP method string is a mutating operation.

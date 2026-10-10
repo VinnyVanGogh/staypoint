@@ -76,6 +76,13 @@ var (
 	// resolved path, so a symlink cannot rename its way past it.
 	secretPathRe = `(^|/)(\.env(\.[^/]*)?|[^/]*\.env|[^/]*[Ss][Ee][Cc][Rr][Ee][Tt][^/]*|[^/]*[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll][^/]*|[^/]*\.(pem|key|p12|pfx|jks|keystore)|id_(rsa|dsa|ecdsa|ed25519)[^/]*|\.netrc|\.pgpass|\.htpasswd|\.ssh)(/|$)`
 	secretPath   = regexp.MustCompile(secretPathRe)
+	// textFileRe is what cat_file reads: source, config and docs by
+	// extension, plus a few well-known extensionless names. Anything else
+	// (db.sqlite3, *.db, *.log, *.pyc, *.pickle, dumps, archives) is
+	// refused rather than returned unredacted (Board review #2 M2). Like
+	// secretPathRe it runs on the host too, against the resolved path.
+	textFileRe = `(^|/)([^/]+\.(py|txt|md|rst|html|htm|css|scss|js|mjs|cjs|ts|tsx|jsx|json|yaml|yml|toml|cfg|ini|conf|service|timer|socket|sh|bash|xml|svg|j2|jinja|jinja2|tmpl|tpl|po|go|rb|java|kt|swift|c|h|cpp|hpp|rs|lock)|Dockerfile|Makefile|Procfile|Pipfile|Gemfile|README|LICENSE|CHANGELOG|VERSION)$`
+	textFile   = regexp.MustCompile(textFileRe)
 )
 
 // defaultDevBranches are what git_ff_pull may pull when a host lists none.
@@ -90,7 +97,7 @@ const (
 
 // PlanDevHost validates r against the configured dev hosts and builds the
 // remote command. Nothing about r reaches the remote shell unvalidated.
-func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, error) {
+func PlanDevHost(gates config.GatesConfig, dataDir string, r DevHostRequest) (*DevHostPlan, error) {
 	if !hostRe.MatchString(r.Host) {
 		return nil, fmt.Errorf("host %q is not a valid host alias", r.Host)
 	}
@@ -113,10 +120,20 @@ func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, erro
 	if !hostRe.MatchString(hc.HostName) {
 		return nil, fmt.Errorf("host %s: [gates.ops.dev_hosts.%s] host_name must be set to the address to connect to", r.Host, r.Host)
 	}
-	if hc.SSHConfig != "" && !filepath.IsAbs(hc.SSHConfig) {
+	// ssh -F is required and must be StayPoint's own file: without it ssh
+	// reads ~/.ssh/config, whose Match exec runs a local command and whose
+	// Port, User, KnownHostsCommand, PKCS11Provider and IdentityAgent the
+	// -o pins below do not cover (Board review #2 #6).
+	sshConfig := filepath.Clean(hc.SSHConfig)
+	switch {
+	case hc.SSHConfig == "":
+		return nil, fmt.Errorf("host %s: [gates.ops.dev_hosts.%s] ssh_config is required (a StayPoint-owned ssh config under %s)", r.Host, r.Host, dataDir)
+	case !filepath.IsAbs(hc.SSHConfig):
 		return nil, fmt.Errorf("host %s: ssh_config must be an absolute path", r.Host)
+	case dataDir == "" || !strings.HasPrefix(sshConfig, filepath.Clean(dataDir)+string(filepath.Separator)):
+		return nil, fmt.Errorf("host %s: ssh_config %s must be inside the StayPoint data dir %s", r.Host, hc.SSHConfig, dataDir)
 	}
-	p := &DevHostPlan{Host: r.Host, HostName: hc.HostName, SSHConfig: hc.SSHConfig, Timeout: readTimeout}
+	p := &DevHostPlan{Host: r.Host, HostName: hc.HostName, SSHConfig: sshConfig, Timeout: readTimeout}
 	p.Tool = "dev_host_run"
 	p.Effect = effect
 	if effect == DevWrite {
@@ -159,7 +176,11 @@ func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, erro
 		}
 		cmd := "ls -la -- \"$p\""
 		if r.Action == "cat_file" {
-			cmd = "head -c " + strconv.Itoa(maxFileBytes) + " -- \"$p\""
+			if !textFile.MatchString(target) {
+				return nil, fmt.Errorf("path %q is not a text source/config/doc file; cat_file never returns data files (databases, logs, pickles, dumps)", r.Path)
+			}
+			cmd = "if ! printf '%s' \"$p\" | grep -Eq " + shQuote(textFileRe) + "; then echo 'refused: not a text file' >&2; exit 3; fi; " +
+				"head -c " + strconv.Itoa(maxFileBytes) + " -- \"$p\""
 		}
 		p.Remote = resolvedUnder(target, dir) + cmd
 		summary = append(summary, "path="+target)
@@ -246,9 +267,11 @@ func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, erro
 // resolvedUnder resolves target on the host and refuses it unless it is
 // still under dir and is not a secret file; it leaves the path in $p.
 func resolvedUnder(target, dir string) string {
-	q := shQuote(dir)
-	return "p=$(readlink -f -- " + shQuote(target) + ") && [ -e \"$p\" ] || { echo 'no such path' >&2; exit 2; }; " +
-		"case \"$p\" in " + q + "|" + q + "/*) ;; *) echo 'refused: path resolves outside the app dir' >&2; exit 3;; esac; " +
+	// The app dir is resolved too, so a dir that is itself a symlink (a
+	// current-release link) compares resolved to resolved (Board review #3).
+	return "d=$(readlink -f -- " + shQuote(dir) + ") && [ -d \"$d\" ] || { echo 'no such app dir' >&2; exit 2; }; " +
+		"p=$(readlink -f -- " + shQuote(target) + ") && [ -e \"$p\" ] || { echo 'no such path' >&2; exit 2; }; " +
+		"case \"$p\" in \"$d\"|\"$d\"/*) ;; *) echo 'refused: path resolves outside the app dir' >&2; exit 3;; esac; " +
 		"if printf '%s' \"$p\" | grep -Eq " + shQuote(secretPathRe) + "; then echo 'refused: env/secret file' >&2; exit 3; fi; "
 }
 
@@ -332,10 +355,7 @@ func RunDevHost(ctx context.Context, run Runner, p *DevHostPlan) string {
 // file, so the configured HostName is where it connects, with no proxy,
 // shared control socket or local command an ssh config could add.
 func (p *DevHostPlan) SSHArgs() []string {
-	args := []string{"-T"}
-	if p.SSHConfig != "" {
-		args = append(args, "-F", p.SSHConfig)
-	}
+	args := []string{"-T", "-F", p.SSHConfig}
 	for _, o := range []string{
 		"BatchMode=yes", "ConnectTimeout=10", "HostName=" + p.HostName,
 		"ProxyCommand=none", "ProxyJump=none", "ControlMaster=no", "ControlPath=none",

@@ -31,6 +31,17 @@ type Server struct {
 	// approver asks the Board about prod and external writes; nil refuses
 	// them (fail closed).
 	approver Approver
+	// opsDataDir is the real data dir whose ops_key proves a run's token;
+	// "" turns the ops tools off.
+	opsDataDir string
+}
+
+// WithOpsDataDir turns the ops tools on for runs whose token checks out
+// against dir's ops key (opstools.VerifyRunToken).
+func WithOpsDataDir(dir string) Option {
+	return func(s *Server) {
+		s.opsDataDir = dir
+	}
 }
 
 // WithApprover lets prod and external writes ask the Board.

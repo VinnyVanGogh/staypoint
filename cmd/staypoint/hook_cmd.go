@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -541,6 +542,10 @@ func handleHookPreTool() {
 	// a daemon-run agent, file edits (task-9d94997c).
 	taskID := os.Getenv("STAYPOINT_TASK_ID")
 	if !strings.EqualFold(payload.ToolName, "bash") {
+		if why := credentialFileAccess(payload.ToolName, payload.ToolInput); why != "" {
+			preToolBlock(why)
+			return
+		}
 		if taskID != "" && fileEditTools[strings.ToLower(payload.ToolName)] {
 			gateFileEdit(payload.ToolName, payload.ToolInput, payload.SessionID, payload.CWD, taskID)
 			return
@@ -560,8 +565,10 @@ func handleHookPreTool() {
 	}
 
 	// A command an ops MCP tool replaces is denied with a pointer to the tool,
-	// not held for the Board (task-7d279c9d).
-	if why := opsRedirect(bashInput.Command); why != "" {
+	// not held for the Board (task-7d279c9d). Only in a StayPoint run: the
+	// ops tools refuse a session the harness did not start, so elsewhere the
+	// command goes to the normal gate instead.
+	if why := opsRedirect(bashInput.Command); why != "" && taskID != "" {
 		preToolBlock(why)
 		return
 	}
@@ -681,6 +688,41 @@ func handleHookPreTool() {
 			// still pending — loop
 		}
 	}
+}
+
+var (
+	// credentialFileRe names the StayPoint credential files: the daemon and
+	// Board tokens, and the ops key that signs each run's ops-tool token.
+	credentialFileRe = regexp.MustCompile(`\.staypoint/(?:.*/)?(?:ops_key|auth_token|board_token)\b`)
+	// dataDirSearchRe is a search path that is the data dir itself, so a
+	// Grep or Glob would reach its credential files.
+	dataDirSearchRe = regexp.MustCompile(`/\.staypoint/*$`)
+)
+
+// credentialFileAccess is the denial for a non-shell tool call (Read, Grep,
+// Glob, ...) whose path names a StayPoint credential file or searches the
+// whole data dir, or "". Only path parameters are read, so editing code
+// that mentions these names is unaffected. The Bash path already holds
+// ~/.staypoint; without this the Read tool could hand an agent the ops key,
+// and with it a run token for any task (Board review #2 H1).
+func credentialFileAccess(tool string, input json.RawMessage) string {
+	var args map[string]any
+	if json.Unmarshal(input, &args) != nil {
+		return ""
+	}
+	for _, k := range []string{"file_path", "path", "notebook_path", "pattern", "glob"} {
+		p, _ := args[k].(string)
+		if p == "" {
+			continue
+		}
+		if credentialFileRe.MatchString(p) {
+			return "denied, not run: " + tool + " names a StayPoint credential file (ops_key, auth_token, board_token)"
+		}
+		if k == "path" && dataDirSearchRe.MatchString(p) {
+			return "denied, not run: " + tool + " searches the whole StayPoint data dir; use staypoint_query for your task's records"
+		}
+	}
+	return ""
 }
 
 // opsRedirect is the denial for a shell command an ops MCP tool replaces, or

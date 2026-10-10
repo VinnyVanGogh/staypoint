@@ -14,7 +14,7 @@ import (
 func TestPreToolHookRedirectsToOpsTools(t *testing.T) {
 	oldCfg, oldConn := cfg, gateDaemonConn
 	t.Cleanup(func() { cfg, gateDaemonConn = oldCfg, oldConn })
-	t.Setenv("STAYPOINT_TASK_ID", "")
+	t.Setenv("STAYPOINT_TASK_ID", "task-redirect-test")
 	cfg = config.DefaultConfig()
 	cfg.Gates.Hosts = config.HostClasses{Dev: []string{"mansol-dev"}, Prod: []string{"mansol-prod"}}
 	daemonAsked := false
@@ -39,15 +39,22 @@ func TestPreToolHookRedirectsToOpsTools(t *testing.T) {
 		"cat > /tmp/comment.md <<'EOF'\nDone.\nEOF":                                           "task_comment",
 		"gh pr merge 42 --merge":                                                              "pr_merge",
 	} {
-		daemonAsked = false
+		// In a run the hook also asks the daemon for the pause flag, so
+		// "denied, not run" plus the tool pointer is what shows the command
+		// never became a Board hold.
 		decision, reason := run(cmd)
 		if decision != "block" || !strings.Contains(reason, "mcp__staypoint__"+tool) || !strings.HasPrefix(reason, "denied, not run") {
 			t.Errorf("%q: decision=%q reason=%q, want deny pointing at %s", cmd, decision, reason, tool)
 		}
-		if daemonAsked {
-			t.Errorf("%q reached the Board gate", cmd)
-		}
 	}
+
+	// Outside a StayPoint run the ops tools refuse (no run token), so the
+	// hook does not point there; the command goes to the normal gate.
+	t.Setenv("STAYPOINT_TASK_ID", "")
+	if _, reason := run("gh pr merge 42 --merge"); strings.Contains(reason, "mcp__staypoint__") {
+		t.Fatalf("no run: redirected to an ops tool: %q", reason)
+	}
+	t.Setenv("STAYPOINT_TASK_ID", "task-redirect-test")
 
 	// ssh to a prod host is not redirected: it still goes to the Board gate
 	// (here unreachable, so blocked fail-closed).

@@ -314,6 +314,7 @@ func runDaemon(ctx context.Context) error {
 	orchestrator.GlobalRunControl.SetDB(dbStore.DB())
 	wireRunQueue(ctx, runLimitsFrom(cfg), httpServer)
 	setTurnLimits(cfg)
+	opsDataDir = cfg.DataDir
 
 	repoRoot := cfg.HarnessRepoRoot
 	if repoRoot == "" {
@@ -494,6 +495,7 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			RunControl:       orchestrator.GlobalRunControl,
 			SkipGitPreflight: adapterOverride != nil || testSkipGitPreflight,
 			HookBin:          resolveStaypointCLIBin(),
+			OpsDataDir:       opsDataDir,
 			// Board rule (STA-856, all repos): Gemini never writes code; a
 			// Board Touch ID approval (personal repo, this run) relaxes it.
 			GeminiDocsOnly:     geminiDocsOnly(route),

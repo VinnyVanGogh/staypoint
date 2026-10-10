@@ -105,6 +105,22 @@ func TestClassifyTiers(t *testing.T) {
 		// red: worktree escapes
 		{"cat ../outside/file", Red}, {"ls /usr/local", Red}, {"cp a ../b", Red}, {"echo x > /tmp/x", Red},
 		{"cat --file=../x", Red},
+		// red: the ops-tool MCP server outside the harness, and staypoint
+		// under a rewritten env (Board review #2 H1)
+		{"staypoint mcp", Red}, {"/usr/local/bin/staypoint mcp", Red}, {"staypoint --verbose mcp", Red},
+		{"printf '{}' | env -u STAYPOINT_TASK_ID HOME=/tmp/fakehome PATH=/tmp/bin:$PATH staypoint mcp", Red},
+		{"HOME=/tmp/fakehome staypoint task list", Red}, {"PATH=/tmp/bin:$PATH staypoint status", Red},
+		{"GH_HOST=evil.example staypoint status", Red}, {"GH_CONFIG_DIR=/tmp/gh staypoint status", Red},
+		{"STAYPOINT_TASK_ID=task-other staypoint status", Red}, {"XDG_CONFIG_HOME=/tmp/x staypoint status", Red},
+		{"env -u STAYPOINT_TASK_ID staypoint status", Red}, {"env -i staypoint status", Red},
+		{"env HOME=/tmp/x staypoint status", Red}, {"nohup env HOME=/tmp/x staypoint status", Red},
+		{"HOME=/tmp/x env staypoint status", Red}, {"env -iu FOO staypoint status", Red},
+		{"NO_COLOR=1 staypoint status", Yellow}, {"env NO_COLOR=1 staypoint task list", Yellow},
+		// red: retargeting a PR's base (Board review #2 M1)
+		{"gh pr edit 12 --base main", Red}, {"gh pr edit 12 -B main", Red}, {"gh pr edit 12 --base=main", Red},
+		{"gh pr edit 12 -Bmain", Red}, {"gh -R o/r pr edit 12 --base main", Red},
+		{"gh api -X PATCH repos/o/r/pulls/12 -f base=main", Red}, {"gh api --method PATCH repos/o/r/pulls/12", Red},
+		{"gh pr edit 12 --title x", Yellow}, {"gh pr view 12 --json baseRefName", Yellow},
 	}
 	for _, tc := range cases {
 		got := c.Classify(tc.cmd)

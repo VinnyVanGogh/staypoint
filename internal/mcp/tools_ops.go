@@ -120,7 +120,7 @@ func opsTools() []Tool {
 		{
 			Name: "pr_body",
 			Description: "Replace a GitHub PR's body with text passed directly (gh pr edit --body-file -), instead of staging it in /tmp. " +
-				"Effect dev_write for a PR in your task's own GitHub repo whose head is not main/master/prod (runs unattended); " +
+				"Effect dev_write for your task's own PR: in your task's GitHub repo, head branch staypoint/<task id> (runs unattended); " +
 				"external_write for any other PR (held for the Board). If a call was held past the wait, call again with approval_gate_id.",
 			InputSchema: InputSchema{
 				Type: "object",
@@ -174,8 +174,30 @@ func (s *Server) opsRunner() opstools.Runner {
 	return opstools.ExecRunner
 }
 
-// ownTask resolves a task_id parameter: a daemon run (STAYPOINT_TASK_ID set)
-// may only name its own task.
+// opsToolNames are the tools requireRun guards.
+var opsToolNames = map[string]bool{
+	"dev_host_run": true, "dev_deploy_verify": true, "staypoint_query": true,
+	"task_comment": true, "task_doc": true, "pr_body": true, "pr_merge": true,
+}
+
+// requireRun refuses an ops tool unless this server was started by the
+// harness for STAYPOINT_TASK_ID: its run token must check out against the
+// ops key in the pinned data dir (Board review #2 H1). A server an agent
+// started itself, with STAYPOINT_TASK_ID unset or another task's ID, gets
+// no ops tools.
+func (s *Server) requireRun() *ToolCallResult {
+	if s.opsDataDir == "" {
+		return toolError("ops tools are off in this MCP server (no trusted StayPoint data dir); not run")
+	}
+	taskID := strings.TrimSpace(os.Getenv("STAYPOINT_TASK_ID"))
+	if err := opstools.VerifyRunToken(s.opsDataDir, taskID, os.Getenv(opstools.RunTokenEnv)); err != nil {
+		return toolError("refused, not run: " + err.Error())
+	}
+	return nil
+}
+
+// ownTask resolves a task_id parameter: a run (STAYPOINT_TASK_ID, proven by
+// requireRun) may only name its own task.
 func ownTask(arg string) (string, error) {
 	env := strings.TrimSpace(os.Getenv("STAYPOINT_TASK_ID"))
 	arg = strings.TrimSpace(arg)
@@ -229,7 +251,7 @@ func (s *Server) handleDevHostRun(ctx context.Context, rawArgs json.RawMessage) 
 	if err := decodeArgs(rawArgs, &req); err != nil {
 		return toolError(err.Error())
 	}
-	plan, err := opstools.PlanDevHost(s.getConfig().Gates, req)
+	plan, err := opstools.PlanDevHost(s.getConfig().Gates, s.opsDataDir, req)
 	if err != nil {
 		return toolError("dev_host_run refused: " + err.Error())
 	}
@@ -374,7 +396,7 @@ func (s *Server) handlePRBody(ctx context.Context, rawArgs json.RawMessage) *Too
 			return opstools.Call{}, "", toolError("pr_body refused: " + err.Error())
 		}
 		sum := sha256.Sum256([]byte(args.Text))
-		effect := opstools.PRBodyEffect(ghRepo, v.HeadRefName, s.taskRepoSlug(ctx), s.getConfig().Gates.Ops.OwnRepos)
+		effect := opstools.PRBodyEffect(ghRepo, v.HeadRefName, s.taskRepoSlug(ctx), strings.TrimSpace(os.Getenv("STAYPOINT_TASK_ID")), s.getConfig().Gates.Ops.OwnRepos)
 		return opstools.Call{Tool: "pr_body", Effect: effect,
 			Summary: fmt.Sprintf("gh_repo=%s pr=%d head=%s bytes=%d text_sha256=%x", ghRepo, args.PR, v.HeadRefName, len(args.Text), sum)}, ghRepo, nil
 	}
@@ -382,7 +404,8 @@ func (s *Server) handlePRBody(ctx context.Context, rawArgs json.RawMessage) *Too
 	if errRes != nil {
 		return errRes
 	}
-	reason := fmt.Sprintf("%s: replace the body of PR #%d in GitHub repo %s, which is not this task's repo or is a release PR", c.Effect, args.PR, ghRepo)
+	reason := fmt.Sprintf("%s: replace the body of PR #%d in GitHub repo %s, which is not this task's own PR (head %s in its repo)", c.Effect, args.PR, ghRepo,
+		opstools.TaskBranch(strings.TrimSpace(os.Getenv("STAYPOINT_TASK_ID"))))
 	if res := s.gate(ctx, c, reason, args.ApprovalGateID); res != nil {
 		return res
 	}
@@ -448,6 +471,13 @@ func (s *Server) handlePRMerge(ctx context.Context, rawArgs json.RawMessage) *To
 	}
 	if current.Summary != plan.Summary {
 		return toolError(fmt.Sprintf("pr_merge refused: the PR changed while held (was %s, now %s); not merged", plan.Summary, current.Summary))
+	}
+	live := run(ctx, opstools.Cmd{Name: "gh", Args: plan.LiveArgs(), Dir: plan.Repo})
+	if live.ExitCode != 0 || live.Err != nil {
+		return toolError("pr_merge: gh api read of the PR failed; not merged\n" + live.Format())
+	}
+	if err := plan.CheckLive(live.Stdout); err != nil {
+		return toolError("pr_merge refused: " + err.Error())
 	}
 	s.logOps(plan.Call)
 	merged := run(ctx, opstools.Cmd{Name: "gh", Args: plan.MergeArgs(), Dir: plan.Repo})

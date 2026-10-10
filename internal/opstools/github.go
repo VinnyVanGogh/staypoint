@@ -142,6 +142,32 @@ func (p *PRMergePlan) MergeArgs() []string {
 	return []string{"pr", "merge", strconv.Itoa(p.PR), "--repo", p.GHRepo, "--" + p.Method, "--match-head-commit", p.HeadSHA}
 }
 
+// LiveArgs are the gh arguments that read p's PR straight from the REST API
+// as "base head state", for the check right before the merge.
+func (p *PRMergePlan) LiveArgs() []string {
+	return []string{"api", "repos/" + p.GHRepo + "/pulls/" + strconv.Itoa(p.PR), "--jq", `[.base.ref, .head.sha, .state] | join(" ")`}
+}
+
+// CheckLive reads LiveArgs' answer: the PR must still be open on the base
+// the gate decided on, at the head the Board saw. It runs immediately
+// before the merge so a `gh pr edit --base main` during the hold is caught
+// before, not only after (Board review #2 M1).
+func (p *PRMergePlan) CheckLive(out string) error {
+	f := strings.Fields(out)
+	if len(f) != 3 {
+		return fmt.Errorf("PR #%d: unreadable API answer %q", p.PR, strings.TrimSpace(out))
+	}
+	switch {
+	case f[0] != p.Base:
+		return fmt.Errorf("PR #%d base is now %q, not %q (the gate decided on %q); not merged", p.PR, f[0], p.Base, p.Base)
+	case f[1] != p.HeadSHA:
+		return fmt.Errorf("PR #%d head is now %s, not %s; not merged", p.PR, f[1], p.HeadSHA)
+	case f[2] != "open":
+		return fmt.Errorf("PR #%d is %s; not merged", p.PR, f[2])
+	}
+	return nil
+}
+
 // CheckMerged reads gh's answer after the merge: the PR must be merged into
 // the base the gate decided on. The base cannot be checked atomically with
 // the merge (GitHub's merge call takes a head sha, not a base), so a base
@@ -189,18 +215,18 @@ func OriginSlug(ctx context.Context, run Runner, dir string) (slug, url string) 
 	return slug, url
 }
 
-// protectedHeads are head branches whose PR body pr_body never edits
-// unattended: a release PR's description is the Board's, not a run's.
-var protectedHeads = map[string]bool{"main": true, "master": true, "prod": true, "production": true}
+// TaskBranch is the branch the harness gives taskID's worktree.
+func TaskBranch(taskID string) string { return "staypoint/" + taskID }
 
-// PRBodyEffect is the effect of replacing PR body text: a dev write for a
-// PR in the task's own GitHub repo (taskSlug) from a non-release branch,
-// when that repo is also one the Board listed (ownRepos, [gates.ops]
-// own_repos: an agent can repoint a checkout's origin but not edit the
-// config); an external write (the Board) otherwise.
-func PRBodyEffect(ghRepo, headRef, taskSlug string, ownRepos []string) Effect {
+// PRBodyEffect is the effect of replacing PR body text: a dev write only
+// for the task's own PR, one whose head is the task's branch
+// (TaskBranch(taskID)) in the task's own GitHub repo (taskSlug), when that
+// repo is also one the Board listed (ownRepos, [gates.ops] own_repos: an
+// agent can repoint a checkout's origin but not edit the config); an
+// external write (the Board) for every other PR (Board review #2 #7/L1).
+func PRBodyEffect(ghRepo, headRef, taskSlug, taskID string, ownRepos []string) Effect {
 	listed := slices.ContainsFunc(ownRepos, func(r string) bool { return strings.EqualFold(r, ghRepo) })
-	if listed && taskSlug != "" && strings.EqualFold(ghRepo, taskSlug) && !protectedHeads[headRef] {
+	if listed && taskSlug != "" && taskID != "" && strings.EqualFold(ghRepo, taskSlug) && headRef == TaskBranch(taskID) {
 		return DevWrite
 	}
 	return ExternalWrite

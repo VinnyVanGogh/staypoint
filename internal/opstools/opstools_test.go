@@ -12,22 +12,33 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/config"
 )
 
+// testDataDir stands in for the StayPoint data dir; ssh_config must be in it.
+const (
+	testDataDir   = "/Users/x/.staypoint"
+	testSSHConfig = testDataDir + "/ssh_config"
+)
+
 func testGates() config.GatesConfig {
 	return config.GatesConfig{
-		Hosts: config.HostClasses{Dev: []string{"mansol-dev", "both-host", "dev-noname", "dev-relcfg"}, Prod: []string{"mansol-prod", "both-host"}},
+		Hosts: config.HostClasses{Dev: []string{"mansol-dev", "both-host", "dev-noname", "dev-relcfg", "dev-nocfg", "dev-usercfg", "dev-sibling"}, Prod: []string{"mansol-prod", "both-host"}},
 		Ops: config.OpsConfig{DevHosts: map[string]config.DevHostConfig{
 			"mansol-dev": {
-				HostName: "10.0.0.5",
-				AppDir:   "/var/www/mansol_apps",
-				Services: []string{"mansol-web", "mansol-worker"},
+				HostName:  "10.0.0.5",
+				SSHConfig: testSSHConfig,
+				AppDir:    "/var/www/mansol_apps",
+				Services:  []string{"mansol-web", "mansol-worker"},
 				Apps: map[string]config.DevAppConfig{
 					"billing": {Dir: "/var/www/mansol_apps/billing", Python: "/var/www/mansol_apps/venv/bin/python"},
 				},
 			},
-			"both-host":   {HostName: "10.0.0.6", AppDir: "/srv/app"},
-			"mansol-prod": {HostName: "10.0.0.7", AppDir: "/srv/app"},
-			"dev-noname":  {AppDir: "/srv/app"},
+			"both-host":   {HostName: "10.0.0.6", SSHConfig: testSSHConfig, AppDir: "/srv/app"},
+			"mansol-prod": {HostName: "10.0.0.7", SSHConfig: testSSHConfig, AppDir: "/srv/app"},
+			"dev-noname":  {SSHConfig: testSSHConfig, AppDir: "/srv/app"},
 			"dev-relcfg":  {HostName: "10.0.0.8", SSHConfig: "ssh_config", AppDir: "/srv/app"},
+			"dev-nocfg":   {HostName: "10.0.0.9", AppDir: "/srv/app"},
+			"dev-usercfg": {HostName: "10.0.0.10", SSHConfig: "/Users/x/.ssh/config", AppDir: "/srv/app"},
+			// A prefix match is not containment: .staypoint-evil is not .staypoint.
+			"dev-sibling": {HostName: "10.0.0.11", SSHConfig: "/Users/x/.staypoint-evil/ssh_config", AppDir: "/srv/app"},
 		}},
 	}
 }
@@ -56,6 +67,19 @@ func TestPlanDevHostRefuses(t *testing.T) {
 		{"unknown action", DevHostRequest{Host: "mansol-dev", Action: "shell"}, "not one of"},
 		{"no pinned host_name", DevHostRequest{Host: "dev-noname", Action: "git_status"}, "host_name must be set"},
 		{"relative ssh_config", DevHostRequest{Host: "dev-relcfg", Action: "git_status"}, "ssh_config must be an absolute path"},
+		// Board review #2 #6: ssh_config is required and StayPoint-owned.
+		{"no ssh_config", DevHostRequest{Host: "dev-nocfg", Action: "git_status"}, "ssh_config is required"},
+		{"user ssh_config", DevHostRequest{Host: "dev-usercfg", Action: "git_status"}, "inside the StayPoint data dir"},
+		{"sibling of data dir", DevHostRequest{Host: "dev-sibling", Action: "git_status"}, "inside the StayPoint data dir"},
+		// Board review #2 M2: data files are not text.
+		{"cat sqlite", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "db.sqlite3"}, "not a text"},
+		{"cat db", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "data/app.db"}, "not a text"},
+		{"cat log", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "logs/django.log"}, "not a text"},
+		{"cat pyc", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "billing/__pycache__/views.cpython-312.pyc"}, "not a text"},
+		{"cat pickle", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "cache/model.pickle"}, "not a text"},
+		{"cat sql dump", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "backups/dump.sql"}, "not a text"},
+		{"cat archive", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "backups/db.tar.gz"}, "not a text"},
+		{"cat no extension", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "media/upload"}, "not a text"},
 		{"cat traversal", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "../../etc/passwd"}, "outside the app dir"},
 		{"cat absolute outside", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "/etc/shadow"}, "outside the app dir"},
 		{"cat sibling prefix", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "/var/www/mansol_apps_old/x"}, "outside the app dir"},
@@ -78,7 +102,7 @@ func TestPlanDevHostRefuses(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p, err := PlanDevHost(g, tc.req)
+			p, err := PlanDevHost(g, testDataDir, tc.req)
 			if err == nil {
 				t.Fatalf("expected refusal, got plan %q", p.Remote)
 			}
@@ -109,7 +133,7 @@ func TestPlanDevHostEffects(t *testing.T) {
 		{DevHostRequest{Host: "mansol-dev", Action: "pip_sync", App: "billing"}, DevWrite, "-m pip install -r 'requirements.txt'"},
 	}
 	for _, tc := range cases {
-		p, err := PlanDevHost(g, tc.req)
+		p, err := PlanDevHost(g, testDataDir, tc.req)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.req.Action, err)
 		}
@@ -171,12 +195,17 @@ func TestResolvedUnderOnRealShell(t *testing.T) {
 	if err := os.Symlink(filepath.Join(app, "django.env"), filepath.Join(app, "settings.txt")); err != nil {
 		t.Fatal(err)
 	}
+	// A text-named link to a database is judged by what it resolves to.
+	write(filepath.Join(app, "db.sqlite3"), "SQLite format 3\x00sessionid=fixture\n")
+	if err := os.Symlink(filepath.Join(app, "db.sqlite3"), filepath.Join(app, "schema.txt")); err != nil {
+		t.Fatal(err)
+	}
 	g := config.GatesConfig{
 		Hosts: config.HostClasses{Dev: []string{"dev"}},
-		Ops:   config.OpsConfig{DevHosts: map[string]config.DevHostConfig{"dev": {HostName: "127.0.0.1", AppDir: app}}},
+		Ops:   config.OpsConfig{DevHosts: map[string]config.DevHostConfig{"dev": {HostName: "127.0.0.1", SSHConfig: testSSHConfig, AppDir: app}}},
 	}
 	run := func(path string) (string, int) {
-		p, err := PlanDevHost(g, DevHostRequest{Host: "dev", Action: "cat_file", Path: path})
+		p, err := PlanDevHost(g, testDataDir, DevHostRequest{Host: "dev", Action: "cat_file", Path: path})
 		if err != nil {
 			t.Fatalf("plan %s: %v", path, err)
 		}
@@ -193,8 +222,32 @@ func TestResolvedUnderOnRealShell(t *testing.T) {
 	if out, code := run("settings.txt"); code != 3 || strings.Contains(out, "SECRET_KEY") {
 		t.Fatalf("symlink to env file: exit %d %q", code, out)
 	}
+	if out, code := run("schema.txt"); code != 3 || strings.Contains(out, "SQLite") {
+		t.Fatalf("text-named symlink to a database: exit %d %q", code, out)
+	}
 	if _, code := run("missing.py"); code != 2 {
 		t.Fatalf("missing file: exit %d, want 2", code)
+	}
+
+	// Board review #3: an app_dir that is itself a symlink (a current-release
+	// link) still works, and still keeps its escapes out.
+	current := filepath.Join(root, "current")
+	if err := os.Symlink(app, current); err != nil {
+		t.Fatal(err)
+	}
+	g.Ops.DevHosts["dev"] = config.DevHostConfig{HostName: "127.0.0.1", SSHConfig: testSSHConfig, AppDir: current}
+	if out, code := run("views.py"); code != 0 || !strings.Contains(out, "print('ok')") {
+		t.Fatalf("symlinked app dir: exit %d %q", code, out)
+	}
+	if out, code := run("notes.txt"); code != 3 || strings.Contains(out, "root:x") {
+		t.Fatalf("symlinked app dir, link out: exit %d %q", code, out)
+	}
+	p, err := PlanDevHost(g, testDataDir, DevHostRequest{Host: "dev", Action: "ls"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(sh, "-c", p.Remote).CombinedOutput(); err != nil || !strings.Contains(string(out), "views.py") {
+		t.Fatalf("ls of symlinked app dir: %v %q", err, out)
 	}
 }
 
@@ -221,7 +274,7 @@ func TestRunDevHostUsesBatchSSHAndRedacts(t *testing.T) {
 		got = c
 		return Result{Output: string(raw), ExitCode: 0}
 	}
-	p, err := PlanDevHost(testGates(), DevHostRequest{Host: "mansol-dev", Action: "journal_tail", Service: "mansol-web"})
+	p, err := PlanDevHost(testGates(), testDataDir, DevHostRequest{Host: "mansol-dev", Action: "journal_tail", Service: "mansol-web"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,26 +284,14 @@ func TestRunDevHostUsesBatchSSHAndRedacts(t *testing.T) {
 		"-o", "ProxyCommand=none", "-o", "ProxyJump=none", "-o", "ControlMaster=no", "-o", "ControlPath=none",
 		"-o", "PermitLocalCommand=no", "-o", "StrictHostKeyChecking=yes",
 	}
-	want := append(append([]string{"-T"}, pinned...), "mansol-dev", p.Remote)
+	// The StayPoint-owned ssh config always replaces ~/.ssh/config (Board
+	// review #2 #6); the pins still apply on top of it.
+	want := append(append([]string{"-T", "-F", testSSHConfig}, pinned...), "mansol-dev", p.Remote)
 	if got.Name != "ssh" || strings.Join(got.Args, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("ssh argv = %s %q", got.Name, got.Args)
 	}
 	if strings.Contains(out, "fixture-") || !strings.HasPrefix(out, "exit 0") {
 		t.Fatalf("output not redacted or missing exit: %s", out)
-	}
-
-	// A StayPoint-owned ssh config replaces ~/.ssh/config; the pins still apply.
-	g := testGates()
-	hc := g.Ops.DevHosts["mansol-dev"]
-	hc.SSHConfig = "/Users/x/.staypoint/ssh_config"
-	g.Ops.DevHosts["mansol-dev"] = hc
-	p, err = PlanDevHost(g, DevHostRequest{Host: "mansol-dev", Action: "git_status"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want = append(append([]string{"-T", "-F", "/Users/x/.staypoint/ssh_config"}, pinned...), "mansol-dev", p.Remote)
-	if args := p.SSHArgs(); strings.Join(args, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("ssh argv with -F = %q", args)
 	}
 }
 
@@ -330,24 +371,31 @@ func TestGitHubSlugAndPRBodyEffect(t *testing.T) {
 		}
 	}
 	own := []string{"o/r"}
+	const mine = "staypoint/task-1"
 	cases := []struct {
-		repo, head, task string
-		own              []string
-		want             Effect
+		repo, head, slug, task string
+		own                    []string
+		want                   Effect
 	}{
-		{"o/r", "feature/x", "o/r", own, DevWrite},
-		{"O/R", "feature/x", "o/r", own, DevWrite},
-		{"other/r", "feature/x", "o/r", own, ExternalWrite},
-		{"o/r", "main", "o/r", own, ExternalWrite},
-		{"o/r", "prod", "o/r", own, ExternalWrite},
-		{"o/r", "feature/x", "", own, ExternalWrite},
+		{"o/r", mine, "o/r", "task-1", own, DevWrite},
+		{"O/R", mine, "o/r", "task-1", own, DevWrite},
+		{"other/r", mine, "o/r", "task-1", own, ExternalWrite},
+		{"o/r", "main", "o/r", "task-1", own, ExternalWrite},
+		{"o/r", "prod", "o/r", "task-1", own, ExternalWrite},
+		{"o/r", mine, "", "task-1", own, ExternalWrite},
+		// Board review #2 #7/L1: another task's PR, or any other branch's,
+		// in the same repo is not this task's to edit unattended.
+		{"o/r", "feature/x", "o/r", "task-1", own, ExternalWrite},
+		{"o/r", "staypoint/task-2", "o/r", "task-1", own, ExternalWrite},
+		{"o/r", "staypoint/task-1-evil", "o/r", "task-1", own, ExternalWrite},
+		{"o/r", "staypoint/", "o/r", "", own, ExternalWrite},
 		// A repointed task origin names a repo the Board never listed.
-		{"attacker/r", "feature/x", "attacker/r", own, ExternalWrite},
-		{"o/r", "feature/x", "o/r", nil, ExternalWrite},
+		{"attacker/r", mine, "attacker/r", "task-1", own, ExternalWrite},
+		{"o/r", mine, "o/r", "task-1", nil, ExternalWrite},
 	}
 	for _, c := range cases {
-		if got := PRBodyEffect(c.repo, c.head, c.task, c.own); got != c.want {
-			t.Errorf("PRBodyEffect(%q, %q, %q, %v) = %s, want %s", c.repo, c.head, c.task, c.own, got, c.want)
+		if got := PRBodyEffect(c.repo, c.head, c.slug, c.task, c.own); got != c.want {
+			t.Errorf("PRBodyEffect(%q, %q, %q, %q, %v) = %s, want %s", c.repo, c.head, c.slug, c.task, c.own, got, c.want)
 		}
 	}
 }
@@ -374,6 +422,21 @@ func TestRedactTable(t *testing.T) {
 		{"pem no END line", "cfg ok\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAfixture\nMIIcut", []string{"MIIEpAIBAAKCAQEAfixture", "MIIcut"}, []string{"cfg ok"}},
 		{"pem with END line", "-----BEGIN PRIVATE KEY-----\nMIIfixture\n-----END PRIVATE KEY-----\nafter", []string{"MIIfixture"}, []string{"after"}},
 		{"authorization header", "Authorization: Bearer abc.def ghi", []string{"abc.def", "ghi"}, nil},
+		// Board review #2 #3 residual.
+		{"url password with slash", "DATABASE_URL=postgres://user:pa/ss@db.host/app", []string{"pa/ss", "ss@db"}, []string{"db.host/app"}},
+		{"url password with question mark", "connecting to postgres://user:pa?ss@db.host/app", []string{"pa?ss"}, []string{"db.host/app"}},
+		{"url digit password with slash", "redis://u:1234/x@cache:6379", []string{"1234/x"}, []string{"cache:6379"}},
+		{"url port and path with @ stays", "GET http://127.0.0.1:8000/login?next=/a@b HTTP 200", nil, []string{"http://127.0.0.1:8000/login?next=/a@b"}},
+		{"ADMIN_PW", "ADMIN_PW=adminpw1", []string{"adminpw1"}, nil},
+		{"_SK suffix", "STRIPE_SK=sk_live_fixture1", []string{"sk_live_fixture1"}, nil},
+		{"_SALT suffix", "PASSWORD_HASH_SALT=salt-fixture\nHASH_SALT: s2", []string{"salt-fixture", "s2"}, nil},
+		{"set-cookie header", "Set-Cookie: sessionid=sess-fixture; HttpOnly; Path=/", []string{"sess-fixture"}, nil},
+		{"cookie header", "Cookie: csrftoken=c1; sessionid=sess-fixture2", []string{"sess-fixture2", "c1"}, nil},
+		{"sessionid in log", "auth ok sessionid=sess-fixture3 user=7", []string{"sess-fixture3"}, nil},
+		{"mysql -p", "mysql -u root -pmy-fixture-pw appdb", []string{"my-fixture-pw"}, []string{"mysql -u root -p", "appdb"}},
+		{"mysqldump -p quoted", "mysqldump -h db -p'my fixture' appdb", []string{"my fixture"}, []string{"appdb"}},
+		{"mysql -P port stays", "mysql -h db -P 3306 appdb", nil, []string{"-P 3306 appdb"}},
+		{"line continuation", "PASSWORD=first \\\n  second-line-fixture \\\n  third-fixture\nNEXT=1", []string{"first", "second-line-fixture", "third-fixture"}, []string{"NEXT=1"}},
 		{"verify PASS lines stay", "PASS: /billing marker found\nDEV DEPLOY VERIFIED abc1234", nil, []string{"PASS: /billing marker found", "DEV DEPLOY VERIFIED abc1234"}},
 		{"non-secret keys stay", "DEBUG=True\nmonkey: banana\nALLOWED_HOSTS=a.example", nil, []string{"DEBUG=True", "monkey: banana", "ALLOWED_HOSTS=a.example"}},
 	}

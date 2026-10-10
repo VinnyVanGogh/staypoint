@@ -26,8 +26,9 @@ holds the `Decide` function.
 **The MCP server enforces the gate itself**, not the PreToolUse hook. The tools
 can be reached through the agent CLI, through `staypoint mcp` on piped stdin,
 or through the daemon's IPC socket, and a gate in the server covers all three.
-A server with no approver refuses every prod and external write: the
-daemon's socket server has none, and neither does any test server. `staypoint
+A server with no approver refuses every prod and external write. The
+daemon's socket server runs no ops tools at all: it has no trusted ops data
+dir (see "Which servers run ops tools" below). `staypoint
 mcp` asks the Board the same way the hook does. It creates a gate request whose
 cmdline is the call's canonical form (`mcp__staypoint__pr_merge gh_repo=<owner/name>
 pr=5 base=main method=merge head=<sha>`), then waits for the hook's budget of
@@ -41,6 +42,47 @@ org trust never does: `security.AnalyzeForTrust` marks every
 does not depend on a text rule happening to match (Board review 2026-10-09).
 A Board allow rule the Board itself wrote still applies.
 
+### Which servers run ops tools
+
+Only a server the harness started for a run (Board review #2, 2026-10-09).
+An agent could otherwise run `printf '{}' | env -u STAYPOINT_TASK_ID
+HOME=/tmp/fakehome PATH=/tmp/bin:$PATH staypoint mcp`: the server read
+`/tmp/fakehome/.staypoint/config.toml`, so a dev host at any address with
+prod services and `branch=main` ran as `dev_write`, and with no task there
+was no activity row. Four things close that:
+
+- **Run token.** The harness gives each run `STAYPOINT_RUN_MAC`, an
+  HMAC-SHA256 of the task ID under `<data dir>/ops_key` (32 random bytes,
+  mode 0600, created on first use; `internal/opstools/origin.go`). The
+  server runs an ops tool only when `STAYPOINT_TASK_ID` is set and the token
+  checks out. An agent can read its own run's token, but cannot mint one for
+  another task without the key. A server with no task, another task's ID,
+  or a missing or wrong token refuses every ops tool; the other `staypoint_*`
+  tools are unaffected. The hook denies Read, Grep and Glob calls whose path
+  names `ops_key`, `auth_token` or `board_token` under `.staypoint`, or that
+  search the whole data dir.
+- **Pinned config.** `staypoint mcp` loads its config from the account's
+  home in the user database (`os/user`, not `$HOME`), resets `HOME` to it,
+  and checks the run token against that data dir. A fake `HOME` changes
+  nothing.
+- **Scrubbed children.** Every process an ops tool starts (`gh`, `git`,
+  `ssh`, `bash`) gets the server's environment minus `GH_*`, `GITHUB_*`,
+  `GIT_*`, `XDG_CONFIG_HOME`, `BASH_ENV`, `ENV`, proxy and CA-bundle
+  variables, `DYLD_*`/`LD_*` and exported shell functions, with `PATH` set to
+  `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`. Commands
+  are looked up on that PATH, not the server's. `GH_HOST` / `GH_CONFIG_DIR`
+  can no longer point `dev_deploy_verify`'s `gh api` at another host.
+- **Red in the shell.** `staypoint mcp`, and any `staypoint` call that sets
+  or unsets `HOME`, `PATH`, `USER`, `TMPDIR`, `XDG_*`, `GH_*`, `GITHUB_*`,
+  `GIT_*`, `STAYPOINT_*`, `DYLD_*` or `LD_*` (as a prefix or through `env`,
+  including any `env` flag), is Red. The harness starts the MCP server
+  itself; an agent never needs to.
+
+A renamed copy of the binary (`go build -o /tmp/x ./cmd/staypoint && /tmp/x
+mcp`) is not caught by name. It gets the same pinned config and the same
+token check, so it can do only what the agent's own MCP tools already do,
+and its calls are logged on the agent's own task.
+
 Every call lands on the run timeline with its effect. Run-step titles look
 like `dev_host_run [dev_write] host=mansol-dev action=restart
 service=mansol-web`. The server also writes an `ops_tool` activity row on the
@@ -50,14 +92,19 @@ task, so calls that bypass the agent CLI are on record too.
 
 ### `dev_host_run(host, action, ...)`
 
-The tool runs `ssh -T [-F <ssh_config>] -o BatchMode=yes -o ConnectTimeout=10
+The tool runs `ssh -T -F <ssh_config> -o BatchMode=yes -o ConnectTimeout=10
 -o HostName=<host_name> -o ProxyCommand=none -o ProxyJump=none -o
 ControlMaster=no -o ControlPath=none -o PermitLocalCommand=no -o
-StrictHostKeyChecking=yes <host> <command>`. Command-line options win over any
-ssh config, so `~/.ssh/config` (or an `Include` an agent added to it) cannot
-redirect the dev alias, proxy it, or reuse a control socket. `host_name` is
-required; `ssh_config` optionally points at a StayPoint-owned file used
-instead of `~/.ssh/config` (for User, Port, IdentityFile).
+StrictHostKeyChecking=yes <host> <command>`.
+
+Both `host_name` and `ssh_config` are required, and `ssh_config` must be a
+file inside the StayPoint data dir (e.g. `~/.staypoint/ssh_config`), which
+agents cannot write. With `-F`, ssh reads only that file: not
+`~/.ssh/config`, its `Include`s, or `/etc/ssh/ssh_config`. The `-o` pins
+alone were not enough (Board review #2 #6): `~/.ssh/config` can still set
+`Port`, `User`, `KnownHostsCommand`, `PKCS11Provider` and `IdentityAgent`,
+and a `Match exec` line runs a local command while ssh parses it. Put the
+host's `User`, `Port` and `IdentityFile` in the StayPoint file.
 
 The remote command is built from a fixed table, and every value in it is
 validated and single-quoted. The tool never sources env files with a shell.
@@ -69,19 +116,31 @@ Output is redacted (`internal/opstools/redact.go`), on top of
 - Private key blocks, to the end of the output when the END line is missing
   (a capped `cat_file` can cut it off).
 - Secret-named assignments (`SECRET_KEY`, `*PASSWORD*`, `*_PASS`, `*PWD*`,
-  `*TOKEN*`, `*_KEY`, `key`, `*api_key*`, `*dsn*`, `*auth*`, ...): a quoted
-  value (backslash escapes honoured, Python triple quotes to their end) or
-  else everything to the end of the line. A bare `PASS:` is not a secret
-  name, so verify output survives.
-- Passwords in URLs, with an empty user (`redis://:pw@host`) and up to the
-  last `@` before the path (`user:p@ss@host`).
+  `*_PW`, `*_SK`, `*SALT*`, `*TOKEN*`, `*_KEY`, `key`, `*api_key*`, `*dsn*`,
+  `*auth*`, `*session_id*`, `*cookie*` including `Set-Cookie:` headers, ...):
+  a quoted value (backslash escapes honoured, Python triple quotes to their
+  end) or else everything to the end of the line, following `\` line
+  continuations onto the next lines. A bare `PASS:` is not a secret name, so
+  verify output survives.
+- Passwords in URLs, with an empty user (`redis://:pw@host`), up to the
+  last `@` in the URL (`user:p@ss@host`), and with `/` or `?` in them
+  (`user:pa/ss@host`). `host:8000/path?next=a@b` is a port, not a password,
+  when the part before `:` is a dotted host or `localhost`.
+- `mysql`/`mysqldump`/`mysqladmin ... -pPASSWORD` (`-P` is the port and
+  stays).
+
+Redaction masks values, never whole lines. A stdout line missing from a
+result was a capture bug, not redaction (Board review #2 L2): the runner
+gave stdout an `io.MultiWriter` and stderr the same buffer, and every
+stdout line was lost from the combined output, so `dev_host_run` returned
+only `exit 0`. One locked writer now takes both streams.
 
 | Action | Effect | Parameters | Runs |
 |---|---|---|---|
 | `git_status` | read | `app`? | `git -C <dir> status --short --branch` |
 | `git_log` | read | `lines` (≤200), `app`? | `git -C <dir> log --oneline -n N` |
 | `ls` | read | `path`?, `app`? | `ls -la` on the resolved path |
-| `cat_file` | read | `path`, `app`? | `head -c 256KiB` on the resolved path |
+| `cat_file` | read | `path`, `app`? | `head -c 256KiB` on the resolved path, text files only |
 | `journal_tail` | read | `service`, `lines` (≤2000) | `journalctl -u <svc> -n N --no-pager` |
 | `systemctl_status` | read | `service` | `systemctl status <svc> --no-pager -n 20` |
 | `http_get_local` | read | `port`, `path` | `curl -sS -m 10 http://127.0.0.1:<port><path>` |
@@ -101,9 +160,17 @@ Validation rules:
     env, key or credential file (`.env*`, `*.env`, `*secret*`,
     `*credential*`, `*.pem`/`*.key`/`*.p12`, `id_*`, `.netrc`, `.pgpass`,
     `.ssh`).
-  - On the host, the path is resolved with `readlink -f` and the same two
-    checks run on the result, so a symlink can't get out of the app dir or
-    reach an env file.
+  - `cat_file` also needs a text file: an allowlisted extension (`.py`,
+    `.txt`, `.md`, `.html`, `.css`, `.js`, `.json`, `.yaml`, `.toml`,
+    `.cfg`, `.ini`, `.conf`, `.service`, `.sh`, `.xml`, templates, source
+    files, ...) or a known name (`Dockerfile`, `Makefile`, `Procfile`,
+    `README`, `LICENSE`, ...). Data files are refused, not returned
+    unredacted: `db.sqlite3`, `*.db`, `*.log`, `*.pyc`, `*.pickle`, `*.sql`
+    dumps, archives (Board review #2 M2: a Django `db.sqlite3` holds
+    sessions, OAuth tokens and PII).
+  - On the host, the path is resolved with `readlink -f` and the same
+    checks run on the result, so a symlink can't get out of the app dir,
+    reach an env file, or give a database a text name.
 
 ### `dev_deploy_verify(repo, sha, page_checks[])`, effect read
 
@@ -149,7 +216,8 @@ output names the blob, so the Board can review it and add it.
 ### `staypoint_query(query, ...)`, effect read
 
 These are named queries only; there is no free-form SQL. They cover the run's
-own task (when `STAYPOINT_TASK_ID` is set, any other `task_id` is refused):
+own task (`STAYPOINT_TASK_ID`, proven by the run token; any other `task_id`
+is refused):
 
 - `task`
 - `comments`
@@ -178,12 +246,13 @@ These take the text directly, so there is no temp file and no heredoc.
 own URL, and runs `gh pr edit <pr> --repo <owner/name> --body-file -` with the
 text on stdin. Its effect:
 
-- `dev_write` when the PR is in the task's own GitHub repo (the `origin` of
-  the task's configured checkout, not the agent's working directory), that
-  repo is listed in `[gates.ops] own_repos`, and its head branch is not
-  `main`, `master`, `prod` or `production`. Worktrees share the checkout's
-  git config, so an agent can repoint `origin`; it cannot add its repo to
-  the Board's config list.
+- `dev_write` only for the task's own PR: its head branch is the task's
+  branch (`staypoint/<task id>`), it is in the task's own GitHub repo (the
+  `origin` of the task's configured checkout, not the agent's working
+  directory), and that repo is listed in `[gates.ops] own_repos`. Another
+  task's PR or any other branch's in the same repo goes to the Board (Board
+  review #2 #7). Worktrees share the checkout's git config, so an agent can
+  repoint `origin`; it cannot add its repo to the Board's config list.
 - `external_write` (Board) for anything else, including when the task's repo
   is unknown. The canonical call holds the text's full sha256, so the
   approval covers exactly that text.
@@ -204,17 +273,27 @@ comes from the PR's URL and goes into the canonical call and the Board's
 reason. The declared `base` must match the real base, and the PR must be
 `OPEN`. After approval the tool reads the PR again from `repo` and refuses if
 anything changed, including the GitHub repo (a remote repointed after the
-approval). The merge runs as `gh pr merge <pr> --repo <owner/name> --<method>
---match-head-commit <head the Board saw>`, and afterwards the tool checks the
-PR is `MERGED` into the decided base. GitHub's merge call takes a head sha but
-not a base, so a base swapped in the moment between the re-read and the merge
-can't be prevented; the post-merge check reports it as an error.
+approval). Immediately before the merge it reads the PR once more straight
+from the REST API (`gh api repos/<owner/name>/pulls/<pr>`): base, head sha
+and state must still be the decided base, the head the Board saw, and
+`open` (Board review #2 M1). The merge runs as `gh pr merge <pr> --repo
+<owner/name> --<method> --match-head-commit <head the Board saw>`, and
+afterwards the tool checks the PR is `MERGED` into the decided base.
+
+GitHub's merge call takes a head sha but not a base, so a base swapped in
+the instant between the API read and the merge can't be prevented; the
+post-merge check reports it as an error. The shell side of that race is
+closed: `gh pr edit --base` / `-B` is Red, as is any `gh api` call with a
+method other than GET/HEAD or a body (`PATCH .../pulls/<n>` included), so an
+agent cannot retarget a PR without the Board.
 
 ## Hook: deny with a pointer
 
-When a Bash command (Claude Code or agy) matches one of the patterns these
-tools cover, the PreToolUse hook denies it with a pointer to the tool. It
-does not hold the command for the Board:
+When a Bash command (Claude Code or agy) in a StayPoint run matches one of
+the patterns these tools cover, the PreToolUse hook denies it with a pointer
+to the tool. It does not hold the command for the Board. Outside a run
+(no `STAYPOINT_TASK_ID`) the ops tools refuse, so the hook does not point
+there; the command goes to the normal gate.
 
 | Shell | Pointer |
 |---|---|
@@ -244,8 +323,8 @@ verify_script_blobs = []
 own_repos = ["VinnyVanGogh/staypoint"]
 
 [gates.ops.dev_hosts.mansol-dev]
-host_name    = "<dev host address>"  # required: ssh connects here, whatever ~/.ssh/config says
-# ssh_config = "/Users/<you>/.staypoint/ssh_config"  # optional StayPoint-owned ssh -F file
+host_name    = "<dev host address>"  # required: ssh connects here
+ssh_config   = "/Users/<you>/.staypoint/ssh_config"  # required: ssh -F; must be inside the data dir
 app_dir      = "/var/www/mansol_apps"
 services     = ["mansol-web", "mansol-worker"]
 branches     = ["dev-server"]        # default: dev-server, dev
@@ -268,13 +347,16 @@ there should read the same table.
 | Shell injection through parameters | Every value comes from a regex and/or the config allow-list and is single-quoted; unknown JSON fields are rejected. |
 | Path traversal or symlink escape in `cat_file`/`ls` | Lexical check plus an on-host `readlink -f` re-check; a test runs the remote guard against a real symlinked tree. |
 | Secret leak in output | Redaction on every result; env/key files are refused; a fixture env test and a table test of every gap the Board found cover it. |
-| ssh config redirects the dev alias | `HostName`, no proxy, no control socket and strict host keys are pinned on the command line; optional StayPoint-owned `-F` file. |
+| ssh config redirects the dev alias | A required StayPoint-owned `-F` file inside the data dir replaces `~/.ssh/config` (no `Match exec`, `Include`, `KnownHostsCommand` from it); `HostName`, no proxy, no control socket and strict host keys are pinned on the command line too. |
+| Agent starts its own `staypoint mcp` with a fake HOME/config, no task, or another task's ID | Ops tools need the harness's per-run HMAC token; config is loaded from the real account home; child env scrubbed and PATH pinned; `staypoint mcp` and env-rewritten `staypoint` are Red; Read/Grep of the ops key is denied. |
+| `gh pr edit --base main` during a dev merge | `gh pr edit --base` and `gh api` writes are Red; base, head and state are re-read from the REST API right before the merge. |
+| `cat_file` returns a database or log | Text-file allowlist, checked locally and on the host after `readlink -f`. |
 | Agent-pushed verify script runs as "read" | The repo must be in `verify_repos`; the trust anchor is GitHub's main blob, not local refs; the bytes are hashed and must match; local `origin` must be that repo. |
 | Merging main by declaring `base=dev-server` | The declared base must equal GitHub's real base; the effect comes from the base. |
 | PR changes while held | The canonical call includes the GitHub repo and head sha, `--match-head-commit` pins it, the PR is re-read after approval, and the merge names `--repo` explicitly. |
 | Remote repointed after approval | The GitHub repo is re-resolved and must equal the approved one. |
 | Trusted task's prod merge auto-approved | Ops-tool canonicals are protected under any trust and tev1. |
-| `pr_body` edits someone else's PR | Unattended only in the task's own repo on a non-release head; otherwise the Board. |
+| `pr_body` edits someone else's PR | Unattended only for the task's own PR (head `staypoint/<task id>` in the task's own listed repo); otherwise the Board. |
 | Approval reused for a different call | `approval_gate_id` must match the canonical cmdline and task id. |
 | Bypass via `staypoint mcp` stdin or daemon socket | The gate lives in the server; with no approver, prod and external writes are refused. |
 | Agent comment wakes itself, dismisses a Board card, or poses as the Board | `AddAgentComment`: fixed author `agent-comment`, no wake, no supersede, excluded from the prompt's comments. |
