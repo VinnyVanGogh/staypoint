@@ -129,7 +129,11 @@ func compMatch(pat, name string, dots bool) bool {
 	pat = strings.ReplaceAll(pat, "[!", "[^")
 	ok, err := filepath.Match(pat, name)
 	if err != nil {
-		// The shell reads a malformed pattern ([ alone) literally.
+		// A [ with no ] after it is literal to the shell; a class Go
+		// cannot read ([]a], [a-]) may still match: fail closed.
+		if k := strings.IndexByte(pat, '['); k >= 0 && strings.IndexByte(pat[k:], ']') > 0 {
+			return true
+		}
 		return strings.ReplaceAll(pat, "[^", "[!") == name
 	}
 	return ok

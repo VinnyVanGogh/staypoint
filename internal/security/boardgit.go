@@ -17,7 +17,8 @@ import (
 var gitRunKeyRe = regexp.MustCompile(`^(alias\.|pager\.|include\.|includeif\.|` +
 	`core\.(fsmonitor|hookspath|sshcommand|pager|editor|askpass|gitproxy|alternaterefscommand|worktree)$|` +
 	`sequence\.editor$|diff\.external$|protocol\.|uploadpack\.|receivepack\.|init\.templatedir$|ssh\.variant$|` +
-	`url\.|.*\.(command|program|helper|cmd|driver|textconv|clean|smudge|process|path|editor|pager|proxy|` +
+	`url\.|interactive\.|sendemail\.|submodule\.|remote\.[^.]*\.vcs$|.*cmd$|` +
+	`.*\.(command|program|helper|cmd|driver|textconv|clean|smudge|process|path|editor|pager|proxy|` +
 	`sshcommand|askpass|uploadpack|receivepack|packobjectshook|external|browser|viewer|insteadof|pushinsteadof|hookspath|fsmonitor)$)`)
 
 // gitRunVars are environment variables git runs or reads config from.
@@ -27,6 +28,11 @@ var gitRunVars = map[string]bool{
 	"GIT_CONFIG": true, "GIT_CONFIG_PARAMETERS": true, "GIT_CONFIG_COUNT": true, "GIT_CONFIG_GLOBAL": true,
 	"GIT_CONFIG_SYSTEM": true, "GIT_EXEC_PATH": true, "GIT_TEMPLATE_DIR": true,
 }
+
+// gitConfigSourceVars move where git reads config (and so hooks, filters
+// and helpers) from; set on a line that runs git, they hold.
+var gitConfigSourceVars = map[string]bool{"HOME": true, "XDG_CONFIG_HOME": true, "GIT_DIR": true,
+	"GIT_WORK_TREE": true, "GIT_COMMON_DIR": true}
 
 // pagerVars name a pager or editor git runs; harmless values pass.
 var pagerVars = map[string]bool{"GIT_PAGER": true, "PAGER": true, "EDITOR": true, "VISUAL": true, "MANPAGER": true}
@@ -86,6 +92,9 @@ func gitRunsConfig(code string, depth int) bool {
 			if pagerVars[name] && runsGit && !harmlessPagers[strings.TrimSpace(val)] {
 				return true
 			}
+			if gitConfigSourceVars[name] && runsGit {
+				return true
+			}
 		}
 		if len(argv) == 0 {
 			continue
@@ -133,6 +142,9 @@ func gitArgsRunConfig(args []string) bool {
 			if gitKeyRuns(a[2:]) {
 				return true
 			}
+		case a == "--git-dir" || a == "--exec-path" || strings.HasPrefix(a, "--git-dir=") || strings.HasPrefix(a, "--exec-path="):
+			// Another repo's config, or another place git-* commands run from.
+			return true
 		case gitGlobalValue[a]:
 			i++
 		case strings.HasPrefix(a, "-"):

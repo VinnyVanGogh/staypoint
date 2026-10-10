@@ -367,11 +367,39 @@ func devRemoteSegs(inner string, depth int) string {
 		}
 		var v Verdict
 		c.classifySegment(s, &v, depth+1)
-		if v.Tier != Green {
+		// Green is not enough: awk and sed can run commands. Only plain
+		// readers, with no option that writes a file.
+		if v.Tier != Green || !remoteReaders[baseCmd(argv)] || argv[0] != baseCmd(argv) || filterWrites(argv) ||
+			argv[0] == "git" && !remoteGitRead(argv) {
 			return "remote command `" + strings.Join(s.argv, " ") + "` is not a read or a known dev deploy step (git pull, systemctl restart of a [gates.hosts] dev_services service, verify_dev_deploy.sh)"
 		}
 	}
 	return ""
+}
+
+// remoteReaders are the programs a dev-host command may run besides the
+// deploy steps: they only read and print (git only with a read subcommand,
+// which the tier check enforces).
+var remoteReaders = map[string]bool{
+	"cd": true, "ls": true, "cat": true, "head": true, "tail": true, "wc": true, "grep": true, "egrep": true,
+	"fgrep": true, "pwd": true, "echo": true, "printf": true, "git": true, "df": true, "du": true, "stat": true,
+	"whoami": true, "uname": true, "id": true, "test": true, "[": true,
+	"true": true, "false": true, "sort": true, "uniq": true, "cut": true, "tr": true, "nl": true, "diff": true,
+	"readlink": true, "realpath": true, "basename": true, "dirname": true, "file": true,
+	"sleep": true, "column": true, "md5sum": true, "sha256sum": true, "shasum": true,
+}
+
+// remoteGitRead reports a git call with no global option and no option
+// that runs a program or writes a file (--output, --ext-diff, -O).
+func remoteGitRead(argv []string) bool {
+	i := 1
+	for i+1 < len(argv) && argv[i] == "-C" {
+		i += 2
+	}
+	if i >= len(argv) || strings.HasPrefix(argv[i], "-") {
+		return false
+	}
+	return !gitRunsProgram(argv[i], argv[i+1:])
 }
 
 // gitPullFlags are git pull options a dev deploy may use.
@@ -392,7 +420,8 @@ func devDeployStep(argv []string) bool {
 		if sub != "pull" {
 			return false
 		}
-		pos := 0
+		// Only from origin, and only branch names (no refspec mapping).
+		var pos []string
 		for _, a := range rest {
 			if strings.HasPrefix(a, "-") {
 				if !gitPullFlags[a] {
@@ -400,9 +429,17 @@ func devDeployStep(argv []string) bool {
 				}
 				continue
 			}
-			pos++
+			pos = append(pos, a)
 		}
-		return pos <= 2
+		if len(pos) > 0 && pos[0] != "origin" {
+			return false
+		}
+		for _, ref := range pos[min(1, len(pos)):] {
+			if strings.ContainsAny(ref, ":+") || strings.HasPrefix(ref, "-") {
+				return false
+			}
+		}
+		return len(pos) <= 2
 	case name == "systemctl":
 		if len(argv) < 3 {
 			return false
@@ -421,11 +458,17 @@ func devDeployStep(argv []string) bool {
 		}
 		return true
 	case name == "verify_dev_deploy.sh":
-		return true
+		return verifyScriptPath(argv[0])
 	case name == "bash" || name == "sh":
-		return len(argv) >= 2 && baseCmd(argv[1:]) == "verify_dev_deploy.sh"
+		return len(argv) >= 2 && verifyScriptPath(argv[1])
 	}
 	return false
+}
+
+// verifyScriptPath is the repo's own scripts/verify_dev_deploy.sh, named
+// relative to the app checkout the command cd'd into.
+func verifyScriptPath(p string) bool {
+	return p == "scripts/verify_dev_deploy.sh" || p == "./scripts/verify_dev_deploy.sh"
 }
 
 func devService(svc string) bool {
