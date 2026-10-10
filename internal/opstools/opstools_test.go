@@ -452,6 +452,9 @@ func TestGitBlobIDMatchesGit(t *testing.T) {
 	}
 }
 
+// fullSHA is what fakeGitHub resolves the requested short sha abc1234 to.
+const fullSHA = "abc1234" + "0123456789abcdef0123456789abcdef0"
+
 // fakeGitHub answers the verify flow's gh api calls with the given script
 // bodies per ref ("" = no such file); lie makes GitHub report a sha that
 // does not match the bytes. It records every script bash ran.
@@ -483,7 +486,9 @@ func fakeGitHub(dev, main string, lie bool, ranBash *[]string) Runner {
 			return Result{Stdout: "git@github.com:org/mansol_apps.git\n"}
 		case c.Name == "git" && strings.HasPrefix(args, "rev-parse "):
 			return Result{Stdout: devCommit + "\n"}
-		case c.Name == "gh" && strings.Contains(args, "/compare/abc1234..."+devCommit+" --jq .status"):
+		case c.Name == "gh" && strings.HasSuffix(args, "/commits/abc1234 --jq .sha"):
+			return Result{Stdout: fullSHA + "\n"}
+		case c.Name == "gh" && strings.Contains(args, "/compare/"+fullSHA+"..."+devCommit+" --jq .status"):
 			return Result{Stdout: "ahead\n"}
 		case c.Name == "git":
 			return Result{}
@@ -580,6 +585,32 @@ func TestRunVerifyTrustsOnlyReviewedScript(t *testing.T) {
 		t.Fatalf("redirected fetch ran the script: %s", out)
 	}
 
+	// The script gets the full sha GitHub resolved, never the short one.
+	var scriptArgs []string
+	fullRunner := func(ctx context.Context, c Cmd) Result {
+		if c.Name == "bash" {
+			scriptArgs = c.Args
+		}
+		return gh(ctx, c)
+	}
+	RunVerify(context.Background(), fullRunner, req, dir, nil)
+	if len(scriptArgs) < 3 || scriptArgs[2] != fullSHA {
+		t.Fatalf("script args %q, want full sha %s", scriptArgs, fullSHA)
+	}
+	// A short sha GitHub cannot resolve (ambiguous, unknown) never runs it.
+	for _, answer := range []string{"", "notasha", "ffff" + fullSHA[4:]} {
+		unresolved := func(ctx context.Context, c Cmd) Result {
+			if c.Name == "gh" && strings.Contains(strings.Join(c.Args, " "), "/commits/") {
+				return Result{Stdout: answer + "\n"}
+			}
+			return gh(ctx, c)
+		}
+		before := len(ran)
+		if out = RunVerify(context.Background(), unresolved, req, dir, nil); len(ran) != before || !strings.Contains(out, "no single commit") {
+			t.Fatalf("unresolved sha %q ran the script: %s", answer, out)
+		}
+	}
+
 	// GitHub, not local objects, decides whether sha is on dev-server.
 	for _, status := range []string{"behind", "diverged", ""} {
 		notOn := func(ctx context.Context, c Cmd) Result {
@@ -589,7 +620,7 @@ func TestRunVerifyTrustsOnlyReviewedScript(t *testing.T) {
 			return gh(ctx, c)
 		}
 		before := len(ran)
-		if out = RunVerify(context.Background(), notOn, req, dir, nil); len(ran) != before || !strings.Contains(out, "GitHub does not show abc1234 on dev-server") {
+		if out = RunVerify(context.Background(), notOn, req, dir, nil); len(ran) != before || !strings.Contains(out, "GitHub does not show "+fullSHA+" on dev-server") {
 			t.Fatalf("compare %q ran the script: %s", status, out)
 		}
 	}

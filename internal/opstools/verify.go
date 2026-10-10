@@ -152,11 +152,19 @@ func RunVerify(ctx context.Context, run Runner, r VerifyRequest, dir string, tru
 	// Local objects can still lie (refs/replace), so GitHub decides whether
 	// sha is on dev-server: compare sha...dev-server is "identical" or
 	// "ahead" exactly when sha is an ancestor of the dev-server commit.
-	cmp := run(ctx, Cmd{Name: "gh", Args: []string{"api", "repos/" + r.Repo + "/compare/" + r.SHA + "..." + devCommit, "--jq", ".status"}})
-	if st := strings.TrimSpace(cmp.Stdout); cmp.ExitCode != 0 || cmp.Err != nil || (st != "identical" && st != "ahead") {
-		return fmt.Sprintf("NOT ON DEV: GitHub does not show %s on dev-server (%s, compare status %q)", r.SHA, devCommit, st)
+	// A short sha is resolved by GitHub once, and that full id is what is
+	// compared and what the script checks, so a planted local commit with
+	// the same prefix cannot stand in for it.
+	full := run(ctx, Cmd{Name: "gh", Args: []string{"api", "repos/" + r.Repo + "/commits/" + r.SHA, "--jq", ".sha"}})
+	sha := strings.TrimSpace(full.Stdout)
+	if full.ExitCode != 0 || full.Err != nil || !commitRe.MatchString(sha) || !strings.HasPrefix(sha, r.SHA) {
+		return fmt.Sprintf("NOT ON DEV: GitHub has no single commit %s in %s", r.SHA, r.Repo)
 	}
-	args := append([]string{"-s", "--", r.SHA}, r.PageChecks...)
+	cmp := run(ctx, Cmd{Name: "gh", Args: []string{"api", "repos/" + r.Repo + "/compare/" + sha + "..." + devCommit, "--jq", ".status"}})
+	if st := strings.TrimSpace(cmp.Stdout); cmp.ExitCode != 0 || cmp.Err != nil || (st != "identical" && st != "ahead") {
+		return fmt.Sprintf("NOT ON DEV: GitHub does not show %s on dev-server (%s, compare status %q)", sha, devCommit, st)
+	}
+	args := append([]string{"-s", "--", sha}, r.PageChecks...)
 	res := run(ctx, Cmd{Name: "bash", Args: args, Dir: dir, Stdin: script, Env: []string{"GIT_NO_REPLACE_OBJECTS=1"}})
 	return summarizeVerify(res)
 }
