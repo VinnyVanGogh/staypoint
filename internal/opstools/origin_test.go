@@ -12,7 +12,7 @@ import (
 // and run, and dead once the run ends.
 func TestRunTokens(t *testing.T) {
 	r := NewRunTokens()
-	if _, err := r.Check("task-a", "anything"); err == nil {
+	if _, err := checkToken(r, "task-a", "anything"); err == nil {
 		t.Fatal("an unissued token checked out")
 	}
 	tok, revoke, err := r.Issue("task-a", "run-1")
@@ -22,7 +22,7 @@ func TestRunTokens(t *testing.T) {
 	if len(tok) != 64 {
 		t.Fatalf("token %q is not 32 random bytes in hex", tok)
 	}
-	ref, err := r.Check("task-a", tok)
+	ref, err := checkToken(r, "task-a", tok)
 	if err != nil || ref != (RunRef{TaskID: "task-a", RunID: "run-1"}) {
 		t.Fatalf("issued token: %+v, %v", ref, err)
 	}
@@ -34,20 +34,20 @@ func TestRunTokens(t *testing.T) {
 	for _, c := range []struct{ task, tok, want string }{
 		{"task-b", tok, "does not belong to task task-b"},
 		{"", tok, "no STAYPOINT_TASK_ID"},
-		{"task-a", "", "no " + RunTokenEnv},
+		{"task-a", "", "not a live run's token"},
 		{"task-a", strings.ToUpper(tok), "not a live run's token"},
 		{"task-a", tok[:63], "not a live run's token"},
 	} {
-		if _, err := r.Check(c.task, c.tok); err == nil || !strings.Contains(err.Error(), c.want) {
+		if _, err := checkToken(r, c.task, c.tok); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("Check(%q, %q) = %v, want %q", c.task, c.tok, err, c.want)
 		}
 	}
 	revoke()
 	revoke() // idempotent
-	if _, err := r.Check("task-a", tok); err == nil {
+	if _, err := checkToken(r, "task-a", tok); err == nil {
 		t.Fatal("token checked out after its run ended")
 	}
-	if _, err := r.Check("task-a", again); err != nil {
+	if _, err := checkToken(r, "task-a", again); err != nil {
 		t.Fatalf("revoking run-1 ended run-2's token: %v", err)
 	}
 	if _, _, err := r.Issue("", "run"); err == nil {
@@ -101,7 +101,7 @@ func TestRunTokensConcurrent(t *testing.T) {
 				return
 			}
 			toks[i] = tok
-			if _, err := r.Check("task-a", tok); err != nil {
+			if _, err := checkToken(r, "task-a", tok); err != nil {
 				t.Error(err)
 			}
 			revoke()
@@ -114,7 +114,7 @@ func TestRunTokensConcurrent(t *testing.T) {
 			t.Fatal("duplicate token")
 		}
 		seen[tok] = true
-		if _, err := r.Check("task-a", tok); err == nil {
+		if _, err := checkToken(r, "task-a", tok); err == nil {
 			t.Fatal("token live after revoke")
 		}
 	}
@@ -135,4 +135,11 @@ func TestRemoveLegacyOpsKey(t *testing.T) {
 	if _, err := os.Lstat(p); !os.IsNotExist(err) {
 		t.Fatalf("ops_key still there: %v", err)
 	}
+}
+
+// checkToken checks tok the way the daemon's run-token endpoint does: by
+// hash, with no proof wanted.
+func checkToken(r *RunTokens, taskID, tok string) (RunRef, error) {
+	ref, _, err := r.CheckHash(taskID, TokenHash(tok), "")
+	return ref, err
 }

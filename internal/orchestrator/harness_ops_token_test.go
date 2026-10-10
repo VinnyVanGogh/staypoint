@@ -24,7 +24,7 @@ func TestHarness_IssuesOpsRunToken(t *testing.T) {
 			env = extraEnv
 			for _, kv := range extraEnv {
 				if v, ok := strings.CutPrefix(kv, opstools.RunTokenEnv+"="); ok {
-					_, liveDuringRun = tokens.Check("task-ops-token", v)
+					_, _, liveDuringRun = tokens.CheckHash("task-ops-token", opstools.TokenHash(v), "")
 				}
 			}
 			return fakeSeatLimit{all: true}
@@ -48,7 +48,7 @@ func TestHarness_IssuesOpsRunToken(t *testing.T) {
 	if liveDuringRun != nil {
 		t.Fatalf("issued token did not check out during the run: %v", liveDuringRun)
 	}
-	if _, err := tokens.Check("task-ops-token", tok); err == nil {
+	if _, _, err := tokens.CheckHash("task-ops-token", opstools.TokenHash(tok), ""); err == nil {
 		t.Fatal("token still live after the run ended")
 	}
 

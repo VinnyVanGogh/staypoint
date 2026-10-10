@@ -84,19 +84,10 @@ func (r *RunTokens) Issue(taskID, runID string) (token string, revoke func(), er
 	}, nil
 }
 
-// Check reports the run token belongs to, if it is live and was issued to
-// taskID.
-func (r *RunTokens) Check(taskID, token string) (RunRef, error) {
-	if token == "" {
-		return RunRef{}, fmt.Errorf("no %s: ops tools run only in an MCP server the StayPoint harness started", RunTokenEnv)
-	}
-	ref, _, err := r.CheckHash(taskID, TokenHash(token), "")
-	return ref, err
-}
-
-// CheckHash is Check for a client that sends only TokenHash(token), never
-// the token: the daemon answers with RunCheckProof over nonce, which only a
-// holder of the token can compute. A listener posing as the daemon (say on
+// CheckHash reports the run a live token belongs to, if it was issued to
+// taskID. The client sends only TokenHash(token), never the token: the
+// daemon answers with RunCheckProof over nonce, which only a holder of the
+// token can compute. A listener posing as the daemon (say on
 // its port while it restarts) sees the hash and cannot forge the proof, so
 // it cannot vouch for a token it was never issued.
 func (r *RunTokens) CheckHash(taskID, tokenHash, nonce string) (ref RunRef, proof string, err error) {
