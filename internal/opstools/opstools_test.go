@@ -481,6 +481,8 @@ func fakeGitHub(dev, main string, lie bool, ranBash *[]string) Runner {
 			return answer(main)
 		case c.Name == "git" && args == "remote get-url origin":
 			return Result{Stdout: "git@github.com:org/mansol_apps.git\n"}
+		case c.Name == "git" && strings.HasPrefix(args, "rev-parse "):
+			return Result{Stdout: devCommit + "\n"}
 		case c.Name == "git":
 			return Result{}
 		case c.Name == "bash":
@@ -560,6 +562,20 @@ func TestRunVerifyTrustsOnlyReviewedScript(t *testing.T) {
 		if !fail && len(ran) != before+1 {
 			t.Fatalf("good fetch did not run the script: %s", out)
 		}
+	}
+
+	// A fetch that local git config redirected (insteadOf, sshCommand)
+	// leaves a ref GitHub's API does not report: the script never runs.
+	gh := fakeGitHub(good, good, false, &ran)
+	redirected := func(ctx context.Context, c Cmd) Result {
+		if c.Name == "git" && len(c.Args) > 0 && c.Args[0] == "rev-parse" {
+			return Result{Stdout: strings.Repeat("f", 40) + "\n"}
+		}
+		return gh(ctx, c)
+	}
+	before := len(ran)
+	if out = RunVerify(context.Background(), redirected, req, dir, nil); len(ran) != before || !strings.Contains(out, "GitHub's API reports") {
+		t.Fatalf("redirected fetch ran the script: %s", out)
 	}
 }
 

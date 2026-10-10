@@ -74,28 +74,28 @@ var commitRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 // checks that the bytes hash to the blob id GitHub reported. The branch is
 // resolved through refs/heads to a commit first, so a tag or other ref an
 // agent pushed under the same name cannot stand in for it.
-func fetchScript(ctx context.Context, run Runner, repo, branch string) (blob string, body []byte, err error) {
+func fetchScript(ctx context.Context, run Runner, repo, branch string) (commit, blob string, body []byte, err error) {
 	ref := run(ctx, Cmd{Name: "gh", Args: []string{"api", "repos/" + repo + "/git/ref/heads/" + branch, "--jq", ".object.sha"}})
-	commit := strings.TrimSpace(ref.Stdout)
+	commit = strings.TrimSpace(ref.Stdout)
 	if ref.ExitCode != 0 || ref.Err != nil || !commitRe.MatchString(commit) {
-		return "", nil, fmt.Errorf("branch %s not found on GitHub", branch)
+		return "", "", nil, fmt.Errorf("branch %s not found on GitHub", branch)
 	}
 	res := run(ctx, Cmd{Name: "gh", Args: []string{"api", "repos/" + repo + "/contents/" + verifyScript + "?ref=" + commit}})
 	if res.ExitCode != 0 || res.Err != nil {
-		return "", nil, fmt.Errorf("%s has no %s on GitHub", branch, verifyScript)
+		return "", "", nil, fmt.Errorf("%s has no %s on GitHub", branch, verifyScript)
 	}
 	var c ghContent
 	if err := json.Unmarshal([]byte(res.Stdout), &c); err != nil || c.Encoding != "base64" || !blobRe.MatchString(c.SHA) {
-		return "", nil, fmt.Errorf("unexpected GitHub contents answer for %s", branch)
+		return "", "", nil, fmt.Errorf("unexpected GitHub contents answer for %s", branch)
 	}
 	body, err = base64.StdEncoding.DecodeString(strings.ReplaceAll(c.Content, "\n", ""))
 	if err != nil {
-		return "", nil, fmt.Errorf("decode %s: %w", branch, err)
+		return "", "", nil, fmt.Errorf("decode %s: %w", branch, err)
 	}
 	if gitBlobID(body) != c.SHA {
-		return "", nil, fmt.Errorf("%s content does not hash to blob %s", branch, c.SHA)
+		return "", "", nil, fmt.Errorf("%s content does not hash to blob %s", branch, c.SHA)
 	}
-	return c.SHA, body, nil
+	return commit, c.SHA, body, nil
 }
 
 // gitBlobID is git's SHA-1 object id for a blob holding b.
@@ -117,11 +117,11 @@ func gitBlobID(b []byte) string {
 func RunVerify(ctx context.Context, run Runner, r VerifyRequest, dir string, trusted []string) string {
 	ctx, cancel := context.WithTimeout(ctx, verifyTimeout)
 	defer cancel()
-	blob, script, err := fetchScript(ctx, run, r.Repo, "dev-server")
+	devCommit, blob, script, err := fetchScript(ctx, run, r.Repo, "dev-server")
 	if err != nil {
 		return "NOT ON DEV: " + err.Error()
 	}
-	mainBlob, _, err := fetchScript(ctx, run, r.Repo, "main")
+	_, mainBlob, _, err := fetchScript(ctx, run, r.Repo, "main")
 	if err != nil {
 		mainBlob = ""
 	}
@@ -141,6 +141,13 @@ func RunVerify(ctx context.Context, run Runner, r VerifyRequest, dir string, tru
 	fetch := run(ctx, Cmd{Name: "git", Args: []string{"fetch", "--no-tags", url, "+refs/heads/dev-server:refs/remotes/origin/dev-server"}, Dir: dir})
 	if fetch.ExitCode != 0 || fetch.Err != nil {
 		return "NOT ON DEV: could not fetch dev-server from github.com/" + r.Repo + "\n" + fetch.Format()
+	}
+	// The fetch went through local git config (url.*.insteadOf,
+	// core.sshCommand) an agent can edit, so the anchor is GitHub's API:
+	// the ref the script checks must be the commit the API reported.
+	local := run(ctx, Cmd{Name: "git", Args: []string{"rev-parse", "--verify", "--quiet", "refs/remotes/origin/dev-server^{commit}"}, Dir: dir})
+	if got := strings.TrimSpace(local.Stdout); local.ExitCode != 0 || local.Err != nil || got != devCommit {
+		return fmt.Sprintf("NOT ON DEV: local origin/dev-server is %q after the fetch, but GitHub's API reports %s; local git config may redirect the fetch", got, devCommit)
 	}
 	args := append([]string{"-s", "--", r.SHA}, r.PageChecks...)
 	res := run(ctx, Cmd{Name: "bash", Args: args, Dir: dir, Stdin: script})

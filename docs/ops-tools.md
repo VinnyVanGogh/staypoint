@@ -124,8 +124,11 @@ verify_repos`.
    fork's `dev-server` look deployed. It then fetches
    `+refs/heads/dev-server:refs/remotes/origin/dev-server` from that exact
    URL (not the remote's config, which could change in between) and stops
-   with `NOT ON DEV` if the fetch fails, so a stale or planted local ref is
-   never what the script checks.
+   with `NOT ON DEV` if the fetch fails. The fetch still honours local git
+   config an agent can edit (`url.*.insteadOf`, `core.sshCommand`), so the
+   anchor is GitHub's API: after the fetch, local `origin/dev-server` must be
+   the commit the API reported for `refs/heads/dev-server`, or the script
+   does not run.
 3. It runs exactly those bytes with `bash -s -- <sha> <checks>`.
 4. It returns the PASS/FAIL lines and the final `DEV DEPLOY VERIFIED` /
    `NOT ON DEV` line. If the script never prints a verdict, the tool adds a
