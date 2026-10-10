@@ -131,10 +131,10 @@ type RunConfig struct {
 	// per-run --settings file (STA-525).  Should point to the staypoint CLI binary
 	// built from the same commit as the daemon.
 	HookBin string
-	// OpsDataDir, when set, is the data dir whose ops key signs this run's
-	// STAYPOINT_RUN_MAC, which the staypoint MCP server checks before any
-	// ops tool runs (task-7d279c9d).
-	OpsDataDir string
+	// OpsTokens, when set, issues this run's ops token (opstools.RunTokenEnv),
+	// which the staypoint MCP server has the daemon check before any ops tool
+	// runs (task-7d279c9d). The token is revoked when Run returns.
+	OpsTokens *opstools.RunTokens
 	// GeminiDocsOnly applies the Board rule router.GeminiCodeForbidden to this
 	// run (every repo, STA-856 revised 2026-10-06): after any turn that
 	// spawned Gemini, changes outside the non-code allowlist are reverted to
@@ -472,9 +472,10 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// each tool call, enabling step-boundary pause rather than turn-boundary.
 	providerEnv = append(providerEnv, "STAYPOINT_TASK_ID="+taskID)
 	// The run token lets the MCP server the agent CLI starts use the ops
-	// tools for this task, and only this task.
-	if cfg.OpsDataDir != "" {
-		if tok, err := opstools.RunToken(cfg.OpsDataDir, taskID); err == nil {
+	// tools for this task, and only while this run lasts.
+	if cfg.OpsTokens != nil {
+		if tok, revoke, err := cfg.OpsTokens.Issue(taskID, runID); err == nil {
+			defer revoke()
 			providerEnv = append(providerEnv, opstools.RunTokenEnv+"="+tok)
 		} else {
 			runLog.Warn("ops run token not issued; ops tools will refuse this run", slog.Any("error", err))

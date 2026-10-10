@@ -181,16 +181,24 @@ var opsToolNames = map[string]bool{
 }
 
 // requireRun refuses an ops tool unless this server was started by the
-// harness for STAYPOINT_TASK_ID: its run token must check out against the
-// ops key in the pinned data dir (Board review #2 H1). A server an agent
-// started itself, with STAYPOINT_TASK_ID unset or another task's ID, gets
-// no ops tools.
-func (s *Server) requireRun() *ToolCallResult {
-	if s.opsDataDir == "" {
-		return toolError("ops tools are off in this MCP server (no trusted StayPoint data dir); not run")
+// harness for STAYPOINT_TASK_ID: the daemon must confirm its run token is a
+// live run's token for that task (Board reviews #2 H1 and #4). It asks on
+// every call, so a token stops working the moment its run ends. A server an
+// agent started itself, with STAYPOINT_TASK_ID unset or another task's ID,
+// gets no ops tools.
+func (s *Server) requireRun(ctx context.Context) *ToolCallResult {
+	if s.opsDataDir == "" || s.runCheck == nil {
+		return toolError("ops tools are off in this MCP server (no trusted StayPoint data dir or daemon); not run")
 	}
 	taskID := strings.TrimSpace(os.Getenv("STAYPOINT_TASK_ID"))
-	if err := opstools.VerifyRunToken(s.opsDataDir, taskID, os.Getenv(opstools.RunTokenEnv)); err != nil {
+	if taskID == "" {
+		return toolError("refused, not run: no STAYPOINT_TASK_ID: ops tools run only inside a StayPoint run")
+	}
+	token := os.Getenv(opstools.RunTokenEnv)
+	if token == "" {
+		return toolError(fmt.Sprintf("refused, not run: no %s: ops tools run only in an MCP server the StayPoint harness started", opstools.RunTokenEnv))
+	}
+	if err := s.runCheck(ctx, taskID, token); err != nil {
 		return toolError("refused, not run: " + err.Error())
 	}
 	return nil

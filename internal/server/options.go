@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/gates"
+	"github.com/VinnyVanGogh/staypoint/internal/opstools"
 )
 
 var (
@@ -109,6 +110,10 @@ type Options struct {
 	// GateResolver overrides how requests get task/repo/org and script
 	// hashes (tests). Nil uses the real filesystem and git.
 	GateResolver *gates.Resolver
+	// RunTokens is the daemon's live run-token registry; the ops-tool MCP
+	// server checks a run's token against it (task-7d279c9d). Nil refuses
+	// every check.
+	RunTokens *opstools.RunTokens
 }
 
 // GenerateAuthToken generates a 32-byte (64-character hex) cryptographically secure random token.

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/config"
+	"github.com/VinnyVanGogh/staypoint/internal/opstools"
 )
 
 // turnLimits holds the per-turn time limits from config.toml in
@@ -15,9 +16,9 @@ var turnLimits struct {
 	stall time.Duration
 }
 
-// opsDataDir is the data dir whose ops key signs each run's ops token
-// (orchestrator.RunConfig.OpsDataDir); "" in tests, so runs get none.
-var opsDataDir string
+// opsTokens holds each live run's ops token in memory
+// (orchestrator.RunConfig.OpsTokens); nil in tests, so runs get none.
+var opsTokens *opstools.RunTokens
 
 // setTurnLimits loads turn_timeout and stall_timeout. There is no fixed cap
 // on how long a run or an active turn may take; only a turn with no agent

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,7 +33,7 @@ var mcpCmd = &cobra.Command{
 			fmt.Fprintf(os.Stderr, "staypoint mcp: ops tools disabled: %v\n", err)
 		} else {
 			cfg = pinned
-			opts = append(opts, mcp.WithOpsDataDir(pinned.DataDir))
+			opts = append(opts, mcp.WithOpsDataDir(pinned.DataDir), mcp.WithRunCheck(daemonRunCheck))
 		}
 		if cfg != nil {
 			opts = append(opts, mcp.WithConfig(cfg))
@@ -76,6 +78,44 @@ func pinMCPConfig() (*config.Config, error) {
 		return nil, fmt.Errorf("data dir %q is not absolute", c.DataDir)
 	}
 	return c, nil
+}
+
+// daemonRunCheck asks the daemon whether token is a live run's token for
+// taskID (Board review #4: the daemon holds run tokens in memory only, so
+// nothing on disk can mint one). Any failure to get a yes refuses.
+func daemonRunCheck(ctx context.Context, taskID, token string) error {
+	daemonURL, auth := gateDaemonConn()
+	if daemonURL == "" || auth == "" {
+		return fmt.Errorf("StayPoint daemon unreachable; cannot confirm this run's token")
+	}
+	body, err := json.Marshal(map[string]string{"task_id": taskID, "token": token})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, daemonURL+"/api/ops/run-token/check", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+auth)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("StayPoint daemon unreachable; cannot confirm this run's token")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	var e struct {
+		Error string `json:"error"`
+	}
+	_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&e)
+	if e.Error == "" {
+		e.Error = fmt.Sprintf("daemon answered %d", resp.StatusCode)
+	}
+	return fmt.Errorf("run token not confirmed: %s", e.Error)
 }
 
 // boardApprover holds an ops tool's prod or external write for the Board,

@@ -248,6 +248,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.Handle("POST /api/security/gate-rules", s.secMid.WrapBoardGateAction(http.HandlerFunc(gateH.CreateRule)))
 		mux.Handle("DELETE /api/security/gate-rules/{id}", s.secMid.WrapBoardGateAction(http.HandlerFunc(gateH.DeleteRule)))
 		mux.HandleFunc("GET /api/security/gate-stats", gateH.Stats)
+		// The ops-tool MCP server confirms its run token here before any ops
+		// tool runs (task-7d279c9d). Confirm-only: tokens are never issued over HTTP.
+		mux.HandleFunc("POST /api/ops/run-token/check", s.checkRunToken)
 		// task-6c1ed91f: "Trust this task until…". Creating one is a fresh
 		// Touch ID (no grace); revoking only removes power, so a session will do.
 		mux.HandleFunc("GET /api/security/trusts", gateH.ListTrusts)

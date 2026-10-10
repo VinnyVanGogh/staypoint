@@ -98,14 +98,26 @@ func opsRun(t *testing.T, cfg *config.Config) Option {
 		taskID = "task-ops-test"
 		t.Setenv("STAYPOINT_TASK_ID", taskID)
 	}
-	tok, err := opstools.RunToken(cfg.DataDir, taskID)
+	tokens := opstools.NewRunTokens()
+	tok, revoke, err := tokens.Issue(taskID, "run-test")
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(revoke)
 	t.Setenv(opstools.RunTokenEnv, tok)
 	return func(s *Server) {
 		WithConfig(cfg)(s)
 		WithOpsDataDir(cfg.DataDir)(s)
+		WithRunCheck(registryCheck(tokens))(s)
+	}
+}
+
+// registryCheck checks tokens against r in-process, the way the daemon's
+// /api/ops/run-token/check does.
+func registryCheck(r *opstools.RunTokens) RunChecker {
+	return func(_ context.Context, taskID, token string) error {
+		_, err := r.Check(taskID, token)
+		return err
 	}
 }
 

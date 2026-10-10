@@ -31,16 +31,29 @@ type Server struct {
 	// approver asks the Board about prod and external writes; nil refuses
 	// them (fail closed).
 	approver Approver
-	// opsDataDir is the real data dir whose ops_key proves a run's token;
-	// "" turns the ops tools off.
+	// opsDataDir is the real (pinned) data dir, where dev hosts' ssh_config
+	// files must live; "" turns the ops tools off.
 	opsDataDir string
+	// runCheck asks the daemon whether a run token is live for a task; nil
+	// turns the ops tools off.
+	runCheck RunChecker
 }
 
-// WithOpsDataDir turns the ops tools on for runs whose token checks out
-// against dir's ops key (opstools.VerifyRunToken).
+// RunChecker confirms token is a live run's token for taskID (the daemon
+// holds the tokens; opstools.RunTokens).
+type RunChecker func(ctx context.Context, taskID, token string) error
+
+// WithOpsDataDir sets the pinned data dir the ops tools trust.
 func WithOpsDataDir(dir string) Option {
 	return func(s *Server) {
 		s.opsDataDir = dir
+	}
+}
+
+// WithRunCheck turns the ops tools on for runs whose token check confirms.
+func WithRunCheck(check RunChecker) Option {
+	return func(s *Server) {
+		s.runCheck = check
 	}
 }
 

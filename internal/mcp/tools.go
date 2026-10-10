@@ -304,7 +304,7 @@ func (s *Server) handleCallTool(ctx context.Context, params CallToolParams) *Too
 		return s.handleTaskCreateChild(ctx, params.Arguments)
 	}
 	if opsToolNames[params.Name] {
-		if res := s.requireRun(); res != nil {
+		if res := s.requireRun(ctx); res != nil {
 			return res
 		}
 	}

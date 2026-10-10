@@ -25,6 +25,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/ipc"
 	"github.com/VinnyVanGogh/staypoint/internal/logging"
 	"github.com/VinnyVanGogh/staypoint/internal/mcp"
+	"github.com/VinnyVanGogh/staypoint/internal/opstools"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/repoaccess"
 	"github.com/VinnyVanGogh/staypoint/internal/server"
@@ -263,7 +264,12 @@ func runDaemon(ctx context.Context) error {
 	if gr := gates.NewGeminiReviewerFromEnv(); gr != nil {
 		gateReviewer = gr
 	}
+	opsTokens = opstools.NewRunTokens()
+	if err := opstools.RemoveLegacyOpsKey(cfg.DataDir); err != nil {
+		slog.Warn("could not remove the legacy ops_key file", slog.Any("error", err))
+	}
 	if s, err := server.New(server.Options{
+		RunTokens:      opsTokens,
 		GateAdvisor:    gateAdvisor,
 		GateReviewer:   gateReviewer,
 		BindHost:       "127.0.0.1",
@@ -314,7 +320,6 @@ func runDaemon(ctx context.Context) error {
 	orchestrator.GlobalRunControl.SetDB(dbStore.DB())
 	wireRunQueue(ctx, runLimitsFrom(cfg), httpServer)
 	setTurnLimits(cfg)
-	opsDataDir = cfg.DataDir
 
 	repoRoot := cfg.HarnessRepoRoot
 	if repoRoot == "" {
@@ -495,7 +500,7 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 			RunControl:       orchestrator.GlobalRunControl,
 			SkipGitPreflight: adapterOverride != nil || testSkipGitPreflight,
 			HookBin:          resolveStaypointCLIBin(),
-			OpsDataDir:       opsDataDir,
+			OpsTokens:        opsTokens,
 			// Board rule (STA-856, all repos): Gemini never writes code; a
 			// Board Touch ID approval (personal repo, this run) relaxes it.
 			GeminiDocsOnly:     geminiDocsOnly(route),

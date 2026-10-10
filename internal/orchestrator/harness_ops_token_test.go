@@ -9,18 +9,24 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/opstools"
 )
 
-// task-7d279c9d Board review #2 H1: each run gets STAYPOINT_RUN_MAC, the
-// token the staypoint MCP server checks before any ops tool runs, valid for
-// this run's task only.
+// task-7d279c9d Board reviews #2 H1 and #4: each run gets a random token the
+// daemon holds in memory, valid for this run's task only and only while the
+// run lasts.
 func TestHarness_IssuesOpsRunToken(t *testing.T) {
 	h, _ := seatLimitHarness(t, "task-ops-token")
-	dataDir := t.TempDir()
+	tokens := opstools.NewRunTokens()
 	var env []string
+	var liveDuringRun error
 	_, err := h.Run(context.Background(), "task-ops-token", RunConfig{
-		MaxTurns:   1,
-		OpsDataDir: dataDir,
+		MaxTurns:  1,
+		OpsTokens: tokens,
 		RunAdapter: func(ctx context.Context, cwd, provider string, rawArgs, extraEnv []string, stdout, stderr io.Writer) error {
 			env = extraEnv
+			for _, kv := range extraEnv {
+				if v, ok := strings.CutPrefix(kv, opstools.RunTokenEnv+"="); ok {
+					_, liveDuringRun = tokens.Check("task-ops-token", v)
+				}
+			}
 			return fakeSeatLimit{all: true}
 		},
 	})
@@ -39,14 +45,32 @@ func TestHarness_IssuesOpsRunToken(t *testing.T) {
 	if tok == "" || task != "task-ops-token" {
 		t.Fatalf("env lacks the run token or task id: task=%q token set=%v", task, tok != "")
 	}
-	if err := opstools.VerifyRunToken(dataDir, "task-ops-token", tok); err != nil {
-		t.Fatalf("issued token does not verify: %v", err)
+	if liveDuringRun != nil {
+		t.Fatalf("issued token did not check out during the run: %v", liveDuringRun)
 	}
-	if err := opstools.VerifyRunToken(dataDir, "task-other", tok); err == nil {
-		t.Fatal("issued token verifies for another task")
+	if _, err := tokens.Check("task-ops-token", tok); err == nil {
+		t.Fatal("token still live after the run ended")
 	}
 
-	// No ops data dir (tests, an old daemon): no token, so ops tools refuse.
+	// Two runs of the same task never share a token.
+	env = nil
+	if _, err := h.Run(context.Background(), "task-ops-token", RunConfig{
+		MaxTurns:  1,
+		OpsTokens: tokens,
+		RunAdapter: func(ctx context.Context, cwd, provider string, rawArgs, extraEnv []string, stdout, stderr io.Writer) error {
+			env = extraEnv
+			return fakeSeatLimit{all: true}
+		},
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, opstools.RunTokenEnv+"="); ok && v == tok {
+			t.Fatal("second run reused the first run's token")
+		}
+	}
+
+	// No registry (tests, an old daemon): no token, so ops tools refuse.
 	env = nil
 	if _, err := h.Run(context.Background(), "task-ops-token", RunConfig{
 		MaxTurns: 1,
@@ -59,7 +83,7 @@ func TestHarness_IssuesOpsRunToken(t *testing.T) {
 	}
 	for _, kv := range env {
 		if strings.HasPrefix(kv, opstools.RunTokenEnv+"=") {
-			t.Fatal("token issued without an ops data dir")
+			t.Fatal("token issued without a registry")
 		}
 	}
 }
