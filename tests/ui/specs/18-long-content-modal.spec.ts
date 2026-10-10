@@ -46,12 +46,14 @@ test('thread is behind a Messages (n) toggle in the composer row', async ({ page
   const toggle = dock.locator('.task-page-composer #page-chat-toggle');
   await expect(toggle).toHaveText('Messages (1)');
   await expect(toggle).toHaveAttribute('aria-expanded', 'false');
-  await expect(dock.locator('#page-chat-messages')).toBeHidden();
+  // The thread opens over the timeline column, outside the dock (task-d13978fc).
+  const thread = page.locator('#page-chat-messages');
+  await expect(thread).toBeHidden();
 
   await toggle.click();
   await expect(toggle).toHaveAttribute('aria-expanded', 'true');
-  await expect(dock.getByText('harness preflight message')).toBeVisible();
+  await expect(thread.getByText('harness preflight message')).toBeVisible();
 
   await toggle.click();
-  await expect(dock.locator('#page-chat-messages')).toBeHidden();
+  await expect(thread).toBeHidden();
 });

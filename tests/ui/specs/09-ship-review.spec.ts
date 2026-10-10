@@ -417,8 +417,9 @@ test.describe('ship review card', () => {
     const chatSection = page.locator('#page-chat-section');
     await expect(chatSection).toBeVisible();
 
-    // page-chat-messages must live inside page-chat-section (single source of truth).
-    await expect(chatSection.locator('#page-chat-messages')).toHaveCount(1);
+    // One messages list (single source of truth). It opens over the timeline
+    // column, so it no longer sits inside the dock (task-d13978fc).
+    await expect(page.locator('#page-chat-messages')).toHaveCount(1);
 
     // The comment must appear exactly once — no duplicate Activity section.
     await expect(page.getByText('Board comment for duplicate test')).toHaveCount(1);
