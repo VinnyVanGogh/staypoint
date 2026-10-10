@@ -13486,8 +13486,8 @@ function renderPullRequestsRepo(repo, status) {
     tr.appendChild(titleTd);
     const taskTd = el('td', 'prs-task');
     if (pr.task) {
-      const ta = el('a', null, pr.task.name || pr.task.id);
-      ta.href = `/tasks/${encodeURIComponent(pr.task.id)}`;
+      const ta = el('a', null, pr.task.identifier ? `${pr.task.identifier} ${pr.task.name || ''}` : (pr.task.name || pr.task.id));
+      ta.href = taskRefPath(pr.task) || `/tasks/${encodeURIComponent(pr.task.id)}`;
       ta.title = pr.task.id;
       ta.addEventListener('click', (e) => { e.preventDefault(); if (typeof openTaskPage === 'function') openTaskPage(pr.task.id); });
       taskTd.appendChild(ta);

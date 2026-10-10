@@ -258,7 +258,7 @@ func TestBuildPlan_ReadOnlyUnmigratedDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Simulate the deployed daemon's schema: no source columns yet.
-	for _, stmt := range []string{`DROP INDEX idx_tasks_source_id`, `ALTER TABLE tasks DROP COLUMN source_ref`, `ALTER TABLE tasks DROP COLUMN source_id`} {
+	for _, stmt := range []string{`DROP INDEX idx_tasks_source_id`, `DROP INDEX idx_tasks_source_ref`, `ALTER TABLE tasks DROP COLUMN source_ref`, `ALTER TABLE tasks DROP COLUMN source_id`} {
 		if _, err := store.DB().Exec(stmt); err != nil {
 			t.Fatal(err)
 		}
