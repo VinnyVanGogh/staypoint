@@ -84,8 +84,8 @@ export class StayPointAPI {
     return r.task;
   }
 
-  async addComment(id: string, body: string) {
-    return this.json('POST', `/api/tasks/${encodeURIComponent(id)}/comments`, { body, author: 'ui-e2e' });
+  async addComment(id: string, body: string, author = 'ui-e2e') {
+    return this.json('POST', `/api/tasks/${encodeURIComponent(id)}/comments`, { body, author });
   }
 
   async listComments(id: string): Promise<Array<{ message?: string; body?: string }>> {

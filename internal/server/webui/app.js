@@ -7066,6 +7066,23 @@ function chatToggleLabel(n) {
   return `Messages (${n})`;
 }
 
+// Notices the daemon writes as author 'board' on the Board's behalf: they
+// record a Board decision, they are not something the Board typed.
+const BOARD_NOTICE_RE = /^(Board (approved|rejected) held action |Marked done by Board\b)/;
+
+// Which side of the thread a comment goes on. Only what the Board wrote goes
+// right; everything else (agent, agent-summary, harness, interceptor, gate
+// notes, reviews, CLI notes) goes left. Local comments carry only `author`;
+// fleet (Paperclip) comments carry `authorType`.
+function chatMsgKind(c) {
+  const authorType = String(c.authorType || c.author_type || '').toLowerCase();
+  const author = String(c.author || '').toLowerCase();
+  const fromBoard = authorType ? (authorType === 'user' || authorType === 'board')
+    : (author === 'user' || author === 'board');
+  if (!fromBoard) return 'agent';
+  return BOARD_NOTICE_RE.test(c.body || c.message || '') ? 'notice' : 'user';
+}
+
 function renderChatMessages(container, comments) {
   container.innerHTML = '';
   if (!comments.length) {
@@ -7073,14 +7090,14 @@ function renderChatMessages(container, comments) {
     return;
   }
   for (const c of comments) {
-    const authorType = (c.authorType || c.author_type || '').toLowerCase();
-    const isAgent = authorType === 'agent' || authorType === 'system';
-    const authorLabel = isAgent
-      ? (c.authorName || c.author_name || 'Agent')
-      : (c.author || 'You');
+    const kind = chatMsgKind(c);
+    const authorLabel = kind === 'user' ? 'You'
+      : kind === 'notice' ? 'StayPoint'
+      : (c.authorName || c.author_name || c.author || 'Agent');
     const ts = c.createdAt || c.created_at || c.timestamp || '';
 
-    const msg = el('div', `chat-msg ${isAgent ? 'chat-msg-agent' : 'chat-msg-user'}`);
+    const msg = el('div', kind === 'user' ? 'chat-msg chat-msg-user'
+      : `chat-msg chat-msg-agent${kind === 'notice' ? ' chat-msg-notice' : ''}`);
     msg.appendChild(el('div', 'chat-msg-meta', `${authorLabel}${ts ? ' · ' + fmtDateTime(ts) : ''}`));
     const bubble = el('div', 'chat-msg-bubble');
     bubble.appendChild(mdEl(c.body || c.message || ''));
@@ -11144,15 +11161,17 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
   }
 
   // Agent interaction (chat): only the composer row is pinned to the bottom of
-  // the page. The thread sits behind a "Messages (n)" toggle in that row and
-  // opens in place above it (STA-643).
+  // the page. The thread sits behind a "Messages (n)" toggle in that row
+  // (STA-643).
   const chatSection = el('div', 'task-page-dock');
   chatSection.id = 'page-chat-section';
 
-  const messagesDiv = el('div', 'chat-messages');
+  // Open, the thread covers the timeline column only, so the right panel
+  // stays usable (task-d13978fc): it sits in the layout grid, in the
+  // timeline's cell, appended with the side panel below.
+  const messagesDiv = el('div', 'chat-messages task-page-thread');
   messagesDiv.id = 'page-chat-messages';
   renderChatMessages(messagesDiv, comments || []);
-  chatSection.appendChild(messagesDiv);
 
   const chatToggle = el('button', 'btn btn-secondary btn-sm task-page-chat-toggle', chatToggleLabel((comments || []).length));
   chatToggle.type = 'button';
@@ -11509,6 +11528,7 @@ function renderTaskPage(container, task, comments, interactions, diffData, check
 
   tabPanels.review.appendChild(meta);
   layout.appendChild(side);
+  layout.appendChild(messagesDiv);
   container.appendChild(layout);
   container.appendChild(chatSection);
   return { setDiff };
