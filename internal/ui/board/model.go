@@ -36,6 +36,10 @@ type Model struct {
 	activeProducts []meshContext.TaskWorkProduct
 	activeActivity []meshContext.ActivityLog
 
+	// confirmBlock is set after 'b' in the thread view; the toggle runs only
+	// on 'y', so a stray keypress can't silently block a task.
+	confirmBlock bool
+
 	viewport viewport.Model
 	textarea textarea.Model
 
@@ -209,6 +213,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case ViewThread:
+			if m.confirmBlock {
+				m.confirmBlock = false
+				if lowerKey == "y" && m.activeTask != nil {
+					cmds = append(cmds, m.toggleBlockCmd(m.activeTask))
+				} else {
+					m.statusMessage = "Block toggle cancelled"
+					m.statusIsErr = false
+				}
+				break
+			}
 			switch lowerKey {
 			case "esc", "q", "backspace":
 				m.viewMode = ViewBoard
@@ -222,7 +236,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewMode = ViewMove
 			case "b":
 				if m.activeTask != nil {
-					cmds = append(cmds, m.toggleBlockCmd(m.activeTask))
+					m.confirmBlock = true
 				}
 			default:
 				var vpCmd tea.Cmd
@@ -367,6 +381,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case blockToggledMsg:
+		if msg.err != nil {
+			m.statusMessage = "Block toggle failed: " + msg.err.Error()
+			m.statusIsErr = true
+		} else {
+			m.statusMessage = "Task unblocked"
+			if msg.blocked {
+				m.statusMessage = "Task blocked"
+			}
+			m.statusIsErr = false
+			cmds = append(cmds, m.loadTasksCmd())
+			if m.activeTask != nil && m.activeTask.ID == msg.taskID {
+				cmds = append(cmds, m.loadThreadCmd(msg.taskID))
+			}
+		}
+
 	case statusMessageMsg:
 		m.statusMessage = msg.message
 		m.statusIsErr = msg.isError
@@ -489,29 +519,39 @@ func (m *Model) changeStageCmd(taskID, stage string) tea.Cmd {
 
 func (m *Model) addCommentCmd(taskID, message string) tea.Cmd {
 	return func() tea.Msg {
-		author := os.Getenv("USER")
-		if author == "" {
-			author = "user"
-		}
-		err := meshContext.AddTaskComment(m.db, taskID, author, message)
+		err := meshContext.AddTaskComment(m.db, taskID, tuiActor(), message)
 		return commentAddedMsg{taskID: taskID, err: err}
 	}
 }
 
+// tuiActor names the local user for comments and activity entries.
+func tuiActor() string {
+	if u := os.Getenv("USER"); u != "" {
+		return u
+	}
+	return "user"
+}
+
+// toggleBlockCmd flips the block flag and records who did it in activity_log,
+// so the task page can say who blocked it and when.
 func (m *Model) toggleBlockCmd(task *meshContext.Task) tea.Cmd {
+	taskID, blocking := task.ID, !task.IsBlocked
 	return func() tea.Msg {
-		if task.IsBlocked {
-			err := meshContext.UnblockTask(m.db, task.ID)
-			if err != nil {
-				return statusMessageMsg{message: "Unblock error: " + err.Error(), isError: true}
+		const reason = "Blocked via TUI"
+		var err error
+		if blocking {
+			err = meshContext.BlockTask(m.db, taskID, reason)
+		} else {
+			err = meshContext.UnblockTask(m.db, taskID)
+		}
+		if err == nil {
+			logReason := ""
+			if blocking {
+				logReason = reason
 			}
-			return statusMessageMsg{message: "Task unblocked", isError: false}
+			err = meshContext.LogBlockEvent(m.db, taskID, blocking, tuiActor(), "tui", logReason)
 		}
-		err := meshContext.BlockTask(m.db, task.ID, "Blocked via TUI")
-		if err != nil {
-			return statusMessageMsg{message: "Block error: " + err.Error(), isError: true}
-		}
-		return statusMessageMsg{message: "Task blocked", isError: false}
+		return blockToggledMsg{taskID: taskID, blocked: blocking, err: err}
 	}
 }
 
@@ -583,7 +623,7 @@ THREAD VIEW:
   Esc, q         Return to Kanban Board view
   c              Add new comment to thread
   m              Change task stage
-  b              Toggle block / unblock task
+  b              Toggle block / unblock task (asks y/n first)
   j, Down        Scroll thread content down
   k, Up          Scroll thread content up
 
