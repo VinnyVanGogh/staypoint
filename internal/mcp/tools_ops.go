@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -117,14 +118,17 @@ func opsTools() []Tool {
 			},
 		},
 		{
-			Name:        "pr_body",
-			Description: "Effect dev_write. Replace a GitHub PR's body with text passed directly (gh pr edit --body-file -), instead of staging it in /tmp.",
+			Name: "pr_body",
+			Description: "Replace a GitHub PR's body with text passed directly (gh pr edit --body-file -), instead of staging it in /tmp. " +
+				"Effect dev_write for a PR in your task's own GitHub repo whose head is not main/master/prod (runs unattended); " +
+				"external_write for any other PR (held for the Board). If a call was held past the wait, call again with approval_gate_id.",
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]Property{
-					"repo": str("Absolute path of the local repo checkout (defaults to the working directory)"),
-					"pr":   num("PR number"),
-					"text": str("New PR body (markdown)"),
+					"repo":             str("Absolute path of the local repo checkout (defaults to the working directory)"),
+					"pr":               num("PR number"),
+					"text":             str("New PR body (markdown)"),
+					"approval_gate_id": str("Gate request ID from an earlier held call with the same parameters"),
 				},
 				Required: []string{"pr", "text"},
 			},
@@ -317,11 +321,30 @@ func (s *Server) handleTaskDoc(ctx context.Context, rawArgs json.RawMessage) *To
 	return opsResult(c, "document saved")
 }
 
+// taskRepoSlug is the GitHub "owner/name" of the running task's own repo
+// (its configured checkout, not the agent's working directory), or "".
+func (s *Server) taskRepoSlug(ctx context.Context) string {
+	taskID := strings.TrimSpace(os.Getenv("STAYPOINT_TASK_ID"))
+	if taskID == "" {
+		return ""
+	}
+	dbConn, err := s.getDB()
+	if err != nil {
+		return ""
+	}
+	t, err := meshContext.GetTask(dbConn, taskID)
+	if err != nil || t == nil || t.RepoPath == "" {
+		return ""
+	}
+	return opstools.OriginSlug(ctx, s.opsRunner(), t.RepoPath)
+}
+
 func (s *Server) handlePRBody(ctx context.Context, rawArgs json.RawMessage) *ToolCallResult {
 	var args struct {
-		Repo string `json:"repo"`
-		PR   int    `json:"pr"`
-		Text string `json:"text"`
+		Repo           string `json:"repo"`
+		PR             int    `json:"pr"`
+		Text           string `json:"text"`
+		ApprovalGateID string `json:"approval_gate_id"`
 	}
 	if err := decodeArgs(rawArgs, &args); err != nil {
 		return toolError(err.Error())
@@ -336,9 +359,42 @@ func (s *Server) handlePRBody(ctx context.Context, rawArgs json.RawMessage) *Too
 	if err := opstools.ValidateText(args.Text); err != nil {
 		return toolError(err.Error())
 	}
-	c := opstools.Call{Tool: "pr_body", Effect: opstools.DevWrite, Summary: fmt.Sprintf("repo=%s pr=%d bytes=%d", repo, args.PR, len(args.Text))}
+	if args.ApprovalGateID != "" && !gateIDRe.MatchString(args.ApprovalGateID) {
+		return toolError("approval_gate_id is not a gate request ID")
+	}
+	run := s.opsRunner()
+	view := func() (opstools.Call, string, *ToolCallResult) {
+		res := run(ctx, opstools.Cmd{Name: "gh", Args: opstools.PRViewArgs(args.PR, ""), Dir: repo})
+		if res.ExitCode != 0 || res.Err != nil {
+			return opstools.Call{}, "", toolError("pr_body: gh pr view failed\n" + res.Format())
+		}
+		v, ghRepo, err := opstools.ParsePRView(args.PR, []byte(res.Stdout))
+		if err != nil {
+			return opstools.Call{}, "", toolError("pr_body refused: " + err.Error())
+		}
+		sum := sha256.Sum256([]byte(args.Text))
+		return opstools.Call{Tool: "pr_body", Effect: opstools.PRBodyEffect(ghRepo, v.HeadRefName, s.taskRepoSlug(ctx)),
+			Summary: fmt.Sprintf("gh_repo=%s pr=%d head=%s bytes=%d text_sha256=%x", ghRepo, args.PR, v.HeadRefName, len(args.Text), sum[:8])}, ghRepo, nil
+	}
+	c, ghRepo, bad := view()
+	if bad != nil {
+		return bad
+	}
+	reason := fmt.Sprintf("%s: replace the body of PR #%d in GitHub repo %s, which is not this task's repo or is a release PR", c.Effect, args.PR, ghRepo)
+	if res := s.gate(ctx, c, reason, args.ApprovalGateID); res != nil {
+		return res
+	}
+	if c.Effect != opstools.DevWrite {
+		again, _, bad := view()
+		if bad != nil {
+			return bad
+		}
+		if again != c {
+			return toolError(fmt.Sprintf("pr_body refused: the PR changed while held (was %s, now %s)", c.Summary, again.Summary))
+		}
+	}
 	s.logOps(c)
-	res := s.opsRunner()(ctx, opstools.Cmd{Name: "gh", Args: []string{"pr", "edit", strconv.Itoa(args.PR), "--body-file", "-"}, Dir: repo, Stdin: []byte(args.Text)})
+	res := run(ctx, opstools.Cmd{Name: "gh", Args: []string{"pr", "edit", strconv.Itoa(args.PR), "--repo", ghRepo, "--body-file", "-"}, Dir: repo, Stdin: []byte(args.Text)})
 	return opsResult(c, res.Format())
 }
 
@@ -358,8 +414,11 @@ func (s *Server) handlePRMerge(ctx context.Context, rawArgs json.RawMessage) *To
 		return toolError("pr_merge refused: " + err.Error())
 	}
 	run := s.opsRunner()
+	// view resolves the PR from the checkout, as the agent named it; the
+	// GitHub repo it answers with is bound into the canonical form, so a
+	// remote repointed after the approval resolves to a different call.
 	view := func() (*opstools.PRMergePlan, *ToolCallResult) {
-		res := run(ctx, opstools.Cmd{Name: "gh", Args: opstools.PRViewArgs(req.PR), Dir: req.Repo})
+		res := run(ctx, opstools.Cmd{Name: "gh", Args: opstools.PRViewArgs(req.PR, ""), Dir: req.Repo})
 		if res.ExitCode != 0 || res.Err != nil {
 			return nil, toolError("pr_merge: gh pr view failed\n" + res.Format())
 		}
@@ -373,7 +432,7 @@ func (s *Server) handlePRMerge(ctx context.Context, rawArgs json.RawMessage) *To
 	if bad != nil {
 		return bad
 	}
-	reason := fmt.Sprintf("%s: merge PR #%d into %s of %s (head %s)", plan.Effect, plan.PR, req.Base, plan.Repo, plan.HeadSHA[:12])
+	reason := fmt.Sprintf("%s: merge PR #%d into %s of GitHub repo %s (head %s)", plan.Effect, plan.PR, req.Base, plan.GHRepo, plan.HeadSHA[:12])
 	if plan.Effect == opstools.ProdWrite {
 		reason += "; night rule: prod merges only at night unless urgent"
 	}
@@ -389,5 +448,14 @@ func (s *Server) handlePRMerge(ctx context.Context, rawArgs json.RawMessage) *To
 		return toolError(fmt.Sprintf("pr_merge refused: the PR changed while held (was %s, now %s); not merged", plan.Summary, again.Summary))
 	}
 	s.logOps(plan.Call)
-	return opsResult(plan.Call, run(ctx, opstools.Cmd{Name: "gh", Args: plan.MergeArgs(), Dir: plan.Repo}).Format())
+	merged := run(ctx, opstools.Cmd{Name: "gh", Args: plan.MergeArgs(), Dir: plan.Repo})
+	body := merged.Format()
+	if merged.ExitCode == 0 && merged.Err == nil {
+		after := run(ctx, opstools.Cmd{Name: "gh", Args: opstools.PRViewArgs(plan.PR, plan.GHRepo), Dir: plan.Repo})
+		if err := plan.CheckMerged([]byte(after.Stdout)); err != nil {
+			return toolError(fmt.Sprintf("pr_merge: post-merge check failed: %v\n%s", err, body))
+		}
+		body += "\npost-merge check: merged into " + plan.Base + " of " + plan.GHRepo
+	}
+	return opsResult(plan.Call, body)
 }

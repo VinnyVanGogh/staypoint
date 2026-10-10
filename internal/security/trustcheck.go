@@ -59,6 +59,15 @@ func (f *TrustFacts) deleteOut(why string) {
 	}
 }
 
+// OpsToolPrefix starts the gate-request cmdline of a typed ops MCP tool call
+// (opstools.Call.Canonical, task-7d279c9d).
+const OpsToolPrefix = "mcp__staypoint__"
+
+// IsOpsToolCall reports whether a gate-request cmdline is an ops tool call.
+func IsOpsToolCall(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), OpsToolPrefix)
+}
+
 // TruncatedMarker ends script content that was cut for storage.
 const TruncatedMarker = "…(truncated)"
 
@@ -79,6 +88,13 @@ var interpreters = map[string]bool{
 // for the Board.
 func AnalyzeForTrust(line string, tc TrustContext) TrustFacts {
 	var f TrustFacts
+	if IsOpsToolCall(line) {
+		// The ops MCP server asks the gate only for prod and external
+		// writes, so no trust or tev1 may approve one: the decision is the
+		// tool's declared effect, not text a rule happens to match.
+		f.protect("ops tool prod/external write: only the Board approves it")
+		return f
+	}
 	a := trustAnalyzer{tc: tc, f: &f}
 	a.line(line, tc.CWD, 0)
 	return f

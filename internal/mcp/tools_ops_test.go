@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,10 @@ type recorder struct {
 	mu   sync.Mutex
 	cmds []opstools.Cmd
 	view string
+	// views, when set, answer successive gh pr view calls (the last repeats).
+	views []string
+	// origin answers git remote get-url origin.
+	origin string
 }
 
 func (r *recorder) run(ctx context.Context, c opstools.Cmd) opstools.Result {
@@ -27,7 +32,17 @@ func (r *recorder) run(ctx context.Context, c opstools.Cmd) opstools.Result {
 	defer r.mu.Unlock()
 	r.cmds = append(r.cmds, c)
 	if c.Name == "gh" && len(c.Args) > 1 && c.Args[1] == "view" {
-		return opstools.Result{Stdout: r.view, Output: r.view}
+		v := r.view
+		if len(r.views) > 0 {
+			v = r.views[0]
+			if len(r.views) > 1 {
+				r.views = r.views[1:]
+			}
+		}
+		return opstools.Result{Stdout: v, Output: v}
+	}
+	if c.Name == "git" && strings.Join(c.Args, " ") == "remote get-url origin" {
+		return opstools.Result{Stdout: r.origin + "\n", Output: r.origin + "\n"}
 	}
 	return opstools.Result{Output: "SECRET_KEY=fixture-leak-123\nok\n"}
 }
@@ -53,7 +68,7 @@ func opsConfig(t *testing.T) *config.Config {
 	cfg.DataDir = t.TempDir()
 	cfg.Gates.Hosts = config.HostClasses{Dev: []string{"mansol-dev"}}
 	cfg.Gates.Ops.DevHosts = map[string]config.DevHostConfig{
-		"mansol-dev": {AppDir: "/var/www/mansol_apps", Services: []string{"mansol-web"}},
+		"mansol-dev": {HostName: "10.0.0.5", AppDir: "/var/www/mansol_apps", Services: []string{"mansol-web"}},
 	}
 	return cfg
 }
@@ -120,7 +135,7 @@ func TestPRMergeGatesOnRealBase(t *testing.T) {
 	repo := t.TempDir()
 	head := strings.Repeat("c", 40)
 	view := func(base string) string {
-		return `{"baseRefName":"` + base + `","headRefOid":"` + head + `","state":"OPEN"}`
+		return prViewJSON("o/r", 5, base, "feature", head, "OPEN")
 	}
 
 	t.Run("main without approver is refused", func(t *testing.T) {
@@ -135,7 +150,7 @@ func TestPRMergeGatesOnRealBase(t *testing.T) {
 
 	t.Run("main asks the Board and merges only when approved", func(t *testing.T) {
 		for _, approve := range []bool{false, true} {
-			rec := &recorder{view: view("main")}
+			rec := &recorder{views: []string{view("main"), view("main"), prViewJSON("o/r", 5, "main", "feature", head, "MERGED")}}
 			var asked []ApprovalRequest
 			approver := func(ctx context.Context, req ApprovalRequest) (bool, string) {
 				asked = append(asked, req)
@@ -144,11 +159,11 @@ func TestPRMergeGatesOnRealBase(t *testing.T) {
 			s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run), WithApprover(approver))
 			res := callOps(t, s, "pr_merge", map[string]any{"repo": repo, "pr": 5, "base": "main"})
 			s.Close()
-			if len(asked) != 1 || asked[0].Call.Effect != opstools.ProdWrite || !strings.Contains(asked[0].Reason, "night rule") {
+			if len(asked) != 1 || asked[0].Call.Effect != opstools.ProdWrite || !strings.Contains(asked[0].Reason, "night rule") || !strings.Contains(asked[0].Reason, "GitHub repo o/r") {
 				t.Fatalf("approver asked %+v", asked)
 			}
-			if !strings.Contains(asked[0].Call.Canonical(), "head="+head) {
-				t.Fatalf("canonical not pinned to head: %s", asked[0].Call.Canonical())
+			if !strings.Contains(asked[0].Call.Canonical(), "head="+head) || !strings.Contains(asked[0].Call.Canonical(), "gh_repo=o/r") {
+				t.Fatalf("canonical not pinned to repo and head: %s", asked[0].Call.Canonical())
 			}
 			if rec.ran("gh", "merge") != approve || res.IsError == approve {
 				t.Fatalf("approve=%v merged=%v isError=%v %s", approve, rec.ran("gh", "merge"), res.IsError, resultText(res))
@@ -157,7 +172,7 @@ func TestPRMergeGatesOnRealBase(t *testing.T) {
 	})
 
 	t.Run("dev-server merges unattended", func(t *testing.T) {
-		rec := &recorder{view: view("dev-server")}
+		rec := &recorder{views: []string{view("dev-server"), view("dev-server"), prViewJSON("o/r", 5, "dev-server", "feature", head, "MERGED")}}
 		called := false
 		s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run), WithApprover(func(context.Context, ApprovalRequest) (bool, string) {
 			called = true
@@ -179,6 +194,50 @@ func TestPRMergeGatesOnRealBase(t *testing.T) {
 			t.Fatalf("base lie merged: %s", resultText(res))
 		}
 	})
+
+	t.Run("remote repointed after approval is refused", func(t *testing.T) {
+		// The Board approved o/r#5; by merge time the checkout's remote
+		// resolves PR #5 in another repo.
+		rec := &recorder{views: []string{view("main"), prViewJSON("attacker/r", 5, "main", "feature", head, "OPEN")}}
+		s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run), WithApprover(func(context.Context, ApprovalRequest) (bool, string) { return true, "" }))
+		defer s.Close()
+		res := callOps(t, s, "pr_merge", map[string]any{"repo": repo, "pr": 5, "base": "main"})
+		if !res.IsError || rec.ran("gh", "merge") || !strings.Contains(resultText(res), "changed while held") {
+			t.Fatalf("repointed remote merged: %s", resultText(res))
+		}
+	})
+
+	t.Run("merge targets the approved GitHub repo explicitly", func(t *testing.T) {
+		rec := &recorder{views: []string{view("dev-server"), view("dev-server"), prViewJSON("o/r", 5, "dev-server", "feature", head, "MERGED")}}
+		s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run))
+		defer s.Close()
+		if res := callOps(t, s, "pr_merge", map[string]any{"repo": repo, "pr": 5, "base": "dev-server"}); res.IsError {
+			t.Fatalf("dev merge: %s", resultText(res))
+		}
+		var merge []string
+		for _, c := range rec.cmds {
+			if c.Name == "gh" && c.Args[1] == "merge" {
+				merge = c.Args
+			}
+		}
+		if got := strings.Join(merge, " "); got != "pr merge 5 --repo o/r --merge --match-head-commit "+head {
+			t.Fatalf("merge argv %q", got)
+		}
+	})
+
+	t.Run("base swapped during the merge is reported", func(t *testing.T) {
+		rec := &recorder{views: []string{view("dev-server"), view("dev-server"), prViewJSON("o/r", 5, "main", "feature", head, "MERGED")}}
+		s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run))
+		defer s.Close()
+		res := callOps(t, s, "pr_merge", map[string]any{"repo": repo, "pr": 5, "base": "dev-server"})
+		if !res.IsError || !strings.Contains(resultText(res), "base changed") {
+			t.Fatalf("base swap not reported: %s", resultText(res))
+		}
+	})
+}
+
+func prViewJSON(ghRepo string, pr int, base, headRef, head, state string) string {
+	return fmt.Sprintf(`{"url":"https://github.com/%s/pull/%d","baseRefName":%q,"headRefName":%q,"headRefOid":%q,"state":%q}`, ghRepo, pr, base, headRef, head, state)
 }
 
 func TestStaypointQueryOwnTaskOnly(t *testing.T) {
@@ -280,18 +339,86 @@ func TestTaskCommentAndDoc(t *testing.T) {
 	}
 }
 
-func TestPRBodyPassesTextOnStdin(t *testing.T) {
-	rec := &recorder{}
+func TestPRBodyScopedToTaskRepo(t *testing.T) {
+	_, database := setupTestDB(t)
+	taskRepo := t.TempDir()
+	own, err := meshContext.CreateTask(database, "own", taskRepo, "main", "personal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("STAYPOINT_TASK_ID", own.ID)
+	head := strings.Repeat("d", 40)
 	repo := t.TempDir()
-	s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run))
-	defer s.Close()
 	body := "## Summary\n$(touch /tmp/pwned) `x`"
-	res := callOps(t, s, "pr_body", map[string]any{"repo": repo, "pr": 9, "text": body})
-	if res.IsError || len(rec.cmds) != 1 {
-		t.Fatalf("pr_body: %s", resultText(res))
+	edits := func(rec *recorder) []opstools.Cmd {
+		var out []opstools.Cmd
+		for _, c := range rec.cmds {
+			if c.Name == "gh" && c.Args[1] == "edit" {
+				out = append(out, c)
+			}
+		}
+		return out
 	}
-	c := rec.cmds[0]
-	if c.Name != "gh" || strings.Join(c.Args, " ") != "pr edit 9 --body-file -" || string(c.Stdin) != body || c.Dir != repo {
-		t.Fatalf("pr_body ran %+v", c)
+
+	t.Run("own repo feature PR runs unattended, text on stdin", func(t *testing.T) {
+		rec := &recorder{view: prViewJSON("o/r", 9, "main", "staypoint/task-x", head, "OPEN"), origin: "git@github.com:o/r.git"}
+		asked := false
+		s := NewServer(WithDB(database), WithConfig(opsConfig(t)), withRunner(rec.run), WithApprover(func(context.Context, ApprovalRequest) (bool, string) {
+			asked = true
+			return false, "no"
+		}))
+		defer s.Close()
+		res := callOps(t, s, "pr_body", map[string]any{"repo": repo, "pr": 9, "text": body})
+		e := edits(rec)
+		if res.IsError || asked || len(e) != 1 || !strings.Contains(resultText(res), "effect=dev_write") {
+			t.Fatalf("pr_body: asked=%v %s", asked, resultText(res))
+		}
+		if strings.Join(e[0].Args, " ") != "pr edit 9 --repo o/r --body-file -" || string(e[0].Stdin) != body || e[0].Dir != repo {
+			t.Fatalf("pr_body ran %+v", e[0])
+		}
+		// The task's repo comes from its configured checkout, not the agent's dir.
+		var originDir string
+		for _, c := range rec.cmds {
+			if c.Name == "git" {
+				originDir = c.Dir
+			}
+		}
+		if originDir != taskRepo {
+			t.Fatalf("task repo resolved from %q, want %q", originDir, taskRepo)
+		}
+	})
+
+	for _, c := range []struct{ name, view string }{
+		{"another repo", prViewJSON("other/r", 9, "main", "feature", head, "OPEN")},
+		{"release PR from main", prViewJSON("o/r", 9, "prod", "main", head, "OPEN")},
+	} {
+		t.Run(c.name+" needs the Board", func(t *testing.T) {
+			for _, approve := range []bool{false, true} {
+				rec := &recorder{view: c.view, origin: "https://github.com/o/r.git"}
+				var asked []ApprovalRequest
+				s := NewServer(WithDB(database), WithConfig(opsConfig(t)), withRunner(rec.run), WithApprover(func(_ context.Context, req ApprovalRequest) (bool, string) {
+					asked = append(asked, req)
+					return approve, "Board denied"
+				}))
+				res := callOps(t, s, "pr_body", map[string]any{"repo": repo, "pr": 9, "text": body})
+				s.Close()
+				if len(asked) != 1 || asked[0].Call.Effect != opstools.ExternalWrite || !strings.Contains(asked[0].Call.Canonical(), "text_sha256=") {
+					t.Fatalf("approver asked %+v", asked)
+				}
+				if (len(edits(rec)) == 1) != approve || res.IsError == approve {
+					t.Fatalf("approve=%v edits=%d %s", approve, len(edits(rec)), resultText(res))
+				}
+			}
+		})
 	}
+
+	t.Run("no task repo is external", func(t *testing.T) {
+		t.Setenv("STAYPOINT_TASK_ID", "")
+		rec := &recorder{view: prViewJSON("o/r", 9, "main", "feature", head, "OPEN")}
+		s := NewServer(WithConfig(opsConfig(t)), withRunner(rec.run))
+		defer s.Close()
+		if res := callOps(t, s, "pr_body", map[string]any{"repo": repo, "pr": 9, "text": body}); !res.IsError || len(edits(rec)) != 0 {
+			t.Fatalf("pr_body without a task ran: %s", resultText(res))
+		}
+	})
 }

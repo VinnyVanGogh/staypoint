@@ -3,7 +3,7 @@
 // parameters, so the gate decides from the declaration, never from shell text.
 package opstools
 
-import "fmt"
+import "github.com/VinnyVanGogh/staypoint/internal/security"
 
 // Effect is what a tool call does to the world.
 type Effect string
@@ -52,5 +52,5 @@ type Call struct {
 // Canonical is the gate-request command line for c: an approval for it
 // covers exactly this tool and these parameters.
 func (c Call) Canonical() string {
-	return fmt.Sprintf("mcp__staypoint__%s %s", c.Tool, c.Summary)
+	return security.OpsToolPrefix + c.Tool + " " + c.Summary
 }

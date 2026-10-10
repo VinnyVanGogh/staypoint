@@ -458,6 +458,53 @@ func TestTrust_Tev1DecidesAndParksOnlyThatTask(t *testing.T) {
 	}
 }
 
+// task-7d279c9d: an ops tool's prod/external write reaches the gate only
+// because it needs the Board; no trust, plain or tev1, may approve it,
+// whatever text its canonical form happens to hold.
+func TestTrust_OpsToolCallsNeverTrustOrTev1Approved(t *testing.T) {
+	canonicals := []string{
+		"mcp__staypoint__pr_merge gh_repo=o/r pr=5 base=main method=merge head=" + strings.Repeat("c", 40),
+		// No field any text rule knows (no method=, no merge word).
+		"mcp__staypoint__pr_merge gh_repo=o/r pr=5 base=main head=" + strings.Repeat("c", 40),
+		"mcp__staypoint__pr_body gh_repo=other/r pr=9 bytes=10",
+		"  mcp__staypoint__dev_host_run host=x action=unknown",
+	}
+	for _, mode := range []struct{ name, body string }{
+		{"trust", `{"preset":"overnight"}`},
+		{"tev1", `{"preset":"overnight","tev1":true,"tev1_ack":true}`},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			e := startGateServer(t, &tev1Fake{rec: gates.RecApprove, p: 0.99}, nil)
+			dir := runningTask(t, e, "T1")
+			e.trust(t, "T1", mode.body)
+			for _, c := range canonicals {
+				got := e.createIn(t, c, "T1", dir, "ops-run")
+				if got["status"] != "pending" {
+					t.Fatalf("%q auto-approved under %s: %v", c, mode.name, got)
+				}
+				// tev1 decides asynchronously: give it time to (wrongly) act.
+				time.Sleep(150 * time.Millisecond)
+				gr, _ := security.GetGateRequest(e.db, got["id"].(string))
+				if gr == nil || gr.Status != security.GateRequestPending {
+					t.Fatalf("%q decided without the Board under %s: %+v", c, mode.name, gr)
+				}
+			}
+			// The ordinary command under the same trust is still decided by it.
+			got := e.createIn(t, "sudo ls /var/log", "T1", dir)
+			if gr := waitDecided(t, e, got["id"].(string)); gr.Status != security.GateRequestApproved {
+				t.Fatalf("trust stopped approving ordinary commands: %+v", gr)
+			}
+		})
+	}
+}
+
+func TestAnalyzeForTrust_OpsToolProtected(t *testing.T) {
+	f := security.AnalyzeForTrust("mcp__staypoint__pr_merge gh_repo=o/r pr=1 base=main head=x", security.TrustContext{})
+	if !f.Protected {
+		t.Fatalf("ops canonical not protected: %+v", f)
+	}
+}
+
 func TestTrust_SettingsAreBoardOnlyAndBounded(t *testing.T) {
 	e := startGateServer(t, nil, nil)
 	if st, _, _ := e.do(t, "POST", "/api/settings/security-gate", `{"tev1_threshold":0.9}`, true, ""); st != http.StatusForbidden {

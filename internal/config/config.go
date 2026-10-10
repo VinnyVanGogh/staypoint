@@ -141,6 +141,13 @@ type OpsConfig struct {
 
 // DevHostConfig is one [gates.ops.dev_hosts.<alias>] table.
 type DevHostConfig struct {
+	// HostName is the address ssh connects to for this alias. It is passed
+	// on the ssh command line, so ~/.ssh/config (or an Include in it) cannot
+	// redirect the alias elsewhere. Required.
+	HostName string `json:"host_name" toml:"host_name"`
+	// SSHConfig is an optional StayPoint-owned ssh config file (ssh -F) used
+	// instead of ~/.ssh/config, e.g. for User, Port and IdentityFile.
+	SSHConfig string `json:"ssh_config,omitempty" toml:"ssh_config"`
 	// AppDir is the absolute app checkout; read actions stay under it.
 	AppDir string `json:"app_dir" toml:"app_dir"`
 	// Services are the systemd units journal_tail, systemctl_status and

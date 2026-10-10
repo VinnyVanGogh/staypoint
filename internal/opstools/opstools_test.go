@@ -14,17 +14,20 @@ import (
 
 func testGates() config.GatesConfig {
 	return config.GatesConfig{
-		Hosts: config.HostClasses{Dev: []string{"mansol-dev", "both-host"}, Prod: []string{"mansol-prod", "both-host"}},
+		Hosts: config.HostClasses{Dev: []string{"mansol-dev", "both-host", "dev-noname", "dev-relcfg"}, Prod: []string{"mansol-prod", "both-host"}},
 		Ops: config.OpsConfig{DevHosts: map[string]config.DevHostConfig{
 			"mansol-dev": {
+				HostName: "10.0.0.5",
 				AppDir:   "/var/www/mansol_apps",
 				Services: []string{"mansol-web", "mansol-worker"},
 				Apps: map[string]config.DevAppConfig{
 					"billing": {Dir: "/var/www/mansol_apps/billing", Python: "/var/www/mansol_apps/venv/bin/python"},
 				},
 			},
-			"both-host":   {AppDir: "/srv/app"},
-			"mansol-prod": {AppDir: "/srv/app"},
+			"both-host":   {HostName: "10.0.0.6", AppDir: "/srv/app"},
+			"mansol-prod": {HostName: "10.0.0.7", AppDir: "/srv/app"},
+			"dev-noname":  {AppDir: "/srv/app"},
+			"dev-relcfg":  {HostName: "10.0.0.8", SSHConfig: "ssh_config", AppDir: "/srv/app"},
 		}},
 	}
 }
@@ -51,6 +54,8 @@ func TestPlanDevHostRefuses(t *testing.T) {
 		{"host option injection", DevHostRequest{Host: "-oProxyCommand=sh", Action: "git_status"}, "not a valid host"},
 		{"host with user", DevHostRequest{Host: "root@mansol-dev", Action: "git_status"}, "not a valid host"},
 		{"unknown action", DevHostRequest{Host: "mansol-dev", Action: "shell"}, "not one of"},
+		{"no pinned host_name", DevHostRequest{Host: "dev-noname", Action: "git_status"}, "host_name must be set"},
+		{"relative ssh_config", DevHostRequest{Host: "dev-relcfg", Action: "git_status"}, "ssh_config must be an absolute path"},
 		{"cat traversal", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "../../etc/passwd"}, "outside the app dir"},
 		{"cat absolute outside", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "/etc/shadow"}, "outside the app dir"},
 		{"cat sibling prefix", DevHostRequest{Host: "mansol-dev", Action: "cat_file", Path: "/var/www/mansol_apps_old/x"}, "outside the app dir"},
@@ -168,7 +173,7 @@ func TestResolvedUnderOnRealShell(t *testing.T) {
 	}
 	g := config.GatesConfig{
 		Hosts: config.HostClasses{Dev: []string{"dev"}},
-		Ops:   config.OpsConfig{DevHosts: map[string]config.DevHostConfig{"dev": {AppDir: app}}},
+		Ops:   config.OpsConfig{DevHosts: map[string]config.DevHostConfig{"dev": {HostName: "127.0.0.1", AppDir: app}}},
 	}
 	run := func(path string) (string, int) {
 		p, err := PlanDevHost(g, DevHostRequest{Host: "dev", Action: "cat_file", Path: path})
@@ -221,12 +226,31 @@ func TestRunDevHostUsesBatchSSHAndRedacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := RunDevHost(context.Background(), fake, p)
-	want := []string{"-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mansol-dev", p.Remote}
+	pinned := []string{
+		"-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "HostName=10.0.0.5",
+		"-o", "ProxyCommand=none", "-o", "ProxyJump=none", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+		"-o", "PermitLocalCommand=no", "-o", "StrictHostKeyChecking=yes",
+	}
+	want := append(append([]string{"-T"}, pinned...), "mansol-dev", p.Remote)
 	if got.Name != "ssh" || strings.Join(got.Args, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("ssh argv = %s %q", got.Name, got.Args)
 	}
 	if strings.Contains(out, "fixture-") || !strings.HasPrefix(out, "exit 0") {
 		t.Fatalf("output not redacted or missing exit: %s", out)
+	}
+
+	// A StayPoint-owned ssh config replaces ~/.ssh/config; the pins still apply.
+	g := testGates()
+	hc := g.Ops.DevHosts["mansol-dev"]
+	hc.SSHConfig = "/Users/x/.staypoint/ssh_config"
+	g.Ops.DevHosts["mansol-dev"] = hc
+	p, err = PlanDevHost(g, DevHostRequest{Host: "mansol-dev", Action: "git_status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = append(append([]string{"-T", "-F", "/Users/x/.staypoint/ssh_config"}, pinned...), "mansol-dev", p.Remote)
+	if args := p.SSHArgs(); strings.Join(args, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("ssh argv with -F = %q", args)
 	}
 }
 
@@ -237,26 +261,131 @@ func TestMergeEffectAndPlan(t *testing.T) {
 		}
 	}
 	head := strings.Repeat("a", 40)
+	view := func(url, base, state string) []byte {
+		return []byte(`{"url":"` + url + `","baseRefName":"` + base + `","headRefName":"feature","headRefOid":"` + head + `","state":"` + state + `"}`)
+	}
+	const prURL = "https://github.com/Owner/repo/pull/7"
 	req := PRMergeRequest{Repo: "/r", PR: 7, Base: "main", Method: "merge"}
-	if _, err := PlanPRMerge(req, []byte(`{"baseRefName":"dev-server","headRefOid":"`+head+`","state":"OPEN"}`)); err == nil || !strings.Contains(err.Error(), "not the declared base") {
+	if _, err := PlanPRMerge(req, view(prURL, "dev-server", "OPEN")); err == nil || !strings.Contains(err.Error(), "not the declared base") {
 		t.Fatalf("declared base lie not refused: %v", err)
 	}
 	devReq := PRMergeRequest{Repo: "/r", PR: 7, Base: "dev-server", Method: "merge"}
-	if _, err := PlanPRMerge(devReq, []byte(`{"baseRefName":"main","headRefOid":"`+head+`","state":"OPEN"}`)); err == nil {
+	if _, err := PlanPRMerge(devReq, view(prURL, "main", "OPEN")); err == nil {
 		t.Fatal("main PR declared as dev-server was not refused")
 	}
-	if _, err := PlanPRMerge(req, []byte(`{"baseRefName":"main","headRefOid":"`+head+`","state":"MERGED"}`)); err == nil {
+	if _, err := PlanPRMerge(req, view(prURL, "main", "MERGED")); err == nil {
 		t.Fatal("merged PR not refused")
 	}
-	p, err := PlanPRMerge(req, []byte(`{"baseRefName":"main","headRefOid":"`+head+`","state":"OPEN"}`))
+	for _, bad := range []string{"", "https://github.example.com/o/r/pull/7", "https://github.com/o/r/pull/8", "https://github.com/o/../pull/7", "https://github.com/o/r/pull/7/files"} {
+		if _, err := PlanPRMerge(req, view(bad, "main", "OPEN")); err == nil {
+			t.Errorf("PR URL %q accepted", bad)
+		}
+	}
+	p, err := PlanPRMerge(req, view(prURL, "main", "OPEN"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Effect != ProdWrite {
-		t.Fatalf("main merge effect %s", p.Effect)
+	if p.Effect != ProdWrite || p.GHRepo != "Owner/repo" {
+		t.Fatalf("main merge effect %s repo %s", p.Effect, p.GHRepo)
 	}
-	if args := strings.Join(p.MergeArgs(), " "); args != "pr merge 7 --merge --match-head-commit "+head {
+	// The approval binds to the GitHub repo, not the local directory.
+	if !strings.Contains(p.Canonical(), "gh_repo=Owner/repo pr=7 base=main") || strings.Contains(p.Canonical(), "/r ") {
+		t.Fatalf("canonical %q", p.Canonical())
+	}
+	if args := strings.Join(p.MergeArgs(), " "); args != "pr merge 7 --repo Owner/repo --merge --match-head-commit "+head {
 		t.Fatalf("merge args %q", args)
+	}
+	if got := strings.Join(PRViewArgs(7, "Owner/repo"), " "); !strings.HasSuffix(got, "--repo Owner/repo") {
+		t.Fatalf("pinned view args %q", got)
+	}
+
+	// After the merge: merged into the decided base, in the same repo.
+	if err := p.CheckMerged(view(prURL, "main", "MERGED")); err != nil {
+		t.Fatalf("clean merge flagged: %v", err)
+	}
+	if err := p.CheckMerged(view(prURL, "prod", "MERGED")); err == nil || !strings.Contains(err.Error(), "base changed") {
+		t.Fatalf("base swapped during merge not reported: %v", err)
+	}
+	if err := p.CheckMerged(view("https://github.com/fork/repo/pull/7", "main", "MERGED")); err == nil {
+		t.Fatal("other repo after merge not reported")
+	}
+	if err := p.CheckMerged(view(prURL, "main", "OPEN")); err == nil {
+		t.Fatal("unmerged PR after merge not reported")
+	}
+}
+
+func TestGitHubSlugAndPRBodyEffect(t *testing.T) {
+	for url, want := range map[string]string{
+		"https://github.com/o/r.git":     "o/r",
+		"https://github.com/o/r":         "o/r",
+		"git@github.com:o/r.git":         "o/r",
+		"ssh://git@github.com/o/r.git\n": "o/r",
+		"https://evil.com/o/r.git":       "",
+		"https://github.com.evil/o/r":    "",
+		"https://github.com/o/r/x":       "",
+		"/local/path":                    "",
+	} {
+		if got := GitHubSlug(url); got != want {
+			t.Errorf("GitHubSlug(%q) = %q, want %q", url, got, want)
+		}
+	}
+	cases := []struct {
+		repo, head, task string
+		want             Effect
+	}{
+		{"o/r", "feature/x", "o/r", DevWrite},
+		{"O/R", "feature/x", "o/r", DevWrite},
+		{"other/r", "feature/x", "o/r", ExternalWrite},
+		{"o/r", "main", "o/r", ExternalWrite},
+		{"o/r", "prod", "o/r", ExternalWrite},
+		{"o/r", "feature/x", "", ExternalWrite},
+	}
+	for _, c := range cases {
+		if got := PRBodyEffect(c.repo, c.head, c.task); got != c.want {
+			t.Errorf("PRBodyEffect(%q, %q, %q) = %s, want %s", c.repo, c.head, c.task, got, c.want)
+		}
+	}
+}
+
+// task-7d279c9d Board review: every redaction gap found, as a table.
+func TestRedactTable(t *testing.T) {
+	cases := []struct {
+		name, in string
+		leak     []string
+		keep     []string
+	}{
+		{"unquoted value with spaces", "SECRET_KEY: abc def ghi\nNEXT=1", []string{"abc", "def", "ghi"}, []string{"NEXT=1"}},
+		{"DB_PASS", "DB_PASS=hunter2 x", []string{"hunter2"}, nil},
+		{"MYSQL_PWD", "MYSQL_PWD=pw-one", []string{"pw-one"}, nil},
+		{"bare key quoted with space", "key = 'a b'", []string{"'a b'", "a b"}, nil},
+		{"redis empty user", "REDIS_URL=redis://:redispw@cache:6379/0", []string{"redispw"}, []string{"cache:6379"}},
+		{"password with @", "DATABASE_URL=postgres://user:p@ss@db.host/app", []string{"p@ss", "ss@db"}, []string{"db.host/app", "postgres://user:"}},
+		{"escaped quote json", `{"password": "ab\"cd ef", "user": "bob"}`, []string{"cd ef", "ab\\"}, []string{`"user": "bob"`}},
+		{"escaped single quote", `api_key='ab\'cd ef'`, []string{"cd ef"}, nil},
+		{"python triple double", "SECRET_KEY = \"\"\"line one\nline two\"\"\"\nDEBUG = True", []string{"line one", "line two"}, []string{"DEBUG = True"}},
+		{"python triple single", "PASSWORD = '''p1\np2'''", []string{"p1", "p2"}, nil},
+		{"unterminated triple", "TOKEN = \"\"\"t1\nt2", []string{"t1", "t2"}, nil},
+		{"unterminated quote", `SECRET="abc def`, []string{"abc", "def"}, nil},
+		{"pem no END line", "cfg ok\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAfixture\nMIIcut", []string{"MIIEpAIBAAKCAQEAfixture", "MIIcut"}, []string{"cfg ok"}},
+		{"pem with END line", "-----BEGIN PRIVATE KEY-----\nMIIfixture\n-----END PRIVATE KEY-----\nafter", []string{"MIIfixture"}, []string{"after"}},
+		{"authorization header", "Authorization: Bearer abc.def ghi", []string{"abc.def", "ghi"}, nil},
+		{"verify PASS lines stay", "PASS: /billing marker found\nDEV DEPLOY VERIFIED abc1234", nil, []string{"PASS: /billing marker found", "DEV DEPLOY VERIFIED abc1234"}},
+		{"non-secret keys stay", "DEBUG=True\nmonkey: banana\nALLOWED_HOSTS=a.example", nil, []string{"DEBUG=True", "monkey: banana", "ALLOWED_HOSTS=a.example"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := Redact(c.in)
+			for _, l := range c.leak {
+				if strings.Contains(out, l) {
+					t.Errorf("leaked %q:\n%s", l, out)
+				}
+			}
+			for _, k := range c.keep {
+				if !strings.Contains(out, k) {
+					t.Errorf("over-redacted %q:\n%s", k, out)
+				}
+			}
+		})
 	}
 }
 
@@ -345,6 +474,8 @@ func fakeGitHub(dev, main string, lie bool, ranBash *[]string) Runner {
 			return answer(dev)
 		case c.Name == "gh" && strings.HasSuffix(args, "?ref="+mainCommit):
 			return answer(main)
+		case c.Name == "git" && args == "remote get-url origin":
+			return Result{Stdout: "git@github.com:org/mansol_apps.git\n"}
 		case c.Name == "git":
 			return Result{}
 		case c.Name == "bash":
@@ -379,6 +510,23 @@ func TestRunVerifyTrustsOnlyReviewedScript(t *testing.T) {
 	out = RunVerify(context.Background(), fakeGitHub(evil, good, false, &ran), req, dir, []string{gitBlobID([]byte(evil))})
 	if len(ran) != 2 || !strings.Contains(out, "PASS /billing") || !strings.Contains(out, "FAIL /x") {
 		t.Fatalf("Board-trusted blob: ran=%d %s", len(ran), out)
+	}
+
+	// A checkout whose origin is not the verified repo never runs the script:
+	// its origin/dev-server could be a fork's.
+	for _, origin := range []string{"git@github.com:fork/mansol_apps.git\n", "/tmp/local-mirror\n", ""} {
+		gh := fakeGitHub(good, good, false, &ran)
+		repointed := func(ctx context.Context, c Cmd) Result {
+			if c.Name == "git" && strings.Join(c.Args, " ") == "remote get-url origin" {
+				return Result{Stdout: origin}
+			}
+			return gh(ctx, c)
+		}
+		before := len(ran)
+		out = RunVerify(context.Background(), repointed, req, dir, nil)
+		if len(ran) != before || !strings.Contains(out, "NOT ON DEV: origin of") {
+			t.Fatalf("origin %q: ran=%d %s", origin, len(ran)-before, out)
+		}
 	}
 }
 

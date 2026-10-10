@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -55,6 +56,9 @@ func DevActions() []string {
 type DevHostPlan struct {
 	Call
 	Host string
+	// HostName and SSHConfig pin where ssh goes (config.DevHostConfig).
+	HostName  string
+	SSHConfig string
 	// Remote is the remote shell command; every value in it was validated
 	// and single-quoted.
 	Remote  string
@@ -106,7 +110,13 @@ func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, erro
 		return nil, fmt.Errorf("host %s: %w", r.Host, err)
 	}
 
-	p := &DevHostPlan{Host: r.Host, Timeout: readTimeout}
+	if !hostRe.MatchString(hc.HostName) {
+		return nil, fmt.Errorf("host %s: [gates.ops.dev_hosts.%s] host_name must be set to the address to connect to", r.Host, r.Host)
+	}
+	if hc.SSHConfig != "" && !filepath.IsAbs(hc.SSHConfig) {
+		return nil, fmt.Errorf("host %s: ssh_config must be an absolute path", r.Host)
+	}
+	p := &DevHostPlan{Host: r.Host, HostName: hc.HostName, SSHConfig: hc.SSHConfig, Timeout: readTimeout}
 	p.Tool = "dev_host_run"
 	p.Effect = effect
 	if effect == DevWrite {
@@ -314,6 +324,24 @@ func shQuote(s string) string {
 func RunDevHost(ctx context.Context, run Runner, p *DevHostPlan) string {
 	ctx, cancel := context.WithTimeout(ctx, p.Timeout)
 	defer cancel()
-	res := run(ctx, Cmd{Name: "ssh", Args: []string{"-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", p.Host, p.Remote}})
+	res := run(ctx, Cmd{Name: "ssh", Args: p.SSHArgs()})
 	return res.Format()
+}
+
+// SSHArgs is the ssh argv for p. Command-line options win over any config
+// file, so the configured HostName is where it connects, with no proxy,
+// shared control socket or local command an ssh config could add.
+func (p *DevHostPlan) SSHArgs() []string {
+	args := []string{"-T"}
+	if p.SSHConfig != "" {
+		args = append(args, "-F", p.SSHConfig)
+	}
+	for _, o := range []string{
+		"BatchMode=yes", "ConnectTimeout=10", "HostName=" + p.HostName,
+		"ProxyCommand=none", "ProxyJump=none", "ControlMaster=no", "ControlPath=none",
+		"PermitLocalCommand=no", "StrictHostKeyChecking=yes",
+	} {
+		args = append(args, "-o", o)
+	}
+	return append(args, p.Host, p.Remote)
 }

@@ -128,8 +128,14 @@ func RunVerify(ctx context.Context, run Runner, r VerifyRequest, dir string, tru
 	if blob != mainBlob && !slices.Contains(trusted, blob) {
 		return fmt.Sprintf("NOT ON DEV: %s on dev-server (blob %s) differs from main on GitHub and is not in [gates.ops] verify_script_blobs; the Board must review it before it runs", verifyScript, blob)
 	}
-	// The script checks the local origin/dev-server; refresh it as the
-	// manual form did. A failed fetch is left for the script to report.
+	// The script checks the local origin/dev-server, so origin must be the
+	// repo the script came from: an agent-repointed origin would let a fork's
+	// refs stand in for GitHub's.
+	if got := OriginSlug(ctx, run, dir); !strings.EqualFold(got, r.Repo) {
+		return fmt.Sprintf("NOT ON DEV: origin of %s is %q, not github.com/%s; verify needs a checkout of that repo", dir, got, r.Repo)
+	}
+	// Refresh origin/dev-server as the manual form did. A failed fetch is
+	// left for the script to report.
 	_ = run(ctx, Cmd{Name: "git", Args: []string{"fetch", "origin", "dev-server"}, Dir: dir})
 	args := append([]string{"-s", "--", r.SHA}, r.PageChecks...)
 	res := run(ctx, Cmd{Name: "bash", Args: args, Dir: dir, Stdin: script})

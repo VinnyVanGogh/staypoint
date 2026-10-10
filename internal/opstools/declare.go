@@ -12,7 +12,9 @@ var toolEffects = map[string]Effect{
 	"staypoint_query":   Read,
 	"task_comment":      DevWrite,
 	"task_doc":          DevWrite,
-	"pr_body":           DevWrite,
+	// pr_body is a dev write only in the task's own repo (PRBodyEffect),
+	// which the parameters alone cannot show: declare the upper bound.
+	"pr_body": ExternalWrite,
 }
 
 // Declared returns the effect an ops tool call declares from its raw

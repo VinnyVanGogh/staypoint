@@ -1,6 +1,7 @@
 package opstools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -38,22 +39,53 @@ type PRMergeRequest struct {
 // PRMergePlan is a validated pr_merge: the PR as GitHub reports it.
 type PRMergePlan struct {
 	Call
-	Repo    string
+	Repo string
+	// GHRepo is the GitHub "owner/name" the PR lives in, from the PR's own
+	// URL: the merge targets it explicitly, never the checkout's remotes.
+	GHRepo  string
 	PR      int
 	Method  string
+	Base    string
 	HeadSHA string
 }
 
-// PRView is the part of `gh pr view --json` pr_merge checks.
+// PRView is the part of `gh pr view --json` the PR tools check.
 type PRView struct {
+	URL         string `json:"url"`
 	BaseRefName string `json:"baseRefName"`
+	HeadRefName string `json:"headRefName"`
 	HeadRefOid  string `json:"headRefOid"`
 	State       string `json:"state"`
 }
 
-// PRViewArgs are the gh arguments that fetch a PRView.
-func PRViewArgs(pr int) []string {
-	return []string{"pr", "view", strconv.Itoa(pr), "--json", "baseRefName,headRefOid,state"}
+// PRViewArgs are the gh arguments that fetch a PRView; ghRepo pins the
+// GitHub repo ("" lets gh resolve it from the checkout's remotes).
+func PRViewArgs(pr int, ghRepo string) []string {
+	args := []string{"pr", "view", strconv.Itoa(pr), "--json", "url,baseRefName,headRefName,headRefOid,state"}
+	if ghRepo != "" {
+		args = append(args, "--repo", ghRepo)
+	}
+	return args
+}
+
+var prURLRe = regexp.MustCompile(`^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([0-9]+)$`)
+
+// ParsePRView reads gh's answer for PR pr and returns it with the GitHub
+// "owner/name" its URL names. A URL that is not github.com, or names
+// another PR, is refused.
+func ParsePRView(pr int, viewJSON []byte) (*PRView, string, error) {
+	var v PRView
+	if err := json.Unmarshal(viewJSON, &v); err != nil {
+		return nil, "", fmt.Errorf("read gh pr view: %w", err)
+	}
+	m := prURLRe.FindStringSubmatch(v.URL)
+	if m == nil || strings.Contains(m[1], "..") {
+		return nil, "", fmt.Errorf("PR #%d has no github.com URL (%q)", pr, v.URL)
+	}
+	if m[2] != strconv.Itoa(pr) {
+		return nil, "", fmt.Errorf("gh answered for PR #%s, not #%d", m[2], pr)
+	}
+	return &v, m[1], nil
 }
 
 // ValidatePRMerge checks r's own fields and resolves its repo.
@@ -83,9 +115,9 @@ func ValidatePRMerge(r *PRMergeRequest, defaultRepo string) error {
 // the real base (so the effect is decided from the truth), the PR must be
 // open, and the merge is pinned to the head commit the Board saw.
 func PlanPRMerge(r PRMergeRequest, viewJSON []byte) (*PRMergePlan, error) {
-	var v PRView
-	if err := json.Unmarshal(viewJSON, &v); err != nil {
-		return nil, fmt.Errorf("read gh pr view: %w", err)
+	v, ghRepo, err := ParsePRView(r.PR, viewJSON)
+	if err != nil {
+		return nil, err
 	}
 	if v.State != "OPEN" {
 		return nil, fmt.Errorf("PR #%d is %s, not OPEN", r.PR, v.State)
@@ -96,16 +128,74 @@ func PlanPRMerge(r PRMergeRequest, viewJSON []byte) (*PRMergePlan, error) {
 	if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(v.HeadRefOid) {
 		return nil, fmt.Errorf("PR #%d has no head commit", r.PR)
 	}
-	p := &PRMergePlan{Repo: r.Repo, PR: r.PR, Method: r.Method, HeadSHA: v.HeadRefOid}
+	p := &PRMergePlan{Repo: r.Repo, GHRepo: ghRepo, PR: r.PR, Method: r.Method, Base: r.Base, HeadSHA: v.HeadRefOid}
 	p.Tool = "pr_merge"
 	p.Effect = MergeEffect(r.Base)
-	p.Summary = fmt.Sprintf("repo=%s pr=%d base=%s method=%s head=%s", r.Repo, r.PR, r.Base, r.Method, v.HeadRefOid)
+	p.Summary = fmt.Sprintf("gh_repo=%s pr=%d base=%s method=%s head=%s", ghRepo, r.PR, r.Base, r.Method, v.HeadRefOid)
 	return p, nil
 }
 
-// MergeArgs are the gh arguments that merge p, pinned to its head commit.
+// MergeArgs are the gh arguments that merge p: in the GitHub repo the Board
+// saw, pinned to its head commit.
 func (p *PRMergePlan) MergeArgs() []string {
-	return []string{"pr", "merge", strconv.Itoa(p.PR), "--" + p.Method, "--match-head-commit", p.HeadSHA}
+	return []string{"pr", "merge", strconv.Itoa(p.PR), "--repo", p.GHRepo, "--" + p.Method, "--match-head-commit", p.HeadSHA}
+}
+
+// CheckMerged reads gh's answer after the merge: the PR must be merged into
+// the base the gate decided on. The base cannot be checked atomically with
+// the merge (GitHub's merge call takes a head sha, not a base), so a base
+// changed in that window is reported, never hidden.
+func (p *PRMergePlan) CheckMerged(viewJSON []byte) error {
+	v, ghRepo, err := ParsePRView(p.PR, viewJSON)
+	if err != nil {
+		return err
+	}
+	if ghRepo != p.GHRepo {
+		return fmt.Errorf("PR #%d now reports repo %s, not %s", p.PR, ghRepo, p.GHRepo)
+	}
+	if v.BaseRefName != p.Base {
+		return fmt.Errorf("PR #%d base changed to %q during the merge (gate decided on %q); tell the Board", p.PR, v.BaseRefName, p.Base)
+	}
+	if v.State != "MERGED" {
+		return fmt.Errorf("PR #%d is %s after the merge call", p.PR, v.State)
+	}
+	return nil
+}
+
+var remoteSlugRe = regexp.MustCompile(`^(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$`)
+
+// GitHubSlug is the "owner/name" of a github.com remote URL, or "".
+func GitHubSlug(remoteURL string) string {
+	m := remoteSlugRe.FindStringSubmatch(strings.TrimSpace(remoteURL))
+	if m == nil || strings.Contains(m[1], "..") {
+		return ""
+	}
+	return m[1]
+}
+
+// OriginSlug is the GitHub "owner/name" dir's origin points at, as git
+// resolves it (insteadOf rewrites applied), or "".
+func OriginSlug(ctx context.Context, run Runner, dir string) string {
+	res := run(ctx, Cmd{Name: "git", Args: []string{"remote", "get-url", "origin"}, Dir: dir})
+	if res.ExitCode != 0 || res.Err != nil {
+		return ""
+	}
+	return GitHubSlug(res.Stdout)
+}
+
+// protectedHeads are head branches whose PR body pr_body never edits
+// unattended: a release PR's description is the Board's, not a run's.
+var protectedHeads = map[string]bool{"main": true, "master": true, "prod": true, "production": true}
+
+// PRBodyEffect is the effect of replacing PR body text: a dev write for a
+// PR in the task's own GitHub repo (taskSlug) from a non-release branch; an
+// external write (the Board) for any other repo, or when the task's repo is
+// unknown.
+func PRBodyEffect(ghRepo, headRef, taskSlug string) Effect {
+	if taskSlug != "" && strings.EqualFold(ghRepo, taskSlug) && !protectedHeads[headRef] {
+		return DevWrite
+	}
+	return ExternalWrite
 }
 
 // RepoDir resolves a repo parameter: empty means def; it must be an

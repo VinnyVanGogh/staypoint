@@ -17,7 +17,7 @@ import (
 func TestBoardApproverHoldsProdWriteForBoard(t *testing.T) {
 	w := startWiringServer(t)
 	call := opstools.Call{Tool: "pr_merge", Effect: opstools.ProdWrite,
-		Summary: "repo=/r pr=5 base=main method=merge head=" + strings.Repeat("c", 40)}
+		Summary: "gh_repo=o/r pr=5 base=main method=merge head=" + strings.Repeat("c", 40)}
 	req := mcp.ApprovalRequest{Call: call, Reason: "prod_write: merge PR #5 into main", TaskID: "wiring-task"}
 
 	type verdict struct {
@@ -76,6 +76,18 @@ func TestBoardApproverHoldsProdWriteForBoard(t *testing.T) {
 	other.Call.Summary = strings.Replace(call.Summary, "pr=5", "pr=6", 1)
 	if ok, msg := boardApprover(context.Background(), other); ok || !strings.Contains(msg, "different call") {
 		t.Fatalf("approval reused for another PR: ok=%v %s", ok, msg)
+	}
+	// The same call replayed from another task with this task's approval.
+	replay := req
+	replay.TaskID = "other-task"
+	if ok, msg := boardApprover(context.Background(), replay); ok || !strings.Contains(msg, "different call") {
+		t.Fatalf("approval replayed from another task: ok=%v %s", ok, msg)
+	}
+	// The same PR number in another GitHub repo is another call.
+	fork := req
+	fork.Call.Summary = strings.Replace(call.Summary, "gh_repo=o/r", "gh_repo=fork/r", 1)
+	if ok, msg := boardApprover(context.Background(), fork); ok || !strings.Contains(msg, "different call") {
+		t.Fatalf("approval reused for another repo: ok=%v %s", ok, msg)
 	}
 }
 
