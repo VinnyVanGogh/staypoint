@@ -142,3 +142,69 @@ func TestApplyRateLimitsState_RespectsMeasurementAndAge(t *testing.T) {
 		t.Error("expired lockout must not lock the card")
 	}
 }
+
+// One pool, one reset (task-036279f2). A state.json lockout written by a
+// different writer carries its own resets_at, a couple of minutes off the
+// live quota_windows row. The web UI renders lockout_until in the card banner
+// and five_hour_resets_at in the Reset Time row, so the card showed "4m" and
+// "6m" for the same reset. lockout_until must follow the exhausted window.
+func TestGatherProviderQuotas_LockoutUntilMatchesExhaustedWindow(t *testing.T) {
+	now := time.Now()
+	reset := now.Add(6 * time.Minute).Truncate(time.Second)
+	a := seatQuotaDB(t, "")
+	if _, err := a.DB.Exec(seatInsert, "claude_work", "rolling_5h", 100.0, 0.0, 1, ts(reset), ts(now)); err != nil {
+		t.Fatal(err)
+	}
+	state := map[string]any{
+		"lockouts": map[string]any{
+			"Claude (Work)": map[string]any{"locked": true, "resets_at": reset.Add(-2 * time.Minute).Unix()},
+		},
+	}
+	path := filepath.Join(t.TempDir(), "state.json")
+	b, _ := json.Marshal(state)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.RateLimitsPath = path
+	w := gatherQuotas(a)["claude_work"]
+
+	if w.FiveHourResetsAt == nil || w.LockoutUntil == nil {
+		t.Fatalf("missing times: resets=%v until=%v", w.FiveHourResetsAt, w.LockoutUntil)
+	}
+	if !w.LockoutUntil.Equal(*w.FiveHourResetsAt) {
+		t.Errorf("lockout_until %v != five_hour_resets_at %v: same pool shows two resets", w.LockoutUntil, w.FiveHourResetsAt)
+	}
+	if !w.FiveHourResetsAt.Equal(reset) {
+		t.Errorf("five_hour_resets_at = %v, want live row %v", w.FiveHourResetsAt, reset)
+	}
+}
+
+// A weekly lockout keeps the weekly reset, not the 5-hour one.
+func TestGatherProviderQuotas_WeeklyLockoutUntilIsWeeklyReset(t *testing.T) {
+	now := time.Now()
+	weekly := now.Add(30 * time.Hour).Truncate(time.Second)
+	a := seatQuotaDB(t, "")
+	for _, r := range [][]any{
+		{"claude_work", "rolling_5h", 20.0, 80.0, 0, ts(now.Add(time.Hour)), ts(now)},
+		{"claude_work", "weekly_7d", 100.0, 0.0, 1, ts(weekly), ts(now)},
+	} {
+		if _, err := a.DB.Exec(seatInsert, r...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state := map[string]any{
+		"lockouts": map[string]any{
+			"Claude (Work)": map[string]any{"locked": true, "resets_at": weekly.Add(-5 * time.Minute).Unix()},
+		},
+	}
+	path := filepath.Join(t.TempDir(), "state.json")
+	b, _ := json.Marshal(state)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.RateLimitsPath = path
+	w := gatherQuotas(a)["claude_work"]
+	if w.LockoutUntil == nil || !w.LockoutUntil.Equal(weekly) {
+		t.Errorf("weekly lockout_until = %v, want %v", w.LockoutUntil, weekly)
+	}
+}
