@@ -255,21 +255,22 @@ func handleHookPrompt() {
 				return false
 			}
 			if pool.FiveHour.UsedPct >= 85.0 || (pool.FiveHour.RemainingPct > 0 && pool.FiveHour.RemainingPct <= 15.0) {
+				// Reset times are stored in UTC; FormatReset shows them in local time.
 				resetStr := "soon"
 				if !pool.FiveHour.ResetsAt.IsZero() {
-					resetStr = pool.FiveHour.ResetsAt.Format("3:04pm")
+					resetStr = router.FormatReset(pool.FiveHour.ResetsAt, time.Now())
 				} else if !pool.LockoutUntil.IsZero() {
-					resetStr = pool.LockoutUntil.Format("3:04pm")
+					resetStr = router.FormatReset(pool.LockoutUntil, time.Now())
 				}
-				warningReason = fmt.Sprintf("5-hour session quota is at %.0f%% (~%.0f%% left, resets @%s)", pool.FiveHour.UsedPct, pool.FiveHour.RemainingPct, resetStr)
+				warningReason = fmt.Sprintf("5-hour session quota is at %.0f%% (~%.0f%% left, resets %s)", pool.FiveHour.UsedPct, pool.FiveHour.RemainingPct, resetStr)
 				return true
 			}
 			if pool.Weekly.UsedPct >= 85.0 || (pool.Weekly.RemainingPct > 0 && pool.Weekly.RemainingPct <= 15.0) {
 				resetStr := "soon"
 				if !pool.Weekly.ResetsAt.IsZero() {
-					resetStr = pool.Weekly.ResetsAt.Format("Mon 3:04pm")
+					resetStr = router.FormatReset(pool.Weekly.ResetsAt, time.Now())
 				}
-				warningReason = fmt.Sprintf("weekly quota is at %.0f%% (only %.0f%% remaining, resets @%s)", pool.Weekly.UsedPct, pool.Weekly.RemainingPct, resetStr)
+				warningReason = fmt.Sprintf("weekly quota is at %.0f%% (only %.0f%% remaining, resets %s)", pool.Weekly.UsedPct, pool.Weekly.RemainingPct, resetStr)
 				return true
 			}
 			if pool.IsLocked {

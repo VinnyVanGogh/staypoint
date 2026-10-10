@@ -333,7 +333,7 @@ func Route(ctx context.Context, cwd string, pacerState *PacerState, opts RouteOp
 			// Fall back to the personal Claude seat; if it is locked too, wait.
 			until := ""
 			if poolWork != nil && !poolWork.LockoutUntil.IsZero() {
-				until = " until " + poolWork.LockoutUntil.Format("03:04pm")
+				until = " until " + FormatReset(poolWork.LockoutUntil, time.Now())
 			}
 			decision.Tool = "claude"
 			decision.Model = "claude-opus-5"
@@ -418,7 +418,7 @@ func Route(ctx context.Context, cwd string, pacerState *PacerState, opts RouteOp
 	if locked, why := PoolLockReason(poolPersonal, now); locked {
 		until := ""
 		if poolPersonal != nil && !poolPersonal.LockoutUntil.IsZero() {
-			until = " until " + poolPersonal.LockoutUntil.Format("03:04pm")
+			until = " until " + FormatReset(poolPersonal.LockoutUntil, time.Now())
 		}
 		d, _ := routeToClaude(fmt.Sprintf("Personal repo: waiting for the personal Claude seat (%s%s). %s, so there is no automatic Gemini fallback; launch agy explicitly for non-code work",
 			why, until, GeminiCodeRule))
