@@ -234,7 +234,7 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 		}
 		if trust != nil {
 			// The Board's unattended-run rules hold under any trust.
-			boardRule = security.AnalyzeBoardRulesForTask(in.TaskID, in.Cmdline, in.Scripts)
+			boardRule = security.AnalyzeBoardRulesForTaskIn(in.TaskID, in.CWD, in.Cmdline, in.Scripts)
 			if boardRule == "" && isFileEditRequest(in.Cmdline) {
 				// The hook sends an edit only when it is outside the worktree
 				// or to a protected path: never approved by a trust.

@@ -12,26 +12,26 @@ import (
 )
 
 type Config struct {
-	DataDir               string  `json:"data_dir" toml:"data_dir"`
-	DBPath                string  `json:"db_path" toml:"db_path"`
-	TelemetryDBPath       string  `json:"telemetry_db_path" toml:"telemetry_db_path"`
-	CompanyName           string  `json:"company_name" toml:"company_name"`
-	EngineerName          string  `json:"engineer_name" toml:"engineer_name"`
-	HourlyRate            float64 `json:"hourly_rate" toml:"hourly_rate"`
-	WorkEmail             string  `json:"work_email" toml:"work_email"`
-	PersonalEmail         string  `json:"personal_email" toml:"personal_email"`
-	WorkRepoRoot          string  `json:"work_repo_root" toml:"work_repo_root"`
+	DataDir         string  `json:"data_dir" toml:"data_dir"`
+	DBPath          string  `json:"db_path" toml:"db_path"`
+	TelemetryDBPath string  `json:"telemetry_db_path" toml:"telemetry_db_path"`
+	CompanyName     string  `json:"company_name" toml:"company_name"`
+	EngineerName    string  `json:"engineer_name" toml:"engineer_name"`
+	HourlyRate      float64 `json:"hourly_rate" toml:"hourly_rate"`
+	WorkEmail       string  `json:"work_email" toml:"work_email"`
+	PersonalEmail   string  `json:"personal_email" toml:"personal_email"`
+	WorkRepoRoot    string  `json:"work_repo_root" toml:"work_repo_root"`
 	// HarnessRepoRoot is the git repo used for agent worktrees. Populated from
 	// STAYPOINT_REPO_ROOT env var (takes precedence) or harness_repo_root in
 	// config.toml. Never derived from work_repo_root.
-	HarnessRepoRoot string `json:"harness_repo_root" toml:"harness_repo_root"`
-	RemoteHost            string  `json:"remote_host" toml:"remote_host"`
-	RemoteRepoRoot        string  `json:"remote_repo_root" toml:"remote_repo_root"` // e.g. "~/Documents/dev/managed_solution" or "~/Documents/dev/work"
-	MachineRole           string  `json:"machine_role" toml:"machine_role"`         // "hybrid" (default), "work", or "personal"
-	GooglePlanTier        string  `json:"google_plan_tier" toml:"google_plan_tier"` // e.g. "Google AI Ultra" or "Ultra"
-	ClaudePlanTier        string  `json:"claude_plan_tier" toml:"claude_plan_tier"` // e.g. "Max 5x" or "Pro"
-	MaxHandoffsPerRepo    int     `json:"max_handoffs_per_repo" toml:"max_handoffs_per_repo"`
-	PreferredPersonalTool string  `json:"preferred_personal_tool" toml:"preferred_personal_tool"` // "auto" (default), "claude", or "agy"
+	HarnessRepoRoot       string `json:"harness_repo_root" toml:"harness_repo_root"`
+	RemoteHost            string `json:"remote_host" toml:"remote_host"`
+	RemoteRepoRoot        string `json:"remote_repo_root" toml:"remote_repo_root"` // e.g. "~/Documents/dev/managed_solution" or "~/Documents/dev/work"
+	MachineRole           string `json:"machine_role" toml:"machine_role"`         // "hybrid" (default), "work", or "personal"
+	GooglePlanTier        string `json:"google_plan_tier" toml:"google_plan_tier"` // e.g. "Google AI Ultra" or "Ultra"
+	ClaudePlanTier        string `json:"claude_plan_tier" toml:"claude_plan_tier"` // e.g. "Max 5x" or "Pro"
+	MaxHandoffsPerRepo    int    `json:"max_handoffs_per_repo" toml:"max_handoffs_per_repo"`
+	PreferredPersonalTool string `json:"preferred_personal_tool" toml:"preferred_personal_tool"` // "auto" (default), "claude", or "agy"
 	// MaxConcurrentRuns caps how many agent runs the daemon runs in parallel
 	// (STA-773). Zero or unset = 9 (3 organizations x 3 runs).
 	// Top-level key: it must appear before any [table] in config.toml.
@@ -91,6 +91,26 @@ type GatesConfig struct {
 	// branch is merged. Default true. When off, tasks finish the way they do
 	// today — no card, no dev server.
 	ShipReview *bool `json:"ship_review,omitempty" toml:"ship_review"`
+
+	// Hosts classes ssh destinations for the unattended-run Board rules
+	// ([gates.hosts]). A host in neither list is unknown and held as prod.
+	Hosts GateHostsConfig `json:"hosts,omitempty" toml:"hosts"`
+}
+
+// GateHostsConfig is the [gates.hosts] table:
+//
+//	[gates.hosts]
+//	dev = ["mansol-dev"]
+//	prod = ["mansol-prod"]
+//	dev_services = ["mansol_apps"]
+//
+// ssh to a dev host may run reads and dev deploy steps (git pull, systemctl
+// restart of a dev_services unit, verify_dev_deploy.sh) unattended; ssh to
+// any other host waits for the Board.
+type GateHostsConfig struct {
+	Dev         []string `json:"dev,omitempty" toml:"dev"`
+	Prod        []string `json:"prod,omitempty" toml:"prod"`
+	DevServices []string `json:"dev_services,omitempty" toml:"dev_services"`
 }
 
 // Parallel-run caps used when config.toml does not set them (STA-773,

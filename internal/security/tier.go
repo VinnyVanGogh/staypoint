@@ -145,6 +145,9 @@ type Classifier struct {
 	cdpath     bool     // the line may set CDPATH, so a relative cd is unknown
 	inSubst    bool     // classifying a $(...) or <(...) body, whose output is used
 	pipedOut   bool     // a wrapper's output is piped or written (classifyInner)
+	// selfPaths checks the Board's self-protected paths (selfDirs) instead
+	// of the sensitive dirs: the Board rules' spelled-path check.
+	selfPaths bool
 }
 
 // Classify classifies a shell command line. Unparseable input is Red (fail closed).
@@ -472,8 +475,9 @@ var wrapperValueFlags = map[string][]string{
 	"timeout": {"-k", "-s", "--kill-after", "--signal"},
 	"nice":    {"-n"},
 	"ionice":  {"-c", "-n", "-p"},
-	"xargs":   {"-I", "-n", "-P", "-L", "-s", "-d", "-E"},
+	"xargs":   {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--arg-file", "-J", "-R", "-S"},
 	"stdbuf":  {"-i", "-o", "-e"},
+	"sudo":    {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T"},
 }
 
 // skipWrapper returns the argv of the command a wrapper launches.
@@ -939,6 +943,12 @@ func (c *Classifier) home() string {
 
 // sensitiveDirs are locations whose reads and writes always need confirmation.
 func (c *Classifier) sensitiveDirs() []string {
+	if c.selfPaths {
+		if h := c.home(); h != "" {
+			return selfDirs(h)
+		}
+		return nil
+	}
 	dirs := []string{"/etc", "/private/etc"}
 	if h := c.home(); h != "" {
 		for _, d := range []string{".ssh", ".aws", ".gnupg", ".staypoint"} {
@@ -1036,7 +1046,11 @@ func (c *Classifier) checkPathIn(tok, base string, v *Verdict) {
 func (c *Classifier) checkSensitive(word, base string, v *Verdict) {
 	for _, alt := range c.pathAlts(word) {
 		abs, unknown := c.resolvePattern(alt, base)
-		if (unknown || strings.Contains(abs, unresolved)) && unknownRootTouches(abs, c.dotglob) {
+		names := sensitiveNames
+		if c.selfPaths {
+			names = selfNames
+		}
+		if (unknown || strings.Contains(abs, unresolved)) && unknownRootTouches(abs, names, c.dotglob) {
 			v.raise(Red, "may touch a sensitive path: "+word+" (cannot resolve where it points)")
 			return
 		}
@@ -1045,7 +1059,14 @@ func (c *Classifier) checkSensitive(word, base string, v *Verdict) {
 		}
 		literal := !hasWild(abs)
 		clean := filepath.Clean(abs)
-		for _, d := range c.sensitiveDirs() {
+		if c.ownHandoffPattern(abs) {
+			continue
+		}
+		dirs := c.sensitiveDirs()
+		if c.selfPaths {
+			dirs = append(dirs, cwdSelfDirs(firstNonEmptyStr(c.baseCWD, c.CWD))...)
+		}
+		for _, d := range dirs {
 			if under, _ := patternReach(abs, d, c.dotglob); !under {
 				continue
 			}
@@ -1094,6 +1115,29 @@ func (c *Classifier) ownHandoffPath(clean string) bool {
 	}
 	own := filepath.Join(h, ".staypoint", "handoffs", c.TaskID)
 	return clean == own || strings.HasPrefix(clean, own+"/")
+}
+
+// ownHandoffPattern reports a pattern that can only name files in the
+// task's own handoff dir, on a line that only reads such files: the dir is
+// spelled literally, and what follows has no .., no expansion and no glob
+// that could spell .. or another name starting with a dot (the rules of
+// ownHandoffRead).
+func (c *Classifier) ownHandoffPattern(abs string) bool {
+	h := c.home()
+	if !c.ownHandoff || h == "" || !taskIDRe.MatchString(c.TaskID) {
+		return false
+	}
+	own := filepath.Join(h, ".staypoint", "handoffs", c.TaskID)
+	rest, ok := strings.CutPrefix(abs, own)
+	if !ok || (rest != "" && rest[0] != '/') || strings.ContainsAny(rest, "\\{}[]?"+unresolved) {
+		return false
+	}
+	for _, e := range strings.Split(rest, "/") {
+		if e == ".." || (strings.HasPrefix(e, ".") && strings.Contains(e, "*")) {
+			return false
+		}
+	}
+	return true
 }
 
 // chdirTakers take -C<dir> glued as a directory to work in.

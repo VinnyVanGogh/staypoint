@@ -688,7 +688,7 @@ func raiseForBoardRules(cmd, cwd string, snap *security.Snapshotter, v *security
 	for _, r := range security.ScriptRefs(cmd, cwd, snap, 0) {
 		hashes = append(hashes, security.ScriptHash{Path: r.Path, Content: string(r.Full)})
 	}
-	if why := security.AnalyzeBoardRulesForTask(taskID, cmd, hashes); why != "" {
+	if why := security.AnalyzeBoardRulesForTaskIn(taskID, cwd, cmd, hashes); why != "" {
 		v.Tier = security.Red
 		v.Reasons = append(v.Reasons, "board rule: "+why)
 	}

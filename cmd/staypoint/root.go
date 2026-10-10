@@ -12,6 +12,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/bridge"
 	"github.com/VinnyVanGogh/staypoint/internal/config"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
+	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
@@ -38,6 +39,7 @@ The interactive TUI is "staypoint board".`,
 			if err != nil {
 				return fmt.Errorf("failed to load config: %w", err)
 			}
+			setGateHosts(cfg)
 			return nil
 		},
 		FParseErrWhitelist: cobra.FParseErrWhitelist{
@@ -46,6 +48,16 @@ The interactive TUI is "staypoint board".`,
 		Run: runSmartLaunch,
 	}
 )
+
+// setGateHosts installs config.toml's [gates.hosts] ssh classes for the
+// Board rules the hook and `staypoint serve` apply.
+func setGateHosts(c *config.Config) {
+	if c == nil {
+		return
+	}
+	h := c.Gates.Hosts
+	security.SetGateHosts(security.GateHosts{Dev: h.Dev, Prod: h.Prod, DevServices: h.DevServices})
+}
 
 func runSmartLaunch(cmd *cobra.Command, args []string) {
 	statusFlag, _ := cmd.Flags().GetBool("status")

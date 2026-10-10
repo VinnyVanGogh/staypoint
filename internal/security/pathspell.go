@@ -125,8 +125,14 @@ func compMatch(pat, name string, dots bool) bool {
 			}
 		}
 	}
+	// The shell negates a class with ! as well as ^.
+	pat = strings.ReplaceAll(pat, "[!", "[^")
 	ok, err := filepath.Match(pat, name)
-	return ok || err != nil
+	if err != nil {
+		// The shell reads a malformed pattern ([ alone) literally.
+		return strings.ReplaceAll(pat, "[^", "[!") == name
+	}
+	return ok
 }
 
 func hasWild(s string) bool { return strings.ContainsAny(s, "*?["+unresolved) }
@@ -179,12 +185,12 @@ var sensitiveFiles = []string{"auth_token", "board_token"}
 // starts with an unresolved expansion, or is relative to an unknown dir)
 // may name a sensitive dir: some component, other than one that is only
 // an expansion, may spell a sensitive dir or credential file.
-func unknownRootTouches(pat string, dots bool) bool {
+func unknownRootTouches(pat string, names []string, dots bool) bool {
 	for _, p := range strings.Split(pat, "/") {
 		if p == "" || p == unresolved || p == "." || p == ".." {
 			continue
 		}
-		for _, n := range sensitiveNames {
+		for _, n := range names {
 			if compMatch(p, n, dots) {
 				return true
 			}

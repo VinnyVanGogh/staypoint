@@ -27,6 +27,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/mcp"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/repoaccess"
+	"github.com/VinnyVanGogh/staypoint/internal/security"
 	"github.com/VinnyVanGogh/staypoint/internal/server"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
 )
@@ -202,6 +203,8 @@ func runDaemon(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	h := cfg.Gates.Hosts
+	security.SetGateHosts(security.GateHosts{Dev: h.Dev, Prod: h.Prod, DevServices: h.DevServices})
 	if err := config.EnsureDataDir(cfg); err != nil {
 		return fmt.Errorf("ensure data dir: %w", err)
 	}
