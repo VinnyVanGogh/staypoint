@@ -257,6 +257,9 @@ func lineEnvEdits(s segment) []string {
 		return []string{"-opaque:" + baseCmd(argv)}
 	case "printf":
 		for _, a := range argv[1:] {
+			if strings.ContainsAny(a, "$`") { // printf "$opt" NAME x: options unknown
+				return []string{"-opaque:printf"}
+			}
 			if a == "--" || !strings.HasPrefix(a, "-") {
 				break // the format string; options end here
 			}
