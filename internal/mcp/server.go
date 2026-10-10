@@ -21,8 +21,10 @@ type Server struct {
 	db      *sql.DB
 	store   *db.Store
 	workDir string
-	mu      sync.Mutex
-	outMu   sync.Mutex
+	// boardPlanDaemonURL overrides the daemon URL for board plan proposals (tests).
+	boardPlanDaemonURL string
+	mu                 sync.Mutex
+	outMu              sync.Mutex
 }
 
 // Option configures Server behavior.
