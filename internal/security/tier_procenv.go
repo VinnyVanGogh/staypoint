@@ -263,8 +263,11 @@ func lineEnvEdits(s segment) []string {
 			// expansion, or an option word with one inside, could become -v.
 			// A word that starts with a literal character ("Status: $X")
 			// is the format string, never an option.
+			// $'\055v' is -v: the parser keeps the undecoded body and marks
+			// the word $ANSI, so its characters are not what bash sees.
+			// Fail closed on any such word.
 			if expands := segDyn(s, off+1+i) || segMeta(s, off+1+i); expands && a != "" &&
-				(strings.HasPrefix(a, "-") || strings.ContainsAny(a[:1], "$`{*?[~")) {
+				(strings.HasPrefix(a, "-") || strings.ContainsAny(a[:1], "$`{*?[~") || strings.Contains(a, "$ANSI")) {
 				return []string{"-opaque:printf"}
 			}
 			if a == "--" || !strings.HasPrefix(a, "-") {
