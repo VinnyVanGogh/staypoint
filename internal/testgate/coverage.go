@@ -21,7 +21,7 @@ import (
 
 // testCommandRe matches a shell command that runs a test suite.
 var testCommandRe = regexp.MustCompile(`(?:^|[\s;&|(` + "`" + `"'])(?:` + strings.Join([]string{
-	`go\s+test\b`, `gotestsum\b`,
+	`go\s+test\b`, `gotestsum\b`, `node\s+(?:\S+\s+)*--test\b`,
 	`(?:python3?\s+-m\s+)?pytest\b`, `python3?\s+-m\s+unittest\b`, `tox\b`, `nox\b`,
 	`(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b`, `npm\s+t\b`,
 	`(?:npx\s+|pnpm\s+exec\s+|yarn\s+)?(?:vitest|jest|mocha|ava)\b`, `(?:npx\s+)?playwright\s+test\b`,
@@ -31,19 +31,74 @@ var testCommandRe = regexp.MustCompile(`(?:^|[\s;&|(` + "`" + `"'])(?:` + string
 	`phpunit\b`, `mix\s+test\b`, `ctest\b`, `swift\s+test\b`,
 }, "|") + `)`)
 
-// WorkflowRunsTests reports whether a GitHub Actions workflow file contains
-// a command that runs tests. Commented-out lines are ignored.
-func WorkflowRunsTests(content string) bool {
-	for _, line := range strings.Split(content, "\n") {
-		t := strings.TrimSpace(line)
-		if strings.HasPrefix(t, "#") {
-			continue
-		}
+// scriptRefRe matches a repo shell script a run step calls, e.g.
+// "scripts/ui-e2e.sh" or "bash ./ci/test.sh".
+var scriptRefRe = regexp.MustCompile(`(?:^|[\s;&|(=])((?:\./)?[\w.-]+(?:/[\w.-]+)*\.(?:sh|bash))\b`)
+
+// maxScriptDepth bounds how far RunsTests follows scripts calling scripts.
+const maxScriptDepth = 3
+
+// RunsTests reports whether a GitHub Actions workflow (or a script) runs
+// tests, either with a test command of its own or through a repo script it
+// calls (CI often wraps `go test` or `playwright test` in scripts/*.sh).
+// scripts maps repo-relative script paths to their content; a script not in
+// it is not followed. Commented-out lines are ignored.
+func RunsTests(content string, scripts map[string]string) bool {
+	return runsTests(content, scripts, map[string]bool{}, 0)
+}
+
+func runsTests(content string, scripts map[string]string, seen map[string]bool, depth int) bool {
+	for _, t := range commandLines(content) {
 		if testCommandRe.MatchString(t) {
 			return true
 		}
 	}
+	if depth >= maxScriptDepth {
+		return false
+	}
+	for _, p := range ScriptRefs(content) {
+		body, ok := scripts[p]
+		if !ok || seen[p] {
+			continue
+		}
+		seen[p] = true
+		if runsTests(body, scripts, seen, depth+1) {
+			return true
+		}
+	}
 	return false
+}
+
+// ScriptRefs returns the repo-relative paths of the shell scripts content
+// calls, cleaned ("./scripts/a.sh" is "scripts/a.sh"), in order, once each.
+// Paths outside the repo ("../x.sh", "/usr/x.sh") are skipped.
+func ScriptRefs(content string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, t := range commandLines(content) {
+		for _, m := range scriptRefRe.FindAllStringSubmatch(t, -1) {
+			p := path.Clean(m[1])
+			if strings.HasPrefix(p, "../") || p == ".." || seen[p] {
+				continue
+			}
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// commandLines returns content's trimmed lines, comments dropped.
+func commandLines(content string) []string {
+	var out []string
+	for _, line := range strings.Split(content, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 // ── diff ────────────────────────────────────────────────────────────────────
