@@ -1115,7 +1115,11 @@ func (c *Classifier) checkPathAlt(cand string, v *Verdict) {
 		// cd ~ && cat .staypoint/x: a relative name under a sensitive
 		// dir, from the tracked working directory (Board review #4).
 		if c.CWD != "" && filepath.IsAbs(c.CWD) && !strings.HasPrefix(cand, "-") {
-			c.checkSensitive(filepath.Join(c.CWD, cand), v)
+			joined := filepath.Join(c.CWD, cand)
+			if procEnvironRe.MatchString(joined) {
+				v.raise(Red, "reads a process environment ("+joined+")")
+			}
+			c.checkSensitive(joined, v)
 		}
 		return
 	}

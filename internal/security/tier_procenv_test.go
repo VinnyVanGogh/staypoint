@@ -67,6 +67,10 @@ func TestBoardReview4Bypasses(t *testing.T) {
 		`o=-v; printf "$o" HOME /x; staypoint status`: "earlier printf",
 		`printf {-v,x} HOME /x; staypoint status`:     "earlier printf",
 		`printf -[v] HOME /x; staypoint status`:       "earlier printf",
+		`printf ~- HOME /x; staypoint status`:         "earlier printf",
+		`printf -$o HOME /x; staypoint status`:        "earlier printf",
+		"cat /proc/1/task/1/environ":                  "process environment",
+		"cd /proc/1 && cat environ":                   "process environment",
 		"tar cf - -C~ .staypoint":                     "whole home",
 		"tar cf - --directory=$HOME .staypoint":       "whole home",
 		"cd ~/Documents && cp -r .. /tmp/h":           "whole home",
@@ -110,6 +114,9 @@ func TestBoardReview4Bypasses(t *testing.T) {
 		"ls ~", "find . -name x", "find ~ -name '*.md'", "cp a b", "cp -r src dst", "ln -s a b",
 		"git commit -m 'staypoint mcp fix'", "export FOO=1; staypoint status", "cd ~/x && ls",
 		"tar czf out.tgz ./build", "cat docs/staypoint.md", "claude --version", "cd ~ && cat notes.txt",
+		// A format string with an expansion inside is not an option.
+		`printf "Status: $STATUS\n"; staypoint status`, `printf '%s\n' "$X"; staypoint status`,
+		`printf "[%s]\n" x; staypoint status`,
 	}
 	for _, line := range notRed {
 		if v := c.Classify(line); v.Tier == Red {

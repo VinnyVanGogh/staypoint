@@ -71,64 +71,64 @@ const maxBraceAlts = 256
 // braceCapHit marks a branch cut off by the depth cap.
 const braceCapHit = "\x00brace-cap"
 
-func expandBracesN(s string, depth int) []string {
-	open := strings.IndexByte(s, '{')
-	if open < 0 {
-		return []string{s}
+func expandBracesN(word string, depth int) []string {
+	lbrace := strings.IndexByte(word, '{')
+	if lbrace < 0 {
+		return []string{word}
 	}
 	if depth > 8 {
 		return []string{braceCapHit}
 	}
-	level, close := 0, -1
-	var commas []int
-	for i := open; i < len(s) && close < 0; i++ {
-		switch s[i] {
+	// Find the matching } and the commas at the outer level; each comma
+	// ends one alternative.
+	nesting, rbrace := 0, -1
+	var altEnds []int
+	for i := lbrace; i < len(word) && rbrace < 0; i++ {
+		switch word[i] {
 		case '{':
-			level++
+			nesting++
 		case '}':
-			level--
-			if level == 0 {
-				close = i
+			nesting--
+			if nesting == 0 {
+				rbrace = i
 			}
 		case ',':
-			if level == 1 {
-				commas = append(commas, i)
+			if nesting == 1 {
+				altEnds = append(altEnds, i)
 			}
 		}
 	}
-	if close < 0 {
-		return []string{s}
+	if rbrace < 0 {
+		return []string{word}
 	}
-	pre, post := s[:open], s[close+1:]
-	if len(commas) == 0 {
+	prefix, suffix := word[:lbrace], word[rbrace+1:]
+	if len(altEnds) == 0 {
 		// {x} is literal; look for braces after it.
-		var out []string
-		for _, rest := range expandBracesN(post, depth+1) {
-			if rest == braceCapHit {
+		var words []string
+		for _, tail := range expandBracesN(suffix, depth+1) {
+			if tail == braceCapHit {
 				return []string{braceCapHit}
 			}
-			out = append(out, pre+s[open:close+1]+rest)
+			words = append(words, prefix+word[lbrace:rbrace+1]+tail)
 		}
-		return out
+		return words
 	}
-	var alts []string
-	start := open + 1
-	for _, cm := range append(commas, close) {
-		alts = append(alts, s[start:cm])
-		start = cm + 1
-	}
-	var out []string
-	for _, a := range alts {
-		out = append(out, expandBracesN(pre+a+post, depth+1)...)
-		if len(out) > maxBraceAlts {
+	altEnds = append(altEnds, rbrace) // the last alternative ends at }
+	var words []string
+	altStart := lbrace + 1
+	for _, end := range altEnds {
+		words = append(words, expandBracesN(prefix+word[altStart:end]+suffix, depth+1)...)
+		if len(words) > maxBraceAlts {
 			break // expandBraces reports the cut
 		}
+		altStart = end + 1
 	}
-	return out
+	return words
 }
 
-// procEnvironRe matches Linux /proc/<pid>/environ (and /proc/self/environ).
-var procEnvironRe = regexp.MustCompile(`^/proc/[^/]+/environ$`)
+// procEnvironRe matches Linux /proc/<pid>/environ, /proc/self/environ and
+// the per-thread /proc/<pid>/task/<tid>/environ.
+var procEnvironRe = regexp.MustCompile(`^/proc/[^/]+(/task/[^/]+)?/environ$`)
 
 // isStaypointBin reports whether argv0 runs the staypoint binary under
 // another name: a symlink or hard link to it (`ln -s $(which staypoint)
@@ -256,11 +256,15 @@ func lineEnvEdits(s segment) []string {
 		// in ways not modelled here: fail closed for a later staypoint.
 		return []string{"-opaque:" + baseCmd(argv)}
 	case "printf":
-		for _, a := range argv[1:] {
-			// printf "$opt" NAME x, printf {-v,x} HOME y, printf -[v] ...:
-			// expansion could produce -v, so the options are unknown.
-			if strings.ContainsAny(a, "$`{*?[~") { // ~- is $OLDPWD
-
+		off := len(s.argv) - len(argv)
+		for i, a := range argv[1:] {
+			// printf "$opt" NAME x, printf {-v,x} HOME y, printf -[v] ...,
+			// printf ~- (= $OLDPWD): an expanding word that starts with the
+			// expansion, or an option word with one inside, could become -v.
+			// A word that starts with a literal character ("Status: $X")
+			// is the format string, never an option.
+			if expands := segDyn(s, off+1+i) || segMeta(s, off+1+i); expands && a != "" &&
+				(strings.HasPrefix(a, "-") || strings.ContainsAny(a[:1], "$`{*?[~")) {
 				return []string{"-opaque:printf"}
 			}
 			if a == "--" || !strings.HasPrefix(a, "-") {
