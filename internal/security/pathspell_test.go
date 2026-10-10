@@ -94,6 +94,11 @@ func TestSensitivePathSpellings(t *testing.T) {
 		"export CDPATH=$HOME; cd .staypoint; cat x",
 		"pushd ~ >/dev/null; pushd /tmp; pushd; cat .staypoint/x",
 		"pushd ~; pushd /tmp; pushd +1; cat .st*/x",
+		"C''DPATH=~ cd .staypoint && cat x",
+		`x=CD; declare "${x}PATH=$HOME"; cd .staypoint; cat x`,
+		"find ~ -name auth_token > /tmp/l; xargs cat < /tmp/l",
+		"timeout 5 find ~ -name auth_token | xargs cat",
+		"fd -u auth_token ~",
 		// Inline scripts that name it however split.
 		`python3 -c "import os; print(open(os.path.expanduser('~/.st'+'aypoint/auth_token')).read())"`,
 		`python3 -c "import pathlib; print((pathlib.Path.home()/'.STAYPOINT'/'x').read_text())"`,

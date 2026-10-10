@@ -27,6 +27,10 @@ const maxBraceAlts = 64
 // zsh GLOB_DOTS or a (D) qualifier).
 var dotglobRe = regexp.MustCompile(`(?i)dotglob|glob_?dots|\(D[^)]*\)|\*\(D`)
 
+// cdpathRe: the line may set CDPATH, by name or through a name built from
+// an expansion (declare "${x}PATH=~", printf -v "$n" ...).
+var cdpathRe = regexp.MustCompile(`CDPATH|\b(export|declare|typeset|local|readonly|printf|read|eval)\b[^;&|\n]*\$`)
+
 // expansionRe matches what parseShell leaves in a word for an expansion:
 // $NAME, ${...}, $SUBST (a command substitution), $ANSI, and special
 // parameters.

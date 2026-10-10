@@ -144,6 +144,7 @@ type Classifier struct {
 	ownHandoff bool     // the line only reads the task's own handoff files
 	cdpath     bool     // the line may set CDPATH, so a relative cd is unknown
 	inSubst    bool     // classifying a $(...) or <(...) body, whose output is used
+	pipedOut   bool     // a wrapper's output is piped or written (classifyInner)
 }
 
 // Classify classifies a shell command line. Unparseable input is Red (fail closed).
@@ -153,6 +154,8 @@ func (c *Classifier) Classify(line string) Verdict {
 		cc.Snap = NewSnapshotter() // fresh reads for this command line
 	}
 	cc.ownHandoff = c.TaskID != "" && ownHandoffRead(line, c.TaskID)
+	// An inherited CDPATH makes every relative cd target unknown.
+	cc.cdpath = c.cdpath || os.Getenv("CDPATH") != ""
 	return cc.classifyLine(line, 0)
 }
 
@@ -177,7 +180,7 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 		return v
 	}
 	lineDots := c.dotglob || dotglobRe.MatchString(line)
-	cdpath := c.cdpath || strings.Contains(line, "CDPATH")
+	cdpath := c.cdpath || cdpathRe.MatchString(unquoter.Replace(line))
 	for _, s := range subs {
 		sc := *c
 		sc.dotglob, sc.cdpath, sc.inSubst = lineDots, cdpath, true
@@ -333,7 +336,8 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 	}
 	// find's or fd's list of names, piped on or substituted into a command
 	// line, feeds whatever reads it (find ~ -name x | xargs cat).
-	if recursiveOver(name, args) || ((name == "find" || name == "fd") && (s.piped || c.inSubst)) {
+	feeds := s.piped || c.pipedOut || c.inSubst || writesFile(s)
+	if recursiveOver(name, args) || ((name == "find" || name == "fd" || name == "fdfind") && feeds) {
 		c.checkRecursive(name, args, bases, v)
 	}
 
@@ -341,7 +345,9 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 	case wrappers[name]:
 		v.raise(Yellow, "")
 		if inner := skipWrapper(name, args); len(inner) > 0 {
-			c.classifyInner(inner, v, depth)
+			wc := *c
+			wc.pipedOut = c.pipedOut || s.piped || writesFile(s)
+			wc.classifyInner(inner, v, depth)
 		}
 		return
 	case shells[name]:
@@ -1190,7 +1196,7 @@ func recursiveOver(name string, args []string) bool {
 			}
 		}
 	case "fd", "fdfind":
-		return short("xXH") || long("--exec", "--exec-batch", "--hidden")
+		return short("xXHu") || long("--exec", "--exec-batch", "--hidden", "--unrestricted", "--no-ignore")
 	}
 	return false
 }
