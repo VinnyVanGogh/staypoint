@@ -733,23 +733,84 @@ func credentialFileAccess(tool string, input json.RawMessage, cwd string) string
 	}
 	str := func(k string) string { s, _ := args[k].(string); return s }
 	home, _ := os.UserHomeDir()
-	norm := func(p string) string {
+	abs := func(p string) string {
 		switch {
 		case p == "~" || strings.HasPrefix(p, "~/"):
 			p = filepath.Join(home, strings.TrimPrefix(p, "~"))
+		case p == "" && cwd == "", !filepath.IsAbs(p) && !filepath.IsAbs(cwd):
+			p = "/" // unknown base: fail closed, "/" is above every data dir
 		case p == "":
 			p = cwd
 		case !filepath.IsAbs(p):
-			if cwd == "" {
-				p = "/" + p // unknown base: still caught by the name check below
-			} else {
-				p = filepath.Join(cwd, p)
+			p = filepath.Join(cwd, p)
+		}
+		return resolveBestEffort(filepath.Clean(p))
+	}
+	dirs := credentialDataDirs()
+	// Containment is decided by name and, where the files exist, by inode
+	// (os.SameFile), so case or Unicode folding and hard-linked or
+	// symlinked dirs cannot slip a path past the string compare.
+	var dirInfos []os.FileInfo
+	for _, d := range dirs {
+		if fi, err := os.Stat(d); err == nil {
+			dirInfos = append(dirInfos, fi)
+		}
+	}
+	isDataDir := func(p string) bool {
+		fi, err := os.Stat(p)
+		if err != nil {
+			return false
+		}
+		for _, d := range dirInfos {
+			if os.SameFile(fi, d) {
+				return true
 			}
 		}
-		return strings.ToLower(resolveBestEffort(filepath.Clean(p)))
+		return false
 	}
 	under := func(p, dir string) bool { return p == dir || strings.HasPrefix(p, strings.TrimSuffix(dir, "/")+"/") }
-	dirs := credentialDataDirs()
+	// inDataDir is absolute path p's part below a data dir ("" for the dir
+	// itself), by case-folded name or by inode of an existing ancestor.
+	inDataDir := func(p string) (string, bool) {
+		lp := strings.ToLower(p)
+		for _, d := range dirs {
+			if under(lp, d) {
+				return strings.TrimPrefix(lp, d), true
+			}
+		}
+		for cur := p; ; cur = filepath.Dir(cur) {
+			if isDataDir(cur) {
+				return strings.TrimPrefix(p, cur), true
+			}
+			if cur == filepath.Dir(cur) {
+				return "", false
+			}
+		}
+	}
+	// aboveDataDir reports whether a search rooted at root reaches a data
+	// dir: the root is a data dir or one of its ancestors.
+	aboveDataDir := func(root string) bool {
+		for _, d := range dirs {
+			if under(d, strings.ToLower(root)) {
+				return true
+			}
+		}
+		rfi, err := os.Stat(root)
+		if err != nil {
+			return false
+		}
+		for _, d := range dirs {
+			for cur := d; ; cur = filepath.Dir(cur) {
+				if fi, err := os.Stat(cur); err == nil && os.SameFile(fi, rfi) {
+					return true
+				}
+				if cur == filepath.Dir(cur) {
+					break
+				}
+			}
+		}
+		return false
+	}
 	const named = " names a StayPoint credential file (ops_key, auth_token, board_token)"
 	deny := func(why string) string { return "denied, not run: " + tool + why }
 
@@ -763,32 +824,17 @@ func credentialFileAccess(tool string, input json.RawMessage, cwd string) string
 		if strings.Contains(strings.ToLower(raw), ".staypoint") && credentialNameRe.MatchString(raw) {
 			return deny(named)
 		}
-		p := norm(raw)
-		for _, d := range dirs {
-			if under(p, d) && credentialNameRe.MatchString(strings.TrimPrefix(p, d)) {
-				return deny(named)
-			}
+		if rel, ok := inDataDir(abs(raw)); ok && credentialNameRe.MatchString(rel) {
+			return deny(named)
 		}
 	}
-	if strings.EqualFold(tool, "grep") {
-		if root := norm(str("path")); root != "" {
-			for _, d := range dirs {
-				if under(d, root) {
-					return deny(" searches the StayPoint data dir or a folder above it; search a narrower path, or use staypoint_query for your task's records")
-				}
-			}
-		}
+	if strings.EqualFold(tool, "grep") && aboveDataDir(abs(str("path"))) {
+		return deny(" searches the StayPoint data dir or a folder above it; search a narrower path, or use staypoint_query for your task's records")
 	}
 	if strings.EqualFold(tool, "glob") {
 		if g := str("pattern"); credentialNameRe.MatchString(g) {
-			root := norm(str("path"))
-			if strings.Contains(strings.ToLower(g), ".staypoint") || filepath.IsAbs(g) || strings.HasPrefix(g, "~") {
+			if strings.Contains(strings.ToLower(g), ".staypoint") || filepath.IsAbs(g) || strings.HasPrefix(g, "~") || aboveDataDir(abs(str("path"))) {
 				return deny(named)
-			}
-			for _, d := range dirs {
-				if under(d, root) {
-					return deny(named)
-				}
 			}
 		}
 	}

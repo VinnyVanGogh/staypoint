@@ -107,6 +107,13 @@ func TestCredentialFileAccess(t *testing.T) {
 	if credentialFileAccess("Grep", []byte(`{"pattern":"x"}`), home) == "" {
 		t.Error("Grep from a cwd above the data dir allowed")
 	}
+	// No path and no cwd: the root is unknown, so fail closed.
+	if credentialFileAccess("Grep", []byte(`{"pattern":"x"}`), "") == "" {
+		t.Error("Grep with no path and no cwd allowed")
+	}
+	if credentialFileAccess("Read", []byte(`{"file_path":"../.staypoint/ops_key"}`), "") == "" {
+		t.Error("relative Read with no cwd allowed")
+	}
 	allow := []call{
 		{"Read", map[string]string{"file_path": dd + "/handoffs/task-1/plan.md"}},
 		{"Grep", map[string]string{"path": dd + "/handoffs/task-1", "pattern": "x"}},
