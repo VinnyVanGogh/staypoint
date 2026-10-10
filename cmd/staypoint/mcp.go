@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/VinnyVanGogh/staypoint/internal/config"
 	"github.com/VinnyVanGogh/staypoint/internal/mcp"
+	"github.com/VinnyVanGogh/staypoint/internal/opstools"
 	"github.com/spf13/cobra"
 )
 
@@ -82,13 +85,20 @@ func pinMCPConfig() (*config.Config, error) {
 
 // daemonRunCheck asks the daemon whether token is a live run's token for
 // taskID (Board review #4: the daemon holds run tokens in memory only, so
-// nothing on disk can mint one). Any failure to get a yes refuses.
+// nothing on disk can mint one). Only the token's hash is sent, and the yes
+// must carry a proof keyed by the token over a fresh nonce, so a listener
+// posing as the daemon cannot vouch for a token. Any failure refuses.
 func daemonRunCheck(ctx context.Context, taskID, token string) error {
 	daemonURL, auth := gateDaemonConn()
 	if daemonURL == "" || auth == "" {
 		return fmt.Errorf("StayPoint daemon unreachable; cannot confirm this run's token")
 	}
-	body, err := json.Marshal(map[string]string{"task_id": taskID, "token": token})
+	nb := make([]byte, 32)
+	if _, err := rand.Read(nb); err != nil {
+		return err
+	}
+	nonce := hex.EncodeToString(nb)
+	body, err := json.Marshal(map[string]string{"task_id": taskID, "token_hash": opstools.TokenHash(token), "nonce": nonce})
 	if err != nil {
 		return err
 	}
@@ -105,13 +115,20 @@ func daemonRunCheck(ctx context.Context, taskID, token string) error {
 		return fmt.Errorf("StayPoint daemon unreachable; cannot confirm this run's token")
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
-		return nil
-	}
 	var e struct {
-		Error string `json:"error"`
+		Error  string `json:"error"`
+		TaskID string `json:"task_id"`
+		RunID  string `json:"run_id"`
+		Proof  string `json:"proof"`
 	}
 	_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&e)
+	if resp.StatusCode == http.StatusOK {
+		ref := opstools.RunRef{TaskID: e.TaskID, RunID: e.RunID}
+		if e.TaskID != taskID || e.RunID == "" || !opstools.VerifyRunCheckProof(token, nonce, ref, e.Proof) {
+			return fmt.Errorf("run token not confirmed: the daemon's answer did not prove it issued this token")
+		}
+		return nil
+	}
 	if e.Error == "" {
 		e.Error = fmt.Sprintf("daemon answered %d", resp.StatusCode)
 	}

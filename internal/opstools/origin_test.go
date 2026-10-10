@@ -58,6 +58,35 @@ func TestRunTokens(t *testing.T) {
 	}
 }
 
+// The daemon's answer to a hash-only check proves it holds the token.
+func TestRunTokensCheckHashProof(t *testing.T) {
+	r := NewRunTokens()
+	tok, revoke, _ := r.Issue("task-a", "run-1")
+	defer revoke()
+	nonce := strings.Repeat("n", 32)
+	ref, proof, err := r.CheckHash("task-a", TokenHash(tok), nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !VerifyRunCheckProof(tok, nonce, ref, proof) {
+		t.Fatal("daemon proof does not verify")
+	}
+	for name, ok := range map[string]bool{
+		"other nonce":       VerifyRunCheckProof(tok, strings.Repeat("m", 32), ref, proof),
+		"other run":         VerifyRunCheckProof(tok, nonce, RunRef{TaskID: "task-a", RunID: "run-2"}, proof),
+		"keyed by the hash": VerifyRunCheckProof(tok, nonce, ref, RunCheckProof(TokenHash(tok), nonce, ref)),
+	} {
+		if ok {
+			t.Errorf("%s: proof verified", name)
+		}
+	}
+	for _, bad := range []string{"", "zz", TokenHash(tok)[:62], tok} {
+		if _, _, err := r.CheckHash("task-a", bad, nonce); err == nil {
+			t.Errorf("CheckHash(%q) passed", bad)
+		}
+	}
+}
+
 func TestRunTokensConcurrent(t *testing.T) {
 	r := NewRunTokens()
 	var wg sync.WaitGroup

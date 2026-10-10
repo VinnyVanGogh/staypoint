@@ -2,6 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -89,5 +93,26 @@ func TestDaemonRunCheck(t *testing.T) {
 	gateDaemonConn = func() (string, string) { return "", "" }
 	if err := daemonRunCheck(ctx, "task-a", tok2); err == nil {
 		t.Fatal("no daemon conn: passed")
+	}
+
+	// A listener posing as the daemon (on its port while it restarts) says
+	// yes to everything. It sees only the token's hash, so it cannot produce
+	// the proof, and the yes is refused.
+	var sawToken bool
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		sawToken = sawToken || strings.Contains(fmt.Sprint(req), tok2)
+		// Its best guess: key the proof with what it was sent.
+		guess := opstools.RunCheckProof(req["token_hash"], req["nonce"], opstools.RunRef{TaskID: req["task_id"], RunID: "run-x"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"task_id": req["task_id"], "run_id": "run-x", "proof": guess})
+	}))
+	defer fake.Close()
+	gateDaemonConn = func() (string, string) { return fake.URL, "x" }
+	if err := daemonRunCheck(ctx, "task-a", tok2); err == nil || !strings.Contains(err.Error(), "did not prove") {
+		t.Fatalf("fake daemon's yes accepted: %v", err)
+	}
+	if sawToken {
+		t.Fatal("the run token itself was sent to the daemon")
 	}
 }

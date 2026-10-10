@@ -1,6 +1,7 @@
 package opstools
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -38,7 +39,13 @@ type RunTokens struct {
 	mu sync.Mutex
 	// live maps sha256(token) to the run it was issued to, so a lookup never
 	// compares the secret itself.
-	live map[[32]byte]RunRef
+	live map[[32]byte]liveRun
+}
+
+type liveRun struct {
+	ref RunRef
+	// token keys the proof the daemon answers a check with (CheckHash).
+	token string
 }
 
 // RunRef is the run a token was issued to.
@@ -49,7 +56,7 @@ type RunRef struct {
 
 // NewRunTokens returns an empty registry.
 func NewRunTokens() *RunTokens {
-	return &RunTokens{live: map[[32]byte]RunRef{}}
+	return &RunTokens{live: map[[32]byte]liveRun{}}
 }
 
 // Issue mints a random token for taskID's run runID. revoke ends it; call it
@@ -65,7 +72,7 @@ func (r *RunTokens) Issue(taskID, runID string) (token string, revoke func(), er
 	token = hex.EncodeToString(buf)
 	h := sha256.Sum256([]byte(token))
 	r.mu.Lock()
-	r.live[h] = RunRef{TaskID: taskID, RunID: runID}
+	r.live[h] = liveRun{ref: RunRef{TaskID: taskID, RunID: runID}, token: token}
 	r.mu.Unlock()
 	var once sync.Once
 	return token, func() {
@@ -80,23 +87,58 @@ func (r *RunTokens) Issue(taskID, runID string) (token string, revoke func(), er
 // Check reports the run token belongs to, if it is live and was issued to
 // taskID.
 func (r *RunTokens) Check(taskID, token string) (RunRef, error) {
-	if strings.TrimSpace(taskID) == "" {
-		return RunRef{}, errors.New("no STAYPOINT_TASK_ID: ops tools run only inside a StayPoint run")
-	}
 	if token == "" {
 		return RunRef{}, fmt.Errorf("no %s: ops tools run only in an MCP server the StayPoint harness started", RunTokenEnv)
 	}
-	h := sha256.Sum256([]byte(token))
+	ref, _, err := r.CheckHash(taskID, TokenHash(token), "")
+	return ref, err
+}
+
+// CheckHash is Check for a client that sends only TokenHash(token), never
+// the token: the daemon answers with RunCheckProof over nonce, which only a
+// holder of the token can compute. A listener posing as the daemon (say on
+// its port while it restarts) sees the hash and cannot forge the proof, so
+// it cannot vouch for a token it was never issued.
+func (r *RunTokens) CheckHash(taskID, tokenHash, nonce string) (ref RunRef, proof string, err error) {
+	if strings.TrimSpace(taskID) == "" {
+		return RunRef{}, "", errors.New("no STAYPOINT_TASK_ID: ops tools run only inside a StayPoint run")
+	}
+	raw, derr := hex.DecodeString(tokenHash)
+	if derr != nil || len(raw) != sha256.Size {
+		return RunRef{}, "", fmt.Errorf("%s is not a live run's token (malformed hash)", RunTokenEnv)
+	}
+	var h [32]byte
+	copy(h[:], raw)
 	r.mu.Lock()
-	ref, ok := r.live[h]
+	e, ok := r.live[h]
 	r.mu.Unlock()
 	switch {
 	case !ok:
-		return RunRef{}, fmt.Errorf("%s is not a live run's token (the run ended, or it was never issued)", RunTokenEnv)
-	case ref.TaskID != taskID:
-		return RunRef{}, fmt.Errorf("%s does not belong to task %s", RunTokenEnv, taskID)
+		return RunRef{}, "", fmt.Errorf("%s is not a live run's token (the run ended, or it was never issued)", RunTokenEnv)
+	case e.ref.TaskID != taskID:
+		return RunRef{}, "", fmt.Errorf("%s does not belong to task %s", RunTokenEnv, taskID)
 	}
-	return ref, nil
+	return e.ref, RunCheckProof(e.token, nonce, e.ref), nil
+}
+
+// TokenHash is what a client sends the daemon instead of its run token.
+func TokenHash(token string) string {
+	h := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(h[:])
+}
+
+// RunCheckProof is the daemon's answer to a check: an HMAC keyed by the run
+// token over the client's nonce and the run it names.
+func RunCheckProof(token, nonce string, ref RunRef) string {
+	m := hmac.New(sha256.New, []byte(token))
+	m.Write([]byte("staypoint-run-check\x00" + nonce + "\x00" + ref.TaskID + "\x00" + ref.RunID))
+	return hex.EncodeToString(m.Sum(nil))
+}
+
+// VerifyRunCheckProof reports whether proof is the daemon's answer for
+// token, nonce and ref.
+func VerifyRunCheckProof(token, nonce string, ref RunRef, proof string) bool {
+	return hmac.Equal([]byte(RunCheckProof(token, nonce, ref)), []byte(proof))
 }
 
 // RemoveLegacyOpsKey deletes the ops_key file the first version left in
