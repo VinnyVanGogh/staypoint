@@ -282,6 +282,16 @@ func (sm *SecurityMiddleware) boardAction(next http.Handler, allowGrace bool) ht
 			return
 		}
 
+		// A row of a signed Board action plan (task-e1b24d66): the plan's one
+		// passkey assertion was verified for exactly this row. The marker is
+		// a context value, so it exists only on requests the plan executor
+		// builds in process; nothing on the wire can set it. No grace window
+		// is opened from it.
+		if planRowAuthorized(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		assertion := r.Header.Get("X-WebAuthn-Assertion")
 		if assertion == "" {
 			if allowGrace {

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/repoaccess"
+	"github.com/go-webauthn/webauthn/webauthn"
 )
 
 // RepoAccessReporter supplies the latest repo access check (repoaccess.Checker).
@@ -326,6 +328,18 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.Handle("POST /api/board/webauthn/challenge", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.Challenge)))
 		mux.Handle("GET /api/board/webauthn/credentials", s.secMid.WrapBoardSession(http.HandlerFunc(webAuthnH.ListCredentials)))
 		mux.Handle("DELETE /api/board/webauthn/credentials/{id}", s.secMid.WrapBoardAction(http.HandlerFunc(webAuthnH.DeleteCredential)))
+
+		// task-e1b24d66: Board action plans. Proposing needs a Board
+		// credential (checked in the handler) and changes nothing; executing
+		// needs one passkey assertion bound to the exact selected rows, which
+		// then run through this same mux.
+		plansH := NewBoardPlansHandler(s.opts.DB, s.hub, s.secMid, webAuthnH, mux)
+		mux.HandleFunc("POST /api/board/plans", plansH.Propose)
+		mux.HandleFunc("GET /api/board/plans", plansH.List)
+		mux.HandleFunc("GET /api/board/plans/{id}", plansH.Get)
+		mux.Handle("POST /api/board/plans/{id}/challenge", s.secMid.WrapBoardSession(http.HandlerFunc(plansH.Challenge)))
+		mux.Handle("POST /api/board/plans/{id}/execute", s.secMid.WrapBoardSession(http.HandlerFunc(plansH.Execute)))
+		mux.Handle("POST /api/board/plans/{id}/discard", s.secMid.WrapBoardSession(http.HandlerFunc(plansH.Discard)))
 		if s.opts.TestMode {
 			// Test-only: expose the last generated pairing code so Playwright's CDP
 			// enrollment helper can finish registration without the macOS dialog.
@@ -460,6 +474,23 @@ func (s *Server) SetPRClientFactory(f PRClientFactory) {
 // real Touch ID hardware.
 func (s *Server) SetWebAuthnVerifier(fn func(r *http.Request, assertion string) error) {
 	s.secMid.setWebAuthnVerifier(fn)
+}
+
+// SetPlanAssertionValidator replaces only the signature check of a Board
+// action plan assertion (test seam). fn gets the challenge bytes the daemon
+// minted, so a stub can insist the assertion "signs" exactly that challenge;
+// the plan binding, expiry and single use are still enforced for real.
+func (s *Server) SetPlanAssertionValidator(fn func(challenge []byte, assertion string) (string, error)) {
+	if s.webAuthnH == nil {
+		return
+	}
+	s.webAuthnH.validateLogin = func(sd webauthn.SessionData, assertion string) (string, error) {
+		challenge, err := base64.RawURLEncoding.DecodeString(sd.Challenge)
+		if err != nil {
+			return "", err
+		}
+		return fn(challenge, assertion)
+	}
 }
 
 // SetPairingNotifier replaces the macOS pairing-code dialog with a custom function

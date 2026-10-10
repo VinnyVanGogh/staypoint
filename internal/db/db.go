@@ -1555,6 +1555,32 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		// task-e1b24d66: Board action plans. A Board session proposes a batch
+		// of Board actions; the Board signs the selected rows with one passkey
+		// assertion and the daemon executes them. 46 and 47 are taken by open
+		// branches (task-eb38c245, task-db71fba9).
+		Version: 48,
+		Name:    "board_action_plans",
+		Up: func(conn *sql.DB) error {
+			_, err := conn.Exec(`CREATE TABLE IF NOT EXISTS board_action_plans (
+				id                TEXT PRIMARY KEY,
+				proposer          TEXT NOT NULL,
+				proposer_kind     TEXT NOT NULL,
+				actions_json      TEXT NOT NULL,
+				content_hash      TEXT NOT NULL,
+				status            TEXT NOT NULL DEFAULT 'pending'
+				                  CHECK (status IN ('pending','executing','executed','discarded')),
+				selected_json     TEXT,
+				selection_hash    TEXT,
+				signer_credential TEXT,
+				results_json      TEXT,
+				created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+				executed_at       TEXT
+			);`)
+			return err
+		},
+	},
 }
 
 func copyFile(src, dst string) error {

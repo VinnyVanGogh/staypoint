@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -72,7 +73,25 @@ type WebAuthnHandler struct {
 
 	sessionMu sync.Mutex
 	sessions  map[string]*webauthn.SessionData
+	// planBound marks challenges minted for one Board action plan selection
+	// (task-e1b24d66). They are usable only by VerifyPlanAssertion, and
+	// VerifyAssertion refuses them.
+	planBound map[string]planBinding
+
+	// validateLogin checks the assertion's signature against the session
+	// (test seam; nil uses go-webauthn ValidateLogin). Returns the signing
+	// credential id.
+	validateLogin func(session webauthn.SessionData, assertion string) (string, error)
 }
+
+// planBinding is what a plan challenge was minted for.
+type planBinding struct {
+	planID        string
+	selectionHash []byte
+}
+
+// planChallengeTTL is how long a signed plan selection stays usable.
+const planChallengeTTL = 10 * time.Minute
 
 func NewWebAuthnHandler(db *sql.DB, hub *EventHub) *WebAuthnHandler {
 	return &WebAuthnHandler{
@@ -508,30 +527,128 @@ func (h *WebAuthnHandler) VerifyAssertion(r *http.Request, assertion string) err
 	}
 
 	sessionToken := r.Header.Get("X-WebAuthn-Session")
-	h.sessionMu.Lock()
-	sessionData := h.sessions[sessionToken]
-	if sessionData != nil {
-		delete(h.sessions, sessionToken)
-	}
-	h.sessionMu.Unlock()
+	sessionData, bound := h.takeSession(sessionToken)
 	if sessionData == nil {
 		return fmt.Errorf("missing or expired WebAuthn session (X-WebAuthn-Session header required)")
 	}
+	if bound != nil {
+		return fmt.Errorf("WebAuthn session was minted for board plan %s and signs nothing else", bound.planID)
+	}
+	_, err = h.finishLogin(wa, sessionData, assertion)
+	return err
+}
 
+// takeSession removes and returns a challenge session and its plan binding
+// (nil for an ordinary challenge). Every session is single-use.
+func (h *WebAuthnHandler) takeSession(token string) (*webauthn.SessionData, *planBinding) {
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+	sessionData := h.sessions[token]
+	if sessionData == nil {
+		return nil, nil
+	}
+	delete(h.sessions, token)
+	if b, ok := h.planBound[token]; ok {
+		delete(h.planBound, token)
+		return sessionData, &b
+	}
+	return sessionData, nil
+}
+
+// PlanChallenge mints a one-time assertion challenge bound to one Board
+// action plan selection: the challenge bytes are a fresh nonce followed by
+// selectionHash, so the passkey signature itself commits to the exact rows.
+func (h *WebAuthnHandler) PlanChallenge(planID string, selectionHash []byte) (*protocol.CredentialAssertion, string, error) {
+	wa, err := h.initWebAuthn()
+	if err != nil {
+		return nil, "", fmt.Errorf("webauthn init: %w", err)
+	}
 	user := h.loadUser()
 	if len(user.credentials) == 0 {
-		return fmt.Errorf("no credentials registered")
+		return nil, "", errNoPasskey
+	}
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, "", err
+	}
+	challenge := append(nonce, selectionHash...)
+	options, sessionData, err := wa.BeginLogin(user,
+		webauthn.WithUserVerification(protocol.VerificationRequired),
+		webauthn.WithChallenge(challenge),
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("begin login: %w", err)
+	}
+	if exp := time.Now().Add(planChallengeTTL); sessionData.Expires.IsZero() || sessionData.Expires.After(exp) {
+		sessionData.Expires = exp
+	}
+	token := uuid.New().String()
+	h.sessionMu.Lock()
+	h.evictSessions()
+	h.sessions[token] = sessionData
+	if h.planBound == nil {
+		h.planBound = map[string]planBinding{}
+	}
+	h.planBound[token] = planBinding{planID: planID, selectionHash: append([]byte(nil), selectionHash...)}
+	h.sessionMu.Unlock()
+	return options, token, nil
+}
+
+var errNoPasskey = errors.New("no credentials registered")
+
+// VerifyPlanAssertion verifies a passkey assertion for a Board action plan.
+// The session must have been minted by PlanChallenge for this plan and this
+// selectionHash (recomputed by the caller from the plan as stored now), be
+// unexpired and unused, and the signature must verify. Returns the signing
+// credential id.
+func (h *WebAuthnHandler) VerifyPlanAssertion(sessionToken, assertion, planID string, selectionHash []byte) (string, error) {
+	sessionData, bound := h.takeSession(sessionToken)
+	if sessionData == nil {
+		return "", fmt.Errorf("missing, expired or already used WebAuthn session")
+	}
+	if bound == nil {
+		return "", fmt.Errorf("WebAuthn session was not minted for a board plan")
+	}
+	if bound.planID != planID {
+		return "", fmt.Errorf("WebAuthn session was minted for board plan %s, not %s", bound.planID, planID)
+	}
+	if !bytes.Equal(bound.selectionHash, selectionHash) {
+		return "", fmt.Errorf("board plan selection changed since it was signed")
+	}
+	if !sessionData.Expires.IsZero() && sessionData.Expires.Before(time.Now()) {
+		return "", fmt.Errorf("signed board plan expired; sign it again")
+	}
+	challenge, err := base64.RawURLEncoding.DecodeString(sessionData.Challenge)
+	if err != nil || !bytes.HasSuffix(challenge, selectionHash) {
+		return "", fmt.Errorf("WebAuthn challenge is not bound to this selection")
+	}
+	wa, err := h.initWebAuthn()
+	if err != nil {
+		return "", fmt.Errorf("webauthn init: %w", err)
+	}
+	return h.finishLogin(wa, sessionData, assertion)
+}
+
+// finishLogin validates an assertion against its session and persists the
+// credential's sign count and flags. Returns the credential id (hex).
+func (h *WebAuthnHandler) finishLogin(wa *webauthn.WebAuthn, sessionData *webauthn.SessionData, assertion string) (string, error) {
+	if h.validateLogin != nil {
+		return h.validateLogin(*sessionData, assertion)
+	}
+	user := h.loadUser()
+	if len(user.credentials) == 0 {
+		return "", errNoPasskey
 	}
 
 	parsed, err := protocol.ParseCredentialRequestResponseBytes([]byte(assertion))
 	if err != nil {
-		return fmt.Errorf("assertion parse failed: %w", err)
+		return "", fmt.Errorf("assertion parse failed: %w", err)
 	}
 	adopted := user.adoptLegacyFlags(parsed.RawID, parsed.Response.AuthenticatorData.Flags)
 
 	cred, err := wa.ValidateLogin(user, *sessionData, parsed)
 	if err != nil {
-		return fmt.Errorf("assertion verification failed: %w", err)
+		return "", fmt.Errorf("assertion verification failed: %w", err)
 	}
 
 	// Persist signCount (cloned-authenticator defence) and the flags as of this
@@ -552,7 +669,7 @@ func (h *WebAuthnHandler) VerifyAssertion(r *http.Request, assertion string) err
 			slog.Bool("backup_eligible", cred.Flags.BackupEligible),
 			slog.Bool("backup_state", cred.Flags.BackupState))
 	}
-	return nil
+	return fmt.Sprintf("%x", cred.ID), nil
 }
 
 // ListCredentials handles GET /api/board/webauthn/credentials
