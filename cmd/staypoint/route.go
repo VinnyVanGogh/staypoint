@@ -134,7 +134,7 @@ var routeCmd = &cobra.Command{
 				fmt.Printf("  %s %-18s | 5h Left: %5s | Week Left: %5s | Runway: %3d turns",
 					statusIcon, pool.Name, pool.FiveHour.FormatPct(true, 1), pool.Weekly.FormatPct(true, 1), pool.TurnsRunway)
 				if pool.IsLocked {
-					fmt.Printf(" (resets @%s)", pool.LockoutUntil.Format("03:04pm"))
+					fmt.Printf(" (resets %s)", router.FormatReset(pool.LockoutUntil, time.Now()))
 				}
 				fmt.Println()
 			}
