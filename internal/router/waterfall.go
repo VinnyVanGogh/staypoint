@@ -378,6 +378,14 @@ func Route(ctx context.Context, cwd string, pacerState *PacerState, opts RouteOp
 		decision.Model = "claude-opus-5"
 		decision.Command = "CLAUDE_CONFIG_DIR=~/.claude-work claude"
 		decision.Reason = fmt.Sprintf("Enterprise work repo (%s); remote node %s unreachable via SSH, routing to local Claude Code with Managed Solution work seat", workSrc, opts.RemoteHost)
+		if u, model := uioliSteer(poolWork, now, opts); u.Active {
+			if model != "" {
+				decision.Model = model
+			}
+			decision.Reason = fmt.Sprintf("Enterprise work repo (%s): %s - Claude Code on the work seat (%s)", workSrc, u.describe(), u.Note(PoolWorkClaude, decision.Model))
+		} else if opts.PreferredModel != "" {
+			decision.Model = opts.PreferredModel
+		}
 		if opts.CheckSSH {
 			decision.Warnings = append(decision.Warnings, fmt.Sprintf("Remote node %s unreachable via SSH; falling back to local Claude", opts.RemoteHost))
 		}
@@ -428,18 +436,30 @@ func Route(ctx context.Context, cwd string, pacerState *PacerState, opts RouteOp
 	}
 
 	// Use-it-or-lose-it: near the weekly reset with unspent personal Claude
-	// quota, high-priority work gets the top-tier model.
+	// quota, runs get the top-tier model (uioliSteer).
 	if poolPersonal != nil {
-		if u := poolPersonal.UIOLIPressure(now, opts.UIOLI); u.Active {
-			if opts.PreferredModel == "" && opts.HighPriority {
-				opts.PreferredModel = UIOLIHighPriorityModel
-			}
-			return routeToClaude("Personal repo: " + u.describe() + " - Claude Code")
+		if u, model := uioliSteer(poolPersonal, now, opts); u.Active {
+			opts.PreferredModel = model
+			d, _ := routeToClaude("Personal repo: " + u.describe() + " - Claude Code")
+			d.Reason += " (" + u.Note(PoolPersonalClaude, d.Model) + ")"
+			return d, nil
 		}
 		return routeToClaude(fmt.Sprintf("Personal repo: Claude Code on the personal seat (%d turns runway | week: %s left)",
 			poolPersonal.TurnsRunway, poolPersonal.Weekly.FormatPct(true, 1)))
 	}
 	return routeToClaude("Personal repo: Claude Code on the personal seat")
+}
+
+// uioliSteer evaluates use-it-or-lose-it pressure on a Claude seat's pool and
+// returns the model to run: an explicit PreferredModel always wins; otherwise
+// the top-tier model when the pool is in its window and the config steers this
+// run. A locked or nil pool is never under pressure.
+func uioliSteer(pool *QuotaPool, now time.Time, opts RouteOptions) (UIOLIPressure, string) {
+	u := pool.UIOLIPressure(now, opts.UIOLI)
+	if u.Active && opts.PreferredModel == "" && opts.UIOLI.Steers(opts.HighPriority) {
+		return u, UIOLIHighPriorityModel
+	}
+	return u, opts.PreferredModel
 }
 
 // firstComponentUnder returns the first path element of p below root, or ""
