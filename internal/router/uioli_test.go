@@ -40,7 +40,12 @@ func TestUIOLIPressure(t *testing.T) {
 	}{
 		{"end of window, unspent quota", 38, 7 * time.Hour, UIOLIConfig{}, true},
 		{"mid-week, plenty left is inactive", 38, 4 * 24 * time.Hour, UIOLIConfig{}, false},
-		{"end of window but nearly spent", 5, 3 * time.Hour, UIOLIConfig{}, false},
+		{"near reset, crumbs still expire", 5, 3 * time.Hour, UIOLIConfig{}, true},    // floor 3%
+		{"near reset, only dust left", 2, 3 * time.Hour, UIOLIConfig{}, false},        // floor 3%
+		{"start of window, crumbs ignored", 10, 20 * time.Hour, UIOLIConfig{}, false}, // floor 12.5%
+		{"work seat tonight: 15% left, 7h to reset", 15, 7 * time.Hour, UIOLIConfig{}, true},
+		{"floor is inclusive", 7.5, 12 * time.Hour, UIOLIConfig{MinPctPerHour: 0.5}, true}, // floor 7.5%
+		{"just under the floor", 7.4, 12 * time.Hour, UIOLIConfig{MinPctPerHour: 0.5}, false},
 		{"disabled by config", 38, 7 * time.Hour, UIOLIConfig{Disabled: true}, false},
 		{"custom window widens trigger", 38, 30 * time.Hour, UIOLIConfig{WindowHours: 48}, true},
 		{"low burn-down rate below threshold", 20, 23 * time.Hour, UIOLIConfig{}, false}, // 0.87%/h < 1
@@ -96,8 +101,15 @@ func TestUIOLIRoutingPrefersPersonalClaudeOverGemini(t *testing.T) {
 	if hp.Model != UIOLIHighPriorityModel {
 		t.Errorf("high-priority UIOLI model=%s want %s", hp.Model, UIOLIHighPriorityModel)
 	}
-	if lo, _ := Route(ctx, repo, st, RouteOptions{Now: uioliNow}); lo.Model == UIOLIHighPriorityModel {
-		t.Errorf("normal-priority task must not get the top-tier model")
+	if lo, _ := Route(ctx, repo, st, RouteOptions{Now: uioliNow}); lo.Model != UIOLIHighPriorityModel {
+		t.Errorf("every run in the window steers by default, got %s", lo.Model)
+	}
+	hpOnly := UIOLIConfig{HighPriorityOnly: true}
+	if lo, _ := Route(ctx, repo, st, RouteOptions{Now: uioliNow, UIOLI: hpOnly}); lo.Model == UIOLIHighPriorityModel {
+		t.Errorf("high_priority_only: normal-priority task must not get the top-tier model")
+	}
+	if hi, _ := Route(ctx, repo, st, RouteOptions{Now: uioliNow, UIOLI: hpOnly, HighPriority: true}); hi.Model != UIOLIHighPriorityModel {
+		t.Errorf("high_priority_only: high-priority task model=%s want %s", hi.Model, UIOLIHighPriorityModel)
 	}
 	pinned, _ := Route(ctx, repo, st, RouteOptions{Now: uioliNow, HighPriority: true, PreferredModel: "sonnet"})
 	if pinned.Model != "sonnet" {
@@ -223,5 +235,141 @@ func TestReadSamplesTailBackfillsMissingWeekly(t *testing.T) {
 	}
 	if p.Weekly.ResetsAt.Unix() != int64(futureReset) {
 		t.Fatalf("expected ResetsAt %v, got %v", int64(futureReset), p.Weekly.ResetsAt.Unix())
+	}
+}
+
+// uioliWorkState: work seat in its burn-down window, personal seat mid-week
+// (not in its window), Gemini with plenty of headroom.
+func uioliWorkState(workLeft float64, resetIn time.Duration) *PacerState {
+	st := uioliState(60, 4*24*time.Hour, 80)
+	st.Pools[PoolWorkClaude] = &QuotaPool{
+		ID:          PoolWorkClaude,
+		TurnsRunway: 50,
+		FiveHour:    QuotaWindow{RemainingPct: 100, Known: true},
+		Weekly: QuotaWindow{
+			UsedPct: 100 - workLeft, RemainingPct: workLeft,
+			ResetsAt: uioliNow.Add(resetIn), Known: true,
+		},
+	}
+	return st
+}
+
+func TestUIOLIWorkSeatInteractiveRoute(t *testing.T) {
+	ctx := context.Background()
+	repo := "/Users/vincevasile/Documents/dev/mansol-apps-server/github_repo-prod"
+	st := uioliWorkState(15, 7*time.Hour)
+
+	d, _ := Route(ctx, repo, st, RouteOptions{Now: uioliNow})
+	if d.Target != TargetLocalClaudeWork || d.Tool != "claude" || d.Model != UIOLIHighPriorityModel {
+		t.Fatalf("work seat in window: want Fable on local work seat, got %s/%s/%s (%s)", d.Target, d.Tool, d.Model, d.Reason)
+	}
+	if !strings.Contains(d.Reason, "UIOLI active: pool work-claude") {
+		t.Errorf("reason must carry the UIOLI note: %s", d.Reason)
+	}
+
+	if d, _ := Route(ctx, repo, st, RouteOptions{Now: uioliNow, PreferredModel: "sonnet"}); d.Model != "sonnet" {
+		t.Errorf("explicit model must win in a work repo, got %s", d.Model)
+	}
+	if d, _ := Route(ctx, repo, st, RouteOptions{Now: uioliNow, UIOLI: UIOLIConfig{Disabled: true}}); d.Model != "claude-opus-5" || strings.Contains(d.Reason, "UIOLI") {
+		t.Errorf("disabled: want plain opus, got %s (%s)", d.Model, d.Reason)
+	}
+	if d, _ := Route(ctx, repo, uioliWorkState(15, 4*24*time.Hour), RouteOptions{Now: uioliNow}); d.Model != "claude-opus-5" {
+		t.Errorf("mid-week work seat must not steer, got %s", d.Model)
+	}
+
+	locked := uioliWorkState(15, 7*time.Hour)
+	locked.Pools[PoolWorkClaude].IsLocked = true
+	d, _ = Route(ctx, repo, locked, RouteOptions{Now: uioliNow})
+	if d.Target != TargetClaudePersonal || d.Model == UIOLIHighPriorityModel || strings.Contains(d.Reason, "UIOLI") {
+		t.Errorf("locked work seat: want personal fallback without UIOLI, got %s/%s (%s)", d.Target, d.Model, d.Reason)
+	}
+
+	// Personal repo is unaffected by the work seat's window.
+	if d, _ := Route(ctx, "/Users/vincevasile/Documents/dev/personal-app", st, RouteOptions{Now: uioliNow}); d.Model == UIOLIHighPriorityModel || d.Target != TargetClaudePersonal {
+		t.Errorf("personal repo must not steer off the work seat's window, got %s/%s", d.Target, d.Model)
+	}
+}
+
+func TestUIOLIDaemonRouteSteersWorkSeatToFable(t *testing.T) {
+	cfg := &UIOLIConfig{}
+	st := uioliWorkState(15, 7*time.Hour)
+
+	for _, kind := range []string{"coding", "qa", "docs", "planning", "review", "architecture"} {
+		r := ResolveRouteChoice(kind, true, st, RouteChoice{UIOLI: cfg}, uioliNow)
+		s, ok := r.Chosen()
+		if !ok || s.Family != FamilyClaude || s.Seat != SeatWork || s.Model != UIOLIHighPriorityModel {
+			t.Errorf("%s: want Fable on the work seat, got %+v ok=%v", kind, s, ok)
+		}
+		if r.Candidates[0].Family == FamilyGemini {
+			t.Errorf("%s: Gemini must never be chosen under UIOLI", kind)
+		}
+		if !strings.Contains(r.UIOLINote, "pool work-claude") || !strings.Contains(r.Body(), r.UIOLINote) {
+			t.Errorf("%s: note %q must be on the route row body %q", kind, r.UIOLINote, r.Body())
+		}
+		if r.Title() != "Ran on Claude Fable · work seat" {
+			t.Errorf("%s: title=%q", kind, r.Title())
+		}
+		for _, c := range r.Candidates[1:] {
+			if c.Model == UIOLIHighPriorityModel {
+				t.Errorf("%s: only the steered slot runs Fable, got %+v", kind, c)
+			}
+		}
+	}
+
+	// Coding chain keeps its personal fallback on opus.
+	r := ResolveRouteChoice("coding", true, st, RouteChoice{UIOLI: cfg}, uioliNow)
+	if len(r.Candidates) != 2 || r.Candidates[1].Seat != SeatPersonal || r.Candidates[1].Model != "opus" {
+		t.Errorf("personal fallback changed: %+v", r.Candidates)
+	}
+}
+
+func TestUIOLIDaemonRouteLeavesOtherRoutesAlone(t *testing.T) {
+	cfg := &UIOLIConfig{}
+	st := uioliWorkState(15, 7*time.Hour)
+	chosen := func(r KindRoute) RouteSlot { s, _ := r.Chosen(); return s }
+
+	if r := ResolveRouteChoice("coding", false, st, RouteChoice{UIOLI: cfg}, uioliNow); chosen(r).Model != "opus" || r.UIOLINote != "" {
+		t.Errorf("personal repo (personal seat mid-week) must be unaffected, got %+v note=%q", chosen(r), r.UIOLINote)
+	}
+	if r := ResolveRouteChoice("coding", true, st, RouteChoice{}, uioliNow); chosen(r).Model != "opus" || r.UIOLINote != "" {
+		t.Errorf("nil UIOLI config must leave the route alone, got %+v", chosen(r))
+	}
+	if r := ResolveRouteChoice("coding", true, st, RouteChoice{UIOLI: &UIOLIConfig{Disabled: true}}, uioliNow); chosen(r).Model != "opus" {
+		t.Errorf("disabled must not steer, got %+v", chosen(r))
+	}
+	if r := ResolveRouteChoice("coding", true, st, RouteChoice{Model: "sonnet", UIOLI: cfg}, uioliNow); chosen(r).Model != "sonnet" || r.UIOLINote != "" {
+		t.Errorf("explicit model must win, got %+v", chosen(r))
+	}
+	if r := ResolveRouteChoice("docs", true, st, RouteChoice{Provider: ProviderGemini, UIOLI: cfg}, uioliNow); chosen(r).Family != FamilyGemini || r.UIOLINote != "" {
+		t.Errorf("Board's provider=gemini on a docs task stays, got %+v", chosen(r))
+	}
+
+	hpOnly := &UIOLIConfig{HighPriorityOnly: true}
+	if r := ResolveRouteChoice("coding", true, st, RouteChoice{UIOLI: hpOnly}, uioliNow); chosen(r).Model != "opus" {
+		t.Errorf("high_priority_only, normal task: want opus, got %+v", chosen(r))
+	}
+	if r := ResolveRouteChoice("coding", true, st, RouteChoice{UIOLI: hpOnly, HighPriority: true}, uioliNow); chosen(r).Model != UIOLIHighPriorityModel {
+		t.Errorf("high_priority_only, high task: want Fable, got %+v", chosen(r))
+	}
+
+	// Locked work seat: hard lock or a spent 5h window. Never steered to;
+	// the personal fallback runs its normal model.
+	hard := uioliWorkState(15, 7*time.Hour)
+	hard.Pools[PoolWorkClaude].IsLocked = true
+	fiveH := uioliWorkState(15, 7*time.Hour)
+	fiveH.Pools[PoolWorkClaude].FiveHour = QuotaWindow{RemainingPct: 0, ResetsAt: uioliNow.Add(time.Hour), Known: true}
+	for name, p := range map[string]*PacerState{"hard lock": hard, "5h spent": fiveH} {
+		r := ResolveRouteChoice("coding", true, p, RouteChoice{UIOLI: cfg}, uioliNow)
+		if s := chosen(r); s.Seat != SeatPersonal || s.Model != "opus" || r.UIOLINote != "" {
+			t.Errorf("%s: want personal opus fallback without UIOLI, got %+v note=%q", name, s, r.UIOLINote)
+		}
+	}
+}
+
+func TestIsHighPriority(t *testing.T) {
+	for p, want := range map[string]bool{"high": true, "Urgent": true, "critical": true, "medium": false, "": false, "low": false} {
+		if IsHighPriority(p) != want {
+			t.Errorf("IsHighPriority(%q) != %v", p, want)
+		}
 	}
 }

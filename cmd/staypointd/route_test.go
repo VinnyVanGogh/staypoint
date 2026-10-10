@@ -504,3 +504,65 @@ func TestRouteTracker_OnlyEmitsOnSwitch(t *testing.T) {
 		t.Errorf("provider = %q", tr.Provider())
 	}
 }
+
+// uioliPacer: the work seat's weekly window resets in 7h with 15% left (the
+// Board's 2026-10-09 case); the personal seat is mid-week.
+func uioliPacer() *router.PacerState {
+	now := time.Now()
+	return &router.PacerState{Pools: map[router.PoolID]*router.QuotaPool{
+		router.PoolWorkClaude: {ID: router.PoolWorkClaude,
+			Weekly: router.QuotaWindow{RemainingPct: 15, UsedPct: 85, ResetsAt: now.Add(7 * time.Hour), Known: true}},
+		router.PoolPersonalClaude: {ID: router.PoolPersonalClaude,
+			Weekly: router.QuotaWindow{RemainingPct: 60, UsedPct: 40, ResetsAt: now.Add(96 * time.Hour), Known: true}},
+	}}
+}
+
+// Daemon runs (not just the interactive router) steer the work seat to Fable
+// near its weekly reset, and the route row says so.
+func TestWake_UIOLIWorkSeatRunsFable(t *testing.T) {
+	r := runWake(t, workRepo(t), "coding", uioliPacer(), "")
+	cfgDir, args := mustOneSpawn(t, r)
+	home, _ := os.UserHomeDir()
+	if !isClaude(args) || !strings.Contains(args, "--model "+router.UIOLIHighPriorityModel) {
+		t.Errorf("spawned %q, want claude --model %s", args, router.UIOLIHighPriorityModel)
+	}
+	if cfgDir != home+"/.claude-work" {
+		t.Errorf("CLAUDE_CONFIG_DIR = %q, want the work seat", cfgDir)
+	}
+	if len(r.routes) != 1 || r.routes[0] != "Ran on Claude Fable · work seat" {
+		t.Errorf("route rows = %q", r.routes)
+	}
+	if len(r.bodies) == 0 || !strings.Contains(r.bodies[0], "UIOLI active: pool work-claude") {
+		t.Errorf("route body must carry the UIOLI note: %q", r.bodies)
+	}
+}
+
+// A docs task in a work repo normally runs Gemini first; in the window the
+// work seat's Claude slot runs instead, so the expiring quota is used.
+func TestWake_UIOLIWorkSeatBeatsDefaultGemini(t *testing.T) {
+	r := runWake(t, workRepo(t), "docs", uioliPacer(), "")
+	_, args := mustOneSpawn(t, r)
+	if !isClaude(args) || !strings.Contains(args, "--model "+router.UIOLIHighPriorityModel) {
+		t.Errorf("spawned %q, want Claude Fable, never Gemini", args)
+	}
+}
+
+func TestResolveTaskRoute_UIOLIHighPriorityOnly(t *testing.T) {
+	orig := routeUIOLI
+	t.Cleanup(func() { routeUIOLI = orig })
+	routeUIOLI = router.UIOLIConfig{HighPriorityOnly: true}
+	store := openTestStore(t)
+	repo := workRepo(t)
+	for id, prio := range map[string]string{"t-high": "high", "t-medium": "medium"} {
+		if _, err := store.DB().Exec(`INSERT INTO tasks (id, name, repo_path, work_kind, priority) VALUES (?, 'n', ?, 'coding', ?)`, id, repo, prio); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now()
+	if s, _ := resolveTaskRoute(store.DB(), "t-high", repo, uioliPacer(), now).Chosen(); s.Model != router.UIOLIHighPriorityModel {
+		t.Errorf("high-priority task: want Fable, got %+v", s)
+	}
+	if s, _ := resolveTaskRoute(store.DB(), "t-medium", repo, uioliPacer(), now).Chosen(); s.Model != "opus" {
+		t.Errorf("medium task with high_priority_only: want opus, got %+v", s)
+	}
+}
