@@ -101,6 +101,9 @@ type routeTracker struct {
 	// geminiSpawned is set whenever a Gemini CLI is about to stream; the
 	// harness consumes it after each turn for the STA-856 guard.
 	geminiSpawned bool
+	// lastSeat labels the most recent spawn ("Claude Opus · personal seat");
+	// the harness consumes it after each turn to record the seat used.
+	lastSeat string
 }
 
 func newRouteTracker(route router.KindRoute, emit func(title, body string)) *routeTracker {
@@ -125,6 +128,10 @@ func (t *routeTracker) Observe(a adapter.AttemptInfo) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.provider = a.Provider
+	t.lastSeat = a.Slot.Label()
+	if a.Slot == (router.RouteSlot{}) {
+		t.lastSeat = a.Name
+	}
 	if a.Provider == "gemini" || a.Slot.Family == router.FamilyGemini {
 		t.geminiSpawned = true
 	}
@@ -157,6 +164,16 @@ func (t *routeTracker) TakeGeminiSpawned() bool {
 	v := t.geminiSpawned
 	t.geminiSpawned = false
 	return v
+}
+
+// TakeSeat returns the label of the seat spawned since the last call ("" when
+// nothing spawned, e.g. every seat locked), and resets (RunConfig.TurnSeat).
+func (t *routeTracker) TakeSeat() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s := t.lastSeat
+	t.lastSeat = ""
+	return s
 }
 
 // Provider is the provider of the most recent (or planned) spawn.

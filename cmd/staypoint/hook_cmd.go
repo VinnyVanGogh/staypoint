@@ -255,21 +255,22 @@ func handleHookPrompt() {
 				return false
 			}
 			if pool.FiveHour.UsedPct >= 85.0 || (pool.FiveHour.RemainingPct > 0 && pool.FiveHour.RemainingPct <= 15.0) {
+				// Reset times are stored in UTC; FormatReset shows them in local time.
 				resetStr := "soon"
 				if !pool.FiveHour.ResetsAt.IsZero() {
-					resetStr = pool.FiveHour.ResetsAt.Format("3:04pm")
+					resetStr = router.FormatReset(pool.FiveHour.ResetsAt, time.Now())
 				} else if !pool.LockoutUntil.IsZero() {
-					resetStr = pool.LockoutUntil.Format("3:04pm")
+					resetStr = router.FormatReset(pool.LockoutUntil, time.Now())
 				}
-				warningReason = fmt.Sprintf("5-hour session quota is at %.0f%% (~%.0f%% left, resets @%s)", pool.FiveHour.UsedPct, pool.FiveHour.RemainingPct, resetStr)
+				warningReason = fmt.Sprintf("5-hour session quota is at %.0f%% (~%.0f%% left, resets %s)", pool.FiveHour.UsedPct, pool.FiveHour.RemainingPct, resetStr)
 				return true
 			}
 			if pool.Weekly.UsedPct >= 85.0 || (pool.Weekly.RemainingPct > 0 && pool.Weekly.RemainingPct <= 15.0) {
 				resetStr := "soon"
 				if !pool.Weekly.ResetsAt.IsZero() {
-					resetStr = pool.Weekly.ResetsAt.Format("Mon 3:04pm")
+					resetStr = router.FormatReset(pool.Weekly.ResetsAt, time.Now())
 				}
-				warningReason = fmt.Sprintf("weekly quota is at %.0f%% (only %.0f%% remaining, resets @%s)", pool.Weekly.UsedPct, pool.Weekly.RemainingPct, resetStr)
+				warningReason = fmt.Sprintf("weekly quota is at %.0f%% (only %.0f%% remaining, resets %s)", pool.Weekly.UsedPct, pool.Weekly.RemainingPct, resetStr)
 				return true
 			}
 			if pool.IsLocked {
@@ -584,7 +585,7 @@ func handleHookPreTool() {
 	// the command cannot change) asks the Board for anything that breaks an
 	// unattended-run Board rule, whatever its tier (task-9d94997c).
 	if taskID != "" {
-		raiseForBoardRules(bashInput.Command, cwd, snap, &verdict)
+		raiseForBoardRules(bashInput.Command, cwd, snap, &verdict, taskID)
 	}
 
 	if pinned := pinJudged(bashInput.Command, &verdict); pinned != "" {
@@ -680,13 +681,14 @@ func deferredMessage(id string) string {
 }
 
 // raiseForBoardRules raises v to Red when cmd, or a script it runs, breaks a
-// Board rule. Scripts are read through snap, as on the Red path.
-func raiseForBoardRules(cmd, cwd string, snap *security.Snapshotter, v *security.Verdict) {
+// Board rule. Scripts are read through snap, as on the Red path. taskID is
+// the run's own task, whose handoff files it may read.
+func raiseForBoardRules(cmd, cwd string, snap *security.Snapshotter, v *security.Verdict, taskID string) {
 	var hashes []security.ScriptHash
 	for _, r := range security.ScriptRefs(cmd, cwd, snap, 0) {
 		hashes = append(hashes, security.ScriptHash{Path: r.Path, Content: string(r.Full)})
 	}
-	if why := security.AnalyzeBoardRules(cmd, hashes); why != "" {
+	if why := security.AnalyzeBoardRulesForTask(taskID, cmd, hashes); why != "" {
 		v.Tier = security.Red
 		v.Reasons = append(v.Reasons, "board rule: "+why)
 	}

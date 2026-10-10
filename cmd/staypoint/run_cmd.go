@@ -125,6 +125,9 @@ The harness:
 		if result.Disposition == "in_progress" {
 			return fmt.Errorf("interceptor blocked completion; task remains in_progress")
 		}
+		if result.Disposition == "blocked" {
+			return fmt.Errorf("run did not start; task blocked: %s", result.DiagnosticMsg)
+		}
 		return nil
 	},
 }

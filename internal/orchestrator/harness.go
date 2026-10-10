@@ -143,6 +143,29 @@ type RunConfig struct {
 	// TurnUsedGemini reports whether a Gemini CLI was spawned since its last
 	// call, and resets. Nil falls back to the static Provider.
 	TurnUsedGemini func() bool
+	// TurnSeat names the provider and seat the turn that just ran was spawned
+	// on ("Claude Opus · personal seat"), and resets. Nil or "" falls back to
+	// Provider. Recorded per turn so a seat switch mid-run is on the record.
+	TurnSeat func() string
+}
+
+// turnSeat names the seat the turn that just ran used.
+func (cfg RunConfig) turnSeat() string {
+	if cfg.TurnSeat != nil {
+		if s := cfg.TurnSeat(); s != "" {
+			return s
+		}
+	}
+	return cfg.Provider
+}
+
+// seatLimitErr is implemented by adapter errors for a turn that ended because
+// a seat ran out of quota (adapter.SeatLimitError). SeatsExhausted is true when
+// no seat in the chain can take work, so the run must wait for a reset. It is
+// matched by method so this package does not import the adapter.
+type seatLimitErr interface {
+	error
+	SeatsExhausted() bool
 }
 
 // turnUsedGemini reports whether the turn that just ran spawned Gemini.
@@ -162,6 +185,10 @@ type RunResult struct {
 	Disposition   string // "in_review" | "done" | "capped" | "in_progress"
 	DiffStat      string
 	DiagnosticMsg string // non-empty when interceptor blocked the transition
+	// QuotaWait is set when the run ended because every seat in its chain is
+	// out of quota. The task stays in_progress and the caller queues it to
+	// resume when a seat resets (WaitQuota); it is not a failure.
+	QuotaWait bool
 }
 
 // WorktreeManagerIface abstracts worktree operations for testability.
@@ -226,6 +253,23 @@ func preflightBranch(ctx context.Context, db *sql.DB, repo, taskID string) strin
 		return b
 	}
 	return "main"
+}
+
+// preflightMergeBase is the base pre-flight may merge a diverged task branch
+// over: the task's verified recorded base, and only when the task also has a
+// recorded target. Otherwise preflightBranch fell back to a project or repo
+// default, which may not be the line the task was cut from, and "" keeps
+// pre-flight fast-forward only so it fails safe instead of merging main into
+// a dev-server task.
+func preflightMergeBase(ctx context.Context, db *sql.DB, repo, taskID string) string {
+	if target, err := workspace.RecordedTaskTarget(ctx, db, taskID); err != nil || target == "" {
+		return ""
+	}
+	base, err := workspace.VerifiedBase(ctx, db, repo, taskID)
+	if err != nil {
+		return ""
+	}
+	return base
 }
 
 func newWorktreeManager(repoRoot string, db *sql.DB) *workspace.WorktreeManager {
@@ -504,7 +548,8 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 	// Skipped when cfg.SkipGitPreflight is true (tests running in a non-git dir).
 	if !cfg.SkipGitPreflight && !nonGit {
 		gfCtx, gfCancel := context.WithTimeout(ctx, 60*time.Second)
-		gfResult, gfErr := gitgate.PreFlight(gfCtx, wtPath, preflightBranch(gfCtx, h.DB, repoPath, taskID))
+		gfBranch := preflightBranch(gfCtx, h.DB, repoPath, taskID)
+		gfResult, gfErr := gitgate.PreFlightMerge(gfCtx, wtPath, gfBranch, preflightMergeBase(gfCtx, h.DB, repoPath, taskID))
 		gfCancel()
 		gfSummary := "git-preflight: "
 		if gfErr != nil {
@@ -520,22 +565,31 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			taskID, gfSummary,
 		)
 		if gfErr != nil || (gfResult != nil && !gfResult.OK) {
-			result.Disposition = "in_progress"
+			// Park the task as blocked with the reason on it: ending as
+			// in_progress showed the Board only "Finished: in_progress" and a
+			// 3s run that looked like it had worked (task-25ac4f3b).
+			blockReason := "git pre-flight failed: " + strings.TrimPrefix(gfSummary, "git-preflight: ")
+			if gfResult != nil && len(gfResult.Conflicts) > 0 {
+				blockReason = fmt.Sprintf("git pre-flight: task branch conflicts with origin/%s in %s. Resolve the merge on the branch, then Run Now.",
+					gfBranch, strings.Join(gfResult.Conflicts, ", "))
+			}
+			result.Disposition = governance.StageBlocked
 			result.DiagnosticMsg = gfSummary
 			if sr != nil {
-				sr.EmitState("in_progress")
+				sr.EmitMessage("Git pre-flight failed", blockReason, "error")
+				sr.EmitState(governance.StageBlocked)
 				sr.Close()
 			}
 			cleanCtx2, cleanCancel2 := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cleanCancel2()
 			now2 := time.Now().UTC().Format(time.RFC3339Nano)
 			_, _ = h.DB.ExecContext(cleanCtx2,
-				`UPDATE tasks SET execution_stage='in_progress', updated_at=? WHERE id=?`+closedStageGuard,
-				now2, taskID,
+				`UPDATE tasks SET execution_stage='blocked', is_blocked=1, block_reason=?, updated_at=? WHERE id=?`+closedStageGuard,
+				blockReason, now2, taskID,
 			)
 			_, _ = h.DB.ExecContext(cleanCtx2,
 				`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'run_complete', ?)`,
-				taskID, "disposition=in_progress turns=0 reason=git_preflight_failed",
+				taskID, "disposition=blocked turns=0 reason=git_preflight_failed",
 			)
 			return result, nil
 		}
@@ -761,7 +815,47 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 			}
 
 			turnDuration := time.Since(turnStart)
-			if turnErr != nil {
+			// Record which seat ran this turn: work -> personal switches
+			// happen inside a run and must be visible afterwards.
+			seat := cfg.turnSeat()
+			if seat != "" {
+				_, _ = h.DB.ExecContext(ctx,
+					`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'turn_seat', ?)`,
+					taskID, fmt.Sprintf("turn %d ran on %s", turn, seat),
+				)
+			}
+			var limitErr seatLimitErr
+			if errors.As(turnErr, &limitErr) {
+				// A seat out of quota is a wait, not a broken provider: it
+				// never counts toward the consecutive-failure stop.
+				consecutiveAdapterErrors = 0
+				runLog.Info("seat out of quota",
+					slog.Int("turn", turn),
+					slog.Bool("all_seats", limitErr.SeatsExhausted()),
+					slog.String("detail", limitErr.Error()),
+				)
+				_, _ = h.DB.ExecContext(ctx,
+					`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'seat_limit', ?)`,
+					taskID, limitErr.Error(),
+				)
+				if limitErr.SeatsExhausted() {
+					if stw, ok := stdout.(*stepTeeWriter); ok {
+						_ = stw.Close()
+					}
+					result.Turns++
+					result.QuotaWait = true
+					result.Disposition = "in_progress"
+					result.DiagnosticMsg = "Waiting for a Claude seat: " + limitErr.Error() +
+						". The run is queued and resumes on its own when a seat resets."
+					sawOutput = true // the wait row explains the run
+					if sr != nil {
+						sr.EmitMessage("Waiting for a Claude seat", limitErr.Error(), "done")
+					}
+					break
+				}
+				// The seat ran out mid-turn after doing work; the next turn
+				// re-routes past it to the next seat.
+			} else if turnErr != nil {
 				lastTurnWasAdapterError = true
 				consecutiveAdapterErrors++
 				stderrTail := stderrBuf.String()
@@ -779,7 +873,7 @@ func (h *Harness) Run(ctx context.Context, taskID string, cfg RunConfig) (*RunRe
 					uuid.NewString(), runID, taskID, turn, exitCode,
 					truncate(stderrTail, 4096),
 					turnDuration.Milliseconds(),
-					cfg.Provider, cfg.Provider,
+					cfg.Provider, seat,
 				)
 				_, _ = h.DB.ExecContext(ctx,
 					`INSERT INTO activity_log (task_id, event_type, details) VALUES (?, 'adapter_failure', ?)`,
