@@ -122,7 +122,7 @@ func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, erro
 	if effect == DevWrite {
 		p.Timeout = writeTimeout
 	}
-	sum := []string{"host=" + r.Host, "action=" + r.Action}
+	summary := []string{"host=" + r.Host, "action=" + r.Action}
 
 	// dir is the checkout the git and file actions work in.
 	dir := appDir
@@ -139,7 +139,7 @@ func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, erro
 			return nil, err
 		}
 		app = a
-		sum = append(sum, "app="+r.App)
+		summary = append(summary, "app="+r.App)
 	}
 
 	switch r.Action {
@@ -151,7 +151,7 @@ func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, erro
 			return nil, err
 		}
 		p.Remote = "git -C " + shQuote(dir) + " log --oneline -n " + strconv.Itoa(n)
-		sum = append(sum, "lines="+strconv.Itoa(n))
+		summary = append(summary, "lines="+strconv.Itoa(n))
 	case "ls", "cat_file":
 		target, err := underDir(dir, r.Path, r.Action == "ls")
 		if err != nil {
@@ -162,7 +162,7 @@ func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, erro
 			cmd = "head -c " + strconv.Itoa(maxFileBytes) + " -- \"$p\""
 		}
 		p.Remote = resolvedUnder(target, dir) + cmd
-		sum = append(sum, "path="+target)
+		summary = append(summary, "path="+target)
 	case "journal_tail":
 		svc, err := service(hc, r.Service)
 		if err != nil {
@@ -173,14 +173,14 @@ func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, erro
 			return nil, err
 		}
 		p.Remote = "journalctl -u " + shQuote(svc) + " -n " + strconv.Itoa(n) + " --no-pager"
-		sum = append(sum, "service="+svc, "lines="+strconv.Itoa(n))
+		summary = append(summary, "service="+svc, "lines="+strconv.Itoa(n))
 	case "systemctl_status":
 		svc, err := service(hc, r.Service)
 		if err != nil {
 			return nil, err
 		}
 		p.Remote = "systemctl status " + shQuote(svc) + " --no-pager -n 20"
-		sum = append(sum, "service="+svc)
+		summary = append(summary, "service="+svc)
 	case "http_get_local":
 		if r.Port < 1 || r.Port > 65535 {
 			return nil, fmt.Errorf("port %d is not 1-65535", r.Port)
@@ -194,7 +194,7 @@ func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, erro
 		}
 		url := "http://127.0.0.1:" + strconv.Itoa(r.Port) + pth
 		p.Remote = "curl -sS -m 10 -w " + shQuote(`\nHTTP %{http_code}\n`) + " -- " + shQuote(url)
-		sum = append(sum, "port="+strconv.Itoa(r.Port), "path="+pth)
+		summary = append(summary, "port="+strconv.Itoa(r.Port), "path="+pth)
 	case "git_ff_pull":
 		allowed := hc.Branches
 		if len(allowed) == 0 {
@@ -206,7 +206,7 @@ func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, erro
 		d, b := shQuote(dir), shQuote(r.Branch)
 		p.Remote = "cur=$(git -C " + d + " branch --show-current) && [ \"$cur\" = " + b + " ] || { echo \"refused: checkout is on branch $cur, not \"" + b + " >&2; exit 3; }; " +
 			"git -C " + d + " pull --ff-only origin " + b + " && git -C " + d + " log --oneline -1"
-		sum = append(sum, "branch="+r.Branch)
+		summary = append(summary, "branch="+r.Branch)
 	case "restart":
 		svc, err := service(hc, r.Service)
 		if err != nil {
@@ -217,7 +217,7 @@ func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, erro
 			pre = "sudo -n "
 		}
 		p.Remote = pre + "systemctl restart " + shQuote(svc) + " && systemctl is-active " + shQuote(svc)
-		sum = append(sum, "service="+svc)
+		summary = append(summary, "service="+svc)
 	case "collectstatic", "pip_sync":
 		if r.App == "" {
 			return nil, fmt.Errorf("%s needs app (one of %s)", r.Action, strings.Join(appNames(hc), ", "))
@@ -239,7 +239,7 @@ func PlanDevHost(gates config.GatesConfig, r DevHostRequest) (*DevHostPlan, erro
 		}
 		p.Remote = "cd " + shQuote(dir) + " && " + shQuote(py) + " -m pip install -r " + shQuote(req)
 	}
-	p.Summary = strings.Join(sum, " ")
+	p.Summary = strings.Join(summary, " ")
 	return p, nil
 }
 

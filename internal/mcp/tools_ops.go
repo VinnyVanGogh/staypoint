@@ -378,21 +378,21 @@ func (s *Server) handlePRBody(ctx context.Context, rawArgs json.RawMessage) *Too
 		return opstools.Call{Tool: "pr_body", Effect: effect,
 			Summary: fmt.Sprintf("gh_repo=%s pr=%d head=%s bytes=%d text_sha256=%x", ghRepo, args.PR, v.HeadRefName, len(args.Text), sum)}, ghRepo, nil
 	}
-	c, ghRepo, bad := view()
-	if bad != nil {
-		return bad
+	c, ghRepo, errRes := view()
+	if errRes != nil {
+		return errRes
 	}
 	reason := fmt.Sprintf("%s: replace the body of PR #%d in GitHub repo %s, which is not this task's repo or is a release PR", c.Effect, args.PR, ghRepo)
 	if res := s.gate(ctx, c, reason, args.ApprovalGateID); res != nil {
 		return res
 	}
 	if c.Effect != opstools.DevWrite {
-		again, _, bad := view()
-		if bad != nil {
-			return bad
+		current, _, errRes := view()
+		if errRes != nil {
+			return errRes
 		}
-		if again != c {
-			return toolError(fmt.Sprintf("pr_body refused: the PR changed while held (was %s, now %s)", c.Summary, again.Summary))
+		if current != c {
+			return toolError(fmt.Sprintf("pr_body refused: the PR changed while held (was %s, now %s)", c.Summary, current.Summary))
 		}
 	}
 	s.logOps(c)
@@ -430,9 +430,9 @@ func (s *Server) handlePRMerge(ctx context.Context, rawArgs json.RawMessage) *To
 		}
 		return plan, nil
 	}
-	plan, bad := view()
-	if bad != nil {
-		return bad
+	plan, errRes := view()
+	if errRes != nil {
+		return errRes
 	}
 	reason := fmt.Sprintf("%s: merge PR #%d into %s of GitHub repo %s (head %s)", plan.Effect, plan.PR, req.Base, plan.GHRepo, plan.HeadSHA[:12])
 	if plan.Effect == opstools.ProdWrite {
@@ -442,12 +442,12 @@ func (s *Server) handlePRMerge(ctx context.Context, rawArgs json.RawMessage) *To
 		return res
 	}
 	// The Board may have taken a while: merge only what it saw.
-	again, bad := view()
-	if bad != nil {
-		return bad
+	current, errRes := view()
+	if errRes != nil {
+		return errRes
 	}
-	if again.Summary != plan.Summary {
-		return toolError(fmt.Sprintf("pr_merge refused: the PR changed while held (was %s, now %s); not merged", plan.Summary, again.Summary))
+	if current.Summary != plan.Summary {
+		return toolError(fmt.Sprintf("pr_merge refused: the PR changed while held (was %s, now %s); not merged", plan.Summary, current.Summary))
 	}
 	s.logOps(plan.Call)
 	merged := run(ctx, opstools.Cmd{Name: "gh", Args: plan.MergeArgs(), Dir: plan.Repo})
