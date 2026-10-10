@@ -2,6 +2,8 @@ package testgate
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -26,8 +28,8 @@ func TestWorkflowRunsTests(t *testing.T) {
 		"dotnet":     "      - run: dotnet test\n",
 	}
 	for name, y := range yes {
-		if !WorkflowRunsTests(y) {
-			t.Errorf("%s: WorkflowRunsTests = false, want true for\n%s", name, y)
+		if !RunsTests(y, nil) {
+			t.Errorf("%s: RunsTests = false, want true for\n%s", name, y)
 		}
 	}
 	no := map[string]string{
@@ -38,8 +40,8 @@ func TestWorkflowRunsTests(t *testing.T) {
 		"word inside":   "      - run: echo latest testing contest\n",
 	}
 	for name, y := range no {
-		if WorkflowRunsTests(y) {
-			t.Errorf("%s: WorkflowRunsTests = true, want false for\n%s", name, y)
+		if RunsTests(y, nil) {
+			t.Errorf("%s: RunsTests = true, want false for\n%s", name, y)
 		}
 	}
 }
@@ -354,5 +356,79 @@ func TestParseCoverageRejectsCloverAsCobertura(t *testing.T) {
 	clover := `<?xml version="1.0"?><coverage generated="1"><project timestamp="1"><file name="/w/src/A.php"><line num="3" type="stmt" count="0"/></file></project></coverage>`
 	if cov, err := ParseCoverage("coverage.xml", []byte(clover)); !errors.Is(err, ErrNotCoverage) {
 		t.Fatalf("Clover: got cov=%+v err=%v, want ErrNotCoverage", cov, err)
+	}
+}
+
+// task-a5c42165: CI that runs its tests through scripts or `node --test`
+// was reported as "no CI that runs tests".
+func TestRunsTestsThroughScripts(t *testing.T) {
+	wf := "jobs:\n  t:\n    steps:\n      - name: Run\n        run: scripts/check-test-home.sh -v -race ./...\n" +
+		"      - run: |\n          cd tests/ui\n          bash ./scripts/ui-e2e.sh\n"
+	scripts := map[string]string{
+		"scripts/check-test-home.sh": "#!/usr/bin/env bash\n# runs go test\n(cd \"$REPO\" && HOME=\"$T\" go test \"$@\")\n",
+		"scripts/ui-e2e.sh":          "#!/bin/sh\nnpx playwright test \"$@\"\n",
+	}
+	if !RunsTests(wf, scripts) {
+		t.Fatal("workflow calling a script that runs go test: RunsTests = false")
+	}
+	if RunsTests(wf, nil) {
+		t.Fatal("without the scripts' content, the workflow itself runs no test command")
+	}
+	if got, want := ScriptRefs(wf), []string{"scripts/check-test-home.sh", "scripts/ui-e2e.sh"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("ScriptRefs = %v, want %v", got, want)
+	}
+	// Followed through a script that calls another script.
+	nested := map[string]string{"ci/all.sh": "./ci/unit.sh\n", "ci/unit.sh": "go test ./...\n"}
+	if !RunsTests("      - run: ci/all.sh\n", nested) {
+		t.Fatal("nested script not followed")
+	}
+	// A script that only comments about go test, or calls itself, runs none.
+	loop := map[string]string{"a.sh": "# go test ./...\n./b.sh\n", "b.sh": "./a.sh\n"}
+	if RunsTests("      - run: ./a.sh\n", loop) {
+		t.Fatal("comment-only / looping scripts must not count")
+	}
+	for _, s := range []string{"run: ../outside.sh", "run: /usr/local/bin/x.sh"} {
+		if refs := ScriptRefs(s); len(refs) != 0 {
+			t.Errorf("ScriptRefs(%q) = %v, want none outside the repo", s, refs)
+		}
+	}
+}
+
+func TestWorkflowRunsTestsNodeTest(t *testing.T) {
+	for _, y := range []string{"      - run: node --test tests/unit/*.mjs\n", "      - run: node --experimental-x --test\n"} {
+		if !RunsTests(y, nil) {
+			t.Errorf("RunsTests(%q) = false", y)
+		}
+	}
+	if RunsTests("      - run: node build.js\n", nil) {
+		t.Error("node without --test is not a test command")
+	}
+}
+
+// This repo's own CI runs go test (via scripts/check-test-home.sh),
+// node --test and Playwright (via scripts/ui-e2e.sh): it must be detected.
+func TestThisRepoCIRunsTests(t *testing.T) {
+	root := filepath.Join("..", "..")
+	wf, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scripts := map[string]string{}
+	for _, p := range ScriptRefs(string(wf)) {
+		if b, err := os.ReadFile(filepath.Join(root, p)); err == nil {
+			scripts[p] = string(b)
+		}
+	}
+	if _, ok := scripts["scripts/ui-e2e.sh"]; !ok {
+		t.Fatalf("ci.yml's scripts/ui-e2e.sh not found among %v", ScriptRefs(string(wf)))
+	}
+	if !RunsTests(string(wf), scripts) {
+		t.Fatal("this repo's ci.yml: RunsTests = false")
+	}
+	// Each of the script paths runs tests on its own too.
+	for _, p := range []string{"scripts/check-test-home.sh", "scripts/ui-e2e.sh"} {
+		if !RunsTests(scripts[p], nil) {
+			t.Errorf("%s: RunsTests = false", p)
+		}
 	}
 }
