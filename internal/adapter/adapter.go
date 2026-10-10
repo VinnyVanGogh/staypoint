@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/VinnyVanGogh/staypoint/internal/procwatch"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 )
 
@@ -49,6 +50,8 @@ func runCommandWithEnv(ctx context.Context, dir string, bin string, args []strin
 	if err := cmdExec.Start(); err != nil {
 		return fmt.Errorf("start error: %w", err)
 	}
+	// Record the agent's process group so a restarted daemon can find it.
+	procwatch.Spawned(ctx, cmdExec.Process.Pid)
 
 	ch := make(chan []byte, 1000)
 	errCh := make(chan error, 1)

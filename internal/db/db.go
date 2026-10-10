@@ -1555,6 +1555,55 @@ var Migrations = []Migration{
 			return nil
 		},
 	},
+	{
+		// PR #284 holds 46.
+		Version: 47,
+		Name:    "run_queue_and_live_runs",
+		Up: func(conn *sql.DB) error {
+			// task-db71fba9 (zero-kill deploys). run_queue persists the
+			// daemon's run queue so a restart or crash does not drop queued
+			// runs (STA-846). live_runs has one row per run the daemon is
+			// driving: the agent CLI's process group, so the next daemon can
+			// stop an orphaned agent before it claims the task again, and the
+			// turn to resume from after a deploy suspends the run.
+			for _, stmt := range []string{
+				`CREATE TABLE IF NOT EXISTS run_queue (
+					task_id   TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+					repo_key  TEXT NOT NULL DEFAULT '',
+					plain     INTEGER NOT NULL DEFAULT 0,
+					org       TEXT NOT NULL DEFAULT '',
+					reason    TEXT NOT NULL DEFAULT '',
+					wait      TEXT NOT NULL DEFAULT '',
+					queued_at TEXT NOT NULL
+				);`,
+				`CREATE TABLE IF NOT EXISTS live_runs (
+					task_id              TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+					run_id               TEXT NOT NULL,
+					daemon_pid           INTEGER NOT NULL DEFAULT 0,
+					agent_pid            INTEGER NOT NULL DEFAULT 0,
+					agent_started_at     TEXT NOT NULL DEFAULT '',
+					worktree             TEXT NOT NULL DEFAULT '',
+					next_turn            INTEGER NOT NULL DEFAULT 0,
+					last_seen_comment_id INTEGER NOT NULL DEFAULT 0,
+					wake_reason          TEXT NOT NULL DEFAULT '',
+					pre_checkpoint_id    TEXT NOT NULL DEFAULT '',
+					pre_checkpoint_sha   TEXT NOT NULL DEFAULT '',
+					checkpoint_sha       TEXT NOT NULL DEFAULT '',
+					state                TEXT NOT NULL DEFAULT 'running'
+					                     CHECK (state IN ('running','suspended','interrupted')),
+					board_paused         INTEGER NOT NULL DEFAULT 0,
+					resumes              INTEGER NOT NULL DEFAULT 0,
+					started_at           TEXT NOT NULL,
+					updated_at           TEXT NOT NULL
+				);`,
+			} {
+				if _, err := conn.Exec(stmt); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func copyFile(src, dst string) error {
