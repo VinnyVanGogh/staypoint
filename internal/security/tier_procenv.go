@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -55,11 +56,28 @@ func isLetters(s string) bool {
 
 // expandBraces expands shell brace alternatives ({a,b}, nested) the way the
 // shell will before the command sees the path. Ranges ({1..3}) are left as
-// written; they do not spell names. Capped so a crafted token cannot blow up.
-func expandBraces(s string, depth int) []string {
+// written; they do not spell names. ok is false when a crafted token hits
+// the cap and the list is partial; callers must then fail closed.
+func expandBraces(s string) (alts []string, ok bool) {
+	out := expandBracesN(s, 0)
+	if len(out) > maxBraceAlts || slices.Contains(out, braceCapHit) {
+		return nil, false
+	}
+	return out, true
+}
+
+const maxBraceAlts = 256
+
+// braceCapHit marks a branch cut off by the depth cap.
+const braceCapHit = "\x00brace-cap"
+
+func expandBracesN(s string, depth int) []string {
 	open := strings.IndexByte(s, '{')
-	if open < 0 || depth > 8 {
+	if open < 0 {
 		return []string{s}
+	}
+	if depth > 8 {
+		return []string{braceCapHit}
 	}
 	level, close := 0, -1
 	var commas []int
@@ -85,7 +103,10 @@ func expandBraces(s string, depth int) []string {
 	if len(commas) == 0 {
 		// {x} is literal; look for braces after it.
 		var out []string
-		for _, rest := range expandBraces(post, depth+1) {
+		for _, rest := range expandBracesN(post, depth+1) {
+			if rest == braceCapHit {
+				return []string{braceCapHit}
+			}
 			out = append(out, pre+s[open:close+1]+rest)
 		}
 		return out
@@ -98,9 +119,9 @@ func expandBraces(s string, depth int) []string {
 	}
 	var out []string
 	for _, a := range alts {
-		out = append(out, expandBraces(pre+a+post, depth+1)...)
-		if len(out) > 256 {
-			break
+		out = append(out, expandBracesN(pre+a+post, depth+1)...)
+		if len(out) > maxBraceAlts {
+			break // expandBraces reports the cut
 		}
 	}
 	return out
@@ -229,13 +250,17 @@ func lineEnvEdits(s segment) []string {
 		return out
 	case "source", ".":
 		return []string{"-source"}
-	case "eval", "set", "alias", "hash", "read", "mapfile", "readarray", "getopts", "enable", "trap", "builtin", "command":
+	case "eval", "set", "alias", "hash", "read", "mapfile", "readarray", "getopts", "enable", "trap", "builtin", "command",
+		"let", "shopt", "wait", "for", "select", "function":
 		// Can set or export variables, or change what a later name runs,
 		// in ways not modelled here: fail closed for a later staypoint.
 		return []string{"-opaque:" + baseCmd(argv)}
 	case "printf":
 		for _, a := range argv[1:] {
-			if a == "-v" {
+			if a == "--" || !strings.HasPrefix(a, "-") {
+				break // the format string; options end here
+			}
+			if !strings.HasPrefix(a, "--") && strings.Contains(a, "v") { // -v NAME, -vNAME
 				return []string{"-opaque:printf -v"}
 			}
 		}

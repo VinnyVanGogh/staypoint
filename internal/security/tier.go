@@ -1064,14 +1064,10 @@ func looksLikePath(s string) bool {
 // ~/.STAYPOINT/x is ~/.staypoint/x) and expands a glob against the real
 // filesystem the way the shell will (~/.st*/x, ~/.staypoin?/x).
 func (c *Classifier) checkSensitive(clean string, v *Verdict) {
-	var paths []string
-	for _, p := range expandBraces(clean, 0) { // ~/.{staypoint,x}/y
-		p = filepath.Clean(p)
-		paths = append(paths, p)
-		if strings.ContainsAny(p, "*?[") {
-			if m, err := filepath.Glob(p); err == nil {
-				paths = append(paths, m...)
-			}
+	paths := []string{clean}
+	if strings.ContainsAny(clean, "*?[") {
+		if m, err := filepath.Glob(clean); err == nil {
+			paths = append(paths, m...)
 		}
 	}
 	for _, p := range paths {
@@ -1093,30 +1089,47 @@ func (c *Classifier) checkPath(tok string, v *Verdict) {
 	if i := strings.IndexByte(tok, '='); i > 0 {
 		cands = append(cands, tok[i+1:])
 	}
-	for _, cand := range cands {
-		if cand == "" || strings.Contains(cand, "://") || harmlessPaths[cand] {
+	for _, raw := range cands {
+		if raw == "" || strings.Contains(raw, "://") || harmlessPaths[raw] {
 			continue
 		}
-		exp := c.expandHome(cand)
-		if !looksLikePath(cand) && exp == cand {
-			// cd ~ && cat .staypoint/x: a relative name under a sensitive
-			// dir, from the tracked working directory (Board review #4).
-			if c.CWD != "" && filepath.IsAbs(c.CWD) && !strings.HasPrefix(cand, "-") {
-				c.checkSensitive(filepath.Join(c.CWD, cand), v)
-			}
+		// The shell expands braces before ~ and before the command sees the
+		// path, so check each alternative (~/.{staypoint,x}/y, {~,x}/.staypoint).
+		alts, ok := expandBraces(raw)
+		if !ok {
+			v.raise(Red, "too many brace alternatives to check: "+raw)
 			continue
 		}
-		if !filepath.IsAbs(exp) && c.CWD != "" && filepath.IsAbs(c.CWD) {
-			exp = filepath.Join(c.CWD, exp) // ../.staypoint/x from a tracked cwd
+		for _, cand := range alts {
+			c.checkPathAlt(cand, v)
 		}
-		if procEnvironRe.MatchString(filepath.Clean(exp)) {
-			v.raise(Red, "reads a process environment ("+cand+")")
+	}
+}
+
+func (c *Classifier) checkPathAlt(cand string, v *Verdict) {
+	if cand == "" || harmlessPaths[cand] {
+		return
+	}
+	exp := c.expandHome(cand)
+	if !looksLikePath(cand) && exp == cand {
+		// cd ~ && cat .staypoint/x: a relative name under a sensitive
+		// dir, from the tracked working directory (Board review #4).
+		if c.CWD != "" && filepath.IsAbs(c.CWD) && !strings.HasPrefix(cand, "-") {
+			c.checkSensitive(filepath.Join(c.CWD, cand), v)
 		}
-		c.checkSensitive(filepath.Clean(exp), v)
-		if c.Worktree != nil {
-			if err := c.Worktree.Check(exp); err != nil {
-				v.raise(Red, "path outside worktree: "+cand)
-			}
+		return
+	}
+	abs := exp
+	if !filepath.IsAbs(abs) && c.CWD != "" && filepath.IsAbs(c.CWD) {
+		abs = filepath.Join(c.CWD, abs) // ../.staypoint/x from a tracked cwd
+	}
+	if procEnvironRe.MatchString(filepath.Clean(abs)) {
+		v.raise(Red, "reads a process environment ("+cand+")")
+	}
+	c.checkSensitive(filepath.Clean(abs), v)
+	if c.Worktree != nil {
+		if err := c.Worktree.Check(exp); err != nil {
+			v.raise(Red, "path outside worktree: "+cand)
 		}
 	}
 }
