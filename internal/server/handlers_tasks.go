@@ -163,6 +163,15 @@ func (h *TasksHandler) GetTask(w http.ResponseWriter, r *http.Request) {
 
 	comments, _ := context.GetTaskComments(h.db, task.ID)
 	depGraph, _ := context.GetTaskDependencyGraph(h.db, task.ID)
+	// Who blocked it and when, for a hand-toggled block; null otherwise. The
+	// reason must still match, or a later block from elsewhere (which logs no
+	// event) would be credited to the earlier toggle.
+	var blockEvent *context.BlockEvent
+	if task.IsBlocked {
+		if ev, err := context.LatestBlockEvent(h.db, task.ID); err == nil && ev != nil && ev.Blocked && ev.Reason == task.BlockReason {
+			blockEvent = ev
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -175,7 +184,8 @@ func (h *TasksHandler) GetTask(w http.ResponseWriter, r *http.Request) {
 		// Turn in flight, for the task page's turn timer; null when idle.
 		"turn": orchestrator.GlobalActiveTurns.Get(task.ID),
 		// Where the task runs; git=false shows the non-git warning banner (STA-864).
-		"workspace": taskWorkspace(task.RepoPath, task.ID),
+		"workspace":   taskWorkspace(task.RepoPath, task.ID),
+		"block_event": blockEvent,
 	})
 }
 

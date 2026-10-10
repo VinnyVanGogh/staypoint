@@ -29,6 +29,23 @@ func (m *Model) renderThreadView() string {
 	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Center, backBtn, actions))
 	b.WriteString("\n\n")
 
+	if m.confirmBlock {
+		verb := "Block"
+		if task.IsBlocked {
+			verb = "Unblock"
+		}
+		b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colYellow).
+			Render(fmt.Sprintf("%s this task? [y] yes  [any other key] cancel", verb)))
+		b.WriteString("\n\n")
+	} else if m.statusMessage != "" {
+		color := colTextMuted
+		if m.statusIsErr {
+			color = colRed
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(color).Render(m.statusMessage))
+		b.WriteString("\n\n")
+	}
+
 	// Task Header Card
 	stageColor := columnHeaderColor(MapTaskToColumn(*task))
 	stageBadge := lipgloss.NewStyle().

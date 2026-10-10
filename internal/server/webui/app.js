@@ -7370,6 +7370,14 @@ function appendTaskRelations(target, task, openTask) {
 
     const tag = el('span', 'panel-blocker-tag', blockerSummary);
     blockerWrap.appendChild(tag);
+    // Hand-toggled blocks (e.g. 'b' in `staypoint board`) record who and when.
+    const be = task.block_event;
+    if (isBlocked && be && be.blocked) {
+      const via = be.via === 'tui' ? ' via staypoint board' : (be.via ? ` via ${be.via}` : '');
+      const who = el('div', 'panel-field-muted', `Blocked by ${be.by || 'unknown'}${via} · ${fmtDateTime(be.at)}`);
+      who.title = be.at || '';
+      blockerWrap.appendChild(who);
+    }
     target.appendChild(blockerWrap);
   }
 
@@ -7639,6 +7647,7 @@ async function fetchTaskViewData(resolvedId) {
   task.queue = taskResp.queue || null;
   task.turn = taskResp.turn || null;
   task.workspace = taskResp.workspace || null;
+  task.block_event = taskResp.block_event || null;
   const comments = (taskResp.comments && taskResp.comments.length)
     ? taskResp.comments
     : (commentsResp?.comments || (Array.isArray(commentsResp) ? commentsResp : []));
