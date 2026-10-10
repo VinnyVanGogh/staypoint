@@ -1358,6 +1358,7 @@ func buildBriefBlock(brief taskBrief, comments []harnessComment, isFirstTurn boo
 		if brief.ShipReviewGate {
 			b.WriteString("---\nCompletion gate: Ship Review is enabled. Before emitting " + taskCompleteMarker + ", use the `staypoint_ship_review` MCP tool (or run `staypoint ship-review create`) to create a Ship Review card with a numbered test list and check runs. The harness will reject completion without a pending card.\n")
 		}
+		b.WriteString("Board-Note: when you need the Board to act on a task (Run Now, approve a card), open its page for them with the `staypoint_task_open` MCP tool (or `staypoint task open <id>`) and say so.\n")
 	}
 	if len(comments) > 0 {
 		if isFirstTurn {
