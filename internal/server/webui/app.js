@@ -158,21 +158,30 @@ function fmtRelTime(ts) {
   return fmtDateTime(ts);
 }
 
-function formatCountdown(targetTs) {
-  if (!targetTs) return '';
-  const diffMs = new Date(targetTs).getTime() - Date.now();
-  if (diffMs <= 0) return 'resets soon';
-  const mins = Math.floor(diffMs / 60000);
-  const hrs = Math.floor(mins / 60);
-  const remMins = mins % 60;
-  if (hrs >= 24) {
-    const days = Math.floor(hrs / 24);
-    const remHrs = hrs % 24;
-    return `in ${days}d ${remHrs}h`;
-  }
-  if (hrs > 0) return `in ${hrs}h ${remMins}m`;
-  return `in ${remMins}m`;
+// formatCountdown lives in lib/quotagauge.js.
+
+// Live countdowns: every quota countdown on screen is re-rendered from one
+// 30 s ticker with one shared "now", so the same reset never shows two values.
+const liveCountdowns = new Set();
+
+// liveText makes an element whose text is render(nowMs), kept fresh by the
+// shared ticker until it leaves the DOM.
+function liveText(tag, cls, render) {
+  const node = el(tag, cls, render(Date.now()));
+  liveCountdowns.add({ node, render });
+  return node;
 }
+
+setInterval(() => {
+  const now = Date.now();
+  for (const entry of liveCountdowns) {
+    if (!entry.node.isConnected) {
+      liveCountdowns.delete(entry);
+      continue;
+    }
+    entry.node.textContent = entry.render(now);
+  }
+}, 30000);
 
 function formatResetTime(targetTs, isWeekly) {
   if (!targetTs) return '';
@@ -1594,9 +1603,11 @@ function buildGaugeCard(key, q) {
 
   const m5Row = el('div', 'gauge-metrics-row');
   m5Row.appendChild(el('span', null, v5h.text));
-  const count5h = v5h.measured ? formatCountdown(q.five_hour_resets_at) : '';
+  const count5h = quotaFiveHourResetText(q);
   const time5h = v5h.measured ? formatResetTime(q.five_hour_resets_at, false) : '';
-  m5Row.appendChild(el('span', 'gauge-metric-val', count5h ? `resets ${count5h}` : (v5h.measured ? 'rolling' : 'not measured')));
+  m5Row.appendChild(count5h
+    ? liveText('span', 'gauge-metric-val', now => `resets ${quotaFiveHourResetText(q, now)}`)
+    : el('span', 'gauge-metric-val', v5h.measured ? 'rolling' : 'not measured'));
   card.appendChild(m5Row);
   if (time5h) {
     const t5Row = el('div', 'gauge-metrics-row');
@@ -1631,7 +1642,7 @@ function buildGaugeCard(key, q) {
   const mWkRow = el('div', 'gauge-metrics-row');
   mWkRow.appendChild(el('span', null, vWk.text));
   const countWk = vWk.measured ? formatCountdown(q.weekly_resets_at) : '';
-  if (countWk) mWkRow.appendChild(el('span', 'gauge-metric-val', `resets ${countWk}`));
+  if (countWk) mWkRow.appendChild(liveText('span', 'gauge-metric-val', now => `resets ${formatCountdown(q.weekly_resets_at, now)}`));
   card.appendChild(mWkRow);
   const timeWk = vWk.measured ? formatResetTime(q.weekly_resets_at, true) : '';
   if (timeWk) {
@@ -1646,7 +1657,7 @@ function buildGaugeCard(key, q) {
   if (q.runway_turns) bWkRow.appendChild(el('span', 'gauge-metric-val', `${q.runway_turns} turns left`));
   card.appendChild(bWkRow);
 
-  card.appendChild(el('div', 'gauge-projection-box', q.projection_message || 'Sustainable pacing'));
+  card.appendChild(liveText('div', 'gauge-projection-box', now => quotaProjectionText(q, now, 'Sustainable pacing')));
   return card;
 }
 
@@ -5042,7 +5053,8 @@ function renderSettings() {
       const cardHdr = el('div', 'settings-provider-header');
       const titleWrap = el('div');
       titleWrap.appendChild(el('div', 'settings-provider-name', q.display_name || key));
-      titleWrap.appendChild(el('div', 'settings-provider-sub', q.projection_message || (q.projection_status ? `Pacing: ${q.projection_status}` : 'Standard allocation')));
+      const subFallback = q.projection_status ? `Pacing: ${q.projection_status}` : 'Standard allocation';
+      titleWrap.appendChild(liveText('div', 'settings-provider-sub', now => quotaProjectionText(q, now, subFallback)));
       cardHdr.appendChild(titleWrap);
 
       let sCls = 'pill-green', sTxt = '✔ Active · On Track';
@@ -5061,13 +5073,14 @@ function renderSettings() {
 
       // Lockout Alert Banner if locked
       if (q.is_locked || q.lockout_reason) {
-        const lockBanner = el('div', 'settings-lockout-banner');
-        let lockMsg = q.lockout_reason || 'Quota threshold exceeded; requests paused.';
-        if (q.lockout_until) {
-          const untilCountdown = formatCountdown(q.lockout_until);
-          lockMsg += ` · Resets ${untilCountdown || ''} (${fmtDateTime(q.lockout_until)})`;
-        }
-        lockBanner.textContent = `🔒 ${lockMsg}`;
+        const lockReason = q.lockout_reason || 'Quota threshold exceeded; requests paused.';
+        const lockBanner = liveText('div', 'settings-lockout-banner', now => {
+          let lockMsg = lockReason;
+          if (q.lockout_until) {
+            lockMsg += ` · Resets ${formatCountdown(q.lockout_until, now)} (${fmtDateTime(q.lockout_until)})`;
+          }
+          return `🔒 ${lockMsg}`;
+        });
         card.appendChild(lockBanner);
       }
 
@@ -5078,7 +5091,7 @@ function renderSettings() {
       const v5h = quotaWindowView(q, 'five_hour');
       const rem5h = v5h.measured ? v5h.remaining : 100;
       const used5h = v5h.measured ? v5h.used : 0;
-      const count5h = v5h.measured ? formatCountdown(q.five_hour_resets_at) : '';
+      const count5h = quotaFiveHourResetText(q);
       const time5h = v5h.measured ? formatResetTime(q.five_hour_resets_at, false) : '';
       const limit5h = q.lockout_threshold_pct || 100;
 
@@ -5107,8 +5120,9 @@ function renderSettings() {
 
       const m5hReset = el('div', 'settings-metric-item');
       m5hReset.appendChild(el('span', 'settings-metric-lbl', 'Reset Time'));
-      const resetText5h = count5h ? `${count5h}${time5h ? ' · ' + time5h : ''}` : (v5h.measured ? 'Rolling window' : '—');
-      m5hReset.appendChild(el('span', 'settings-metric-val', resetText5h));
+      m5hReset.appendChild(count5h
+        ? liveText('span', 'settings-metric-val', now => `${quotaFiveHourResetText(q, now)}${time5h ? ' · ' + time5h : ''}`)
+        : el('span', 'settings-metric-val', v5h.measured ? 'Rolling window' : '—'));
       metrics5h.appendChild(m5hReset);
 
       const m5hLimit = el('div', 'settings-metric-item');
@@ -5156,8 +5170,9 @@ function renderSettings() {
 
       const mWkReset = el('div', 'settings-metric-item');
       mWkReset.appendChild(el('span', 'settings-metric-lbl', 'Reset Time'));
-      const resetTextWk = countWk ? `${countWk}${timeWk ? ' · ' + timeWk : ''}` : '—';
-      mWkReset.appendChild(el('span', 'settings-metric-val', resetTextWk));
+      mWkReset.appendChild(countWk
+        ? liveText('span', 'settings-metric-val', now => `${formatCountdown(q.weekly_resets_at, now)}${timeWk ? ' · ' + timeWk : ''}`)
+        : el('span', 'settings-metric-val', '—'));
       metricsWk.appendChild(mWkReset);
 
       const mWkBurn = el('div', 'settings-metric-item');

@@ -219,6 +219,7 @@ func (a *Aggregator) gatherProviderQuotas(overview *FleetOverview, now time.Time
 			g.RunwayTurns = 0
 			continue
 		}
+		alignLockoutUntil(g)
 		if g.IsLocked || (g.FiveHourMeasured && (g.FiveHourRemainingPct <= 0.0 || g.FiveHourUsedPct >= 100.0)) {
 			g.IsLocked = true
 			g.ProjectionStatus = "locked_out"
@@ -490,6 +491,26 @@ func applyRateLimitsState(path string, overview *FleetOverview, now time.Time) {
 				g.LockoutUntil = &t
 			}
 		}
+	}
+}
+
+// alignLockoutUntil makes a locked pool report one reset time. state.json
+// lockouts come from a different writer than the quota windows and their
+// resets_at can be minutes off, so the web UI showed two countdowns for the
+// same reset. The exhausted window's reset wins (the later one when both are
+// exhausted); otherwise keep what we have.
+func alignLockoutUntil(g *ProviderQuotaGauge) {
+	var until *time.Time
+	if g.FiveHourMeasured && (g.FiveHourRemainingPct <= 0.0 || g.FiveHourUsedPct >= 100.0) && g.FiveHourResetsAt != nil {
+		until = g.FiveHourResetsAt
+	}
+	if g.WeeklyMeasured && (g.WeeklyRemainingPct <= 0.0 || g.WeeklyUsedPct >= 100.0) && g.WeeklyResetsAt != nil &&
+		(until == nil || g.WeeklyResetsAt.After(*until)) {
+		until = g.WeeklyResetsAt
+	}
+	if until != nil {
+		t := *until
+		g.LockoutUntil = &t
 	}
 }
 

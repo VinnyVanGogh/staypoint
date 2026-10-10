@@ -17,6 +17,32 @@ var liveProviders = []struct{ key, name string }{
 	{"gemini", "Gemini"},
 }
 
+// renderPacerPool prints one pacer pool. Reset times go through
+// router.FormatReset so they read in local time, never raw UTC.
+func renderPacerPool(w io.Writer, pool *router.QuotaPool, now time.Time) {
+	fmt.Fprintf(w, "\n\033[1mProvider:\033[0m %s\n", pool.Name)
+	if pool.AccountEmail != "" {
+		fmt.Fprintf(w, "  Account: %s\n", pool.AccountEmail)
+	}
+
+	statusStr := "\033[0;32mActive\033[0m"
+	if pool.IsLocked {
+		statusStr = fmt.Sprintf("\033[0;31mLocked\033[0m (Reason: %s)", pool.LockoutReason)
+	}
+	fmt.Fprintf(w, "  Status:  %s\n", statusStr)
+	fmt.Fprintf(w, "  Runway:  %d turns\n", pool.TurnsRunway)
+
+	fmt.Fprintf(w, "  [5-Hour Window] Used: %5.1f%% | Remaining: %5.1f%%\n", pool.FiveHour.UsedPct, pool.FiveHour.RemainingPct)
+	if pool.FiveHour.ResetsAt.After(now) {
+		fmt.Fprintf(w, "                  Resets in: %s (at %s)\n", router.FormatDuration(pool.FiveHour.ResetsAt.Sub(now)), router.FormatReset(pool.FiveHour.ResetsAt, now))
+	}
+
+	fmt.Fprintf(w, "  [Weekly Window] Used: %5.1f%% | Remaining: %5.1f%%\n", pool.Weekly.UsedPct, pool.Weekly.RemainingPct)
+	if pool.Weekly.ResetsAt.After(now) {
+		fmt.Fprintf(w, "                  Resets in: %s (at %s)\n", router.FormatDuration(pool.Weekly.ResetsAt.Sub(now)), router.FormatReset(pool.Weekly.ResetsAt, now))
+	}
+}
+
 // renderLiveQuota prints the cached 5h / weekly (and Cursor monthly) reading for
 // each provider. Missing or stale data is labelled, never shown as 0%.
 func renderLiveQuota(w io.Writer, store quota.Store, now time.Time) {
