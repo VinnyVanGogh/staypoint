@@ -8847,6 +8847,22 @@ function renderFinalShipReviewCard(taskId, headSHA, status, mainSHA, rejectComme
     shaRow.appendChild(el('code', 'ship-review-sha ship-review-sha--main', mainSHA.slice(0, 12)));
   }
   section.appendChild(shaRow);
+  if (status === 'approved' && cleanup && cleanup.already_merged) {
+    const am = cleanup.already_merged;
+    const amRow = el('div', 'ship-review-row ship-review-already-merged');
+    amRow.appendChild(el('span', 'ship-review-row-label', 'Already merged'));
+    if (am.pr_url) {
+      const a = el('a', 'ship-review-already-merged-text', am.message);
+      a.href = am.pr_url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      amRow.appendChild(a);
+    } else {
+      amRow.appendChild(el('span', 'ship-review-already-merged-text', am.message));
+    }
+    if (am.next_step) amRow.appendChild(el('span', 'ship-review-already-merged-next', ` Next: ${am.next_step}`));
+    section.appendChild(amRow);
+  }
   if (status === 'approved' && cleanup && cleanup.pr_number > 0) {
     section.appendChild(renderPRStatusSection(taskId, cleanup));
   }
@@ -9172,7 +9188,7 @@ function renderPRStatusSection(taskId, card) {
 // head. A blocking warning keeps Merge disabled until the Board picks
 // "Merge without tests", which also files a backlog "Add tests" task.
 
-const TEST_GATE_ICONS = { no_ci: '⚠', no_tests: '⚠', uncovered: '⚠', untested_sources: 'ℹ', no_coverage_data: 'ℹ', coverage_ambiguous: 'ℹ' };
+const TEST_GATE_ICONS = { no_ci: '⚠', no_ci_run: 'ℹ', no_tests: '⚠', uncovered: '⚠', untested_sources: 'ℹ', no_coverage_data: 'ℹ', coverage_ambiguous: 'ℹ' };
 
 // renderTestTaskRow links the backlog task a bypassed merge filed.
 function renderTestTaskRow(tt) {
@@ -9202,6 +9218,8 @@ async function fetchTestCoverage(taskId) {
 // opts.enforcedAt names a later step that enforces the gate (a pr_merge card
 // before its PR exists: Approve only opens the PR). The section then shows
 // the verdict without a bypass, which would do nothing at this step.
+// opts.onOpenPR, when set, adds an "Open PR" button to the "no CI run for
+// this commit" note (a direct-mode card: opening a PR runs CI).
 function renderTestCoverageSection(taskId, onState, opts = {}) {
   const sec = el('div', 'ship-review-test-coverage');
   sec.dataset.state = 'loading';
@@ -9252,6 +9270,11 @@ function renderTestCoverageSection(taskId, onState, opts = {}) {
         const ul = el('ul', 'ship-review-test-warning-items');
         for (const it of w.items) ul.appendChild(el('li', 'ship-review-test-warning-item', it));
         box.appendChild(ul);
+      }
+      if (w.kind === 'no_ci_run' && opts.onOpenPR) {
+        const openPR = el('button', 'ship-review-repin-btn ship-review-test-coverage-open-pr', 'Open PR');
+        openPR.addEventListener('click', () => opts.onOpenPR(openPR));
+        box.appendChild(openPR);
       }
       nodes.push(box);
     }
@@ -9555,7 +9578,10 @@ function renderShipReviewCardFromData(container, taskId, card) {
     // the server enforces the gate at Merge PR, so no bypass here.
     const enforcedAt = approveMode !== 'pr_merge' || prActive ? ''
       : card.pr_number > 0 ? `Merge PR #${card.pr_number}` : 'Merge PR, once the PR is open,';
-    testGate = renderTestCoverageSection(taskId, () => section.dispatchEvent(new CustomEvent('test-gate')), { enforcedAt });
+    // A direct-mode card has no PR, so CI never ran on it: "Open PR" opens
+    // one (pr_merge flow) instead of merging.
+    const onOpenPR = approveMode === 'direct' ? (btn) => doApprove(btn, { open_pr_for_ci: true }) : null;
+    testGate = renderTestCoverageSection(taskId, () => section.dispatchEvent(new CustomEvent('test-gate')), { enforcedAt, onOpenPR });
     section.appendChild(testGate.el);
   }
 
@@ -9793,7 +9819,7 @@ function renderShipReviewCardFromData(container, taskId, card) {
             method: 'POST',
             headers: { ...authHeader(), 'Content-Type': 'application/json', 'X-WebAuthn-Session': sessionToken, 'X-WebAuthn-Assertion': assertion },
             body: JSON.stringify({ head_sha: card.head_sha, ...(extra || {}) }),
-          }), approveMode === 'direct' ? 'merging to main' : 'opening the PR',
+          }), approveMode === 'direct' && !(extra && extra.open_pr_for_ci) ? 'merging to main' : 'opening the PR',
         );
         if (r === null) { acMerge.disabled = false; return; }
         if (r.status === 409) {
@@ -9817,6 +9843,16 @@ function renderShipReviewCardFromData(container, taskId, card) {
         }
         if (!r.ok) throw await boardActionError(r);
         const result = await r.json();
+        if (result.already_merged) {
+          clearShipReviewHeaderActions(taskId);
+          section.replaceWith(renderFinalShipReviewCard(taskId, card.head_sha, 'approved', result.main_sha || '', '', {
+            branch: card.branch,
+            target_branch: result.target || card.target_branch,
+            already_merged: { message: result.message || '', next_step: result.next_step || '', pr_url: result.pr_url || '' },
+            test_task: result.test_task,
+          }));
+          return;
+        }
         if (result.merge_mode === 'open_pr' || result.merge_mode === 'pr_merge') {
           clearShipReviewHeaderActions(taskId);
           if (result.merge_mode === 'open_pr') {

@@ -27,6 +27,7 @@ import (
 	"github.com/VinnyVanGogh/staypoint/internal/mcp"
 	"github.com/VinnyVanGogh/staypoint/internal/orchestrator"
 	"github.com/VinnyVanGogh/staypoint/internal/repoaccess"
+	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/server"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry"
 )
@@ -205,6 +206,7 @@ func runDaemon(ctx context.Context) error {
 	if err := config.EnsureDataDir(cfg); err != nil {
 		return fmt.Errorf("ensure data dir: %w", err)
 	}
+	routeUIOLI = router.UIOLIFromConfig(cfg)
 
 	// 0. Open persistent DB; used by recovery scan, harness, and HTTP server.
 	// defer guarantees Close on every return path including early errors below.
@@ -426,6 +428,9 @@ func wireOnWake(dbStore *db.Store, repoRoot string, srv *server.Server, adapterO
 		// pick the chain. The spawned CLI and the route row both come from it,
 		// and the tracker re-labels the row if a turn spawns a different slot.
 		route := resolveTaskRouteApproved(dbStore.DB(), taskID, repoRoot, currentPacer(), time.Now(), codeGate.ApprovalID)
+		if route.UIOLINote != "" {
+			slog.Info(route.UIOLINote, slog.String("task", taskID), slog.String("run", runID))
+		}
 		tracker := newRouteTracker(route, sr.EmitRoute)
 
 		var adapterFn orchestrator.AdapterRunFunc

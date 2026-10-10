@@ -69,6 +69,40 @@ func TestEvaluateWorkflowWithoutTests(t *testing.T) {
 	}
 }
 
+// task-a5c42165: tests run through a script count as CI that runs tests.
+func TestEvaluateWorkflowRunsTestsViaScript(t *testing.T) {
+	r := Evaluate(Input{Files: []string{"main.go", "main_test.go"},
+		CI: CIState{
+			Workflows: map[string]string{".github/workflows/ci.yml": "      - run: scripts/test.sh -race\n"},
+			Scripts:   map[string]string{"scripts/test.sh": "go test \"$@\" ./...\n"},
+		}})
+	if r.Blocking || !reflect.DeepEqual(r.TestWorkflows, []string{".github/workflows/ci.yml"}) {
+		t.Fatalf("script-run tests: blocking=%v TestWorkflows=%v warnings=%v", r.Blocking, r.TestWorkflows, kinds(r))
+	}
+}
+
+// A direct-mode card has no PR, so CI never ran: a note, not a block.
+func TestEvaluateNoPRIsANote(t *testing.T) {
+	r := Evaluate(Input{Files: []string{"main.go", "main_test.go"}, CI: CIState{Workflows: testWorkflow, NoPR: true}})
+	if want := []string{"no_ci_run", "no_coverage_data"}; !reflect.DeepEqual(kinds(r), want) {
+		t.Fatalf("kinds = %v, want %v", kinds(r), want)
+	}
+	if r.Blocking || !strings.Contains(r.Warnings[0].Message, "open a PR to run CI") {
+		t.Fatalf("no-PR note: blocking=%v msg=%q", r.Blocking, r.Warnings[0].Message)
+	}
+	// CI did run on the commit (a push run): no note.
+	r = Evaluate(Input{Files: []string{"main.go", "main_test.go"}, CI: CIState{Workflows: testWorkflow, NoPR: true},
+		Coverage: CoverageResult{CIRuns: 2, Note: "CI uploaded no coverage artifact"}})
+	if want := []string{"no_coverage_data"}; !reflect.DeepEqual(kinds(r), want) {
+		t.Fatalf("CI ran: kinds = %v, want %v", kinds(r), want)
+	}
+	// No CI that runs tests still blocks, no PR or not.
+	r = Evaluate(Input{Files: []string{"main.go", "main_test.go"}, CI: CIState{Workflows: map[string]string{}, NoPR: true}})
+	if !r.Blocking || r.Warnings[0].Kind != KindNoCI {
+		t.Fatalf("no CI with no PR must still block: %v", kinds(r))
+	}
+}
+
 func TestEvaluateWorkflowsUnreadableFailsClosed(t *testing.T) {
 	r := Evaluate(Input{Files: []string{"main.go", "main_test.go"}, CI: CIState{WorkflowsErr: errors.New("git timed out")}})
 	if !r.Blocking || r.Warnings[0].Kind != KindNoCI {
