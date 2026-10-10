@@ -172,6 +172,14 @@ func TestBoardReview5InlineAndGroups(t *testing.T) {
 			t.Errorf("%q = %s %v, want Red", line, v.Tier, v.Reasons)
 		}
 	}
+	// A script named like an interpreter is still analysed as a script.
+	sc, dir := scratchClassifier(t)
+	fake := writeScript(t, dir, "node22", "#!/bin/bash\nps -Eww\n")
+	for _, line := range []string{fake + " x", fake + " -e 1"} {
+		if v := sc.Classify(line); v.Tier != Red {
+			t.Errorf("%q = %s %v, want Red", line, v.Tier, v.Reasons)
+		}
+	}
 	notRed := []string{
 		`python3 -c "print('hello')"`,
 		`python3 -c "import os;print(os.getcwd())"`,

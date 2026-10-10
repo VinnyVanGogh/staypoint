@@ -399,6 +399,11 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 		c.classifyFetch(name, args, v)
 	case interpInlineFlags[interpFamily(name)] != nil:
 		c.classifyScriptInterp(name, args, interpInlineFlags[interpFamily(name)], v)
+		// ./node22 or $py: a path or computed name is not necessarily the
+		// interpreter, so it gets the same checks as any other program.
+		if off := len(s.argv) - len(argv); segDyn(s, off) || strings.Contains(argv[0], "/") {
+			c.classifyProgram(s, argv, name, v, depth)
+		}
 	case name == "ps":
 		classifyPs(args, v)
 	case name == "go":
@@ -427,20 +432,26 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 	case greenCmds[name]:
 		// green unless redirected (handled above)
 	default:
-		off := len(s.argv) - len(argv)
-		call := scriptCall{name: name, token: argv[0], direct: true, prefixed: off > 0,
-			tokenDyn: segDyn(s, off) || segMeta(s, off)}
-		// s=staypoint; $s mcp: a command name computed at run time could be
-		// anything (Board review #4).
-		if segDyn(s, off) {
-			v.raise(Red, "command name is computed at run time ("+argv[0]+")")
-			return
-		}
-		if strings.Contains(argv[0], "/") && c.scriptVerdict(call, v, depth) {
-			return
-		}
-		v.raise(Yellow, "")
+		c.classifyProgram(s, argv, name, v, depth)
 	}
+}
+
+// classifyProgram classifies a command with no specific rule: a computed
+// name is Red, a path is analysed as a script when it is one.
+func (c *Classifier) classifyProgram(s segment, argv []string, name string, v *Verdict, depth int) {
+	off := len(s.argv) - len(argv)
+	call := scriptCall{name: name, token: argv[0], direct: true, prefixed: off > 0,
+		tokenDyn: segDyn(s, off) || segMeta(s, off)}
+	// s=staypoint; $s mcp: a command name computed at run time could be
+	// anything (Board review #4).
+	if segDyn(s, off) {
+		v.raise(Red, "command name is computed at run time ("+argv[0]+")")
+		return
+	}
+	if strings.Contains(argv[0], "/") && c.scriptVerdict(call, v, depth) {
+		return
+	}
+	v.raise(Yellow, "")
 }
 
 func (c *Classifier) classifyInner(argv []string, v *Verdict, depth int) {
