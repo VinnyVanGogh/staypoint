@@ -52,6 +52,8 @@ func (s RouteSlot) DisplayName() string {
 		return "Gemini 3.1 Pro"
 	case "gemini-3.8-flash", "gemini-3.8-flash-high":
 		return "Gemini 3.8 Flash"
+	case UIOLIHighPriorityModel:
+		return "Claude Fable"
 	}
 	if s.Model != "" {
 		return s.Model
@@ -122,6 +124,8 @@ type KindRoute struct {
 	// personal repo, provider=gemini, and a Board Touch ID approval consumed
 	// for this run. The harness guard then allows code changes.
 	GeminiCodeApprovalID string
+	// UIOLINote is set when use-it-or-lose-it steered this run (UIOLIPressure.Note).
+	UIOLINote string
 }
 
 // HasGemini reports whether any planned slot (viable or locked) is Gemini.
@@ -179,6 +183,9 @@ func (r KindRoute) Body() string {
 	}
 	if r.ModelOverride != "" {
 		parts = append(parts, "model override: "+r.ModelOverride)
+	}
+	if r.UIOLINote != "" {
+		parts = append(parts, r.UIOLINote)
 	}
 	if r.AllLocked() && len(r.Locked) > 0 {
 		parts = append(parts, joinReasons(r.Locked))
@@ -324,6 +331,11 @@ type RouteChoice struct {
 	// only (GeminiCodeApprovalAllowed). Set by the daemon after it consumed
 	// the approval; never stored on the task.
 	CodeApprovalID string
+	// UIOLI enables use-it-or-lose-it steering for this run (applyUIOLI);
+	// nil leaves the route untouched. Set by the daemon from config.
+	UIOLI *UIOLIConfig
+	// HighPriority is the task's priority, for UIOLIConfig.HighPriorityOnly.
+	HighPriority bool
 }
 
 // NormalizeProvider maps a stored or user-typed provider to its canonical
@@ -445,7 +457,7 @@ func ResolveRoute(kind string, isWork bool, pacer *PacerState, modelOverride str
 // its Claude pair as fallback, and is refused (GeminiBarred, Claude only) on a
 // code kind.
 func ResolveRouteChoice(kind string, isWork bool, pacer *PacerState, choice RouteChoice, now time.Time) KindRoute {
-	approval := choice.CodeApprovalID
+	approval, uioli, highPriority := choice.CodeApprovalID, choice.UIOLI, choice.HighPriority
 	if c, err := NormalizeRouteChoice(choice.Provider, choice.Model); err == nil {
 		choice = c
 	} else {
@@ -526,5 +538,32 @@ func ResolveRouteChoice(kind string, isWork bool, pacer *PacerState, choice Rout
 		}
 		r.Candidates = append(r.Candidates, slot)
 	}
+	// An explicit model or provider=gemini is the Board's choice: UIOLI
+	// only steers default routes.
+	if uioli != nil && choice.Model == "" && !r.GeminiChosen {
+		applyUIOLI(&r, pacer, *uioli, highPriority, now)
+	}
 	return r
+}
+
+// applyUIOLI runs UIOLIHighPriorityModel on the repo's own Claude seat when
+// that seat's weekly quota would otherwise expire unused. It only changes the
+// model, never the family: the chosen slot must already be that seat's Claude
+// slot, so non-code kinds stay Gemini-first unless Gemini is locked out (then
+// Claude is already first). A locked seat has no viable slot, so it is never
+// steered to; the personal fallback in a work repo is untouched.
+func applyUIOLI(r *KindRoute, pacer *PacerState, cfg UIOLIConfig, highPriority bool, now time.Time) {
+	if pacer == nil || !cfg.Steers(highPriority) || len(r.Candidates) == 0 {
+		return
+	}
+	poolID, seat := claudeSeat(r.IsWork)
+	if c := r.Candidates[0]; c.Family != FamilyClaude || c.Seat != seat {
+		return
+	}
+	u := pacer.Pools[poolID].UIOLIPressure(now, cfg)
+	if !u.Active {
+		return
+	}
+	r.Candidates[0].Model = UIOLIHighPriorityModel
+	r.UIOLINote = u.Note(poolID, UIOLIHighPriorityModel)
 }
