@@ -102,6 +102,7 @@ func TestSensitivePathSpellings(t *testing.T) {
 		"export {CD,X}PATH=$HOME; cd .staypoint; cat x",
 		"cdpath=(~); cd .staypoint; cat x",
 		"n=CD; : ${(P)n::=$HOME}; cd .staypoint; cat x",
+		`n=CD; print -v "${n}PATH" ~; cd .staypoint; cat x`,
 		"bash -c 'find ~ -name auth_token' | xargs cat",
 		"eval find ~ -name auth_token | xargs cat",
 		// Inline scripts that name it however split.

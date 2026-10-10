@@ -207,6 +207,11 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 		if dirChangers[baseCmd(stripPrefixes(dropKeywords(s.argv)))] && dir == "" {
 			cdLost = true
 		}
+		// A segment with an expansion or brace group may have set CDPATH
+		// under a name built at run time; later relative cds are unknown.
+		if anyTrue(s.dyn) || strings.ContainsAny(strings.Join(s.argv, " "), "{}") {
+			cdpath = true
+		}
 		// remote-shell pipe: anything | sh
 		if i > 0 && segs[i-1].piped {
 			if name := baseCmd(stripPrefixes(s.argv)); shells[name] {
