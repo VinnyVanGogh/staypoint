@@ -53,6 +53,59 @@ func isLetters(s string) bool {
 	return true
 }
 
+// expandBraces expands shell brace alternatives ({a,b}, nested) the way the
+// shell will before the command sees the path. Ranges ({1..3}) are left as
+// written; they do not spell names. Capped so a crafted token cannot blow up.
+func expandBraces(s string, depth int) []string {
+	open := strings.IndexByte(s, '{')
+	if open < 0 || depth > 8 {
+		return []string{s}
+	}
+	level, close := 0, -1
+	var commas []int
+	for i := open; i < len(s) && close < 0; i++ {
+		switch s[i] {
+		case '{':
+			level++
+		case '}':
+			level--
+			if level == 0 {
+				close = i
+			}
+		case ',':
+			if level == 1 {
+				commas = append(commas, i)
+			}
+		}
+	}
+	if close < 0 {
+		return []string{s}
+	}
+	pre, post := s[:open], s[close+1:]
+	if len(commas) == 0 {
+		// {x} is literal; look for braces after it.
+		var out []string
+		for _, rest := range expandBraces(post, depth+1) {
+			out = append(out, pre+s[open:close+1]+rest)
+		}
+		return out
+	}
+	var alts []string
+	start := open + 1
+	for _, cm := range append(commas, close) {
+		alts = append(alts, s[start:cm])
+		start = cm + 1
+	}
+	var out []string
+	for _, a := range alts {
+		out = append(out, expandBraces(pre+a+post, depth+1)...)
+		if len(out) > 256 {
+			break
+		}
+	}
+	return out
+}
+
 // procEnvironRe matches Linux /proc/<pid>/environ (and /proc/self/environ).
 var procEnvironRe = regexp.MustCompile(`^/proc/[^/]+/environ$`)
 
@@ -176,6 +229,16 @@ func lineEnvEdits(s segment) []string {
 		return out
 	case "source", ".":
 		return []string{"-source"}
+	case "eval", "set", "alias", "hash", "read", "mapfile", "readarray", "getopts", "enable", "trap", "builtin", "command":
+		// Can set or export variables, or change what a later name runs,
+		// in ways not modelled here: fail closed for a later staypoint.
+		return []string{"-opaque:" + baseCmd(argv)}
+	case "printf":
+		for _, a := range argv[1:] {
+			if a == "-v" {
+				return []string{"-opaque:printf -v"}
+			}
+		}
 	}
 	return nil
 }
@@ -186,7 +249,7 @@ func lineEnvEdits(s segment) []string {
 // dir without naming it.
 func (c *Classifier) reachesHomeWhole(name string, args []string) bool {
 	switch name {
-	case "cp", "tar", "zip", "ditto", "cpio", "pax", "bsdtar", "gtar":
+	case "cp", "tar", "zip", "ditto", "cpio", "pax", "bsdtar", "gtar", "7z", "7za", "rsync", "scp", "rclone":
 	case "find":
 		exec := false
 		for _, a := range args {
@@ -205,12 +268,20 @@ func (c *Classifier) reachesHomeWhole(name string, args []string) bool {
 		return false
 	}
 	for _, a := range args {
-		if strings.HasPrefix(a, "-") || a == "" {
+		switch {
+		case strings.HasPrefix(a, "--directory="):
+			a = strings.TrimPrefix(a, "--directory=")
+		case strings.HasPrefix(a, "-C") && len(a) > 2: // tar -C~
+			a = a[2:]
+		case strings.HasPrefix(a, "-") || a == "":
 			continue
 		}
 		p := c.expandHome(a)
 		if !filepath.IsAbs(p) {
-			continue
+			if c.CWD == "" || !filepath.IsAbs(c.CWD) {
+				continue
+			}
+			p = filepath.Join(c.CWD, p) // cd ~/x && cp -r .. /tmp/h
 		}
 		p = filepath.Clean(p)
 		if p == "/" || strings.HasPrefix(home+"/", p+"/") {

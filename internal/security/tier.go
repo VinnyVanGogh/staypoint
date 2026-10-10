@@ -902,6 +902,8 @@ func staypointEnvChange(edits []string) string {
 		switch {
 		case e == "-source":
 			return "an earlier source/. on the line"
+		case strings.HasPrefix(e, "-opaque:"):
+			return "an earlier " + strings.TrimPrefix(e, "-opaque:") + " on the line"
 		// Any env flag (-i, -u VAR, -S, -C, combined -iu ...) edits the
 		// environment or how the rest is parsed; fail closed on all of them.
 		case strings.HasPrefix(e, "-") && e != "--":
@@ -1062,10 +1064,14 @@ func looksLikePath(s string) bool {
 // ~/.STAYPOINT/x is ~/.staypoint/x) and expands a glob against the real
 // filesystem the way the shell will (~/.st*/x, ~/.staypoin?/x).
 func (c *Classifier) checkSensitive(clean string, v *Verdict) {
-	paths := []string{clean}
-	if strings.ContainsAny(clean, "*?[") {
-		if m, err := filepath.Glob(clean); err == nil {
-			paths = append(paths, m...)
+	var paths []string
+	for _, p := range expandBraces(clean, 0) { // ~/.{staypoint,x}/y
+		p = filepath.Clean(p)
+		paths = append(paths, p)
+		if strings.ContainsAny(p, "*?[") {
+			if m, err := filepath.Glob(p); err == nil {
+				paths = append(paths, m...)
+			}
 		}
 	}
 	for _, p := range paths {
@@ -1099,6 +1105,9 @@ func (c *Classifier) checkPath(tok string, v *Verdict) {
 				c.checkSensitive(filepath.Join(c.CWD, cand), v)
 			}
 			continue
+		}
+		if !filepath.IsAbs(exp) && c.CWD != "" && filepath.IsAbs(c.CWD) {
+			exp = filepath.Join(c.CWD, exp) // ../.staypoint/x from a tracked cwd
 		}
 		if procEnvironRe.MatchString(filepath.Clean(exp)) {
 			v.raise(Red, "reads a process environment ("+cand+")")
