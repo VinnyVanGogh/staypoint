@@ -354,7 +354,9 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 		v.raise(Yellow, "")
 		for i, a := range args {
 			if strings.HasPrefix(a, "-") && strings.Contains(a, "c") && !strings.HasPrefix(a, "--") && i+1 < len(args) {
-				v.merge(c.classifyLine(args[i+1], depth+1))
+				wc := *c
+				wc.pipedOut = c.pipedOut || s.piped || writesFile(s)
+				v.merge(wc.classifyLine(args[i+1], depth+1))
 				return
 			}
 		}
@@ -376,7 +378,9 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 		}
 		return
 	case name == "eval":
-		v.merge(c.classifyLine(strings.Join(args, " "), depth+1))
+		wc := *c
+		wc.pipedOut = c.pipedOut || s.piped || writesFile(s)
+		v.merge(wc.classifyLine(strings.Join(args, " "), depth+1))
 		v.raise(Yellow, "")
 		return
 	case name == "rm":
