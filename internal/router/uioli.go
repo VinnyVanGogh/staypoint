@@ -16,6 +16,7 @@ const (
 	DefaultUIOLIMinRemainingPct = 15.0 // floor at the start of the window
 	DefaultUIOLIFinalFloorPct   = 3.0  // floor right before the reset: crumbs still expire
 	DefaultUIOLIMinPctPerHour   = 1.0  // remaining% / hours-to-reset burn-down needed
+	DefaultUIOLIFiveHourFloor   = 10.0 // 5h window must have more than this left
 
 	// UIOLIHighPriorityModel is the model UIOLI steers to on the pressured
 	// Claude seat when no model was explicitly requested.
@@ -31,6 +32,10 @@ type UIOLIConfig struct {
 	MinRemainingPct float64
 	FinalFloorPct   float64
 	MinPctPerHour   float64
+	// FiveHourFloorPct is the 5h-window remaining% at or below which UIOLI
+	// stops steering, so burning down the weekly window can't drive the 5h
+	// window into a lock that pushes work-repo runs to the personal fallback.
+	FiveHourFloorPct float64
 	// HighPriorityOnly limits the model steer to high-priority work. Off by
 	// default: in the window every run burns quota that would expire unused.
 	HighPriorityOnly bool
@@ -52,6 +57,9 @@ func (c UIOLIConfig) withDefaults() UIOLIConfig {
 	if c.MinPctPerHour <= 0 {
 		c.MinPctPerHour = DefaultUIOLIMinPctPerHour
 	}
+	if c.FiveHourFloorPct <= 0 {
+		c.FiveHourFloorPct = DefaultUIOLIFiveHourFloor
+	}
 	return c
 }
 
@@ -67,13 +75,17 @@ type UIOLIPressure struct {
 // UIOLIPressure evaluates whether the pool's weekly window is in the
 // end-of-window burn-down zone: known data, a future reset within WindowHours,
 // at least FloorPct unspent (inclusive), and a required burn rate of at least
-// MinPctPerHour. The floor falls linearly from MinRemainingPct at the start of
+// MinPctPerHour, with the 5h window above FiveHourFloorPct (or unreported).
+// The floor falls linearly from MinRemainingPct at the start of
 // the window to FinalFloorPct at the reset, so the last few percent still get
 // used instead of expiring.
 func (p *QuotaPool) UIOLIPressure(now time.Time, cfg UIOLIConfig) UIOLIPressure {
 	cfg = cfg.withDefaults()
 	var out UIOLIPressure
 	if cfg.Disabled || p == nil || p.IsLocked || !p.Weekly.Known || !p.Weekly.ResetsAt.After(now) {
+		return out
+	}
+	if p.FiveHour.Known && p.FiveHour.RemainingPct <= cfg.FiveHourFloorPct {
 		return out
 	}
 	out.RemainingPct = p.Weekly.RemainingPct
@@ -108,6 +120,7 @@ func UIOLIFromConfig(c *config.Config) UIOLIConfig {
 		MinRemainingPct:  c.UIOLIMinRemainingPct,
 		FinalFloorPct:    c.UIOLIFinalFloorPct,
 		MinPctPerHour:    c.UIOLIMinPctPerHour,
+		FiveHourFloorPct: c.UIOLIFiveHourFloorPct,
 		HighPriorityOnly: c.UIOLIHighPriorityOnly,
 	}
 }

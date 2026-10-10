@@ -537,13 +537,27 @@ func TestWake_UIOLIWorkSeatRunsFable(t *testing.T) {
 	}
 }
 
-// A docs task in a work repo normally runs Gemini first; in the window the
-// work seat's Claude slot runs instead, so the expiring quota is used.
-func TestWake_UIOLIWorkSeatBeatsDefaultGemini(t *testing.T) {
+// A docs task in a work repo runs Gemini first; UIOLI only changes the model
+// of a Claude slot, so non-code work stays on Gemini in the window.
+func TestWake_UIOLIKeepsDocsGeminiFirst(t *testing.T) {
 	r := runWake(t, workRepo(t), "docs", uioliPacer(), "")
 	_, args := mustOneSpawn(t, r)
-	if !isClaude(args) || !strings.Contains(args, "--model "+router.UIOLIHighPriorityModel) {
-		t.Errorf("spawned %q, want Claude Fable, never Gemini", args)
+	if isClaude(args) || strings.Contains(args, router.UIOLIHighPriorityModel) {
+		t.Errorf("spawned %q, want the default Gemini slot", args)
+	}
+	if len(r.bodies) > 0 && strings.Contains(r.bodies[0], "UIOLI") {
+		t.Errorf("Gemini run must not carry a UIOLI note: %q", r.bodies[0])
+	}
+}
+
+// The 5h window at 3% means UIOLI would burn it into a lock: no steer.
+func TestWake_UIOLISkipsNearFiveHourLock(t *testing.T) {
+	p := uioliPacer()
+	p.Pools[router.PoolWorkClaude].FiveHour = router.QuotaWindow{RemainingPct: 3, UsedPct: 97, ResetsAt: time.Now().Add(2 * time.Hour), Known: true}
+	r := runWake(t, workRepo(t), "coding", p, "")
+	_, args := mustOneSpawn(t, r)
+	if !isClaude(args) || strings.Contains(args, router.UIOLIHighPriorityModel) {
+		t.Errorf("spawned %q, want claude on its default model", args)
 	}
 }
 

@@ -294,14 +294,22 @@ func TestUIOLIDaemonRouteSteersWorkSeatToFable(t *testing.T) {
 	cfg := &UIOLIConfig{}
 	st := uioliWorkState(15, 7*time.Hour)
 
+	steered := 0
 	for _, kind := range []string{"coding", "qa", "docs", "planning", "review", "architecture"} {
+		base, _ := ResolveRouteChoice(kind, true, st, RouteChoice{}, uioliNow).Chosen()
 		r := ResolveRouteChoice(kind, true, st, RouteChoice{UIOLI: cfg}, uioliNow)
 		s, ok := r.Chosen()
+		if base.Family == FamilyGemini {
+			// Non-code kinds stay Gemini-first in the window: UIOLI only
+			// changes the model of a Claude slot, never the family.
+			if s.Family != FamilyGemini || s.Model != base.Model || r.UIOLINote != "" {
+				t.Errorf("%s: Gemini-first kind must stay on %+v, got %+v note=%q", kind, base, s, r.UIOLINote)
+			}
+			continue
+		}
+		steered++
 		if !ok || s.Family != FamilyClaude || s.Seat != SeatWork || s.Model != UIOLIHighPriorityModel {
 			t.Errorf("%s: want Fable on the work seat, got %+v ok=%v", kind, s, ok)
-		}
-		if r.Candidates[0].Family == FamilyGemini {
-			t.Errorf("%s: Gemini must never be chosen under UIOLI", kind)
 		}
 		if !strings.Contains(r.UIOLINote, "pool work-claude") || !strings.Contains(r.Body(), r.UIOLINote) {
 			t.Errorf("%s: note %q must be on the route row body %q", kind, r.UIOLINote, r.Body())
@@ -314,6 +322,18 @@ func TestUIOLIDaemonRouteSteersWorkSeatToFable(t *testing.T) {
 				t.Errorf("%s: only the steered slot runs Fable, got %+v", kind, c)
 			}
 		}
+	}
+
+	if steered == 0 {
+		t.Fatal("no Claude-first kind was exercised")
+	}
+
+	// Docs with Gemini locked out: Claude on the work seat is already the
+	// chosen slot, so it runs Fable.
+	gl := uioliWorkState(15, 7*time.Hour)
+	gl.Pools[PoolGeminiNative].IsLocked = true
+	if s, _ := ResolveRouteChoice("docs", true, gl, RouteChoice{UIOLI: cfg}, uioliNow).Chosen(); s.Family != FamilyClaude || s.Seat != SeatWork || s.Model != UIOLIHighPriorityModel {
+		t.Errorf("docs with Gemini locked: want Fable on the work seat, got %+v", s)
 	}
 
 	// Coding chain keeps its personal fallback on opus.
@@ -362,6 +382,35 @@ func TestUIOLIDaemonRouteLeavesOtherRoutesAlone(t *testing.T) {
 		r := ResolveRouteChoice("coding", true, p, RouteChoice{UIOLI: cfg}, uioliNow)
 		if s := chosen(r); s.Seat != SeatPersonal || s.Model != "opus" || r.UIOLINote != "" {
 			t.Errorf("%s: want personal opus fallback without UIOLI, got %+v note=%q", name, s, r.UIOLINote)
+		}
+	}
+}
+
+// UIOLI must not burn the 5h window into a lock: weekly in its window but the
+// 5h window at or below the floor means no steer (interactive and daemon).
+func TestUIOLIRespectsFiveHourFloor(t *testing.T) {
+	cfg := &UIOLIConfig{}
+	for _, left := range []float64{3, DefaultUIOLIFiveHourFloor} {
+		st := uioliWorkState(15, 7*time.Hour)
+		st.Pools[PoolWorkClaude].FiveHour = QuotaWindow{RemainingPct: left, UsedPct: 100 - left, ResetsAt: uioliNow.Add(2 * time.Hour), Known: true}
+		if u := st.Pools[PoolWorkClaude].UIOLIPressure(uioliNow, *cfg); u.Active {
+			t.Errorf("5h at %.0f%%: pressure must be inactive, got %+v", left, u)
+		}
+		r := ResolveRouteChoice("coding", true, st, RouteChoice{UIOLI: cfg}, uioliNow)
+		if s, _ := r.Chosen(); s.Seat != SeatWork || s.Model != "opus" || r.UIOLINote != "" {
+			t.Errorf("5h at %.0f%%: want work seat on opus without UIOLI, got %+v note=%q", left, s, r.UIOLINote)
+		}
+		d, _ := Route(context.Background(), "/Users/vincevasile/Documents/dev/mansol-apps-server/github_repo-prod", st, RouteOptions{Now: uioliNow})
+		if d.Model == UIOLIHighPriorityModel {
+			t.Errorf("5h at %.0f%%: interactive route must not steer, got %s", left, d.Model)
+		}
+	}
+	// Above the floor, or unreported, still steers.
+	for name, w := range map[string]QuotaWindow{"11%": {RemainingPct: 11, Known: true}, "unknown": {}} {
+		st := uioliWorkState(15, 7*time.Hour)
+		st.Pools[PoolWorkClaude].FiveHour = w
+		if s, _ := ResolveRouteChoice("coding", true, st, RouteChoice{UIOLI: cfg}, uioliNow).Chosen(); s.Model != UIOLIHighPriorityModel {
+			t.Errorf("5h %s: want Fable, got %+v", name, s)
 		}
 	}
 }

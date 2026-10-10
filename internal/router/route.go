@@ -546,33 +546,24 @@ func ResolveRouteChoice(kind string, isWork bool, pacer *PacerState, choice Rout
 	return r
 }
 
-// applyUIOLI steers a run onto the repo's own Claude seat when that seat's
-// weekly quota would otherwise expire unused: the seat's viable Claude slot
-// moves to the front (ahead of a default Gemini slot, which then never runs
-// first) and runs UIOLIHighPriorityModel. A locked seat has no viable slot, so
-// it is never steered to; the personal fallback in a work repo is untouched.
+// applyUIOLI runs UIOLIHighPriorityModel on the repo's own Claude seat when
+// that seat's weekly quota would otherwise expire unused. It only changes the
+// model, never the family: the chosen slot must already be that seat's Claude
+// slot, so non-code kinds stay Gemini-first unless Gemini is locked out (then
+// Claude is already first). A locked seat has no viable slot, so it is never
+// steered to; the personal fallback in a work repo is untouched.
 func applyUIOLI(r *KindRoute, pacer *PacerState, cfg UIOLIConfig, highPriority bool, now time.Time) {
-	if pacer == nil || !cfg.Steers(highPriority) {
+	if pacer == nil || !cfg.Steers(highPriority) || len(r.Candidates) == 0 {
 		return
 	}
 	poolID, seat := claudeSeat(r.IsWork)
+	if c := r.Candidates[0]; c.Family != FamilyClaude || c.Seat != seat {
+		return
+	}
 	u := pacer.Pools[poolID].UIOLIPressure(now, cfg)
 	if !u.Active {
 		return
 	}
-	for i, c := range r.Candidates {
-		if c.Family != FamilyClaude || c.Seat != seat {
-			continue
-		}
-		c.Model = UIOLIHighPriorityModel
-		rest := append(append([]RouteSlot(nil), r.Candidates[:i]...), r.Candidates[i+1:]...)
-		r.Candidates = append([]RouteSlot{c}, rest...)
-		if i > 0 {
-			// The slots that were ahead of it were passed over by choice,
-			// not skipped as locked.
-			r.Skipped = nil
-		}
-		r.UIOLINote = u.Note(poolID, c.Model)
-		return
-	}
+	r.Candidates[0].Model = UIOLIHighPriorityModel
+	r.UIOLINote = u.Note(poolID, UIOLIHighPriorityModel)
 }
