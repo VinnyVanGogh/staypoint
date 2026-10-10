@@ -42,29 +42,7 @@ var quotaCmd = &cobra.Command{
 		} else {
 			now := time.Now()
 			for _, pool := range pacerState.Pools {
-				fmt.Printf("\n\033[1mProvider:\033[0m %s\n", pool.Name)
-				if pool.AccountEmail != "" {
-					fmt.Printf("  Account: %s\n", pool.AccountEmail)
-				}
-
-				statusStr := "\033[0;32mActive\033[0m"
-				if pool.IsLocked {
-					statusStr = fmt.Sprintf("\033[0;31mLocked\033[0m (Reason: %s)", pool.LockoutReason)
-				}
-				fmt.Printf("  Status:  %s\n", statusStr)
-				fmt.Printf("  Runway:  %d turns\n", pool.TurnsRunway)
-
-				// 5-Hour Window
-				fmt.Printf("  [5-Hour Window] Used: %5.1f%% | Remaining: %5.1f%%\n", pool.FiveHour.UsedPct, pool.FiveHour.RemainingPct)
-				if !pool.FiveHour.ResetsAt.IsZero() && pool.FiveHour.ResetsAt.After(now) {
-					fmt.Printf("                  Resets in: %s (at %s)\n", router.FormatDuration(pool.FiveHour.ResetsAt.Sub(now)), pool.FiveHour.ResetsAt.Format("15:04:05"))
-				}
-
-				// Weekly Window
-				fmt.Printf("  [Weekly Window] Used: %5.1f%% | Remaining: %5.1f%%\n", pool.Weekly.UsedPct, pool.Weekly.RemainingPct)
-				if !pool.Weekly.ResetsAt.IsZero() && pool.Weekly.ResetsAt.After(now) {
-					fmt.Printf("                  Resets in: %s (at %s)\n", router.FormatDuration(pool.Weekly.ResetsAt.Sub(now)), pool.Weekly.ResetsAt.Format("Jan 02, 15:04"))
-				}
+				renderPacerPool(os.Stdout, pool, now)
 			}
 		}
 
