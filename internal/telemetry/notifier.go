@@ -75,11 +75,11 @@ func (n *RateLimitNotifier) check() {
 	if poolPers != nil && !isPersLocked && poolPers.FiveHour.UsedPct >= 85.0 && !n.warnedPersPreLock {
 		resetStr := "soon"
 		if !poolPers.LockoutUntil.IsZero() {
-			resetStr = poolPers.LockoutUntil.Format("3:04pm")
+			resetStr = router.FormatReset(poolPers.LockoutUntil, time.Now())
 		}
 		SendQuotaAlert(router.PoolPersonalClaude, QuotaWarning,
 			"[Staypoint] Claude 5h Limit Warning (15% left)",
-			fmt.Sprintf("Claude Code 5-hour quota at %.0f%% (resets @%s). Handoff to Gemini staged in clipboard. Switch via /model gemini-3.8-flash-high or open agy.", poolPers.FiveHour.UsedPct, resetStr),
+			fmt.Sprintf("Claude Code 5-hour quota at %.0f%% (resets %s). Handoff to Gemini staged in clipboard. Switch via /model gemini-3.8-flash-high or open agy.", poolPers.FiveHour.UsedPct, resetStr),
 		)
 		n.warnedPersPreLock = true
 	} else if poolPers != nil && poolPers.FiveHour.UsedPct < 80.0 {
@@ -90,11 +90,11 @@ func (n *RateLimitNotifier) check() {
 	if pool3P != nil && !is3PLocked && pool3P.FiveHour.UsedPct >= 85.0 && !n.warned3PPreLock {
 		resetStr := "soon"
 		if !pool3P.LockoutUntil.IsZero() {
-			resetStr = pool3P.LockoutUntil.Format("3:04pm")
+			resetStr = router.FormatReset(pool3P.LockoutUntil, time.Now())
 		}
 		SendQuotaAlert(router.Pool3PClaude, QuotaWarning,
 			"[Staypoint] 5h Quota Warning (15% left)",
-			fmt.Sprintf("3P Claude quota at %.0f%% (resets @%s). Handoff to Gemini staged in clipboard. Switch via /model gemini-3.8-flash-high or paste prompt.", pool3P.FiveHour.UsedPct, resetStr),
+			fmt.Sprintf("3P Claude quota at %.0f%% (resets %s). Handoff to Gemini staged in clipboard. Switch via /model gemini-3.8-flash-high or paste prompt.", pool3P.FiveHour.UsedPct, resetStr),
 		)
 		n.warned3PPreLock = true
 	} else if pool3P != nil && pool3P.FiveHour.UsedPct < 80.0 {
@@ -106,11 +106,11 @@ func (n *RateLimitNotifier) check() {
 		n.warned3PPreLock = true
 		resetStr := "soon"
 		if pool3P != nil && !pool3P.LockoutUntil.IsZero() {
-			resetStr = pool3P.LockoutUntil.Format("3:04pm")
+			resetStr = router.FormatReset(pool3P.LockoutUntil, time.Now())
 		}
 		SendQuotaAlert(router.Pool3PClaude, QuotaLocked,
 			"[Switch -> Gemini] 3P Quota Locked",
-			fmt.Sprintf("3P 5-hour quota exhausted (resets @%s). Switch to Gemini 3.8 Flash for unblocked progress.", resetStr),
+			fmt.Sprintf("3P 5-hour quota exhausted (resets %s). Switch to Gemini 3.8 Flash for unblocked progress.", resetStr),
 		)
 	}
 
@@ -127,11 +127,11 @@ func (n *RateLimitNotifier) check() {
 		n.warnedPersPreLock = true
 		resetStr := "soon"
 		if poolPers != nil && !poolPers.LockoutUntil.IsZero() {
-			resetStr = poolPers.LockoutUntil.Format("3:04pm")
+			resetStr = router.FormatReset(poolPers.LockoutUntil, time.Now())
 		}
 		SendQuotaAlert(router.PoolPersonalClaude, QuotaLocked,
 			"[Switch -> Gemini] Claude Quota Locked",
-			fmt.Sprintf("Claude Code quota exhausted (resets @%s). Switch to Gemini 3.8 Flash in Antigravity (agy).", resetStr),
+			fmt.Sprintf("Claude Code quota exhausted (resets %s). Switch to Gemini 3.8 Flash in Antigravity (agy).", resetStr),
 		)
 	}
 

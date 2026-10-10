@@ -160,6 +160,20 @@ func TestFormatReset(t *testing.T) {
 	}
 }
 
+// Reset times are stored in UTC. A 02:10Z reset seen at 4:37 PM PDT is
+// 7:10 PM the same day, not "2:10am" (task-036279f2).
+func TestFormatResetConvertsUTCToLocal(t *testing.T) {
+	la, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Skip("no tzdata:", err)
+	}
+	now := time.Date(2026, 10, 9, 16, 37, 0, 0, la)
+	reset := time.Date(2026, 10, 10, 2, 10, 0, 0, time.UTC)
+	if got := FormatReset(reset, now); got != "today 7:10 PM" {
+		t.Errorf("FormatReset=%q want %q", got, "today 7:10 PM")
+	}
+}
+
 func TestReadSamplesTailBackfillsMissingWeekly(t *testing.T) {
 	tmpFile, err := os.CreateTemp("", "samples-*.ndjson")
 	if err != nil {

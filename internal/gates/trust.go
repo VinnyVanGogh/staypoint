@@ -112,6 +112,9 @@ type TrustSpec struct {
 	// Tev1Ack confirms the Board saw Tev1Warning; tev1 mode requires it.
 	Tev1Ack bool   `json:"tev1_ack"`
 	Note    string `json:"note"`
+	// MoveToTodo moves a backlog task to todo first, under the same Touch
+	// ID (task-40f0a2f0). It never moves a task from any other stage.
+	MoveToTodo bool `json:"move_to_todo"`
 }
 
 // TrustMinutes validates the spec's window.

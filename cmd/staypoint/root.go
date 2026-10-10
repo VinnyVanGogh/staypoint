@@ -11,8 +11,6 @@ import (
 
 	"github.com/VinnyVanGogh/staypoint/internal/bridge"
 	"github.com/VinnyVanGogh/staypoint/internal/config"
-	meshContext "github.com/VinnyVanGogh/staypoint/internal/context"
-	"github.com/VinnyVanGogh/staypoint/internal/db"
 	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
@@ -27,6 +25,13 @@ var (
 		Use:     "staypoint [command|args...]",
 		Version: version,
 		Short:   "Staypoint: Autonomous AI Agent Ops, Quota Pacing & Context Platform",
+		Long: `Staypoint: Autonomous AI Agent Ops, Quota Pacing & Context Platform
+
+With no command, staypoint is a smart launcher: it routes this directory to a
+Claude seat (or agy with --gemini), prints the route, and execs that CLI with
+any remaining arguments. Use --dry-run (-n) to see the route without launching.
+
+The interactive TUI is "staypoint board".`,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			var err error
 			cfg, err = config.LoadConfig()
@@ -86,6 +91,20 @@ func runSmartLaunch(cmd *cobra.Command, args []string) {
 		}
 	}
 
+	var srcArgs []string
+	if len(os.Args) > 1 && !strings.HasSuffix(os.Args[0], ".test") {
+		srcArgs = os.Args[1:]
+	} else {
+		srcArgs = args
+	}
+	passthroughArgs := extractPassthroughArgs(srcArgs)
+	headless := isHeadlessStream(passthroughArgs)
+
+	// Say something before any work so a bare `staypoint` never looks hung.
+	if !headless {
+		fmt.Fprintln(os.Stderr, "staypoint: routing... (the TUI is `staypoint board`)")
+	}
+
 	pacerState, _ := router.LoadPacerState()
 	cwd, _ := os.Getwd()
 	routeCtx, routeCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -96,72 +115,60 @@ func runSmartLaunch(cmd *cobra.Command, args []string) {
 		remoteHost = cfg.RemoteHost
 	}
 
-	var targetTool string
-	var targetModel string
-	var isRemoteWork bool
-
+	var decision *router.RouteDecision
 	if forceClaude {
-		targetTool = "claude"
-		targetModel = "claude-sonnet-4-6"
+		decision = &router.RouteDecision{Tool: "claude", Model: "claude-sonnet-4-6", Reason: "forced: --claude"}
 	} else if forceGemini {
-		targetTool = "agy"
-		targetModel = "gemini-3.8-flash-high"
+		decision = &router.RouteDecision{Tool: "agy", Model: "gemini-3.8-flash-high", Reason: "forced: --gemini"}
 	} else {
-		lastTool := ""
-		if cfg != nil && cfg.DBPath != "" {
-			if store, err := db.Open(cfg.DBPath); err == nil {
-				if sess, err := meshContext.GetLatestSession(cwd, store.DB()); err == nil && sess != nil {
-					lastTool = sess.AgentType
-				}
-				store.Close()
-			}
-		}
-
 		prefTool := "auto"
 		if cfg != nil && cfg.PreferredPersonalTool != "" {
 			prefTool = cfg.PreferredPersonalTool
 		}
 
-		decision, err := router.Route(routeCtx, cwd, pacerState, router.RouteOptions{
+		// No LastUsedTool: Route never reads it (GeminiCodeForbidden), and
+		// finding it parsed every Claude transcript on disk, seconds of CPU
+		// before the first byte of output.
+		var err error
+		decision, err = router.Route(routeCtx, cwd, pacerState, router.RouteOptions{
 			CheckSSH:              !noSSH,
 			RemoteHost:            remoteHost,
 			PreferredPersonalTool: prefTool,
-			LastUsedTool:          lastTool,
 			UIOLI:                 router.UIOLIFromConfig(cfg),
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Routing error: %v\n", err)
 			os.Exit(1)
 		}
-		targetTool = decision.Tool
-		targetModel = decision.Model
 		if decision.Waiting {
 			fmt.Fprintf(os.Stderr, "[staypoint] %s\n", decision.Reason)
 		}
-		if decision.Target == router.TargetRemoteClaude {
-			isRemoteWork = true
-		}
 	}
+	targetTool := decision.Tool
+	targetModel := decision.Model
+	isRemoteWork := decision.Target == router.TargetRemoteClaude
 
-	var srcArgs []string
-	if len(os.Args) > 1 && !strings.HasSuffix(os.Args[0], ".test") {
-		srcArgs = os.Args[1:]
-	} else {
-		srcArgs = args
-	}
-	passthroughArgs := extractPassthroughArgs(srcArgs)
-
-	// Render the Tokyo Night statusline before launch (to stderr if non-tty pipe or headless stream, stdout if interactive terminal)
-	isTerminal := isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
-	if !isTerminal || isHeadlessStream(passthroughArgs) {
-		_ = router.RenderStatusline(os.Stderr, nil)
-	} else {
-		_ = router.RenderStatusline(os.Stdout, nil)
-	}
-
+	// The seat is the route's too: a work repo whose work seat is locked
+	// routes to the personal seat, and the launch must use that one.
 	home, _ := os.UserHomeDir()
 	isWorkRepo, _, _ := router.IsWorkRepo(cwd)
-	account := resolveClaudeAccount(forceWork, forcePersonal, isWorkRepo)
+	seatIsWork := isWorkRepo
+	if decision.AccountRole != "" {
+		seatIsWork = decision.AccountRole == "work"
+	}
+	account := resolveClaudeAccount(forceWork, forcePersonal, seatIsWork)
+	if targetTool == "claude" {
+		decision.AccountRole = string(account)
+	}
+
+	// Render the Tokyo Night statusline before launch (to stderr if non-tty pipe or headless stream, stdout if interactive terminal).
+	// Its plan line is this decision, not a second routing pass.
+	isTerminal := isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
+	if !isTerminal || headless {
+		_ = router.RenderStatuslineFor(os.Stderr, nil, decision)
+	} else {
+		_ = router.RenderStatuslineFor(os.Stdout, nil, decision)
+	}
 
 	if dryRun {
 		fmt.Printf("\n\033[1;36m[Staypoint :: Dry Run]\033[0m\n")
@@ -216,7 +223,7 @@ func runSmartLaunch(cmd *cobra.Command, args []string) {
 	env := os.Environ()
 	if binName == "claude" {
 		env = claudeAccountEnv(env, account, home)
-		if isTerminal && !isHeadlessStream(passthroughArgs) {
+		if isTerminal && !headless {
 			fmt.Fprintf(os.Stderr, "Claude account: %s %s\n", account, describeClaudeConfigDir(account, home))
 		}
 	}

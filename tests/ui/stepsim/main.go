@@ -25,15 +25,16 @@ import (
 )
 
 func main() {
-	dbPath  := flag.String("db", "", "throwaway SQLite database written by staypoint-apitest-server (required)")
-	taskID  := flag.String("task", "", "task id to record steps for (required)")
-	runID   := flag.String("run", "ui-e2e-run", "run id")
+	dbPath := flag.String("db", "", "throwaway SQLite database written by staypoint-apitest-server (required)")
+	taskID := flag.String("task", "", "task id to record steps for (required)")
+	runID := flag.String("run", "ui-e2e-run", "run id")
 	partial := flag.Bool("partial", false, "emit a wake step only, no terminal state step (simulates a mid-run task)")
-	docKey  := flag.String("doc", "", "store a task document under this key instead of recording steps")
+	docKey := flag.String("doc", "", "store a task document under this key instead of recording steps")
 	content := flag.String("content", "", "document content for --doc")
+	clearRepo := flag.Bool("clear-repo", false, "clear the task's repo instead of recording steps (a task imported with no repo)")
 	flag.Parse()
 	if *dbPath == "" || *taskID == "" {
-		fmt.Fprintln(os.Stderr, "usage: stepsim --db PATH --task ID [--run ID] [--partial] | [--doc KEY --content TEXT]")
+		fmt.Fprintln(os.Stderr, "usage: stepsim --db PATH --task ID [--run ID] [--partial] | [--doc KEY --content TEXT] | [--clear-repo]")
 		os.Exit(2)
 	}
 
@@ -43,6 +44,24 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
+
+	if *clearRepo {
+		// POST /api/tasks fills an empty repo with the daemon's cwd, so a
+		// no-repo task (as a Paperclip import leaves it) can only be made here.
+		res, err := store.DB().Exec(`UPDATE tasks SET repo_path = '', git_branch = '' WHERE id = ?`, *taskID)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "stepsim: clear repo:", err)
+			store.Close()
+			os.Exit(1)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			fmt.Fprintln(os.Stderr, "stepsim: clear repo: no task", *taskID)
+			store.Close()
+			os.Exit(1)
+		}
+		fmt.Println("CLEARED")
+		return
+	}
 
 	if *docKey != "" {
 		// db.Open turns foreign keys on, so a task this process cannot see

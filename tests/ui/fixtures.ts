@@ -19,6 +19,7 @@ export type Task = {
   name: string;
   status: string;
   execution_stage: string;
+  repo_path?: string;
   organization?: string;
   project?: string;
   /** Reference (STA-123) and URL slug: the page lives at /STA-123/<slug>. */
@@ -63,6 +64,22 @@ export class StayPointAPI {
     // The create response omits organization/project; keep what was sent so
     // taskPagePath() builds the same URL the UI does.
     return { ...created, organization: body.organization, project: body.project };
+  }
+
+  /** Creates a task the way an agent does (token only): backlog, origin agent. */
+  async createAgentTask(label: string, extra: Record<string, unknown> = {}): Promise<Task> {
+    const name = `${label} ${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const body = { name, organization: 'STA', project: 'ui-e2e', ...extra };
+    const created = await this.json<Task>('POST', '/api/tasks', body, false);
+    return { ...created, organization: body.organization, project: body.project };
+  }
+
+  /** POSTs /stage with the agent token only; returns the raw status and body. */
+  async setStageAsAgent(id: string, stage: string): Promise<{ status: number; body: { error?: string } }> {
+    const res = await this.request.fetch(`/api/tasks/${encodeURIComponent(id)}/stage`, {
+      method: 'POST', headers: this.headers(false), data: { stage },
+    });
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
   }
 
   async getTask(id: string): Promise<Task> {
@@ -245,6 +262,19 @@ export function addTaskDocument(taskId: string, key: string, content: string): n
   const m = out.match(/^VERSION (\d+)$/m);
   if (!m) throw new Error(`stepsim stored no document: ${out}`);
   return Number(m[1]);
+}
+
+/**
+ * Clears a task's repo through tests/ui/stepsim. POST /api/tasks fills an
+ * empty repo_path with the daemon's cwd, so this is the only way a spec gets
+ * a task with no repo (as a Paperclip import leaves it).
+ */
+export function clearTaskRepo(taskId: string): void {
+  const bin = process.env.STAYPOINT_UI_STEPSIM;
+  const db = process.env.STAYPOINT_UI_DB;
+  if (!bin || !db) throw new Error('STAYPOINT_UI_STEPSIM / STAYPOINT_UI_DB not set: run via scripts/ui-e2e.sh');
+  const out = execFileSync(bin, ['--db', db, '--task', taskId, '--clear-repo'], { encoding: 'utf8' });
+  if (!/^CLEARED$/m.test(out)) throw new Error(`stepsim did not clear the repo: ${out}`);
 }
 
 /**
