@@ -1562,13 +1562,8 @@ func safeField(s string) string {
 	return s
 }
 
-// buildRawArgs constructs CLI arguments for the adapter on the given turn.
-// These are parsed by adapter.parseRawArgs into ParsedOptions.
-func buildRawArgs(taskID string, turn int, cfg RunConfig, brief taskBrief, newComments []harnessComment) []string {
-	return buildTurnArgs(taskID, turn, turn == 0, "", cfg, brief, newComments)
-}
-
-// buildTurnArgs is buildRawArgs for a run that may start at a later turn: a
+// buildTurnArgs constructs CLI arguments for the adapter on the given turn
+// (parsed by adapter.parseRawArgs into ParsedOptions), for a run that may start at a later turn: a
 // resumed run's first turn is a first turn (whole brief and handoff), and
 // note, when set, tells the agent where it left off.
 func buildTurnArgs(taskID string, turn int, first bool, note string, cfg RunConfig, brief taskBrief, newComments []harnessComment) []string {

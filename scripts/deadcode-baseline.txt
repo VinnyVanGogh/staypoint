@@ -42,9 +42,7 @@ internal/mcp/server.go: unreachable func: WithWorkDir
 internal/migration/keychain_darwin.go: unreachable func: DeleteProjectDSN
 internal/migration/keychain_darwin.go: unreachable func: SetProjectDSN
 internal/orchestrator/interceptor.go: unreachable func: Interceptor.RegisterGuard
-internal/orchestrator/run_slots.go: unreachable func: RunSlots.Active
 internal/orchestrator/run_slots.go: unreachable func: RunSlots.Max
-internal/orchestrator/run_slots.go: unreachable func: RunSlots.Queue
 internal/orchestrator/run_slots.go: unreachable func: RunSlots.SetMax
 internal/orchestrator/step_recorder.go: unreachable func: extractToolTitle
 internal/reporting/pdf.go: unreachable func: RenderAllReports

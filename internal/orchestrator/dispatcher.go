@@ -89,7 +89,7 @@ func (d *Dispatcher) Close() {
 	d.mu.Lock()
 	d.closed = true
 	d.mu.Unlock()
-	d.wg.Wait()
+	d.Drain()
 }
 
 // RecoveryScan runs once at daemon start to reset stale claims.
