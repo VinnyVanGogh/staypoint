@@ -242,7 +242,7 @@ func gateGeminiPreTool(raw []byte) string {
 	for _, text := range call.commands {
 		v := c.Classify(text)
 		if taskID != "" {
-			raiseForBoardRules(text, cwd, snap, &v)
+			raiseForBoardRules(text, cwd, snap, &v, taskID)
 		}
 		// Claude runs a script judged by its contents pinned to those bytes;
 		// agy cannot run a rewritten command, so such a command goes to the Board.

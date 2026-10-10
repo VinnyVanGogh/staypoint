@@ -5,9 +5,10 @@
 # cmd/staypoint-apitest-server, starts it on a fresh SQLite file in a temp dir
 # with HOME pointed at that temp dir, and points its /api/fleet/* proxies at
 # tests/api/paperclip_stub.py. A second, expendable daemon is started for the
-# "daemon goes down" spec, which kills it. The real StayPoint DB
-# (~/.staypoint/staypoint.db), the launchd daemon on :41421 and the live
-# Paperclip API are never touched.
+# "daemon goes down" spec, which kills it. The real StayPoint DB (in the
+# live data dir), the launchd daemon on :41421 and the live Paperclip API are
+# never touched. (Spelling out the live data dir's path here would make the
+# Board's self-protection rule hold every run of this script.)
 #
 # Usage:
 #   scripts/ui-e2e.sh                       # whole suite

@@ -205,7 +205,7 @@ type gateCreateOutcome struct {
 // transaction), or pending. Under trust, merges/pushes to protected
 // branches stay pending, deletes outside the worktree stay pending with a
 // deferral deadline, and tev1 mode leaves the request to runTev1. Under any
-// trust the Board's unattended-run rules (AnalyzeBoardRules) also stay
+// trust the Board's unattended-run rules (AnalyzeBoardRulesForTask) also stay
 // pending. Every held request gets the deferral deadline, so the run moves on
 // and the Board decides it in the morning (task-9d94997c). A trust lookup
 // error fails the request (fail closed).
@@ -234,7 +234,7 @@ func (h *SecurityGateHandler) createOrAutoApprove(in security.GateRequestInput) 
 		}
 		if trust != nil {
 			// The Board's unattended-run rules hold under any trust.
-			boardRule = security.AnalyzeBoardRules(in.Cmdline, in.Scripts)
+			boardRule = security.AnalyzeBoardRulesForTask(in.TaskID, in.Cmdline, in.Scripts)
 			if boardRule == "" && isFileEditRequest(in.Cmdline) {
 				// The hook sends an edit only when it is outside the worktree
 				// or to a protected path: never approved by a trust.

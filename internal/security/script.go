@@ -327,6 +327,61 @@ func strictShellFlags(flags []string) bool {
 	return true
 }
 
+// shellNoExec reports whether argv is a shell told only to read a script
+// file (-n, -o noexec: a syntax check), so the script does not run. Not
+// with -c (later args are $0...), -s, or -i (interactive shells ignore -n).
+func shellNoExec(argv []string) bool {
+	if len(argv) == 0 || !shells[baseCmd(argv)] {
+		return false
+	}
+	args := argv[1:]
+	end, ok := shellScriptIndex(args)
+	if !ok {
+		return false
+	}
+	noexec := false
+	for i := 0; i < end; i++ {
+		a := args[i]
+		switch {
+		case a == "-o" || a == "+o":
+			// zsh reads option names loosely (+o NO_EXEC, -o exec), so
+			// anything but -o noexec or a harmless option fails closed.
+			if i+1 >= end {
+				return false
+			}
+			switch v := args[i+1]; {
+			case a == "-o" && v == "noexec":
+				noexec = true
+			case !safeShellOptions[v]:
+				return false
+			}
+			i++
+		case len(a) > 1 && a[0] == '+':
+			// +ox noexec: o takes the next word, which may undo -n.
+			if strings.ContainsAny(a[1:], "oO") {
+				return false
+			}
+			if strings.ContainsRune(a[1:], 'n') {
+				noexec = false
+			}
+		case strings.HasPrefix(a, "--"):
+			// --login and --rcfile read startup files.
+			if a != "--norc" && a != "--noprofile" && a != "--posix" {
+				return false
+			}
+		case len(a) > 1 && a[0] == '-':
+			// o in a cluster (-no exec) takes the next word as its option.
+			if strings.ContainsAny(a[1:], "csilo") {
+				return false
+			}
+			if strings.ContainsRune(a[1:], 'n') {
+				noexec = true
+			}
+		}
+	}
+	return noexec
+}
+
 // shellReadsInput reports whether a shell's flags make it read commands from
 // somewhere other than stdin (so a heredoc on stdin is not the whole script).
 func shellReadsInput(args []string) bool {
@@ -1485,7 +1540,7 @@ func ScriptRefs(line, cwd string, snap *Snapshotter, contentLimit int) []ScriptR
 					walk(r.body, dir, depth+1)
 				}
 			}
-			if isScriptCall(argv) {
+			if isScriptCall(argv) && !shellNoExec(argv) {
 				p := argv[0]
 				direct := !shells[baseCmd(argv)]
 				if !direct {

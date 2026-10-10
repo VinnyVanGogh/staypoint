@@ -5,6 +5,11 @@ import (
 	"testing"
 )
 
+// AnalyzeBoardRules is AnalyzeBoardRulesForTask with no task.
+func AnalyzeBoardRules(line string, scripts []ScriptHash) string {
+	return AnalyzeBoardRulesForTask("", line, scripts)
+}
+
 // task-33692ffb: the Board's unattended-run rules.
 func TestAnalyzeBoardRules(t *testing.T) {
 	held := map[string][]string{
@@ -52,7 +57,7 @@ func TestAnalyzeBoardRules(t *testing.T) {
 			"/opt/homebrew/bin/gemini -p x",
 			"npx @anthropic-ai/claude-code -p x",
 			"npx -y @google/gemini-cli -p x",
-			"STAYPOINT_TASK_ID= go test ./...",
+			"STAYPOINT_TASK_ID= staypoint task list",
 			"export STAYPOINT_TASK_ID=x",
 			"env -i bash",
 			"nohup codex exec 'x' &",
@@ -109,7 +114,6 @@ func TestAnalyzeBoardRules(t *testing.T) {
 			"curl -X POST http://[::1]:41421/api/x -d a",
 			"go install ./cmd/staypointd",
 			"go build -o ~/.local/bin/staypoint ./cmd/staypoint",
-			"go build -o /tmp/staypointd-x ./cmd/staypointd",
 			"cp bin/staypoint ~/.local/bin/",
 			"pkill -f staypointd",
 			"killall staypoint",
