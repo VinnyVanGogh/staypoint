@@ -408,21 +408,46 @@ func isScriptCall(argv []string) bool {
 // dir (or prints) is plain data; any other body is classified as commands, as
 // the parser did before it understood heredocs. It reports whether a shell's
 // script came from a heredoc.
-// scriptInterps read a script from stdin when given no script file.
-var scriptInterps = map[string]bool{
-	"python": true, "python2": true, "python3": true, "node": true, "nodejs": true,
-	"ruby": true, "perl": true, "php": true,
+// interpInlineFlags lists, per interpreter family, the flags whose next
+// argument is a script. Every family also reads a script from stdin.
+var interpInlineFlags = map[string][]string{
+	"python": {"-c"},
+	"node":   {"-e", "--eval", "-p", "--print"},
+	"deno":   {"eval"},
+	"bun":    {"-e", "--eval", "-p", "--print"},
+	"ruby":   {"-e"},
+	"perl":   {"-e", "-E"},
+	"php":    {"-r"},
+	"lua":    {"-e"},
+}
+
+var interpVersionRe = regexp.MustCompile(`[0-9.]+$`)
+
+// interpFamily maps an interpreter name to its family: python3.12, pypy3
+// and python are all "python"; nodejs and node22 are "node".
+func interpFamily(name string) string {
+	f := interpVersionRe.ReplaceAllString(strings.ToLower(name), "")
+	switch f {
+	case "python", "pypy":
+		return "python"
+	case "nodejs":
+		return "node"
+	}
+	return f
 }
 
 func (c *Classifier) classifyHeredocs(s segment, name string, args []string, v *Verdict, depth int) bool {
 	var docs []*redirect
+	// env/timeout/nohup ... python3 <<EOF: the interpreter behind wrappers.
+	inner, _ := unwrapArgv(s.argv)
+	interp := interpFamily(baseCmd(inner))
 	for _, r := range s.redirects {
 		if r.heredoc {
 			docs = append(docs, r)
 		}
 		// python3 - <<EOF / node <<< '...': the body is the script, so the
 		// inline-script rules apply to it (Board review #5 M1).
-		if scriptInterps[name] && (r.heredoc || r.op == "<<<") {
+		if interpInlineFlags[interp] != nil && (r.heredoc || r.op == "<<<") {
 			body := r.body
 			if r.op == "<<<" {
 				body = r.target

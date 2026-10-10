@@ -36,12 +36,11 @@ func normalizeGroups(segs []segment) (out []segment, funcAt int) {
 			}
 		}
 		// NAME() { BODY: the parser splits at the parens, leaving a
-		// one-word segment followed by one that opens a group.
-		if n == 0 && len(s.argv) == 1 && i+1 < len(segs) && len(segs[i+1].argv) > 0 && segs[i+1].argv[0] == "{" {
-			if funcAt < 0 {
-				funcAt = len(out)
-			}
-			continue // the name alone runs nothing
+		// one-word segment followed by one that opens a group. The word is
+		// still classified as a command (it may be one: `reboot` on one
+		// line, `{ ...; }` on the next); only the function flag is set.
+		if n == 0 && len(s.argv) == 1 && i+1 < len(segs) && len(segs[i+1].argv) > 0 && segs[i+1].argv[0] == "{" && funcAt < 0 {
+			funcAt = len(out)
 		}
 		ns := trimSegment(s, min(n, len(s.argv)))
 		if len(ns.argv) == 0 && len(ns.redirects) == 0 {

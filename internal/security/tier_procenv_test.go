@@ -154,6 +154,18 @@ func TestBoardReview5InlineAndGroups(t *testing.T) {
 		"python3 - <<'EOF'\nimport os\nos.system('ps -Eww')\nEOF",
 		"node <<'EOF'\nrequire('child_process').spawn('staypoint',['mcp'])\nEOF",
 		`python3 <<< "import os;os.system('ps -E')"`,
+		// Behind wrappers, versioned names, other inline flags.
+		"env python3 - <<'EOF'\nimport os\nos.system('ps -E')\nEOF",
+		"timeout 5 node <<'EOF'\nrequire('child_process').spawn('staypoint',['mcp'])\nEOF",
+		`python3.12 -c "import os;os.system('ps -E')"`,
+		`pypy3 -c "import os;os.system('ps -E')"`,
+		`node -p "require('child_process').execSync('ps -E')+''"`,
+		`perl -E 'system("ps -E")'`,
+		`php -r 'system("ps -E");'`,
+		`python3 -c "import os;os.execvp('staypoint',['staypoint','status'])"`,
+		`python3 -c "import os;os.posix_spawnp('staypoint',['staypoint','status'],{})"`,
+		// A one-word command before a group is still a command.
+		"reboot\n{ echo; }",
 	}
 	for _, line := range red {
 		if v := c.Classify(line); v.Tier != Red {

@@ -397,12 +397,8 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 		c.classifyStaypoint(args, append(slices.Clone(c.envChange), s.argv[:len(s.argv)-len(argv)]...), v)
 	case name == "curl" || name == "wget":
 		c.classifyFetch(name, args, v)
-	case name == "python" || name == "python2" || name == "python3":
-		c.classifyScriptInterp(name, args, []string{"-c"}, v)
-	case name == "node" || name == "nodejs":
-		c.classifyScriptInterp(name, args, []string{"-e", "--eval"}, v)
-	case name == "ruby" || name == "perl" || name == "php":
-		c.classifyScriptInterp(name, args, []string{"-e"}, v)
+	case interpInlineFlags[interpFamily(name)] != nil:
+		c.classifyScriptInterp(name, args, interpInlineFlags[interpFamily(name)], v)
 	case name == "ps":
 		classifyPs(args, v)
 	case name == "go":
@@ -1063,8 +1059,10 @@ var (
 	inlinePsEnvRe       = regexp.MustCompile(`\bps(?:[\s'",\[\]]+(?:-[A-Za-z]*E[A-Za-z]*\b|[A-Za-z]*e[A-Za-z]*\b)|(?:[\s'",\[\]]+[-\w,=]+)+?[\s'",\[\]]+-[A-Za-z]*E[A-Za-z]*\b)`)
 	inlineProcEnvironRe = regexp.MustCompile(`/proc/[^/\s'"]+(?:/task/[^/\s'"]+)?/environ\b`)
 	inlineStaypointRe   = regexp.MustCompile(`(?i)\bstaypoint\b`)
-	// Ways an interpreter starts a process.
-	inlineExecRe = regexp.MustCompile(`\b(?:system|popen|Popen|subprocess|spawn|spawnSync|exec|execSync|execFile|execFileSync|execv[pe]*|run|call|check_output|check_call|getoutput|getstatusoutput|IO\.popen|Open3|qx|Command)\b|` + "`" + `|%x[({\[]`)
+	// Ways an interpreter starts a process. No left word boundary, so
+	// os.execvp, posix_spawnp, execFileSync and spawnSync all match; a
+	// false match only holds a script that also names staypoint.
+	inlineExecRe = regexp.MustCompile(`(?i)(?:system|popen|subprocess|spawn|exec|run\b|call\b|check_output|getoutput|getstatusoutput|open3|qx|command\b|child_process|pty)|` + "`" + `|%x[({\[]`)
 )
 
 func (c *Classifier) expandHome(p string) string {
