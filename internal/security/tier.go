@@ -122,7 +122,12 @@ type Classifier struct {
 	// runs in (after -C and cd), replacing PushPolicy. A push whose repo
 	// cannot be modelled (--git-dir, --work-tree, -c) is treated as "never".
 	PushPolicyFor func(dir string) string
+	// StaypointBins are the staypoint binaries a command name may be a link
+	// to (isStaypointBin). Nil means the running binary and the staypoint
+	// on PATH.
+	StaypointBins []string
 
+	viaXargs  bool     // the command's arguments come partly from xargs input
 	line      *lineCtx // facts about the whole command line being classified
 	baseCWD   string   // CWD before any `cd` in the line
 	inner     bool     // classifying a wrapper's inner command (env/xargs/find -exec ...)
@@ -168,13 +173,18 @@ func (c *Classifier) classifyLine(line string, depth int) Verdict {
 	lc := c.lineContext(line, segs, subs, depth)
 	dir := c.CWD
 	fromCd := c.cwdFromCd
+	var lineEnv []string // env edits earlier segments make for later ones
 	for i, s := range segs {
 		cc := *c
 		cc.CWD, cc.line, cc.cwdFromCd = dir, lc, fromCd
 		if cc.baseCWD == "" {
 			cc.baseCWD = c.CWD
 		}
+		if len(lineEnv) > 0 {
+			cc.envChange = append(slices.Clone(c.envChange), lineEnv...)
+		}
 		cc.classifySegment(s, &v, depth)
+		lineEnv = append(lineEnv, lineEnvEdits(s)...)
 		if a := stripPrefixes(s.argv); baseCmd(a) == "cd" {
 			fromCd = len(a) == 2 && filepath.IsAbs(a[1]) && !segDyn(s, len(s.argv)-len(a)+1)
 		}
@@ -226,6 +236,9 @@ var alwaysRed = map[string]string{
 	"script":   "TTY-forging tool (bypasses terminal checks)",
 	"unbuffer": "TTY-forging tool (bypasses terminal checks)",
 	"expect":   "TTY-forging / automation tool (bypasses terminal checks)",
+	// Read other processes' memory, where the daemon keeps run tokens.
+	"lldb": "debugger (reads other processes' memory)", "gdb": "debugger (reads other processes' memory)",
+	"dtrace": "tracer (reads other processes' memory)", "dtruss": "tracer (reads other processes' memory)",
 }
 
 // wrapper commands whose real command follows their own flags.
@@ -276,6 +289,11 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 		}
 		c.checkPath(r.target, v)
 	}
+	// d=~/.staypoint; cat $d/x: an assignment's value is a path like any
+	// argument (Board review #4).
+	for _, a := range s.argv[:len(s.argv)-len(argv)] {
+		c.checkPath(a, v)
+	}
 	if len(argv) == 0 {
 		return
 	}
@@ -300,12 +318,29 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 	for _, a := range args {
 		c.checkPath(a, v)
 	}
+	// Board review #4: staypoint under another name (a link to the binary)
+	// is still staypoint; making such a link or copy, registering
+	// `staypoint mcp` with an agent CLI, or reaching ~/.staypoint through a
+	// whole-home copy is Red.
+	if name != "staypoint" && c.isStaypointBin(argv[0]) {
+		name = "staypoint"
+	}
+	if linkOrCopyCmds[name] && c.copiesStaypoint(args) {
+		v.raise(Red, name+": links or copies the staypoint binary")
+	}
+	if registersStaypointMCP(name, args) {
+		v.raise(Red, name+": registers `staypoint mcp` outside the harness")
+	}
+	if c.reachesHomeWhole(name, args) {
+		v.raise(Red, name+": copies or walks the whole home directory (reaches ~/.staypoint)")
+	}
 
 	switch {
 	case wrappers[name]:
 		v.raise(Yellow, "")
 		if inner := skipWrapper(name, args); len(inner) > 0 {
 			ic := *c
+			ic.viaXargs = name == "xargs"
 			if name == "env" {
 				ic.envChange = append(slices.Clone(c.envChange), args[:len(args)-len(inner)]...)
 			}
@@ -363,6 +398,8 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 		c.classifyScriptInterp(name, args, []string{"-e", "--eval"}, v)
 	case name == "ruby" || name == "perl" || name == "php":
 		c.classifyScriptInterp(name, args, []string{"-e"}, v)
+	case name == "ps":
+		classifyPs(args, v)
 	case name == "go":
 		if len(args) > 0 && greenGo[args[0]] {
 			return
@@ -392,6 +429,12 @@ func (c *Classifier) classifySegment(s segment, v *Verdict, depth int) {
 		off := len(s.argv) - len(argv)
 		call := scriptCall{name: name, token: argv[0], direct: true, prefixed: off > 0,
 			tokenDyn: segDyn(s, off) || segMeta(s, off)}
+		// s=staypoint; $s mcp: a command name computed at run time could be
+		// anything (Board review #4).
+		if segDyn(s, off) {
+			v.raise(Red, "command name is computed at run time ("+argv[0]+")")
+			return
+		}
 		if strings.Contains(argv[0], "/") && c.scriptVerdict(call, v, depth) {
 			return
 		}
@@ -837,6 +880,10 @@ func (c *Classifier) classifyStaypoint(args, envChange []string, v *Verdict) {
 		v.raise(Red, "staypoint mcp: starts the ops-tool MCP server outside the harness")
 		return
 	}
+	if c.viaXargs {
+		v.raise(Red, "xargs staypoint: the subcommand comes from input the classifier cannot see")
+		return
+	}
 	if why := staypointEnvChange(envChange); why != "" {
 		v.raise(Red, "staypoint with "+why+": runs StayPoint under another config, task or PATH")
 		return
@@ -853,6 +900,8 @@ var staypointEnvVarRe = regexp.MustCompile(`^(HOME|PATH|USER|LOGNAME|TMPDIR|XDG_
 func staypointEnvChange(edits []string) string {
 	for _, e := range edits {
 		switch {
+		case e == "-source":
+			return "an earlier source/. on the line"
 		// Any env flag (-i, -u VAR, -S, -C, combined -iu ...) edits the
 		// environment or how the rest is parsed; fail closed on all of them.
 		case strings.HasPrefix(e, "-") && e != "--":
@@ -1008,6 +1057,30 @@ func looksLikePath(s string) bool {
 		strings.HasPrefix(s, "../") || strings.Contains(s, "/../") || strings.HasSuffix(s, "/..")
 }
 
+// checkSensitive raises Red when clean, an absolute path, is in a sensitive
+// dir. It compares case-insensitively (macOS volumes are, so
+// ~/.STAYPOINT/x is ~/.staypoint/x) and expands a glob against the real
+// filesystem the way the shell will (~/.st*/x, ~/.staypoin?/x).
+func (c *Classifier) checkSensitive(clean string, v *Verdict) {
+	paths := []string{clean}
+	if strings.ContainsAny(clean, "*?[") {
+		if m, err := filepath.Glob(clean); err == nil {
+			paths = append(paths, m...)
+		}
+	}
+	for _, p := range paths {
+		lp := strings.ToLower(p)
+		for _, d := range c.sensitiveDirs() {
+			ld := strings.ToLower(d)
+			// The run's own scratch dir may sit under ~/.staypoint/scratch.
+			if (lp == ld || strings.HasPrefix(lp, ld+string(filepath.Separator))) && !c.inScratchUnder(d, p) {
+				v.raise(Red, "touches sensitive path "+d)
+				return
+			}
+		}
+	}
+}
+
 // checkPath escalates for sensitive locations and (when a worktree is set) escapes.
 func (c *Classifier) checkPath(tok string, v *Verdict) {
 	cands := []string{tok}
@@ -1020,15 +1093,17 @@ func (c *Classifier) checkPath(tok string, v *Verdict) {
 		}
 		exp := c.expandHome(cand)
 		if !looksLikePath(cand) && exp == cand {
+			// cd ~ && cat .staypoint/x: a relative name under a sensitive
+			// dir, from the tracked working directory (Board review #4).
+			if c.CWD != "" && filepath.IsAbs(c.CWD) && !strings.HasPrefix(cand, "-") {
+				c.checkSensitive(filepath.Join(c.CWD, cand), v)
+			}
 			continue
 		}
-		clean := filepath.Clean(exp)
-		// The run's own scratch dir may sit under ~/.staypoint/scratch.
-		for _, d := range c.sensitiveDirs() {
-			if (clean == d || strings.HasPrefix(clean, d+string(filepath.Separator))) && !c.inScratchUnder(d, clean) {
-				v.raise(Red, "touches sensitive path "+d)
-			}
+		if procEnvironRe.MatchString(filepath.Clean(exp)) {
+			v.raise(Red, "reads a process environment ("+cand+")")
 		}
+		c.checkSensitive(filepath.Clean(exp), v)
 		if c.Worktree != nil {
 			if err := c.Worktree.Check(exp); err != nil {
 				v.raise(Red, "path outside worktree: "+cand)

@@ -131,6 +131,7 @@ type lineCtx struct {
 	scriptRuns    int                  // scripts executed in the line
 	dirUncertain  bool                 // a subshell or pushd makes `cd` tracking unreliable
 	envTainted    string               // the line changes variables or the environment
+	raw           string               // the line as written
 }
 
 var subshellRe = regexp.MustCompile(`(^|[^$<>])\(`)
@@ -149,7 +150,7 @@ var envChangers = map[string]bool{
 }
 
 func (c *Classifier) lineContext(line string, segs []segment, subs []string, depth int) *lineCtx {
-	lc := &lineCtx{heredocWrites: map[string]*redirect{}, writes: map[string]bool{}}
+	lc := &lineCtx{heredocWrites: map[string]*redirect{}, writes: map[string]bool{}, raw: line}
 	lc.dirUncertain = subshellRe.MatchString(line)
 	plain := &Classifier{Home: c.Home, CWD: c.CWD, ScratchDirs: c.ScratchDirs}
 	for _, s := range subs {
@@ -266,7 +267,7 @@ func (c *Classifier) nextDir(s segment, dir string) string {
 	if len(argv) == 1 {
 		return c.home()
 	}
-	a := argv[1]
+	a := c.expandHome(argv[1]) // cd ~, cd ~/x, cd $HOME
 	if a == "-" || strings.Contains(a, "$") || strings.HasPrefix(a, "-") {
 		return ""
 	}

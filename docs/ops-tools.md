@@ -51,14 +51,25 @@ HOME=/tmp/fakehome PATH=/tmp/bin:$PATH staypoint mcp`: the server read
 prod services and `branch=main` ran as `dev_write`, and with no task there
 was no activity row. Four things close that:
 
-- **Run token.** The harness gives each run `STAYPOINT_RUN_MAC`, an
-  HMAC-SHA256 of the task ID under `<data dir>/ops_key` (32 random bytes,
-  mode 0600, created on first use; `internal/opstools/origin.go`). The
-  server runs an ops tool only when `STAYPOINT_TASK_ID` is set and the token
-  checks out. An agent can read its own run's token, but cannot mint one for
-  another task without the key. A server with no task, another task's ID,
-  or a missing or wrong token refuses every ops tool; the other `staypoint_*`
-  tools are unaffected. The hook denies a Read (or any tool with a path)
+- **Run token.** The harness gives each run `STAYPOINT_RUN_TICKET`: 32
+  random bytes, held only in the daemon's memory, bound to the task and the
+  run, and revoked when the run ends (`internal/opstools/origin.go`). There
+  is no key file; nothing on disk can mint a token. (Board review #4: the
+  first version derived tokens from `<data dir>/ops_key`, which same-uid
+  Bash could read or overwrite however the classifier spelled the path. The
+  daemon deletes that file at start.) On every ops call the server asks the
+  daemon, `POST /api/ops/run-token/check`, sending the task ID, the token's
+  SHA-256 and a fresh nonce, never the token. The daemon answers with an
+  HMAC keyed by the token over the nonce, task and run, which the server
+  verifies; a listener posing as the daemon on its port (say while it
+  restarts) sees only the hash and cannot vouch for a token. A server with
+  no task, another task's ID, a token from an ended run, or a missing or
+  wrong token refuses every ops tool; the other `staypoint_*` tools are
+  unaffected. An agent can read its own run's token, which gives it nothing
+  its own run's MCP server does not already have. Reading another run's
+  token from its environment is Red (`ps -E`, `ps e`, `/proc/*/environ`),
+  as are debuggers and tracers (`lldb`, `gdb`, `dtrace`, `dtruss`), which
+  could read the daemon's memory. The hook denies a Read (or any tool with a path)
   that reaches `ops_key`, `auth_token` or `board_token` in the data dir,
   after making the path absolute against the session's cwd, expanding `~`,
   resolving symlinks and folding case. It denies any Grep rooted at the data
@@ -66,8 +77,8 @@ was no activity row. Four things close that:
   those files there.
 - **Pinned config.** `staypoint mcp` loads its config from the account's
   home in the user database (`os/user`, not `$HOME`), resets `HOME` to it,
-  and checks the run token against that data dir. A fake `HOME` changes
-  nothing.
+  and reads the daemon's auth token from that data dir. A fake `HOME`
+  changes nothing.
 - **Scrubbed children.** Every process an ops tool starts (`gh`, `git`,
   `ssh`, `bash`) gets the server's environment minus `GH_*`, `GITHUB_*`,
   `GIT_*`, `XDG_CONFIG_HOME`, `BASH_ENV`, `ENV`, proxy and CA-bundle
@@ -351,7 +362,11 @@ there should read the same table.
 | Path traversal or symlink escape in `cat_file`/`ls` | Lexical check plus an on-host `readlink -f` re-check; a test runs the remote guard against a real symlinked tree. |
 | Secret leak in output | Redaction on every result; env/key files are refused; a fixture env test and a table test of every gap the Board found cover it. |
 | ssh config redirects the dev alias | A required StayPoint-owned `-F` file inside the data dir replaces `~/.ssh/config` (no `Match exec`, `Include`, `KnownHostsCommand` from it); `HostName`, no proxy, no control socket and strict host keys are pinned on the command line too. |
-| Agent starts its own `staypoint mcp` with a fake HOME/config, no task, or another task's ID | Ops tools need the harness's per-run HMAC token; config is loaded from the real account home; child env scrubbed and PATH pinned; `staypoint mcp` and env-rewritten `staypoint` are Red; Read/Grep of the ops key is denied. |
+| Agent starts its own `staypoint mcp` with a fake HOME/config, no task, or another task's ID | Ops tools need a live run's token, which only the daemon holds and confirms; config is loaded from the real account home; child env scrubbed and PATH pinned; `staypoint mcp` and env-rewritten `staypoint` are Red. |
+| Agent mints or steals another run's token | Tokens are random and live only in daemon memory (no key file); revoked at run end; `ps -E`/`ps e`/`/proc/*/environ`, debuggers and tracers are Red. |
+| Fake daemon on the daemon's port says yes | The check sends only the token's hash; the yes must carry an HMAC keyed by the token. |
+| `staypoint` run under another name or env (`s=staypoint; $s mcp`, a link to the binary, `xargs staypoint`, `export HOME=… ; staypoint`, `claude mcp add x -- staypoint mcp`) | Computed command names are Red; a link to the binary is classified as staypoint; making a link or copy of it is Red; env edits earlier on the line (export, unset, bare assignment, source) count like `env VAR=x`; registering `staypoint mcp` with an agent CLI is Red. |
+| Data-dir path spelled around the check (`~/.st*/x`, `$HOME/.STAYPOINT/x`, `cd ~ && cat .staypoint/x`, `d=~/.staypoint; cat $d/x`, `cp -r ~ /tmp/h`) | Globs are expanded against the filesystem, paths compared case-insensitively, relative names resolved against the tracked cwd (`cd ~` included), assignment values checked as paths; copying, archiving or `find -exec` over the whole home is Red. |
 | `gh pr edit --base main` during a dev merge | `gh pr edit --base` and `gh api` writes are Red; base, head and state are re-read from the REST API right before the merge. |
 | `cat_file` returns a database or log | Text-file allowlist, checked locally and on the host after `readlink -f`. |
 | Agent-pushed verify script runs as "read" | The repo must be in `verify_repos`; the trust anchor is GitHub's main blob, not local refs; the bytes are hashed and must match; local `origin` must be that repo. |
@@ -374,6 +389,15 @@ Not covered:
   canonical still approves it: that is a Board decision.
 - The night rule appears as reason text for the Board. It isn't enforced by
   a clock.
+- The Board approver and the Bash hook's gate still trust whatever answers
+  on `127.0.0.1:41421`. A process an agent leaves listening there while the
+  daemon restarts could answer "approved". The run-token check proves the
+  daemon (above); the gate-request flow does not yet.
+- Same-uid file reads in general. The classifier patterns above are defence
+  in depth; `python3 -c "open(os.path.expanduser('~/.staypoint/' + 'auth' + '_token'))"`
+  still reads `auth_token`. The run token no longer depends on that, but
+  the auth token does; the real fix is file permissions the agent's user
+  cannot read (task-97b4fa02).
 
 ## Ranking query (Phase 2 input)
 
