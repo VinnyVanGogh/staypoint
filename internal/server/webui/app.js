@@ -615,38 +615,26 @@ async function loadAll() {
 }
 
 // ── SSE connection ────────────────────────────────────────
-let sseSource = null;
-let sseRetryTimer = null;
-let sseCursor = null;
+// One EventSource per browser, shared by every tab (lib/livestream.js): a
+// stream per tab used up the six HTTP/1.1 connections a browser allows per
+// host, and every other fetch queued behind them (task-53fcbcff).
+let liveStream = null;
 
 function connectSSE() {
   const badge = document.getElementById('conn-badge');
-  const url = sseCursor ? `/api/events?cursor=${sseCursor}` : '/api/events';
-  if (sseSource) { sseSource.close(); sseSource = null; }
-
-  const fullUrl = TOKEN ? `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(TOKEN)}` : url;
-  sseSource = new EventSource(fullUrl);
-
-  sseSource.onopen = () => {
-    badge.className = 'badge badge-live';
-    badge.textContent = 'live';
-    if (sseRetryTimer) { clearTimeout(sseRetryTimer); sseRetryTimer = null; }
-    // Catch up on alerts raised or dismissed while disconnected.
-    loadBoardAlerts();
-  };
-  sseSource.onerror = () => {
-    badge.className = 'badge badge-error';
-    badge.textContent = 'reconnecting';
-    sseSource.close();
-    sseRetryTimer = setTimeout(connectSSE, 3000);
-  };
-  sseSource.onmessage = (ev) => {
-    try {
-      const evt = JSON.parse(ev.data);
-      sseCursor = evt.id ?? sseCursor;
-      handleEvent(evt);
-    } catch { /* ignore malformed */ }
-  };
+  liveStream = createLiveStream({
+    baseUrl: '/api/events',
+    token: TOKEN,
+    onEvent: (evt) => {
+      try { handleEvent(evt); } catch (err) { console.error('event handler failed', err); }
+    },
+    onStatus: (status) => {
+      badge.className = status === 'live' ? 'badge badge-live' : status === 'reconnecting' ? 'badge badge-error' : 'badge badge-connecting';
+      badge.textContent = status;
+      // Catch up on alerts raised or dismissed while disconnected.
+      if (status === 'live') loadBoardAlerts();
+    },
+  });
 }
 
 // ── Board alerts (STA-705) ───────────────────────────────
@@ -4967,7 +4955,7 @@ function renderSettings() {
   for (const { label, val } of [
     { label: 'API Endpoint', val: window.location.host },
     { label: 'Auth', val: TOKEN ? 'Token (session cookie active)' : 'No token' },
-    { label: 'SSE Status', val: sseSource?.readyState === 1 ? 'Connected' : 'Reconnecting' },
+    { label: 'SSE Status', val: liveStream?.status() === 'live' ? `Connected (${liveStream.role() === 'leader' ? 'this tab holds the stream' : 'shared from another tab'})` : 'Reconnecting' },
   ]) {
     const row = el('div', 'settings-row');
     row.appendChild(el('div', 'settings-row-label', label));
