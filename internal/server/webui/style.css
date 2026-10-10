@@ -4971,7 +4971,8 @@ body:has(#sidebar.collapsed) .detail-panel.full-page {
 .ship-review-test-warning-msg { font-weight: 600; }
 .ship-review-test-warning:not(.ship-review-test-warning--blocking) .ship-review-test-warning-msg { font-weight: 400; }
 .ship-review-test-warning-items { margin: 4px 0 0 16px; padding: 0; font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; }
-.ship-review-test-warning .ship-review-test-coverage-retry { margin-left: 8px; }
+.ship-review-test-warning .ship-review-test-coverage-retry,
+.ship-review-test-warning .ship-review-test-coverage-open-pr { margin-left: 8px; }
 .ship-review-merge-without-tests-missing { margin: 4px 0 4px 16px; padding: 0; }
 .ship-review-merge-without-tests-note { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
 .ship-review-test-task-link { overflow-wrap: anywhere; }

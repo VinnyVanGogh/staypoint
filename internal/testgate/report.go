@@ -9,6 +9,7 @@ import (
 // Warning kinds on a Report.
 const (
 	KindNoCI            = "no_ci"
+	KindNoCIRun         = "no_ci_run"
 	KindNoTests         = "no_tests"
 	KindUntestedSources = "untested_sources"
 	KindUncovered       = "uncovered"
@@ -32,7 +33,9 @@ type CoverageResult struct {
 	// Source names where the report came from, e.g. the CI artifact.
 	Source string `json:"source,omitempty"`
 	// Note explains why there is no report (no CI run, no artifact, ...).
-	Note      string          `json:"note,omitempty"`
+	Note string `json:"note,omitempty"`
+	// CIRuns is how many CI runs GitHub has for this commit, when known.
+	CIRuns    int             `json:"ci_runs,omitempty"`
 	Uncovered []UncoveredFile `json:"uncovered,omitempty"`
 	// Ambiguous lists changed files several report entries could be, so
 	// their coverage is unknown. Evaluate fills it from Uncovered.
@@ -48,9 +51,16 @@ type CIState struct {
 	// content. Nil with WorkflowsErr set means they could not be read.
 	Workflows    map[string]string
 	WorkflowsErr error
+	// Scripts maps repo scripts the workflows call (directly or through
+	// other scripts) to their content at the head, so a test command inside
+	// e.g. scripts/ui-e2e.sh counts.
+	Scripts map[string]string
 	// PRNumber > 0 with PRChecksRead means the PR's checks were read for the
 	// head; PRCheckCount is how many check runs and statuses it had.
-	PRNumber     int
+	PRNumber int
+	// NoPR: the change has no PR (a direct-mode card), so CI has not run on
+	// this commit. That is a note, not a block: opening a PR runs it.
+	NoPR         bool
 	PRChecksRead bool
 	PRCheckCount int
 }
@@ -99,7 +109,7 @@ func Evaluate(in Input) *Report {
 		Missing:        []string{},
 	}
 	for p, c := range in.CI.Workflows {
-		if WorkflowRunsTests(c) {
+		if RunsTests(c, in.CI.Scripts) {
 			r.TestWorkflows = append(r.TestWorkflows, p)
 		}
 	}
@@ -147,6 +157,9 @@ func Evaluate(in Input) *Report {
 		r.add(Warning{Kind: KindNoCI, Blocking: true,
 			Message: fmt.Sprintf("No CI ran on PR #%d: it has no check runs or statuses. Nothing checked this change automatically.", in.CI.PRNumber)},
 			fmt.Sprintf("no CI checks on PR #%d", in.CI.PRNumber))
+	case in.CI.NoPR && in.CI.PRNumber == 0 && !in.Coverage.Available && in.Coverage.CIRuns == 0:
+		r.Warnings = append(r.Warnings, Warning{Kind: KindNoCIRun,
+			Message: "No CI run for this commit: open a PR to run CI."})
 	}
 
 	// 2. No tests changed or added.

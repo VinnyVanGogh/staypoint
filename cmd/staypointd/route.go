@@ -21,6 +21,9 @@ var (
 	// testSkipGitPreflight lets tests drive the production adapter path in a
 	// temp dir that is not a git checkout.
 	testSkipGitPreflight = false
+	// routeUIOLI is the use-it-or-lose-it tuning for run routing, set from
+	// config at startup.
+	routeUIOLI router.UIOLIConfig
 )
 
 // currentPacer loads live quota state, degrading to "no data" (nothing locked)
@@ -51,10 +54,10 @@ func resolveTaskRoute(db *sql.DB, taskID, repoRoot string, pacer *router.PacerSt
 // resolveTaskRouteApproved is resolveTaskRoute for a run that consumed the
 // Board Touch ID approval approvalID (geminiCodeGate); "" for none.
 func resolveTaskRouteApproved(db *sql.DB, taskID, repoRoot string, pacer *router.PacerState, now time.Time, approvalID string) router.KindRoute {
-	var repoPath, workKind, provider, model string
+	var repoPath, workKind, provider, model, priority string
 	if err := db.QueryRowContext(context.Background(),
-		"SELECT COALESCE(repo_path,''), COALESCE(work_kind,''), COALESCE(provider,''), COALESCE(model_override,'') FROM tasks WHERE id=?", taskID,
-	).Scan(&repoPath, &workKind, &provider, &model); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		"SELECT COALESCE(repo_path,''), COALESCE(work_kind,''), COALESCE(provider,''), COALESCE(model_override,''), COALESCE(priority,'') FROM tasks WHERE id=?", taskID,
+	).Scan(&repoPath, &workKind, &provider, &model, &priority); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		slog.Warn("route: task lookup failed; routing as coding on the personal seat",
 			slog.String("task", taskID), slog.Any("error", err))
 	}
@@ -73,6 +76,9 @@ func resolveTaskRouteApproved(db *sql.DB, taskID, repoRoot string, pacer *router
 	}
 	choice := router.ChoiceFromStored(provider, model)
 	choice.CodeApprovalID = approvalID
+	uioli := routeUIOLI
+	choice.UIOLI = &uioli
+	choice.HighPriority = router.IsHighPriority(priority)
 	route := router.ResolveRouteChoice(workKind, isWork, pacer, choice, now)
 	return barGeminiOutsideGit(route, rawRepoPath, taskID)
 }

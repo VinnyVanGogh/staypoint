@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/VinnyVanGogh/staypoint/internal/bridge"
@@ -98,6 +99,11 @@ func (h *ShipReviewHandler) approvePR(w http.ResponseWriter, r *http.Request, ca
 		writeJSONStatus(w, http.StatusConflict, map[string]any{"error": "head_moved", "message": err.Error(), "new_head_sha": newHead})
 		return
 	}
+	var merged *shipreview.AlreadyMergedError
+	if errors.As(err, &merged) {
+		h.approveAlreadyMerged(w, r, card, task, mode, merged, gate)
+		return
+	}
 	if err != nil {
 		writeJSONStatus(w, http.StatusBadGateway, map[string]any{"error": "github_error", "message": err.Error()})
 		return
@@ -140,6 +146,59 @@ func (h *ShipReviewHandler) approvePR(w http.ResponseWriter, r *http.Request, ca
 	// open_pr hands the PR to GitHub here; a bypass files its task now.
 	h.addGateResult(resp, card, task, gate, pr.Number, pr.URL, "")
 	writeJSON(w, resp)
+}
+
+// approveAlreadyMerged closes the card when Approve finds the pinned head
+// already in the target (merged earlier, e.g. by its own PR): there is no PR
+// to open, so the card records the commit that landed it instead of failing
+// on `gh pr create`. The task stays open for the Board's next step.
+func (h *ShipReviewHandler) approveAlreadyMerged(w http.ResponseWriter, r *http.Request, card *shipreview.Card, task *context.Task, mode string, m *shipreview.AlreadyMergedError, gate *gateOutcome) {
+	if err := shipreview.MarkAlreadyMerged(h.db, card.ID, card.HeadSHA, m.TargetSHA); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	shipreview.StopDevServer(h.db, card)
+	if m.TargetSHA != "" {
+		// Lets the Board's Mark done pass its work-product guard.
+		_ = context.AddWorkProduct(h.db, task.ID, "commit", m.TargetSHA)
+	}
+	prNumber, prURL := 0, ""
+	if m.PR != nil {
+		prNumber, prURL = m.PR.Number, m.PR.URL
+		_ = context.AddWorkProduct(h.db, task.ID, "pull_request", prURL)
+	}
+	nextStep := "Mark the task done, or promote " + m.Target + " to production."
+	if m.Target == "main" || m.Target == "master" {
+		nextStep = "Mark the task done."
+	}
+
+	payload := map[string]any{
+		"action": "approve", "task_id": task.ID, "branch": card.Branch, "head_sha": card.HeadSHA,
+		"merge_mode": mode, "already_merged": true, "target": m.Target, "main_sha": m.TargetSHA,
+		"pr_number": prNumber, "pr_url": prURL, "ip": r.RemoteAddr, "user_agent": r.UserAgent(),
+	}
+	_ = governance.LogEvent(h.db, task.ID, "board", governance.AuditBoardAction, nil, nil, payload)
+	_ = governance.LogBoardEvent(h.db, "board", governance.AuditBoardAction, payload)
+	h.hub.Publish("ship_review_approved", map[string]any{
+		"task_id": task.ID, "approved_sha": card.HeadSHA, "main_sha": m.TargetSHA,
+		"merge_mode": mode, "already_merged": true, "pr_number": prNumber, "pr_url": prURL,
+	})
+
+	refreshed, _ := shipreview.GetCard(h.db, task.ID)
+	resp := map[string]any{
+		"card": refreshed, "merge_mode": mode, "already_merged": true, "target": m.Target,
+		"main_sha": m.TargetSHA, "pr_number": prNumber, "pr_url": prURL,
+		"message": "Already merged into " + m.Target + prSuffix(prNumber), "next_step": nextStep,
+	}
+	h.addGateResult(resp, card, task, gate, prNumber, prURL, m.TargetSHA)
+	writeJSON(w, resp)
+}
+
+func prSuffix(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return " (PR #" + strconv.Itoa(n) + ")"
 }
 
 // Checks handles GET /api/tasks/{id}/ship-review/checks: polls the card's PR

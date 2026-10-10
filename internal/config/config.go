@@ -58,6 +58,15 @@ type Config struct {
 	UIOLIWindowHours     float64 `json:"uioli_window_hours" toml:"uioli_window_hours"`
 	UIOLIMinRemainingPct float64 `json:"uioli_min_remaining_pct" toml:"uioli_min_remaining_pct"`
 	UIOLIMinPctPerHour   float64 `json:"uioli_min_pct_per_hour" toml:"uioli_min_pct_per_hour"`
+	// UIOLIFinalFloorPct is the remaining-% floor right before the reset; the
+	// floor falls from UIOLIMinRemainingPct to it across the window.
+	UIOLIFinalFloorPct float64 `json:"uioli_final_floor_pct" toml:"uioli_final_floor_pct"`
+	// UIOLIFiveHourFloorPct: UIOLI stops steering once the 5h window is at or
+	// below this remaining % (default 10), so it never forces a 5h lock.
+	UIOLIFiveHourFloorPct float64 `json:"uioli_five_hour_floor_pct" toml:"uioli_five_hour_floor_pct"`
+	// UIOLIHighPriorityOnly limits the Fable steer to high-priority runs.
+	// Default false: every run in the window steers.
+	UIOLIHighPriorityOnly bool `json:"uioli_high_priority_only" toml:"uioli_high_priority_only"`
 	// Provider CLI binary overrides. Empty = resolve via PATH (exec.LookPath).
 	// STAYPOINT_CLAUDE_BIN / STAYPOINT_AGY_BIN / STAYPOINT_CODEX_BIN env vars take precedence over these.
 	ClaudeBin string `json:"claude_bin" toml:"claude_bin"`
