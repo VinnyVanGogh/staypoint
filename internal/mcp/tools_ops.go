@@ -61,17 +61,17 @@ func opsTools() []Tool {
 		},
 		{
 			Name: "dev_deploy_verify",
-			Description: "Effect read. Run the repo's scripts/verify_dev_deploy.sh (from origin/dev-server, only when it matches origin/main " +
-				"or a Board-trusted blob) and return the PASS/FAIL lines plus the final DEV DEPLOY VERIFIED / NOT ON DEV line. " +
-				"Use this instead of `git show ...:scripts/verify_dev_deploy.sh | bash -s`.",
+			Description: "Effect read. Run the repo's scripts/verify_dev_deploy.sh from its dev-server branch on GitHub (only when it matches main " +
+				"on GitHub or a Board-trusted blob) in the working directory, and return the PASS/FAIL lines plus the final " +
+				"DEV DEPLOY VERIFIED / NOT ON DEV line. Use this instead of `git show ...:scripts/verify_dev_deploy.sh | bash -s`.",
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]Property{
-					"repo":        str("Absolute path of the local repo checkout (defaults to the working directory)"),
+					"repo":        str("GitHub repo owner/name from [gates.ops] verify_repos"),
 					"sha":         str("Commit that must be on dev"),
 					"page_checks": {Type: "array", Description: "Page checks of the form /path=marker", Items: &Property{Type: "string"}},
 				},
-				Required: []string{"sha", "page_checks"},
+				Required: []string{"repo", "sha", "page_checks"},
 			},
 		},
 		{
@@ -241,13 +241,14 @@ func (s *Server) handleDevDeployVerify(ctx context.Context, rawArgs json.RawMess
 	if err := decodeArgs(rawArgs, &req); err != nil {
 		return toolError(err.Error())
 	}
-	if err := opstools.ValidateVerify(&req, s.getWorkDir()); err != nil {
+	ops := s.getConfig().Gates.Ops
+	if err := opstools.ValidateVerify(&req, ops.VerifyRepos); err != nil {
 		return toolError("dev_deploy_verify refused: " + err.Error())
 	}
 	c := opstools.Call{Tool: "dev_deploy_verify", Effect: opstools.Read,
 		Summary: fmt.Sprintf("repo=%s sha=%s checks=%d", req.Repo, req.SHA, len(req.PageChecks))}
 	s.logOps(c)
-	return opsResult(c, opstools.RunVerify(ctx, s.opsRunner(), req, s.getConfig().Gates.Ops.VerifyScriptBlobs))
+	return opsResult(c, opstools.RunVerify(ctx, s.opsRunner(), req, s.getWorkDir(), ops.VerifyScriptBlobs))
 }
 
 var (
@@ -274,13 +275,7 @@ func (s *Server) handleTaskComment(ctx context.Context, rawArgs json.RawMessage)
 	if err != nil {
 		return toolError(fmt.Sprintf("database error: %v", err))
 	}
-	author := "agent"
-	if os.Getenv("STAYPOINT_TASK_ID") == "" {
-		if u := os.Getenv("USER"); u != "" {
-			author = u
-		}
-	}
-	if err := meshContext.AddAgentComment(dbConn, taskID, author, args.Text); err != nil {
+	if err := meshContext.AddAgentComment(dbConn, taskID, args.Text); err != nil {
 		return toolError(fmt.Sprintf("add comment: %v", err))
 	}
 	c := opstools.Call{Tool: "task_comment", Effect: opstools.DevWrite, Summary: fmt.Sprintf("task=%s bytes=%d", taskID, len(args.Text))}

@@ -129,9 +129,13 @@ func (h HostClasses) IsDevHost(host string) bool {
 type OpsConfig struct {
 	// DevHosts maps a [gates.hosts] dev alias to what dev_host_run may do there.
 	DevHosts map[string]DevHostConfig `json:"dev_hosts,omitempty" toml:"dev_hosts"`
+	// VerifyRepos are the GitHub repos ("owner/name") dev_deploy_verify may
+	// run scripts/verify_dev_deploy.sh from.
+	VerifyRepos []string `json:"verify_repos,omitempty" toml:"verify_repos"`
 	// VerifyScriptBlobs are git blob ids of scripts/verify_dev_deploy.sh the
-	// Board trusts besides the one on origin/main: dev_deploy_verify runs
-	// the dev-server copy only when its blob is one of these or main's.
+	// Board trusts besides the one on the repo's main branch on GitHub:
+	// dev_deploy_verify runs the dev-server copy only when its blob is one of
+	// these or main's.
 	VerifyScriptBlobs []string `json:"verify_script_blobs,omitempty" toml:"verify_script_blobs"`
 }
 

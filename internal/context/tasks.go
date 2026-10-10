@@ -1106,14 +1106,22 @@ func AddTaskComment(db *sql.DB, taskID, author, message string) error {
 	return addTaskComment(db, taskID, author, message, true)
 }
 
-// AddAgentComment is AddTaskComment for a comment the task's own agent
-// posts: it never wakes the task, so an agent cannot re-run itself by
-// commenting (task-7d279c9d).
-func AddAgentComment(db *sql.DB, taskID, author, message string) error {
-	return addTaskComment(db, taskID, author, message, false)
+// AgentCommentAuthor is the author of every comment an agent posts through
+// the task_comment MCP tool.
+const AgentCommentAuthor = "agent-comment"
+
+// AddAgentComment posts a comment from the task's own agent (task-7d279c9d).
+// Unlike a Board comment it never wakes the task, so an agent cannot re-run
+// itself, and it never supersedes pending interactions, so an agent cannot
+// dismiss a card that waits for the Board. Its author is always
+// AgentCommentAuthor, which the harness does not feed back as a comment.
+func AddAgentComment(db *sql.DB, taskID, message string) error {
+	return addTaskComment(db, taskID, AgentCommentAuthor, message, false)
 }
 
-func addTaskComment(db *sql.DB, taskID, author, message string, wake bool) error {
+// addTaskComment stores a comment. fromBoard comments wake the task and
+// supersede interactions; agent comments do neither.
+func addTaskComment(db *sql.DB, taskID, author, message string, fromBoard bool) error {
 	task, err := GetTask(db, taskID)
 	if err != nil {
 		return err
@@ -1125,10 +1133,12 @@ func addTaskComment(db *sql.DB, taskID, author, message string, wake bool) error
 
 	_ = LogActivity(db, task.ID, "comment_added", fmt.Sprintf("author=%s", author))
 	// Any pending interactions configured to supersede on comment are superseded
-	_, _ = SupersedeInteractionsOnComment(db, task.ID)
+	if fromBoard {
+		_, _ = SupersedeInteractionsOnComment(db, task.ID)
+	}
 	// Watchdog: re-evaluate criteria on every comment (update-triggered, no polling).
 	_ = governance.TriggerWatchdogEval(db, task.ID, "comment")
-	if wake && commentWakes(db, task.ID) {
+	if fromBoard && commentWakes(db, task.ID) {
 		_ = orchestrator.NotifyDaemon(task.ID, "comment", "")
 	}
 	return nil

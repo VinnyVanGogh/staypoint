@@ -2,14 +2,19 @@ package opstools
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// VerifyRequest is a dev_deploy_verify call.
+// VerifyRequest is a dev_deploy_verify call. Repo is a GitHub "owner/name".
 type VerifyRequest struct {
 	Repo       string   `json:"repo"`
 	SHA        string   `json:"sha"`
@@ -17,7 +22,7 @@ type VerifyRequest struct {
 }
 
 const (
-	// verifyScript is the MAN-255 gate script; it runs from origin/dev-server.
+	// verifyScript is the MAN-255 gate script; it runs from dev-server.
 	verifyScript  = "scripts/verify_dev_deploy.sh"
 	verifyTimeout = 5 * time.Minute
 	maxPageChecks = 20
@@ -25,16 +30,19 @@ const (
 
 var (
 	pageCheckRe = regexp.MustCompile(`^/[^\s=]*=[^\x00\r\n]+$`)
-	blobRe      = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
+	ghRepoRe    = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+	blobRe      = regexp.MustCompile(`^[0-9a-f]{40}$`)
 )
 
-// ValidateVerify checks r and resolves its repo.
-func ValidateVerify(r *VerifyRequest, defaultRepo string) error {
-	repo, err := RepoDir(r.Repo, defaultRepo)
-	if err != nil {
-		return err
+// ValidateVerify checks r: the repo must be one of allowed ([gates.ops]
+// verify_repos).
+func ValidateVerify(r *VerifyRequest, allowed []string) error {
+	if !ghRepoRe.MatchString(r.Repo) || strings.Contains(r.Repo, "..") {
+		return fmt.Errorf("repo %q is not a GitHub owner/name", r.Repo)
 	}
-	r.Repo = repo
+	if !slices.ContainsFunc(allowed, func(a string) bool { return strings.EqualFold(a, r.Repo) }) {
+		return fmt.Errorf("repo %s is not in [gates.ops] verify_repos", r.Repo)
+	}
 	if !shaRe.MatchString(r.SHA) {
 		return fmt.Errorf("sha %q is not a 7-40 character hex commit", r.SHA)
 	}
@@ -52,37 +60,69 @@ func ValidateVerify(r *VerifyRequest, defaultRepo string) error {
 // verifyLineRe picks the lines dev_deploy_verify reports.
 var verifyLineRe = regexp.MustCompile(`PASS|FAIL|DEV DEPLOY VERIFIED|NOT ON DEV`)
 
-// RunVerify runs the dev-server copy of the verify script with bash and
-// returns its PASS/FAIL lines and verdict line.
+// ghContent is the part of GitHub's contents API answer the verify flow reads.
+type ghContent struct {
+	SHA      string `json:"sha"`
+	Content  string `json:"content"`
+	Encoding string `json:"encoding"`
+}
+
+// fetchScript reads the verify script at ref from GitHub and checks that
+// the bytes hash to the blob id GitHub reported.
+func fetchScript(ctx context.Context, run Runner, repo, ref string) (blob string, body []byte, err error) {
+	res := run(ctx, Cmd{Name: "gh", Args: []string{"api", "repos/" + repo + "/contents/" + verifyScript + "?ref=" + ref}})
+	if res.ExitCode != 0 || res.Err != nil {
+		return "", nil, fmt.Errorf("%s has no %s on GitHub", ref, verifyScript)
+	}
+	var c ghContent
+	if err := json.Unmarshal([]byte(res.Stdout), &c); err != nil || c.Encoding != "base64" || !blobRe.MatchString(c.SHA) {
+		return "", nil, fmt.Errorf("unexpected GitHub contents answer for %s", ref)
+	}
+	body, err = base64.StdEncoding.DecodeString(strings.ReplaceAll(c.Content, "\n", ""))
+	if err != nil {
+		return "", nil, fmt.Errorf("decode %s: %w", ref, err)
+	}
+	if gitBlobID(body) != c.SHA {
+		return "", nil, fmt.Errorf("%s content does not hash to blob %s", ref, c.SHA)
+	}
+	return c.SHA, body, nil
+}
+
+// gitBlobID is git's SHA-1 object id for a blob holding b.
+func gitBlobID(b []byte) string {
+	h := sha1.New()
+	h.Write([]byte("blob " + strconv.Itoa(len(b)) + "\x00"))
+	h.Write(b)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// RunVerify runs the dev-server copy of r.Repo's verify script with bash in
+// dir and returns its PASS/FAIL lines and verdict line.
 //
-// Agents can push dev-server, so the script there is agent-writable: it runs
-// only when its blob is the one on origin/main (Board-merged) or one the
-// Board listed in trusted. The blob is read by id, so the bytes checked are
-// the bytes run.
-func RunVerify(ctx context.Context, run Runner, r VerifyRequest, trusted []string) string {
+// Agents can push dev-server, so the script there is agent-writable, and an
+// agent controls its local refs and remotes. The trust anchor is GitHub: the
+// script runs only when its blob there equals the blob on the repo's main
+// branch on GitHub (Board-merged) or one the Board listed in trusted, and
+// the bytes run are the ones hashed.
+func RunVerify(ctx context.Context, run Runner, r VerifyRequest, dir string, trusted []string) string {
 	ctx, cancel := context.WithTimeout(ctx, verifyTimeout)
 	defer cancel()
-	git := func(args ...string) Result {
-		return run(ctx, Cmd{Name: "git", Args: append([]string{"-C", r.Repo}, args...)})
+	blob, script, err := fetchScript(ctx, run, r.Repo, "dev-server")
+	if err != nil {
+		return "NOT ON DEV: " + err.Error()
 	}
-	if res := git("fetch", "origin", "dev-server", "main"); res.ExitCode != 0 || res.Err != nil {
-		return "NOT ON DEV: could not fetch origin dev-server and main\n" + res.Format()
+	mainBlob, _, err := fetchScript(ctx, run, r.Repo, "main")
+	if err != nil {
+		mainBlob = ""
 	}
-	dev := git("rev-parse", "--verify", "-q", "origin/dev-server:"+verifyScript)
-	blob := strings.TrimSpace(dev.Stdout)
-	if dev.ExitCode != 0 || !blobRe.MatchString(blob) {
-		return fmt.Sprintf("NOT ON DEV: origin/dev-server has no %s", verifyScript)
-	}
-	mainBlob := strings.TrimSpace(git("rev-parse", "--verify", "-q", "origin/main:"+verifyScript).Stdout)
 	if blob != mainBlob && !slices.Contains(trusted, blob) {
-		return fmt.Sprintf("NOT ON DEV: %s on origin/dev-server (blob %s) differs from origin/main and is not in [gates.ops] verify_script_blobs; the Board must review it before it runs", verifyScript, blob)
+		return fmt.Sprintf("NOT ON DEV: %s on dev-server (blob %s) differs from main on GitHub and is not in [gates.ops] verify_script_blobs; the Board must review it before it runs", verifyScript, blob)
 	}
-	script := git("cat-file", "blob", blob)
-	if script.ExitCode != 0 || script.Err != nil || script.Stdout == "" {
-		return "NOT ON DEV: could not read the verify script\n" + script.Format()
-	}
+	// The script checks the local origin/dev-server; refresh it as the
+	// manual form did. A failed fetch is left for the script to report.
+	_ = run(ctx, Cmd{Name: "git", Args: []string{"fetch", "origin", "dev-server"}, Dir: dir})
 	args := append([]string{"-s", "--", r.SHA}, r.PageChecks...)
-	res := run(ctx, Cmd{Name: "bash", Args: args, Dir: r.Repo, Stdin: []byte(script.Stdout)})
+	res := run(ctx, Cmd{Name: "bash", Args: args, Dir: dir, Stdin: script})
 	return summarizeVerify(res)
 }
 

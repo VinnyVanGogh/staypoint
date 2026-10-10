@@ -244,13 +244,23 @@ func TestTaskCommentAndDoc(t *testing.T) {
 	s := NewServer(WithDB(database), WithConfig(opsConfig(t)))
 	defer s.Close()
 
+	// A card waiting for the Board that a Board comment would supersede.
+	if _, err := database.Exec(`INSERT INTO task_interactions (task_id, interaction_kind, payload, status, idempotency_key, supersede_on_comment)
+		VALUES (?, 'ask_user_questions', '{}', 'pending', 'k1', 1)`, own.ID); err != nil {
+		t.Fatal(err)
+	}
+
 	text := "Deploy notes with `backticks`, $(not run) and 'quotes'\n- item"
 	if res := callOps(t, s, "task_comment", map[string]any{"text": text}); res.IsError {
 		t.Fatalf("comment: %s", resultText(res))
 	}
 	comments, _ := meshContext.GetTaskComments(database, own.ID)
-	if len(comments) != 1 || comments[0].Message != text || comments[0].Author != "agent" {
+	if len(comments) != 1 || comments[0].Message != text || comments[0].Author != meshContext.AgentCommentAuthor {
 		t.Fatalf("comment stored as %+v", comments)
+	}
+	var status string
+	if err := database.QueryRow(`SELECT status FROM task_interactions WHERE task_id = ?`, own.ID).Scan(&status); err != nil || status != "pending" {
+		t.Fatalf("agent comment superseded a Board card: status=%q err=%v", status, err)
 	}
 	if res := callOps(t, s, "task_comment", map[string]any{"text": "x", "task_id": other.ID}); !res.IsError {
 		t.Fatal("commented on another task")
