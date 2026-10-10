@@ -542,7 +542,7 @@ func handleHookPreTool() {
 	// a daemon-run agent, file edits (task-9d94997c).
 	taskID := os.Getenv("STAYPOINT_TASK_ID")
 	if !strings.EqualFold(payload.ToolName, "bash") {
-		if why := credentialFileAccess(payload.ToolName, payload.ToolInput); why != "" {
+		if why := credentialFileAccess(payload.ToolName, payload.ToolInput, payload.CWD); why != "" {
 			preToolBlock(why)
 			return
 		}
@@ -709,19 +709,24 @@ func credentialDataDirs() []string {
 		dirs = append(dirs, cfg.DataDir)
 	}
 	for i, d := range dirs {
-		dirs[i] = strings.ToLower(filepath.Clean(d))
+		dirs[i] = strings.ToLower(resolveBestEffort(filepath.Clean(d)))
 	}
 	return dirs
 }
 
 // credentialFileAccess is the denial for a non-shell tool call (Read, Grep,
-// Glob, ...) that would read a StayPoint credential file, or "". Only path
+// Glob, ...) that could read a StayPoint credential file, or "". Only path
 // and glob parameters are read, so editing code that mentions these names
 // is unaffected. The Bash path already holds ~/.staypoint; without this the
 // Read tool could hand an agent the ops key, and with it a run token for any
-// task (Board review #2 H1). Paths are expanded (~), cleaned and lowercased
-// before comparing, since the filesystem ignores case.
-func credentialFileAccess(tool string, input json.RawMessage) string {
+// task (Board review #2 H1).
+//
+// Paths are made absolute against cwd, ~-expanded, symlink-resolved where
+// they exist, and lowercased (the filesystem ignores case) before they are
+// compared with the data dirs. A content search (Grep) rooted at a data dir
+// or any parent of one is refused whatever its glob says; a Glob only lists
+// names, so it is refused only when its pattern names a credential file.
+func credentialFileAccess(tool string, input json.RawMessage, cwd string) string {
 	var args map[string]any
 	if json.Unmarshal(input, &args) != nil {
 		return ""
@@ -729,51 +734,61 @@ func credentialFileAccess(tool string, input json.RawMessage) string {
 	str := func(k string) string { s, _ := args[k].(string); return s }
 	home, _ := os.UserHomeDir()
 	norm := func(p string) string {
-		if p == "~" || strings.HasPrefix(p, "~/") {
+		switch {
+		case p == "~" || strings.HasPrefix(p, "~/"):
 			p = filepath.Join(home, strings.TrimPrefix(p, "~"))
+		case p == "":
+			p = cwd
+		case !filepath.IsAbs(p):
+			if cwd == "" {
+				p = "/" + p // unknown base: still caught by the name check below
+			} else {
+				p = filepath.Join(cwd, p)
+			}
 		}
-		return strings.ToLower(filepath.Clean(p))
+		return strings.ToLower(resolveBestEffort(filepath.Clean(p)))
 	}
 	under := func(p, dir string) bool { return p == dir || strings.HasPrefix(p, strings.TrimSuffix(dir, "/")+"/") }
 	dirs := credentialDataDirs()
 	const named = " names a StayPoint credential file (ops_key, auth_token, board_token)"
+	deny := func(why string) string { return "denied, not run: " + tool + why }
 
 	for _, k := range []string{"file_path", "notebook_path", "path"} {
 		raw := str(k)
 		if raw == "" {
 			continue
 		}
+		// Backstop on the raw text: any form that says .staypoint and a
+		// credential name.
+		if strings.Contains(strings.ToLower(raw), ".staypoint") && credentialNameRe.MatchString(raw) {
+			return deny(named)
+		}
 		p := norm(raw)
 		for _, d := range dirs {
-			if !under(p, d) {
-				continue
-			}
-			if credentialNameRe.MatchString(strings.TrimPrefix(p, d)) {
-				return "denied, not run: " + tool + named
-			}
-			if k == "path" && p == d {
-				return "denied, not run: " + tool + " searches the whole StayPoint data dir; use staypoint_query for your task's records"
+			if under(p, d) && credentialNameRe.MatchString(strings.TrimPrefix(p, d)) {
+				return deny(named)
 			}
 		}
 	}
-	// A glob (Glob's pattern, Grep's glob) that names a credential file is
-	// refused when it reaches into a data dir: it says .staypoint, or it is
-	// searched from the data dir or one of its parents.
-	globs := []string{str("glob")}
+	if strings.EqualFold(tool, "grep") {
+		if root := norm(str("path")); root != "" {
+			for _, d := range dirs {
+				if under(d, root) {
+					return deny(" searches the StayPoint data dir or a folder above it; search a narrower path, or use staypoint_query for your task's records")
+				}
+			}
+		}
+	}
 	if strings.EqualFold(tool, "glob") {
-		globs = append(globs, str("pattern"))
-	}
-	root := norm(str("path"))
-	for _, g := range globs {
-		if g == "" || !credentialNameRe.MatchString(g) {
-			continue
-		}
-		if strings.Contains(strings.ToLower(g), ".staypoint") || str("path") == "" {
-			return "denied, not run: " + tool + named
-		}
-		for _, d := range dirs {
-			if under(d, root) {
-				return "denied, not run: " + tool + named
+		if g := str("pattern"); credentialNameRe.MatchString(g) {
+			root := norm(str("path"))
+			if strings.Contains(strings.ToLower(g), ".staypoint") || filepath.IsAbs(g) || strings.HasPrefix(g, "~") {
+				return deny(named)
+			}
+			for _, d := range dirs {
+				if under(d, root) {
+					return deny(named)
+				}
 			}
 		}
 	}

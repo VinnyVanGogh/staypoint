@@ -75,12 +75,37 @@ func TestCredentialFileAccess(t *testing.T) {
 		{"Glob", map[string]string{"path": home, "pattern": "**/ops_key"}},
 		{"Glob", map[string]string{"path": "/", "pattern": "**/{ops_key,x}"}},
 		{"Grep", map[string]string{"path": home, "glob": "**/auth_token", "pattern": "."}},
+		// A content search from a parent of the data dir reaches it whatever
+		// the glob says.
+		{"Grep", map[string]string{"path": home, "pattern": "."}},
+		{"Grep", map[string]string{"path": "/", "pattern": "x"}},
+		{"Grep", map[string]string{"path": "~", "pattern": "x"}},
+		// Relative to the session's cwd.
+		{"Read", map[string]string{"file_path": "../.staypoint/ops_key"}},
+		{"Read", map[string]string{"file_path": "../../.staypoint/../.staypoint/auth_token"}},
+		{"Grep", map[string]string{"path": "..", "pattern": "x"}},
+		// Through a symlink to the data dir.
+		{"Read", map[string]string{"file_path": filepath.Join(home, "work", "link", "ops_key")}},
+	}
+	work := filepath.Join(home, "work")
+	if err := os.MkdirAll(filepath.Join(dd, "handoffs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(dd, filepath.Join(work, "link")); err != nil {
+		t.Fatal(err)
 	}
 	for _, c := range deny {
 		raw, _ := json.Marshal(c.in)
-		if credentialFileAccess(c.tool, raw) == "" {
+		if credentialFileAccess(c.tool, raw, work) == "" {
 			t.Errorf("%s %v allowed", c.tool, c.in)
 		}
+	}
+	// Grep with no path searches the cwd; a cwd above the data dir is refused.
+	if credentialFileAccess("Grep", []byte(`{"pattern":"x"}`), home) == "" {
+		t.Error("Grep from a cwd above the data dir allowed")
 	}
 	allow := []call{
 		{"Read", map[string]string{"file_path": dd + "/handoffs/task-1/plan.md"}},
@@ -94,7 +119,7 @@ func TestCredentialFileAccess(t *testing.T) {
 	}
 	for _, c := range allow {
 		raw, _ := json.Marshal(c.in)
-		if why := credentialFileAccess(c.tool, raw); why != "" {
+		if why := credentialFileAccess(c.tool, raw, work); why != "" {
 			t.Errorf("%s %v denied: %s", c.tool, c.in, why)
 		}
 	}

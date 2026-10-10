@@ -58,9 +58,12 @@ was no activity row. Four things close that:
   checks out. An agent can read its own run's token, but cannot mint one for
   another task without the key. A server with no task, another task's ID,
   or a missing or wrong token refuses every ops tool; the other `staypoint_*`
-  tools are unaffected. The hook denies Read, Grep and Glob calls whose path
-  names `ops_key`, `auth_token` or `board_token` under `.staypoint`, or that
-  search the whole data dir.
+  tools are unaffected. The hook denies a Read (or any tool with a path)
+  that reaches `ops_key`, `auth_token` or `board_token` in the data dir,
+  after making the path absolute against the session's cwd, expanding `~`,
+  resolving symlinks and folding case. It denies any Grep rooted at the data
+  dir or a folder above it (`~`, `/`), and a Glob whose pattern names one of
+  those files there.
 - **Pinned config.** `staypoint mcp` loads its config from the account's
   home in the user database (`os/user`, not `$HOME`), resets `HOME` to it,
   and checks the run token against that data dir. A fake `HOME` changes
