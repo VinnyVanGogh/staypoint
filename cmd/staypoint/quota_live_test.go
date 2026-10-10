@@ -8,8 +8,33 @@ import (
 	"time"
 
 	"github.com/VinnyVanGogh/staypoint/internal/db"
+	"github.com/VinnyVanGogh/staypoint/internal/router"
 	"github.com/VinnyVanGogh/staypoint/internal/telemetry/quota"
 )
+
+// Pacer reset times are stored in UTC; the report must show them in the
+// viewer's zone (07:30Z is 12:30 AM PDT), never the raw UTC clock.
+func TestRenderPacerPoolResetsInLocalTime(t *testing.T) {
+	pdt := time.FixedZone("PDT", -7*3600)
+	now := time.Date(2026, 10, 9, 22, 0, 0, 0, pdt)
+	pool := &router.QuotaPool{Name: "Claude (Work)"}
+	pool.FiveHour.ResetsAt = time.Date(2026, 10, 10, 7, 30, 0, 0, time.UTC)
+	pool.Weekly.ResetsAt = time.Date(2026, 10, 13, 16, 0, 0, 0, time.UTC)
+
+	var b bytes.Buffer
+	renderPacerPool(&b, pool, now)
+	out := b.String()
+	for _, want := range []string{"(at tomorrow 12:30 AM)", "(at Tue 9:00 AM)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	for _, bad := range []string{"07:30", "16:00"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("output shows UTC clock %q:\n%s", bad, out)
+		}
+	}
+}
 
 func TestRenderLiveQuota(t *testing.T) {
 	d, err := db.Open(filepath.Join(t.TempDir(), "q.db"))
