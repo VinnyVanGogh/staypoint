@@ -65,6 +65,8 @@ func TestBoardReview4Bypasses(t *testing.T) {
 		"printf -vHOME /x; staypoint status":          "earlier printf -v",
 		"let x=1; staypoint status":                   "earlier let",
 		`o=-v; printf "$o" HOME /x; staypoint status`: "earlier printf",
+		`printf {-v,x} HOME /x; staypoint status`:     "earlier printf",
+		`printf -[v] HOME /x; staypoint status`:       "earlier printf",
 		"tar cf - -C~ .staypoint":                     "whole home",
 		"tar cf - --directory=$HOME .staypoint":       "whole home",
 		"cd ~/Documents && cp -r .. /tmp/h":           "whole home",
